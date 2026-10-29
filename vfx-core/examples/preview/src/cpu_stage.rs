@@ -42,23 +42,28 @@ impl CpuStage {
         }
     }
 
-    /// Adds a frame's float RGBA pixels to the history as the frame at `time`.
-    fn push(&mut self, rgba: &[f32], time: f64, values: &ParamValues) {
+    /// Adds the frame the reader holds to the history as the frame at `time`.
+    fn push(&mut self, time: f64, values: &ParamValues) {
         if self.last_time.is_some_and(|last| time < last) {
             self.history.clear();
             self.effect.reset();
         }
         self.last_time = Some(time);
         let before = self.effect.frames_before(values);
-        let pixels = rgba.as_chunks::<4>().0;
-        for (dst, &[r, g, b, a]) in self.history.next(before).iter_mut().zip(pixels) {
-            *dst = Argb {
-                alpha: u8::from_unit(a),
-                red: u8::from_unit(r),
-                green: u8::from_unit(g),
-                blue: u8::from_unit(b),
-            };
-        }
+        let frame = self.history.next(before);
+        let width = self.size.0 as usize;
+        self.reader.take(|rgba, pitch| {
+            by_rows(frame, width, rgba, pitch, |dst, src| {
+                for (dst, &[r, g, b, a]) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
+                    *dst = Argb {
+                        alpha: u8::from_unit(a),
+                        red: u8::from_unit(r),
+                        green: u8::from_unit(g),
+                        blue: u8::from_unit(b),
+                    };
+                }
+            });
+        });
         self.rendered_with = None;
     }
 
@@ -79,15 +84,18 @@ impl CpuStage {
             .effect
             .render(&mut self.history, count, out, values, &ctx);
         self.rendered_with = Some(values.clone());
-        for (dst, p) in self
-            .upload
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(&self.rendered)
-        {
-            *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
-        }
+        let width = self.size.0 as usize;
+        by_rows(
+            &mut self.upload,
+            width * 4,
+            &self.rendered,
+            width,
+            |dst, src| {
+                for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                    *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
+                }
+            },
+        );
     }
 
     pub fn render(
@@ -98,8 +106,8 @@ impl CpuStage {
         values: &ParamValues,
         time: f64,
     ) {
-        if let Some((rgba, t)) = self.reader.read(gpu, input, time, self.last_time) {
-            self.push(&rgba, t, values);
+        if let Some(t) = self.reader.read(gpu, input, time, self.last_time) {
+            self.push(t, values);
         }
         self.refresh(values, time);
         if self.history.is_empty() {
@@ -114,6 +122,47 @@ impl CpuStage {
         } else {
             output.write(gpu, bytemuck::cast_slice(&self.upload));
         }
+    }
+}
+
+/// Runs `f` on each row of `dst` with the matching row of `src`, in one band of rows per
+/// core. Rows are `dst_row` and `src_row` elements long.
+#[cfg(not(target_arch = "wasm32"))]
+fn by_rows<D: Send, S: Sync>(
+    dst: &mut [D],
+    dst_row: usize,
+    src: &[S],
+    src_row: usize,
+    f: impl Fn(&mut [D], &[S]) + Sync,
+) {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let band = (dst.len() / dst_row).div_ceil(cores).max(1);
+    std::thread::scope(|scope| {
+        for (dst, src) in dst
+            .chunks_mut(band * dst_row)
+            .zip(src.chunks(band * src_row))
+        {
+            let f = &f;
+            scope.spawn(move || {
+                for (d, s) in dst.chunks_mut(dst_row).zip(src.chunks(src_row)) {
+                    f(d, s);
+                }
+            });
+        }
+    });
+}
+
+/// Browsers run the preview on one thread.
+#[cfg(target_arch = "wasm32")]
+fn by_rows<D, S>(
+    dst: &mut [D],
+    dst_row: usize,
+    src: &[S],
+    src_row: usize,
+    f: impl Fn(&mut [D], &[S]),
+) {
+    for (d, s) in dst.chunks_mut(dst_row).zip(src.chunks(src_row)) {
+        f(d, s);
     }
 }
 
@@ -170,33 +219,22 @@ impl Reader {
         gpu.queue.submit(Some(encoder.finish()));
     }
 
-    /// The mapped buffer's rows as tightly packed float RGBA.
-    fn take(&self) -> Vec<f32> {
-        let row = self.size.0 as usize * 4;
-        let mut rgba = Vec::with_capacity(row * self.size.1 as usize);
+    /// Hands `f` the mapped buffer as float RGBA rows `pitch` floats apart, then unmaps it.
+    fn take(&self, f: impl FnOnce(&[f32], usize)) {
         let data = self
             .buffer
             .slice(..)
             .get_mapped_range()
             .expect("readback is mapped");
-        for src in data.chunks_exact(self.pitch as usize) {
-            rgba.extend_from_slice(bytemuck::cast_slice(&src[..row * 4]));
-        }
+        f(bytemuck::cast_slice(&data), self.pitch as usize / 4);
         drop(data);
         self.buffer.unmap();
-        rgba
     }
 
-    /// The input as float RGBA, with the time it was rendered at, if it is a new frame (a
-    /// time other than `last`).
+    /// Maps the input for [`Reader::take`] and returns the time it was rendered at, if it
+    /// is a new frame (a time other than `last`).
     #[cfg(not(target_arch = "wasm32"))]
-    fn read(
-        &mut self,
-        gpu: &Gpu,
-        input: &Frame,
-        time: f64,
-        last: Option<f64>,
-    ) -> Option<(Vec<f32>, f64)> {
+    fn read(&mut self, gpu: &Gpu, input: &Frame, time: f64, last: Option<f64>) -> Option<f64> {
         if last == Some(time) {
             return None;
         }
@@ -213,17 +251,11 @@ impl Reader {
         rx.recv()
             .expect("map callback dropped")
             .expect("readback failed to map");
-        Some((self.take(), time))
+        Some(time)
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn read(
-        &mut self,
-        gpu: &Gpu,
-        input: &Frame,
-        time: f64,
-        last: Option<f64>,
-    ) -> Option<(Vec<f32>, f64)> {
+    fn read(&mut self, gpu: &Gpu, input: &Frame, time: f64, last: Option<f64>) -> Option<f64> {
         use std::sync::atomic::{AtomicBool, Ordering};
         if let Some(flight) = &self.in_flight {
             if !flight.mapped.load(Ordering::Acquire) {
@@ -231,7 +263,7 @@ impl Reader {
             }
             let time = flight.time;
             self.in_flight = None;
-            return Some((self.take(), time));
+            return Some(time);
         }
         if last == Some(time) {
             return None;
