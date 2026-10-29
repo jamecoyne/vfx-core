@@ -11,7 +11,12 @@
 //! cargo vfx install [-p EFFECT]... [--hosts ffgl]
 //! cargo vfx preview [-p EFFECT] [-- ARGS]      the preview app, opened on the effect
 //! cargo vfx env -p EFFECT                      the identity as KEY="value" lines
+//! cargo vfx check                              problems a host would hit, before building
+//! cargo vfx new NAME                           a new effect crate in effects/NAME
 //! ```
+//!
+//! Every command first checks that no two effects share an identity. Builds turn on the
+//! features an effect lists for the OS in `[package.metadata.vfx.features]`.
 //!
 //! Output goes to `target/vfx-plugin/`. `--native` builds only this machine's
 //! architecture on macOS (quicker, for tests); without it macOS bundles are universal.
@@ -23,8 +28,11 @@ use std::process::{Command, ExitCode};
 
 use vfx_build::Metadata;
 
-const USAGE: &str = "usage: cargo vfx <list|build|package|install|preview|env> [-p EFFECT]... \
-[--hosts ae,ofx,ffgl] [--debug] [--native] [-- ARGS]";
+mod check;
+mod new;
+
+const USAGE: &str = "usage: cargo vfx <list|build|package|install|preview|env|check> [-p EFFECT]... \
+[--hosts ae,ofx,ffgl] [--debug] [--native] [-- ARGS]\n       cargo vfx new NAME";
 
 const MEDIACORE: &str = "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore";
 const MAC_OFX: &str = "/Library/OFX/Plugins";
@@ -103,6 +111,7 @@ fn parse_args() -> Result<Options, String> {
             "--native" => o.native = true,
             "--" => o.rest.extend(it.by_ref()),
             "-h" | "--help" => return Err(USAGE.into()),
+            name if o.command == "new" && !name.starts_with('-') => o.rest.push(name.to_owned()),
             other => return Err(format!("unknown argument `{other}`\n{USAGE}")),
         }
     }
@@ -111,7 +120,13 @@ fn parse_args() -> Result<Options, String> {
 
 /// The workspace's effect crates, and its root and target directory.
 fn workspace() -> Result<(Vec<Effect>, PathBuf, PathBuf), String> {
+    workspace_in(Path::new("."))
+}
+
+/// [`workspace`] for the workspace containing `dir`, its identities checked.
+fn workspace_in(dir: &Path) -> Result<(Vec<Effect>, PathBuf, PathBuf), String> {
     let out = Command::new(env_or("CARGO", "cargo"))
+        .current_dir(dir)
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .output()
         .map_err(|e| format!("cargo metadata: {e}"))?;
@@ -136,6 +151,11 @@ fn workspace() -> Result<(Vec<Effect>, PathBuf, PathBuf), String> {
         });
     }
     effects.sort_by(|a, b| a.package.cmp(&b.package));
+    let identities: Vec<(String, Metadata)> = effects
+        .iter()
+        .map(|e| (e.package.clone(), e.meta.clone()))
+        .collect();
+    vfx_build::check_workspace(&identities).map_err(|errors| errors.join("\n"))?;
     let root = PathBuf::from(json["workspace_root"].as_str().unwrap_or("."));
     let target = PathBuf::from(json["target_directory"].as_str().unwrap_or("target"));
     Ok((effects, root, target))
@@ -165,6 +185,13 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(o: &Options) -> Result<(), String> {
+    if o.command == "new" {
+        let [name] = o.rest.as_slice() else {
+            return Err("usage: cargo vfx new NAME".into());
+        };
+        let (_, root, _) = workspace()?;
+        return new::new(&root, name);
+    }
     let (all, root, target) = workspace()?;
     let chosen: Vec<&Effect> = if o.packages.is_empty() {
         all.iter().collect()
@@ -213,18 +240,41 @@ fn dispatch(o: &Options) -> Result<(), String> {
         }
         "package" => {
             for e in &chosen {
+                warn_installed(e, o);
                 package(e, o, &target, &out)?;
             }
             Ok(())
         }
         "install" => {
             for e in &chosen {
+                warn_installed(e, o);
                 install(e, o, &target, &out)?;
             }
             Ok(())
         }
         "preview" => preview(&chosen, &root, o),
+        "check" => {
+            let problems = check::check(&all, &root);
+            for p in &problems {
+                eprintln!("{p}");
+            }
+            if problems.is_empty() {
+                println!("{} effects: no problems", all.len());
+                Ok(())
+            } else {
+                Err(format!("{} problems", problems.len()))
+            }
+        }
         other => Err(format!("unknown command `{other}`\n{USAGE}")),
+    }
+}
+
+/// Warns about installed After Effects plugins that would clash with this one.
+fn warn_installed(e: &Effect, o: &Options) {
+    if cfg!(target_os = "macos") && o.hosts.contains(&Host::Ae) {
+        for clash in check::installed_clashes(Path::new(MEDIACORE), e) {
+            eprintln!("warning: {clash}");
+        }
     }
 }
 
@@ -251,9 +301,22 @@ fn print_env(e: &Effect) {
     }
 }
 
+/// The OS a target triple builds for (`None`: this machine's).
+fn target_os(triple: Option<&str>) -> &'static str {
+    match triple {
+        Some(t) if t.contains("apple") => "macos",
+        Some(t) if t.contains("windows") => "windows",
+        Some(_) => "linux",
+        None if cfg!(target_os = "macos") => "macos",
+        None if cfg!(target_os = "windows") => "windows",
+        None => "linux",
+    }
+}
+
 /// The plugin binary for one target triple (`None`: the host's own).
 fn cargo_build(e: &Effect, o: &Options, triple: Option<&str>) -> Result<(), String> {
-    let features: Vec<&str> = o.hosts.iter().map(|h| h.feature()).collect();
+    let mut features: Vec<String> = o.hosts.iter().map(|h| h.feature().to_owned()).collect();
+    features.extend(e.meta.features_for(target_os(triple)));
     let mut cmd = Command::new(env_or("CARGO", "cargo"));
     cmd.args([
         "build",

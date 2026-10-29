@@ -4,13 +4,15 @@
 //!
 //! `time` names the frame: a render at a new time adds the input as the next frame, one at
 //! the same time renders that frame again (with whatever the parameters are now), and a
-//! time earlier than the last starts the history over, as a seek back does.
+//! time earlier than the last starts the history over, as a seek back does. The effect is
+//! kept between renders when it keeps state ([`vfx_host::CpuInstance`]).
 
 use vfx_core::cpu::{Argb, Channel, History, ImageMut, ViewMut};
-use vfx_core::{Context, CpuEffect, Frame, Gpu, ParamValues};
+use vfx_core::{Context, Frame, Gpu, ParamValues};
+use vfx_host::CpuInstance;
 
 pub struct CpuStage {
-    effect: Box<dyn CpuEffect>,
+    effect: CpuInstance,
     history: History<u8>,
     size: (u32, u32),
     /// The time of the newest frame in the history.
@@ -24,7 +26,7 @@ pub struct CpuStage {
 }
 
 impl CpuStage {
-    pub fn new(gpu: &Gpu, effect: Box<dyn CpuEffect>, size: (u32, u32)) -> Self {
+    pub fn new(gpu: &Gpu, effect: CpuInstance, size: (u32, u32)) -> Self {
         let pixels = size.0 as usize * size.1 as usize;
         let mut history = History::default();
         history.resize(size.0 as i32, size.1 as i32);
@@ -44,6 +46,7 @@ impl CpuStage {
     fn push(&mut self, rgba: &[f32], time: f64, values: &ParamValues) {
         if self.last_time.is_some_and(|last| time < last) {
             self.history.clear();
+            self.effect.reset();
         }
         self.last_time = Some(time);
         let before = self.effect.frames_before(values);
@@ -71,7 +74,9 @@ impl CpuStage {
         };
         let count = self.history.len();
         let out = ImageMut::U8(ViewMut::from_pixels(&mut self.rendered, w, h));
-        self.effect
+        // A render that panicked starts the effect over; its frame shows what it drew.
+        let _ = self
+            .effect
             .render(&mut self.history, count, out, values, &ctx);
         self.rendered_with = Some(values.clone());
         for (dst, p) in self

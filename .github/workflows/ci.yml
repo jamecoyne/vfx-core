@@ -32,10 +32,20 @@ jobs:
       # The core, the host-neutral crates and the effect crates (as libraries): plain Rust
       # and wgpu, so they build and test on every OS.
       - name: Clippy
-        run: cargo clippy -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p segcam-motion -p cargo-vfx --all-targets -- -D warnings
+        run: cargo clippy -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p segcam-motion -p segcam-face -p cargo-vfx --all-targets -- -D warnings
 
       - name: Tests (headless render, effects, reference checks)
-        run: cargo test -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p segcam-motion -p cargo-vfx
+        run: cargo test -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p segcam-motion -p segcam-face -p cargo-vfx
+
+      # segcam-face without ONNX Runtime: Vision alone on macOS, no detector elsewhere.
+      - name: segcam-face without ONNX Runtime
+        run: |
+          cargo clippy -p segcam-face --no-default-features --all-targets -- -D warnings
+          cargo test -p segcam-face --no-default-features
+
+      # Every effect's identity is unique and the preview offers every effect.
+      - name: cargo vfx check
+        run: cargo vfx check
 
   # Every effect as a plugin for every host: After Effects (.plugin / .aex), OpenFX and
   # FFGL, each built by `cargo vfx` from one binary per effect. Unsigned; signing needs

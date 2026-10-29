@@ -26,7 +26,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
 use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
-use vfx_core::{Context, CpuEffect, ParamValues, Processor};
+use vfx_core::{Context, ParamValues};
 use vfx_host::{Kind, diag, pipeline};
 
 #[cfg(not(target_os = "windows"))]
@@ -129,9 +129,10 @@ fn table() -> &'static [Param] {
     &statics().table
 }
 
-/// A CPU effect's state: its frames so far and its last render.
+/// A CPU effect's state: its frames so far and its last render. The effect is kept between
+/// renders when it keeps state ([`vfx_host::CpuInstance`]).
 struct Cpu {
-    effect: Box<dyn CpuEffect>,
+    effect: vfx_host::CpuInstance,
     ram: Option<transfer::Canvas>,
     history: History<u8>,
     rendered: Vec<Argb<u8>>,
@@ -159,15 +160,12 @@ struct Instance {
 
 impl Instance {
     fn new() -> Self {
-        let cpu = match (vfx_host::plugin().make)() {
-            Processor::Cpu(effect) => Some(Cpu {
-                effect,
-                ram: None,
-                history: History::default(),
-                rendered: Vec::new(),
-            }),
-            Processor::Gpu(_) => None,
-        };
+        let cpu = vfx_host::CpuInstance::new(vfx_host::plugin().make, true).map(|effect| Cpu {
+            effect,
+            ram: None,
+            history: History::default(),
+            rendered: Vec::new(),
+        });
         Self {
             values: table().iter().map(|p| p.default).collect(),
             time: None,
@@ -360,11 +358,13 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
                 // SAFETY: the host passes a pointer to a double, in seconds.
                 let time = unsafe { *input.ptr.cast::<f64>() };
                 if time.is_finite() {
-                    // A CPU effect's earlier frames are the ones before this time.
+                    // A CPU effect's earlier frames are the ones before this time, so going
+                    // back starts over.
                     if me.time.is_some_and(|previous| time < previous)
                         && let Some(cpu) = &mut me.cpu
                     {
                         cpu.history.clear();
+                        cpu.effect.reset();
                     }
                     me.time = Some(time);
                 }
@@ -468,6 +468,7 @@ unsafe fn process_cpu(
             }
         }
         cpu.history.resize(w as i32, h as i32);
+        cpu.effect.reset();
         cpu.rendered
             .resize(w as usize * h as usize, Argb::default());
     }
@@ -488,10 +489,9 @@ unsafe fn process_cpu(
     };
     let count = cpu.history.len();
     let out = ImageMut::U8(ViewMut::from_pixels(&mut cpu.rendered, w as i32, h as i32));
-    let rendered = catch_unwind(AssertUnwindSafe(|| {
-        cpu.effect
-            .render(&mut cpu.history, count, out, &values, &ctx)
-    }));
+    let rendered = cpu
+        .effect
+        .render(&mut cpu.history, count, out, &values, &ctx);
     if rendered.is_err() {
         LOG.note("warning: CPU render failed");
         return false;

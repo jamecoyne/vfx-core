@@ -557,20 +557,21 @@ fn temporal(cpu: bool) -> bool {
 }
 
 fn keeps_state() -> bool {
-    matches!((vfx_host::plugin().make)(), Processor::Cpu(e) if e.keeps_state())
+    vfx_host::CpuInstance::new(vfx_host::plugin().make, true).is_some_and(|i| i.is_kept())
 }
 
-/// An instance's own CPU effect, for effects that keep state.
-type Kept = std::sync::Mutex<Box<dyn vfx_core::CpuEffect>>;
+/// An instance's CPU effect, kept between renders under the shared policy
+/// ([`vfx_host::CpuInstance`]) when the effect keeps state.
+type Kept = vfx_host::CpuInstance;
 
 fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
-    let Processor::Cpu(cpu_effect) = (vfx_host::plugin().make)() else {
+    let Some(instance) = vfx_host::CpuInstance::new(vfx_host::plugin().make, true) else {
         return Ok(());
     };
-    if !cpu_effect.keeps_state() {
+    if !instance.is_kept() {
         return Ok(());
     }
-    let kept: *mut Kept = Box::into_raw(Box::new(std::sync::Mutex::new(cpu_effect)));
+    let kept: *mut Kept = Box::into_raw(Box::new(instance));
     // SAFETY: an instance handle; the pointer is freed in destroy-instance.
     check(unsafe {
         (suites().prop.propSetPointer)(
@@ -604,25 +605,14 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         .unwrap_or(ptr::null_mut());
     // SAFETY: set from a Box in create-instance and freed only in destroy-instance.
     if let Some(kept) = unsafe { kept.cast::<Kept>().as_ref() } {
-        // A render that panicked can leave the effect half updated, so start over.
-        let mut cpu_effect = kept.lock().unwrap_or_else(|poisoned| {
-            kept.clear_poison();
-            let mut cpu_effect = poisoned.into_inner();
-            if let Processor::Cpu(fresh) = (vfx_host::plugin().make)() {
-                *cpu_effect = fresh;
-            }
-            cpu_effect
-        });
-        return render_cpu_with(&mut **cpu_effect, effect, in_args);
+        return render_cpu_with(kept, effect, in_args);
     }
-    let Processor::Cpu(mut cpu_effect) = (vfx_host::plugin().make)() else {
-        return Err(STAT_FAILED);
-    };
-    render_cpu_with(&mut *cpu_effect, effect, in_args)
+    let fresh = vfx_host::CpuInstance::new(vfx_host::plugin().make, false).ok_or(STAT_FAILED)?;
+    render_cpu_with(&fresh, effect, in_args)
 }
 
 fn render_cpu_with(
-    cpu_effect: &mut dyn vfx_core::CpuEffect,
+    cpu_effect: &vfx_host::CpuInstance,
     effect: ImageEffect,
     in_args: Props,
 ) -> Result<(), OfxStatus> {
@@ -651,7 +641,7 @@ fn render_cpu_with(
     ));
     let error = if output.image.depth == Depth::Byte {
         draw::<u8>(
-            &mut *cpu_effect,
+            cpu_effect,
             source,
             start,
             first,
@@ -664,7 +654,7 @@ fn render_cpu_with(
         )
     } else {
         draw::<f32>(
-            &mut *cpu_effect,
+            cpu_effect,
             source,
             start,
             first,
@@ -714,7 +704,7 @@ impl Scratch for f32 {
 
 #[allow(clippy::too_many_arguments)]
 fn draw<C: Scratch>(
-    effect: &mut dyn vfx_core::CpuEffect,
+    effect: &vfx_host::CpuInstance,
     clip: Clip,
     start: f64,
     first: f64,
@@ -738,7 +728,12 @@ fn draw<C: Scratch>(
         pixels.clear();
         pixels.resize(canvas.width() * canvas.height(), Argb::default());
         let view = C::image_mut(ViewMut::from_pixels(pixels, w, h));
-        effect.render(&mut frames, count, view, values, ctx);
+        if effect
+            .render(&mut frames, count, view, values, ctx)
+            .is_err()
+        {
+            return Some(STAT_FAILED);
+        }
         // SAFETY: the render window is clipped to the output and canvas bounds.
         unsafe { cpu::encode(pixels, canvas, output, window) };
         frames.error

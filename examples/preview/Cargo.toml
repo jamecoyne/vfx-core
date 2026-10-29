@@ -8,7 +8,9 @@ publish = false
 [dependencies]
 vfx-core = { path = "../.." }
 vfx-host = { path = "../../wrappers/common" }
-# The repository's effect crates, which the preview offers alongside the core effects.
+# The repository's effect crates, which the preview offers alongside the core effects. Its
+# build script lists every path dependency with [package.metadata.vfx]; `cargo vfx new` adds
+# a new effect here, and `cargo vfx check` reports one that's missing.
 vfx-chain = { path = "../../effects/vfx-chain" }
 segcam-motion = { path = "../../effects/segcam-motion" }
 wgpu = "=30.0.1"
@@ -20,6 +22,9 @@ egui-winit = { version = "0.37.0", default-features = false }
 bytemuck = "1.25.2"
 # std::time::Instant panics in browsers; web-time is the same type on native.
 web-time = "1.1.0"
+
+[build-dependencies]
+vfx-build = { path = "../../wrappers/build" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "links"] }

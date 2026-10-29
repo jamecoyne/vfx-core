@@ -44,85 +44,102 @@ fn define_one(
     Ok(p)
 }
 
-/// Defines a control for every parameter the context can serve: those that need a second
-/// layer only when `layer` is set.
+/// Defines a control for every parameter the context can serve (those that need a second
+/// layer only when `layer` is set), laid out by [`vfx_host::controls::layout`].
 pub fn define(set: ParamSet, specs: &[ParamSpec], layer: bool) -> Result<(), OfxStatus> {
+    use vfx_host::controls::{Groups, Host, Item, layout};
+    let host = Host {
+        layer,
+        region: true,
+        layer_picker: None,
+        groups: Groups::Shown,
+    };
     let mut groups: Vec<&str> = Vec::new();
-    for spec in specs.iter().filter(|s| vfx_host::served(s, layer, true)) {
-        if !spec.group.is_empty() && !groups.contains(&spec.group) {
-            groups.push(spec.group);
-            define_one(
-                set,
-                PARAM_TYPE_GROUP,
-                &group_name(spec.group),
-                spec.group,
-                None,
-            )?;
-        }
-        let parent = (!spec.group.is_empty()).then_some(spec.group);
-        let label = spec.display_label();
-        match spec.kind {
-            ParamKind::Float { min, max, default } => {
-                let p = define_one(set, PARAM_TYPE_DOUBLE, spec.name, &label, parent)?;
-                let [lo, hi] = spec.slider_range().unwrap_or([min, max]);
-                p.set_double(PARAM_PROP_DEFAULT, 0, f64::from(default))?;
-                p.set_double(PARAM_PROP_MIN, 0, f64::from(min))?;
-                p.set_double(PARAM_PROP_MAX, 0, f64::from(max))?;
-                optional(
-                    PARAM_PROP_DISPLAY_MIN,
-                    p.set_double(PARAM_PROP_DISPLAY_MIN, 0, f64::from(lo)),
-                );
-                optional(
-                    PARAM_PROP_DISPLAY_MAX,
-                    p.set_double(PARAM_PROP_DISPLAY_MAX, 0, f64::from(hi)),
-                );
-                optional(
-                    PARAM_PROP_INCREMENT,
-                    p.set_double(PARAM_PROP_INCREMENT, 0, f64::from(hi - lo) / 200.0),
-                );
-                optional(PARAM_PROP_DIGITS, p.set_int(PARAM_PROP_DIGITS, 0, 2));
-            }
-            ParamKind::Int {
-                default, options, ..
-            } if !options.is_empty() => {
-                let p = define_one(set, PARAM_TYPE_CHOICE, spec.name, &label, parent)?;
-                for (i, option) in options.iter().enumerate() {
-                    p.set_str(PARAM_PROP_CHOICE_OPTION, i, &c_string(option)?)?;
+    for item in layout(specs, &host) {
+        match item {
+            Item::Control(spec) => define_control(set, spec, None)?,
+            Item::Layer => {}
+            Item::Group { name, items } => {
+                // A group split by other controls is defined once; its parts join it.
+                if !groups.contains(&name) {
+                    groups.push(name);
+                    define_one(set, PARAM_TYPE_GROUP, &group_name(name), name, None)?;
                 }
-                p.set_int(PARAM_PROP_DEFAULT, 0, default)?;
+                for item in items {
+                    if let Item::Control(spec) = item {
+                        define_control(set, spec, Some(name))?;
+                    }
+                }
             }
-            ParamKind::Int {
-                min, max, default, ..
-            } => {
-                let p = define_one(set, PARAM_TYPE_INTEGER, spec.name, &label, parent)?;
-                let [lo, hi] = spec.slider_range().unwrap_or([min as f32, max as f32]);
-                p.set_int(PARAM_PROP_DEFAULT, 0, default)?;
-                p.set_int(PARAM_PROP_MIN, 0, min)?;
-                p.set_int(PARAM_PROP_MAX, 0, max)?;
-                optional(
-                    PARAM_PROP_DISPLAY_MIN,
-                    p.set_int(PARAM_PROP_DISPLAY_MIN, 0, lo as c_int),
-                );
-                optional(
-                    PARAM_PROP_DISPLAY_MAX,
-                    p.set_int(PARAM_PROP_DISPLAY_MAX, 0, hi as c_int),
-                );
+        }
+    }
+    Ok(())
+}
+
+/// One parameter's control, in the group named `parent`.
+fn define_control(set: ParamSet, spec: &ParamSpec, parent: Option<&str>) -> Result<(), OfxStatus> {
+    let label = spec.display_label();
+    match spec.kind {
+        ParamKind::Float { min, max, default } => {
+            let p = define_one(set, PARAM_TYPE_DOUBLE, spec.name, &label, parent)?;
+            let [lo, hi] = spec.slider_range().unwrap_or([min, max]);
+            p.set_double(PARAM_PROP_DEFAULT, 0, f64::from(default))?;
+            p.set_double(PARAM_PROP_MIN, 0, f64::from(min))?;
+            p.set_double(PARAM_PROP_MAX, 0, f64::from(max))?;
+            optional(
+                PARAM_PROP_DISPLAY_MIN,
+                p.set_double(PARAM_PROP_DISPLAY_MIN, 0, f64::from(lo)),
+            );
+            optional(
+                PARAM_PROP_DISPLAY_MAX,
+                p.set_double(PARAM_PROP_DISPLAY_MAX, 0, f64::from(hi)),
+            );
+            optional(
+                PARAM_PROP_INCREMENT,
+                p.set_double(PARAM_PROP_INCREMENT, 0, f64::from(hi - lo) / 200.0),
+            );
+            optional(PARAM_PROP_DIGITS, p.set_int(PARAM_PROP_DIGITS, 0, 2));
+        }
+        ParamKind::Int {
+            default, options, ..
+        } if !options.is_empty() => {
+            let p = define_one(set, PARAM_TYPE_CHOICE, spec.name, &label, parent)?;
+            for (i, option) in options.iter().enumerate() {
+                p.set_str(PARAM_PROP_CHOICE_OPTION, i, &c_string(option)?)?;
             }
-            ParamKind::Bool { default } => {
-                let p = define_one(set, PARAM_TYPE_BOOLEAN, spec.name, &label, parent)?;
-                p.set_int(PARAM_PROP_DEFAULT, 0, default as c_int)?;
-            }
-            ParamKind::Color { default } => {
-                let p = define_one(set, PARAM_TYPE_RGBA, spec.name, &label, parent)?;
-                p.set_doubles(PARAM_PROP_DEFAULT, &default.map(f64::from))?;
-            }
-            ParamKind::Point { default: [x, y] } => {
-                let p = define_one(set, PARAM_TYPE_DOUBLE_2D, spec.name, &label, parent)?;
-                p.set_str(PARAM_PROP_DOUBLE_TYPE, 0, DOUBLE_TYPE_XY_ABSOLUTE)?;
-                p.set_str(PARAM_PROP_DEFAULT_COORDINATES, 0, COORDINATES_NORMALISED)?;
-                // OpenFX's normalised coordinates run up from the bottom left.
-                p.set_doubles(PARAM_PROP_DEFAULT, &[f64::from(x), f64::from(1.0 - y)])?;
-            }
+            p.set_int(PARAM_PROP_DEFAULT, 0, default)?;
+        }
+        ParamKind::Int {
+            min, max, default, ..
+        } => {
+            let p = define_one(set, PARAM_TYPE_INTEGER, spec.name, &label, parent)?;
+            let [lo, hi] = spec.slider_range().unwrap_or([min as f32, max as f32]);
+            p.set_int(PARAM_PROP_DEFAULT, 0, default)?;
+            p.set_int(PARAM_PROP_MIN, 0, min)?;
+            p.set_int(PARAM_PROP_MAX, 0, max)?;
+            optional(
+                PARAM_PROP_DISPLAY_MIN,
+                p.set_int(PARAM_PROP_DISPLAY_MIN, 0, lo as c_int),
+            );
+            optional(
+                PARAM_PROP_DISPLAY_MAX,
+                p.set_int(PARAM_PROP_DISPLAY_MAX, 0, hi as c_int),
+            );
+        }
+        ParamKind::Bool { default } => {
+            let p = define_one(set, PARAM_TYPE_BOOLEAN, spec.name, &label, parent)?;
+            p.set_int(PARAM_PROP_DEFAULT, 0, default as c_int)?;
+        }
+        ParamKind::Color { default } => {
+            let p = define_one(set, PARAM_TYPE_RGBA, spec.name, &label, parent)?;
+            p.set_doubles(PARAM_PROP_DEFAULT, &default.map(f64::from))?;
+        }
+        ParamKind::Point { default: [x, y] } => {
+            let p = define_one(set, PARAM_TYPE_DOUBLE_2D, spec.name, &label, parent)?;
+            p.set_str(PARAM_PROP_DOUBLE_TYPE, 0, DOUBLE_TYPE_XY_ABSOLUTE)?;
+            p.set_str(PARAM_PROP_DEFAULT_COORDINATES, 0, COORDINATES_NORMALISED)?;
+            // OpenFX's normalised coordinates run up from the bottom left.
+            p.set_doubles(PARAM_PROP_DEFAULT, &[f64::from(x), f64::from(1.0 - y)])?;
         }
     }
     Ok(())

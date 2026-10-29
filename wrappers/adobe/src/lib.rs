@@ -690,10 +690,7 @@ fn cpu_pre_render(
     params: &ae::Parameters<Key>,
 ) -> Result<(), ae::Error> {
     let values = params::read(params, specs())?;
-    let Processor::Cpu(effect) = (vfx_host::plugin().make)() else {
-        return Err(ae::Error::BadCallbackParameter);
-    };
-    let wanted = effect.frames_before(&values);
+    let wanted = cpu_instance()?.frames_before(&values);
 
     // CPU effects see the whole frame, so ask for the whole layer whatever region After
     // Effects wants back.
@@ -786,13 +783,18 @@ fn view<C: CpuDepth>(layer: &ae::Layer) -> Option<View<'_, C>> {
     })
 }
 
+/// The CPU effect for one render. After Effects never keeps one between renders: its cache
+/// and Multi-Frame Rendering ask for any frame, on any thread ([`vfx_host::CpuInstance`]).
+fn cpu_instance() -> Result<vfx_host::CpuInstance, ae::Error> {
+    vfx_host::CpuInstance::new(vfx_host::plugin().make, false)
+        .ok_or(ae::Error::BadCallbackParameter)
+}
+
 fn cpu_render(extra: &ae::SmartRenderExtra) -> Result<(), ae::Error> {
     let plan = extra
         .pre_render_data::<Plan>()
         .ok_or(ae::Error::BadCallbackParameter)?;
-    let Processor::Cpu(mut effect) = (vfx_host::plugin().make)() else {
-        return Err(ae::Error::BadCallbackParameter);
-    };
+    let instance = cpu_instance()?;
     let callbacks = extra.callbacks();
     let current = callbacks.checkout_layer_pixels(INPUT_ID as u32)?;
     let result = (|| {
@@ -804,13 +806,15 @@ fn cpu_render(extra: &ae::SmartRenderExtra) -> Result<(), ae::Error> {
             output.bit_depth(),
             plan.frame_count
         ));
-        catch_unwind(AssertUnwindSafe(|| match output.bit_depth() {
-            8 => render_as::<u8>(&mut *effect, plan, callbacks, current.as_ref(), &mut output),
-            16 => render_as::<u16>(&mut *effect, plan, callbacks, current.as_ref(), &mut output),
-            32 => render_as::<f32>(&mut *effect, plan, callbacks, current.as_ref(), &mut output),
-            _ => Err(ae::Error::BadCallbackParameter),
-        }))
-        .unwrap_or(Err(ae::Error::BadCallbackParameter))
+        instance.with(|effect| {
+            catch_unwind(AssertUnwindSafe(|| match output.bit_depth() {
+                8 => render_as::<u8>(effect, plan, callbacks, current.as_ref(), &mut output),
+                16 => render_as::<u16>(effect, plan, callbacks, current.as_ref(), &mut output),
+                32 => render_as::<f32>(effect, plan, callbacks, current.as_ref(), &mut output),
+                _ => Err(ae::Error::BadCallbackParameter),
+            }))
+            .unwrap_or(Err(ae::Error::BadCallbackParameter))
+        })
     })();
     // Every way out checks the current frame back in.
     callbacks.checkin_layer_pixels(INPUT_ID as u32)?;
@@ -867,7 +871,8 @@ pub fn render_legacy(
             };
             render_frame(values, in_layer, layer.as_ref(), out_layer, ctx)
         }
-        Processor::Cpu(mut effect) => {
+        Processor::Cpu(_) => {
+            let instance = cpu_instance()?;
             struct One<'a, C>(&'a ae::Layer, std::marker::PhantomData<C>);
             impl<C: CpuDepth> FrameSource for One<'_, C> {
                 fn with_frame(&mut self, _index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
@@ -880,12 +885,16 @@ pub fn render_legacy(
                 8 => {
                     let out = ViewMut::<u8>::new(out_layer.buffer_mut(), w, h, stride);
                     let mut one = One::<u8>(in_layer, std::marker::PhantomData);
-                    effect.render(&mut one, 1, u8::image_mut(out), &values, &ctx);
+                    instance
+                        .render(&mut one, 1, u8::image_mut(out), &values, &ctx)
+                        .map_err(|_| ae::Error::BadCallbackParameter)?;
                 }
                 16 => {
                     let out = ViewMut::<u16>::new(out_layer.buffer_mut(), w, h, stride);
                     let mut one = One::<u16>(in_layer, std::marker::PhantomData);
-                    effect.render(&mut one, 1, u16::image_mut(out), &values, &ctx);
+                    instance
+                        .render(&mut one, 1, u16::image_mut(out), &values, &ctx)
+                        .map_err(|_| ae::Error::BadCallbackParameter)?;
                 }
                 _ => return Err(ae::Error::BadCallbackParameter),
             }

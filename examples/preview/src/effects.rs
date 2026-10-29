@@ -272,11 +272,14 @@ impl Stage {
                     },
                 }
             }
-            Processor::Cpu(made) => Self {
-                effect,
-                layers: 0,
-                run: Run::Cpu(Box::new(CpuStage::new(gpu, made, size))),
-            },
+            Processor::Cpu(_) => {
+                let made = vfx_host::CpuInstance::new(entry.make, true).expect("a CPU effect");
+                Self {
+                    effect,
+                    layers: 0,
+                    run: Run::Cpu(Box::new(CpuStage::new(gpu, made, size))),
+                }
+            }
         }
     }
 }
