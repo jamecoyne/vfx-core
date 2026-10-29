@@ -24,6 +24,15 @@ fn group_key(prefix: &str, group: &str) -> Key {
     Key(Box::leak(format!("{prefix}:{group}").into_boxed_str()))
 }
 
+/// Whether `group` becomes a group in Effect Controls. Not when a control has the same
+/// name: scripts and expressions find properties by name, and the group would hide it
+/// (VFX Preview's "Vignette" checkbox sits in the Vignette group of other hosts).
+fn groups_in_ae(specs: &[ParamSpec], group: &str, layer_name: Option<&str>) -> bool {
+    !group.is_empty()
+        && layer_name != Some(group)
+        && !specs.iter().any(|s| s.display_label() == group)
+}
+
 /// Defines every control: `specs` in order, consecutive ones with a group inside it, and
 /// the layer picker (when `layer_name` is given) before the first control that needs it.
 pub fn setup(
@@ -53,7 +62,7 @@ pub fn setup(
             }
             Ok(())
         };
-        if group.is_empty() {
+        if !groups_in_ae(specs, group, layer_name) {
             add_run(params)?;
         } else {
             params.add_group(
@@ -207,5 +216,20 @@ mod tests {
         // The crate's disk IDs hash this text, so it must be the bare name.
         assert_eq!(format!("{:?}", Key("blur_radius")), "blur_radius");
         assert_eq!(format!("{:?}", group_key("group", "Blur")), "group:Blur");
+    }
+
+    #[test]
+    fn groups_never_hide_a_control_of_the_same_name() {
+        static SPECS: [ParamSpec; 3] = [
+            ParamSpec::toggle("vignette", true)
+                .label("Vignette")
+                .group("Vignette"),
+            ParamSpec::float("brightness", -1.0, 1.0, 0.0).group("Color"),
+            ParamSpec::float("amount", 0.0, 1.0, 1.0).group("Blend"),
+        ];
+        assert!(!groups_in_ae(&SPECS, "Vignette", None));
+        assert!(groups_in_ae(&SPECS, "Color", None));
+        assert!(!groups_in_ae(&SPECS, "Blend", Some("Blend")));
+        assert!(!groups_in_ae(&SPECS, "", None));
     }
 }

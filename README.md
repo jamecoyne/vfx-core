@@ -239,10 +239,9 @@ conversions. Beyond those, each host has a harness, run against the effects:
 
 ## Known gaps
 
-- The generic target crates have been checked in the OpenFX and FFGL mini hosts and by
-  unit tests. The generic After Effects target hasn't yet run in After Effects or its
-  harnesses. The apps (After Effects, Resolve, Natron, Resolume) were last checked with
-  the earlier per-effect wrappers.
+- The generic target crates have been checked in the OpenFX and FFGL mini hosts, by unit
+  tests and, for After Effects 26.5 on macOS, by both effects' harnesses. Resolve, Natron
+  and Resolume were last checked with the earlier per-effect wrappers.
 - Windows: the `.aex` builds in CI but hasn't been tested in After Effects; OpenFX hasn't
   been tried in Resolve on Windows; FFGL's Windows paths pass the mini host on an RX 5700
   XT but haven't been tried in Resolume on Windows with VFX Preview.
