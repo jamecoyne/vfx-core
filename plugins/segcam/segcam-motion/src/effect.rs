@@ -80,7 +80,7 @@ pub const PARAMS: &[ParamSpec] = &[
         .label("Swarm max tiles")
         .group("Swarm")
         .slider(1.0, 300.0),
-    ParamSpec::choice("swarm_background", &["Clear", "Source", "Black"], 0)
+    ParamSpec::choice("swarm_background", &["Transparent", "Source", "Black"], 0)
         .label("Swarm backdrop")
         .group("Swarm"),
     ParamSpec::toggle("live_windows", false)
@@ -127,7 +127,7 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
         swarm_background: match p.int("swarm_background") {
             1 => SwarmBackground::Source,
             2 => SwarmBackground::Black,
-            _ => SwarmBackground::Clear,
+            _ => SwarmBackground::Transparent,
         },
         live_windows: p.bool("live_windows"),
     }

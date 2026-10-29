@@ -71,9 +71,9 @@ impl FaceParts {
 /// What the swarm's windows sit on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SwarmBackground {
-    /// The canvas stays clear, for whatever is behind the layer.
+    /// The canvas stays transparent, for whatever is behind the layer.
     #[default]
-    Clear,
+    Transparent,
     Source,
     Black,
 }
@@ -125,7 +125,7 @@ impl Default for RenderSettings {
             },
             trail_frames: 24,
             max_tiles: 100,
-            swarm_background: SwarmBackground::Clear,
+            swarm_background: SwarmBackground::Transparent,
             live_windows: false,
         }
     }

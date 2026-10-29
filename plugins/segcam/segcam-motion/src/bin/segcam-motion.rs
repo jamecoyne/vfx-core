@@ -30,7 +30,7 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --detect motion|threshold|faces       (motion)
   --face  --eyes  --mouth  --body       (off; segcam-face's models)
   --level 0..255  --auto-level  --invert   (170; threshold)
-  --swarm-background clear|source|black (clear)
+  --swarm-background transparent|source|black (transparent)
   --live-windows                       (swarm windows show the current frame)
   --mirror  --no-boxes  --no-labels
   --float                              (render in float, still raw 8-bit I/O)
@@ -86,7 +86,7 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
             "--body" => s.faces.body = true,
             "--swarm-background" => {
                 s.swarm_background = match value()? {
-                    "clear" => SwarmBackground::Clear,
+                    "transparent" => SwarmBackground::Transparent,
                     "source" => SwarmBackground::Source,
                     "black" => SwarmBackground::Black,
                     _ => return None,
