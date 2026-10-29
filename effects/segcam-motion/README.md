@@ -51,9 +51,12 @@ load the first time, then add about 12 ms to a 1080p frame, and the plugin ships
 
 It asks for the **Background** frames before the current one (plus **Trail frames** - 1 in
 Swarm mode) through `CpuEffect::frames_before`. It keeps each frame's grid, motion and tiles
-until they age out (`src/incremental.rs`) and reads only the frames it lacks; the output is
-the same in any render order. After Effects still makes a new effect per render, so its
-cache and Multi-Frame Rendering are unchanged.
+until they age out (`src/incremental.rs`), with a hash of the frame's pixels. Every render
+still reads each frame it depends on, so an edit upstream reaches it however far back it
+is, but only a frame whose pixels changed is worked out again, along with the motion and
+tiles it feeds. A frame the host couldn't hand over counts as empty for that render and is
+read again next time. The output is the same in any render order. After Effects still makes
+a new effect per render, so its cache and Multi-Frame Rendering are unchanged.
 
 The C++ effect's README covers how this differs from the live app (no state carried
 forever, per-frame IDs); all of it applies here.

@@ -19,7 +19,7 @@ pub mod render;
 pub mod swarm;
 
 pub use effect::SegcamMotion;
-pub use incremental::{Advance, Incremental};
+pub use incremental::Incremental;
 
 vfx_plugin::export!(cpu: SegcamMotion);
 pub use motion::{

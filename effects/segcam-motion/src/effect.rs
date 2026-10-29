@@ -5,9 +5,8 @@
 use vfx_core::cpu::{FrameSource, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Unit};
 
-use crate::pixel::{Depth, ViewMut};
 use crate::{
-    Advance, Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode, RenderSettings,
+    Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode, RenderSettings,
     SwarmBackground, ThresholdSettings,
 };
 
@@ -135,7 +134,7 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
 }
 
 /// segcam Motion. It keeps what it works out for each frame (see [`Incremental`]), so a host
-/// that keeps the instance reads one new frame per render.
+/// that keeps the instance works out only what changed since the last render.
 #[derive(Default)]
 pub struct SegcamMotion {
     state: Incremental,
@@ -165,24 +164,10 @@ impl CpuEffect for SegcamMotion {
         let s = settings(params, ctx.premultiplied);
         let (state, n) = (&mut self.state, ctx.frame);
         match output {
-            ImageMut::U8(mut out) => advance(state, &s, frames, count, n, &mut out),
-            ImageMut::U16(mut out) => advance(state, &s, frames, count, n, &mut out),
-            ImageMut::F32(mut out) => advance(state, &s, frames, count, n, &mut out),
+            ImageMut::U8(mut out) => state.advance(&s, frames, count, n, &mut out),
+            ImageMut::U16(mut out) => state.advance(&s, frames, count, n, &mut out),
+            ImageMut::F32(mut out) => state.advance(&s, frames, count, n, &mut out),
         }
-    }
-}
-
-/// Renders through what is kept, and again from cold if the source changed.
-fn advance<C: Depth>(
-    state: &mut Incremental,
-    s: &RenderSettings,
-    frames: &mut dyn FrameSource,
-    count: usize,
-    number: i64,
-    out: &mut ViewMut<C>,
-) {
-    if state.advance(s, frames, count, number, out) == Advance::Discontinuity {
-        let _ = state.advance(s, frames, count, number, out);
     }
 }
 
