@@ -1,0 +1,24 @@
+[package]
+name = "segcam-face"
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Faces, eyes, mouths and bodies for segcam: Vision on macOS, YuNet, MediaPipe Face Mesh and PicoDet-S on ONNX Runtime on other platforms"
+
+[dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-native",
+    "copy-dylibs",
+    "api-31",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+
+# DirectML runs the models on any Direct3D 12 GPU.
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["directml"] }
+windows = { version = "0.62.2", features = ["Win32_Graphics_Dxgi"] }
