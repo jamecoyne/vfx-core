@@ -15,7 +15,7 @@ use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use segcam_motion::pixel::Depth;
-use segcam_motion::{Argb, OutputMode, RenderSettings, View, ViewMut};
+use segcam_motion::{Argb, Detect, OutputMode, RenderSettings, SwarmBackground, View, ViewMut};
 use vfx_core::cpu::{FrameSource, Image};
 
 const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames > argb-frames
@@ -27,6 +27,10 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --max-segments n                      (16)
   --grid columns                        (192)
   --trail frames  --max-tiles n         (24, 100)
+  --detect motion|threshold|faces       (motion)
+  --face  --eyes  --mouth  --body       (off; segcam-face's models)
+  --level 0..255  --auto-level  --invert   (170; threshold)
+  --swarm-background clear|source|black (clear)
   --mirror  --no-boxes  --no-labels
   --float                              (render in float, still raw 8-bit I/O)
   --straight-alpha                     (input and output use straight alpha)";
@@ -61,6 +65,29 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
                     "matte" => OutputMode::Matte,
                     "boxmatte" => OutputMode::BoxMatte,
                     "swarm" => OutputMode::Swarm,
+                    _ => return None,
+                }
+            }
+            "--detect" => {
+                s.detect = match value()? {
+                    "motion" => Detect::Motion,
+                    "threshold" => Detect::Threshold,
+                    "faces" => Detect::FacesOnly,
+                    _ => return None,
+                }
+            }
+            "--level" => s.threshold.level = value()?.parse().ok()?,
+            "--auto-level" => s.threshold.auto = true,
+            "--invert" => s.threshold.invert = true,
+            "--face" => s.faces.face = true,
+            "--eyes" => s.faces.eyes = true,
+            "--mouth" => s.faces.mouth = true,
+            "--body" => s.faces.body = true,
+            "--swarm-background" => {
+                s.swarm_background = match value()? {
+                    "clear" => SwarmBackground::Clear,
+                    "source" => SwarmBackground::Source,
+                    "black" => SwarmBackground::Black,
                     _ => return None,
                 }
             }

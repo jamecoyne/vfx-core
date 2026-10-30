@@ -7,7 +7,9 @@ use std::collections::VecDeque;
 
 use crate::font;
 use crate::incremental::Incremental;
-use crate::motion::{Blob, LumaGrid, Motion, MotionSettings, NormRect};
+use crate::motion::{
+    Blob, LumaGrid, Motion, MotionSettings, NormRect, SegmentKind, ThresholdSettings,
+};
 use crate::pixel::{Argb, Channel, Color, Depth, View, ViewMut, make_pixel, scale_pixel};
 use crate::swarm::{self, SwarmMetrics, Tile};
 use vfx_core::cpu::FrameSource;
@@ -39,10 +41,50 @@ impl OutputMode {
     }
 }
 
+/// What finds the segments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Detect {
+    /// What moved against a background of the frames before.
+    #[default]
+    Motion,
+    /// What is brighter (or darker) than a level, frame by frame.
+    Threshold,
+    /// Only the ticked face parts, as segcam 1.1 does with Motion and Threshold both off.
+    FacesOnly,
+}
+
+/// Which faces, face parts and bodies become segments too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FaceParts {
+    pub face: bool,
+    pub eyes: bool,
+    pub mouth: bool,
+    pub body: bool,
+}
+
+impl FaceParts {
+    pub fn any(&self) -> bool {
+        self.face || self.eyes || self.mouth || self.body
+    }
+}
+
+/// What the swarm's windows sit on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SwarmBackground {
+    /// The canvas stays clear, for whatever is behind the layer.
+    #[default]
+    Clear,
+    Source,
+    Black,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderSettings {
     pub mode: OutputMode,
+    pub detect: Detect,
     pub motion: MotionSettings,
+    pub threshold: ThresholdSettings,
+    pub faces: FaceParts,
     /// How many frames before each frame build its background.
     pub background_frames: i32,
     pub grid_width: i32,
@@ -56,13 +98,17 @@ pub struct RenderSettings {
     pub trail_frames: i32,
     /// Swarm: the pile size, oldest recycled first.
     pub max_tiles: i32,
+    pub swarm_background: SwarmBackground,
 }
 
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             mode: OutputMode::Overlay,
+            detect: Detect::Motion,
             motion: MotionSettings::default(),
+            threshold: ThresholdSettings::default(),
+            faces: FaceParts::default(),
             background_frames: 16,
             grid_width: 192,
             mirror: false,
@@ -76,14 +122,14 @@ impl Default for RenderSettings {
             },
             trail_frames: 24,
             max_tiles: 100,
+            swarm_background: SwarmBackground::Clear,
         }
     }
 }
 
 /// How many frames before the current one [`render`] wants to see.
 pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
-    let background = s.background_frames.max(1);
-    background
+    history_frames(s)
         + if s.mode == OutputMode::Swarm {
             s.trail_frames.max(1) - 1
         } else {
@@ -91,11 +137,19 @@ pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
         }
 }
 
-/// The label segcam would give blob `index` (0-based, biggest first) of frame `frame`. IDs
-/// are per frame, never tracked: a thing standing still in front of the camera is a new
+/// How many frames before a frame its detection reads: the background, for motion.
+pub fn history_frames(s: &RenderSettings) -> i32 {
+    match s.detect {
+        Detect::Motion => s.background_frames.max(1),
+        Detect::Threshold | Detect::FacesOnly => 0,
+    }
+}
+
+/// The label segcam would give segment `index` (0-based, biggest first) of frame `frame`.
+/// IDs are per frame, never tracked: a thing standing still in front of the camera is a new
 /// segment on every frame.
-pub fn segment_label(frame: i64, index: usize) -> String {
-    format!("motion#{frame}.{}", index + 1)
+pub fn segment_label(kind: SegmentKind, frame: i64, index: usize) -> String {
+    format!("{}#{frame}.{}", kind.name(), index + 1)
 }
 
 /// Box-averages a frame down to `target_width` columns, preserving aspect: the same four
@@ -296,7 +350,7 @@ pub fn draw_overlay<C: Channel>(
         }
 
         // The ID chip sits on the box's top edge, outside it; inside if the box is at the top.
-        let label = segment_label(frame, i);
+        let label = segment_label(blob.kind, frame, i);
         let pad = 2 * scale;
         let mut chip = PixelRect::new(
             r.x,
@@ -374,7 +428,7 @@ pub fn frame_tiles<C: Channel>(
 ) -> Vec<Tile> {
     (motion.blobs.iter().enumerate())
         .map(|(b, blob)| {
-            let title = format!("LO.FI.SCI.FI {}", segment_label(number, b));
+            let title = format!("LO.FI.SCI.FI {}", segment_label(blob.kind, number, b));
             swarm::make_tile(blob, frame, title, canvas_w, canvas_h, mirrored)
         })
         .collect()
@@ -478,7 +532,20 @@ pub fn draw_output<'t, C: Channel>(
 ) {
     let canvas = PixelRect::new(0, 0, out.width, out.height);
     match (s.mode, frame) {
-        (OutputMode::Swarm, _) => swarm::draw_swarm(out, tiles, s.straight_alpha),
+        (OutputMode::Swarm, frame) => {
+            let clear = match (s.swarm_background, frame) {
+                (SwarmBackground::Source, Some(frame)) => {
+                    copy_scaled(&frame, out, s.mirror);
+                    false
+                }
+                (SwarmBackground::Black, _) => {
+                    fill_rect(out, canvas, make_pixel::<C>(Color::default(), 1.0));
+                    false
+                }
+                _ => true,
+            };
+            swarm::draw_swarm(out, tiles, s.straight_alpha, clear);
+        }
         (_, None) => fill_rect(out, canvas, Argb::default()),
         (mode, Some(frame)) => {
             copy_scaled(&frame, out, s.mirror);

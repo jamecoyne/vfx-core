@@ -6,12 +6,16 @@ use vfx_core::cpu::{FrameSource, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Unit};
 
 use crate::pixel::{Depth, ViewMut};
-use crate::{Advance, Color, Incremental, MotionSettings, OutputMode, RenderSettings};
+use crate::{
+    Advance, Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode, RenderSettings,
+    SwarmBackground, ThresholdSettings,
+};
 
 /// The controls, with segcam's units (percentages are 0-100), ranges and defaults
 /// (those of [`RenderSettings::default`]).
 pub const PARAMS: &[ParamSpec] = &[
     ParamSpec::choice("output", &OutputMode::NAMES, 0).label("Output"),
+    ParamSpec::choice("detect", &["Motion", "Threshold", "Faces only"], 0).label("Detect"),
     ParamSpec::float("sensitivity", 0.0, 100.0, 86.4)
         .label("Sensitivity")
         .group("Motion")
@@ -39,6 +43,27 @@ pub const PARAMS: &[ParamSpec] = &[
         .group("Motion")
         .slider(64.0, 384.0),
     ParamSpec::toggle("mirror", false).label("Mirror"),
+    ParamSpec::int("level", 0, 255, 170)
+        .label("Level")
+        .group("Threshold"),
+    ParamSpec::toggle("auto_level", false)
+        .label("Auto level")
+        .group("Threshold"),
+    ParamSpec::toggle("invert", false)
+        .label("Invert")
+        .group("Threshold"),
+    ParamSpec::toggle("face", false)
+        .label("Face")
+        .group("Faces"),
+    ParamSpec::toggle("eyes", false)
+        .label("Eyes")
+        .group("Faces"),
+    ParamSpec::toggle("mouth", false)
+        .label("Mouth")
+        .group("Faces"),
+    ParamSpec::toggle("body", false)
+        .label("Body")
+        .group("Faces"),
     ParamSpec::toggle("boxes", true)
         .label("Boxes")
         .group("Overlay"),
@@ -56,6 +81,9 @@ pub const PARAMS: &[ParamSpec] = &[
         .label("Swarm max tiles")
         .group("Swarm")
         .slider(1.0, 300.0),
+    ParamSpec::choice("swarm_background", &["Clear", "Source", "Black"], 0)
+        .label("Swarm backdrop")
+        .group("Swarm"),
 ];
 
 /// One frame's settings. `premultiplied` says how the host's frames store colour.
@@ -63,6 +91,22 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
     let [r, g, b, _] = p.color("box_color");
     RenderSettings {
         mode: OutputMode::from_index(p.int("output") + 1).unwrap_or(OutputMode::Overlay),
+        detect: match p.int("detect") {
+            1 => Detect::Threshold,
+            2 => Detect::FacesOnly,
+            _ => Detect::Motion,
+        },
+        faces: FaceParts {
+            face: p.bool("face"),
+            eyes: p.bool("eyes"),
+            mouth: p.bool("mouth"),
+            body: p.bool("body"),
+        },
+        threshold: ThresholdSettings {
+            level: p.int("level"),
+            auto: p.bool("auto_level"),
+            invert: p.bool("invert"),
+        },
         motion: MotionSettings {
             sensitivity: f64::from(p.float("sensitivity")) / 100.0,
             adaptation: p.float("adaptation") / 100.0,
@@ -78,6 +122,11 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
         box_color: Color { r, g, b },
         trail_frames: p.int("trail"),
         max_tiles: p.int("max_tiles"),
+        swarm_background: match p.int("swarm_background") {
+            1 => SwarmBackground::Source,
+            2 => SwarmBackground::Black,
+            _ => SwarmBackground::Clear,
+        },
     }
 }
 

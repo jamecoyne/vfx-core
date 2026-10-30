@@ -6,10 +6,11 @@ use std::ops::RangeInclusive;
 
 use vfx_core::cpu::FrameSource;
 
-use crate::motion::{self, LumaGrid, Motion, MotionSettings};
+use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
-    OutputMode, Pile, PixelRect, RenderSettings, downsample, draw_output, fill_rect, frame_tiles,
+    Detect, FaceParts, OutputMode, Pile, PixelRect, RenderSettings, downsample, draw_output,
+    fill_rect, frame_tiles, history_frames,
 };
 use crate::swarm::Tile;
 
@@ -21,11 +22,14 @@ struct Canvas {
     grid_width: i32,
 }
 
-/// What a frame's motion depends on besides the grids.
+/// What a frame's segments depend on besides the grids.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Detection {
+    detect: Detect,
     motion: MotionSettings,
     background_frames: i32,
+    threshold: ThresholdSettings,
+    faces: FaceParts,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +85,7 @@ impl Incremental {
         }
         let detection = detection(s);
         let swarm = s.mode == OutputMode::Swarm;
-        let background = i64::from(s.background_frames.max(1));
+        let background = i64::from(history_frames(s));
         let targets = targets(s);
         let first = number - count as i64 + 1;
 
@@ -108,13 +112,27 @@ impl Incremental {
                         Some(motion) => motion.clone(),
                         None => {
                             let empty = LumaGrid::default();
-                            let history = ((frame - background).max(first)..frame)
-                                .map(|k| self.grids.get(&k).unwrap_or(&empty));
-                            let motion = motion::detect(
-                                history,
-                                self.grids.get(&frame).unwrap_or(&empty),
-                                &s.motion,
-                            );
+                            let grid = self.grids.get(&frame).unwrap_or(&empty);
+                            let mut motion = match s.detect {
+                                Detect::Motion => {
+                                    let history = ((frame - background).max(first)..frame)
+                                        .map(|k| self.grids.get(&k).unwrap_or(&empty));
+                                    motion::detect(history, grid, &s.motion)
+                                }
+                                Detect::Threshold => {
+                                    motion::threshold(grid, &s.threshold, &s.motion)
+                                }
+                                Detect::FacesOnly => Motion {
+                                    mask: vec![0; grid.count()],
+                                    width: grid.width,
+                                    height: grid.height,
+                                    ..Motion::default()
+                                },
+                            };
+                            if let Some(view) = view.as_ref().filter(|_| s.faces.any()) {
+                                let found = crate::faces::find(view, s.faces, grid.count());
+                                motion.blobs.extend(found);
+                            }
                             self.motion.insert(frame, (detection, motion.clone()));
                             motion
                         }
@@ -141,7 +159,7 @@ impl Incremental {
     /// The frames [`Incremental::advance`] would read for this render.
     pub fn lacking(&self, s: &RenderSettings, count: usize, number: i64) -> BTreeSet<i64> {
         let detection = detection(s);
-        let background = i64::from(s.background_frames.max(1));
+        let background = i64::from(history_frames(s));
         let first = number - count as i64 + 1;
         let mut wanted = BTreeSet::new();
         for target in (number - targets(s) + 1).max(first)..=number {
@@ -217,8 +235,11 @@ impl Incremental {
 
 fn detection(s: &RenderSettings) -> Detection {
     Detection {
+        detect: s.detect,
         motion: s.motion,
         background_frames: s.background_frames,
+        threshold: s.threshold,
+        faces: s.faces,
     }
 }
 

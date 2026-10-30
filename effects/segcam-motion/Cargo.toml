@@ -18,6 +18,7 @@ id = "com.lofiscifi.SegcamMotionRust"
 ae-match-name = "LOFISCIFI segcam Motion Rust"
 ffgl-code = "SGCM"
 processor = "cpu"                     # a CpuEffect: frames in RAM, earlier frames fetched
+windows-dlls = ["DirectML.dll"]       # segcam-face loads this copy, not the host's
 windows-installer-id = "EA131C10-B8DF-4E13-B2B7-B56AB79BD0A6"
 
 # The host targets. `cargo vfx build` switches them on and bundles the one binary for each.
@@ -39,3 +40,6 @@ vfx-build = { path = "../../wrappers/build" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 libm = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+segcam-face = { path = "../../crates/segcam-face" }

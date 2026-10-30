@@ -427,6 +427,10 @@ fn build_windows(
                 fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
                 fs::copy(&dll, dir.join(format!("{}.ofx", m.file)))
                     .map_err(|err| err.to_string())?;
+                for name in &m.windows_dlls {
+                    fs::copy(target.join(profile(o)).join(name), dir.join(name))
+                        .map_err(|err| format!("{name}: {err}"))?;
+                }
                 println!("{}", bundle.display());
                 bundles.push(bundle);
                 continue;

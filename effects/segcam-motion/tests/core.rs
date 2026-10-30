@@ -9,8 +9,9 @@ use segcam_motion::pixel::make_pixel;
 use segcam_motion::render::{PixelRect, downsample, fit_text, text_width};
 use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, draw_window, make_tile};
 use segcam_motion::{
-    Advance, Argb, Blob, Channel, Color, Incremental, MotionSettings, NormRect, OutputMode,
-    RenderSettings, View, ViewMut, font, previous_frames_needed, render, segment_label,
+    Advance, Argb, Blob, Channel, Color, Detect, FaceParts, Incremental, MotionSettings, NormRect,
+    OutputMode, RenderSettings, SegmentKind, SwarmBackground, ThresholdSettings, View, ViewMut,
+    font, previous_frames_needed, render, segment_label,
 };
 use vfx_core::cpu::{FrameSource, Image as CpuImage};
 
@@ -382,6 +383,7 @@ fn tile_enforces_its_minimum_size() {
             h: 0.01,
         },
         pixels: 1,
+        ..Blob::default()
     };
     let tile = make_tile(
         &tiny,
@@ -467,13 +469,101 @@ fn window_chrome_matches_the_bake() {
 
 #[test]
 fn labels_and_font() {
-    assert_eq!(segment_label(412, 0), "motion#412.1");
+    assert_eq!(segment_label(SegmentKind::Motion, 412, 0), "motion#412.1");
+    assert_eq!(segment_label(SegmentKind::Blob, 7, 1), "blob#7.2");
     assert!(font::glyph('m')[2] != 0 && font::glyph('#')[0] != 0);
     assert_eq!(font::glyph('~'), font::glyph('?'));
     assert_eq!(
         fit_text("LO.FI.SCI.FI motion#1.1", text_width("LO.FI", 1), 1),
         "LO..."
     );
+}
+
+fn threshold_settings(t: ThresholdSettings) -> RenderSettings {
+    RenderSettings {
+        detect: Detect::Threshold,
+        threshold: t,
+        ..RenderSettings::default()
+    }
+}
+
+#[test]
+fn threshold_finds_bright_regions_in_a_single_frame() {
+    let frame = frame_with_square::<u8>(W, H, 100, 60, 48);
+    let grid = downsample(&frame.view(), 192);
+    let s = threshold_settings(ThresholdSettings::default());
+    assert_eq!(previous_frames_needed(&s), 0);
+
+    let found = motion::threshold(&grid, &s.threshold, &s.motion);
+    assert_eq!(found.blobs.len(), 1);
+    assert_eq!(found.blobs[0].kind, SegmentKind::Blob);
+    let b = found.blobs[0].bounds;
+    assert!((b.x - 100.0 / f64::from(W)).abs() < 0.02 && (b.w - 48.0 / f64::from(W)).abs() < 0.02);
+
+    // Inverted, the grey surround is the region; a cell exactly at the level never counts.
+    let inverted = ThresholdSettings {
+        invert: true,
+        ..s.threshold
+    };
+    assert!(motion::threshold(&grid, &inverted, &s.motion).blobs[0].pixels > found.blobs[0].pixels);
+    let white = i32::from(*grid.pixels.iter().max().unwrap());
+    let at_white = ThresholdSettings {
+        level: white,
+        ..s.threshold
+    };
+    assert!(
+        motion::threshold(&grid, &at_white, &s.motion)
+            .blobs
+            .is_empty()
+    );
+
+    let auto = ThresholdSettings {
+        level: 255,
+        auto: true,
+        invert: false,
+    };
+    assert_eq!(motion::threshold(&grid, &auto, &s.motion).blobs.len(), 1);
+}
+
+#[test]
+fn threshold_swarm_renders_the_same_in_any_order() {
+    let frames = crossing::<u8>();
+    let s = RenderSettings {
+        mode: OutputMode::Swarm,
+        trail_frames: 6,
+        swarm_background: SwarmBackground::Source,
+        ..threshold_settings(ThresholdSettings::default())
+    };
+    let cold = |n: usize| render_frames(&s, &frames[..=n], n as i64).0.pixels;
+    let mut state = Incremental::default();
+    for n in [20, 3, 29, 28, 4, 12, 29] {
+        let mut out = Image::new(W, H);
+        let mut source = MemoryFrames::new(&frames[..=n]);
+        let drawn = state.advance(&s, &mut source, n + 1, n as i64, &mut out.view_mut());
+        assert_eq!(drawn, segcam_motion::Advance::Drawn);
+        assert!(out.pixels == cold(n), "frame {n}");
+    }
+}
+
+#[test]
+fn faces_on_a_frame_without_people_change_nothing() {
+    let frames = jump();
+    let all = FaceParts {
+        face: true,
+        eyes: true,
+        mouth: true,
+        body: true,
+    };
+    for detect in [Detect::Motion, Detect::FacesOnly] {
+        let s = RenderSettings {
+            detect,
+            ..RenderSettings::default()
+        };
+        let with = RenderSettings { faces: all, ..s };
+        assert!(
+            render_frames(&with, &frames, 1).0.pixels == render_frames(&s, &frames, 1).0.pixels
+        );
+    }
 }
 
 /// A change upstream that leaves the luma grid as it was still drops the kept tiles.

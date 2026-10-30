@@ -28,6 +28,8 @@ pub struct Metadata {
     pub ae_match_name: String,
     pub ffgl_code: String,
     pub windows_installer_id: Option<String>,
+    /// DLLs from the build's output to ship beside the plugin on Windows.
+    pub windows_dlls: Vec<String>,
     /// "gpu" (an `Effect`) or "cpu" (a `CpuEffect`).
     pub processor: String,
     pub version: String,
@@ -72,6 +74,16 @@ impl Metadata {
             ae_match_name: need("ae-match-name")?,
             ffgl_code: need("ffgl-code")?,
             windows_installer_id: field("windows-installer-id"),
+            windows_dlls: meta
+                .get("windows-dlls")
+                .and_then(toml::Value::as_array)
+                .map(|dlls| {
+                    dlls.iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
             processor: field("processor").unwrap_or_else(|| "gpu".into()),
             version: package_field("version"),
             description: package_field("description"),

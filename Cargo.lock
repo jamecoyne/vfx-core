@@ -2708,6 +2708,7 @@ name = "segcam-motion"
 version = "1.0.0"
 dependencies = [
  "libm",
+ "segcam-face",
  "vfx-build",
  "vfx-core",
  "vfx-plugin",

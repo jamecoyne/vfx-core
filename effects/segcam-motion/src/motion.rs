@@ -30,11 +30,40 @@ impl LumaGrid {
     }
 }
 
+/// What found a segment, which names it in labels as segcam does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SegmentKind {
+    #[default]
+    Motion,
+    /// A region the threshold stage found.
+    Blob,
+    Face,
+    Body,
+    EyeLeft,
+    EyeRight,
+    Mouth,
+}
+
+impl SegmentKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Motion => "motion",
+            Self::Blob => "blob",
+            Self::Face => "face",
+            Self::Body => "body",
+            Self::EyeLeft => "eye.L",
+            Self::EyeRight => "eye.R",
+            Self::Mouth => "mouth",
+        }
+    }
+}
+
 /// One labelled region of a binary mask.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Blob {
     pub bounds: NormRect,
     pub pixels: i32,
+    pub kind: SegmentKind,
 }
 
 /// 8-connected labelling. `mask` is 1 for foreground, 0 for background. Returns the largest
@@ -97,6 +126,7 @@ pub fn label(mask: &[u8], width: i32, height: i32, min_pixels: i32, max_count: i
                 h: f64::from(max_y - min_y + 1) / f64::from(height),
             },
             pixels: count,
+            kind: SegmentKind::Motion,
         });
     }
 
@@ -170,6 +200,91 @@ impl Default for MotionSettings {
             max_segments: 16,
         }
     }
+}
+
+/// segcam's threshold stage: cells brighter than a level, or darker when inverted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThresholdSettings {
+    /// The cutoff on 0..255 luma.
+    pub level: i32,
+    /// Picks the level for each frame with Otsu's method instead.
+    pub auto: bool,
+    pub invert: bool,
+}
+
+impl Default for ThresholdSettings {
+    fn default() -> Self {
+        Self {
+            level: 170,
+            auto: false,
+            invert: false,
+        }
+    }
+}
+
+/// The regions of one grid past the threshold, as segcam finds them: no background and no
+/// morphology, and a cell exactly at the level never counts, in either direction.
+pub fn threshold(grid: &LumaGrid, t: &ThresholdSettings, settings: &MotionSettings) -> Motion {
+    let count = grid.count();
+    let (w, h) = (grid.width, grid.height);
+    if count == 0 || grid.pixels.len() < count {
+        return Motion {
+            mask: vec![0; count],
+            width: w,
+            height: h,
+            ..Motion::default()
+        };
+    }
+    let cells = &grid.pixels[..count];
+    let level = if t.auto { otsu(cells) } else { t.level }.clamp(0, 255) as u8;
+    let mask: Vec<u8> = cells
+        .iter()
+        .map(|&v| u8::from(if t.invert { v < level } else { v > level }))
+        .collect();
+    let min_pixels = 4.max((settings.min_area_fraction * count as f64) as i32);
+    let mut blobs = label(&mask, w, h, min_pixels, settings.max_segments);
+    for blob in &mut blobs {
+        blob.kind = SegmentKind::Blob;
+    }
+    Motion {
+        blobs,
+        mask,
+        width: w,
+        height: h,
+    }
+}
+
+/// Otsu's method: the level that best splits `values` into a dark and a bright class.
+pub fn otsu(values: &[u8]) -> i32 {
+    if values.is_empty() {
+        return 128;
+    }
+    let mut histogram = [0u64; 256];
+    for &v in values {
+        histogram[usize::from(v)] += 1;
+    }
+    let total = values.len() as u64;
+    let sum_all: f64 = (0u64..).zip(&histogram).map(|(i, &n)| (i * n) as f64).sum();
+    let (mut below, mut sum_below) = (0u64, 0.0);
+    let (mut best_level, mut best_variance) = (128, 0.0);
+    for (level, &n) in (0u64..).zip(&histogram) {
+        below += n;
+        if below == 0 {
+            continue;
+        }
+        let above = total - below;
+        if above == 0 {
+            break;
+        }
+        sum_below += (level * n) as f64;
+        let mean_diff = sum_below / below as f64 - (sum_all - sum_below) / above as f64;
+        let variance = below as f64 * above as f64 * mean_diff * mean_diff;
+        if variance > best_variance {
+            best_variance = variance;
+            best_level = level as i32;
+        }
+    }
+    best_level
 }
 
 #[derive(Clone, Debug, Default)]

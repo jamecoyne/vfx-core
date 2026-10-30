@@ -36,6 +36,17 @@ the two render byte-identical frames (see [Checking it](#checking-it)).
 
 **Mirror** flips the picture and the boxes, as segcam does for a selfie camera.
 
+**Detect** picks Motion, Threshold or Faces only. Threshold finds areas brighter than
+**Level**, or darker with **Invert**, and **Auto level** picks the level for each frame. Its
+segments are labelled `blob#…`. **Swarm backdrop** puts the windows on a clear canvas (the
+default), the source frame, or black.
+
+**Face**, **Eyes**, **Mouth** and **Body** add those segments from `crates/segcam-face`, which
+uses Apple's Vision on macOS and ONNX Runtime models on Windows and Linux. **Detect ▸ Faces
+only** shows just the face and body segments. On Windows the models take about 2 seconds to
+load the first time, then add about 12 ms to a 1080p frame, and the plugin ships its own
+`DirectML.dll`. The face modes don't run in the web build yet.
+
 ## How it renders
 
 It asks for the **Background** frames before the current one (plus **Trail frames** - 1 in

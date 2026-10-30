@@ -688,6 +688,7 @@ pub fn draw_swarm<'t, C: Channel>(
     out: &mut ViewMut<C>,
     tiles: impl IntoIterator<Item = &'t Tile>,
     straight_alpha: bool,
+    clear: bool,
 ) {
     // More threads only compete with the host's own render threads.
     const THREADS: usize = 6;
@@ -709,8 +710,10 @@ pub fn draw_swarm<'t, C: Channel>(
             let (next, windows, m, shadow) = (&next, &windows, &m, &shadow);
             scope.spawn(move || {
                 while let Some(mut band) = next() {
-                    let all = PixelRect::new(0, 0, band.width, band.height);
-                    fill_rect(&mut band, all, Argb::default());
+                    if clear {
+                        let all = PixelRect::new(0, 0, band.width, band.height);
+                        fill_rect(&mut band, all, Argb::default());
+                    }
                     for (tile, bar) in windows {
                         draw_window_with(&mut band, tile, bar, m, shadow, straight_alpha);
                     }
