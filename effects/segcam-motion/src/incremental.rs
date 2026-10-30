@@ -1,8 +1,10 @@
 //! segcam Motion worked out incrementally: each frame's grid, motion and tiles are kept, with
-//! a hash of the pixels they came from. A render still reads every frame it depends on, but
-//! works out again only what a changed frame feeds, so an edit upstream reaches it however
-//! far back it is. Results come from each frame and the settings alone, so render order
-//! doesn't change the output.
+//! a hash of the pixels they came from. Where earlier frames can change upstream (OpenFX), a
+//! render still reads every frame it depends on and works out again only what a changed frame
+//! feeds, so an edit reaches it however far back it is. Where they can't (a host's own history
+//! of frames, as in Resolume and the preview: [`FrameSource::fixed`]), it reads only the frames
+//! it hasn't worked out, and the current one. Results come from each frame and the settings
+//! alone, so render order doesn't change the output.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
@@ -46,8 +48,9 @@ pub struct Incremental {
 }
 
 impl Incremental {
-    /// Renders the last of `count` frames, frame `number`, into `out`. Reads each frame the
-    /// render depends on once, oldest first, and works out again only what changed.
+    /// Renders the last of `count` frames, frame `number`, into `out`. Reads the frames the
+    /// render depends on (only those it lacks, from a fixed source) once each, oldest first,
+    /// and works out again only what changed.
     pub fn advance<C: Depth>(
         &mut self,
         s: &RenderSettings,
@@ -87,7 +90,24 @@ impl Incremental {
         let mut missing = BTreeSet::new();
         let mut short = BTreeSet::new();
         let oldest = (number - targets + 1 - background).max(first);
-        for frame in oldest..=number {
+        // A fixed source's earlier frames are as they were, so only the current frame is
+        // checked: a different one means the source started over.
+        let fixed = frames.fixed();
+        let mut current = None;
+        if fixed {
+            frames.with_frame((number - first) as usize, &mut |image| {
+                current = image.and_then(C::view).map(|v| fingerprint(&v));
+            });
+            if current.is_none_or(|print| self.prints.get(&number).is_some_and(|k| *k != print)) {
+                self.reset();
+            }
+        }
+        let visit = if fixed {
+            self.lacking(s, oldest, number, background)
+        } else {
+            (oldest..=number).collect()
+        };
+        for frame in visit {
             frames.with_frame((frame - first) as usize, &mut |image| {
                 let view = image.and_then(C::view);
                 match &view {
@@ -95,10 +115,18 @@ impl Incremental {
                         self.forget(frame, background);
                         missing.insert(frame);
                     }
+                    Some(_) if fixed && self.prints.contains_key(&frame) => {}
                     Some(v) => {
-                        let print = fingerprint(v);
+                        let print = current
+                            .filter(|_| frame == number)
+                            .unwrap_or_else(|| fingerprint(v));
                         if self.prints.get(&frame) != Some(&print) {
-                            self.forget(frame, background);
+                            // A fixed source's frame read for the first time can't have
+                            // changed what later frames worked out from it; elsewhere a
+                            // frame that wasn't kept may have.
+                            if !fixed {
+                                self.forget(frame, background);
+                            }
                             self.grids.insert(frame, downsample(v, s.grid_width));
                             self.prints.insert(frame, print);
                         }
@@ -156,6 +184,27 @@ impl Incremental {
         }
         let reach = background + targets;
         self.keep(number - reach..=number + reach);
+    }
+
+    /// The frames from `oldest` a render of `number` has to read: those whose motion or tiles
+    /// aren't kept, the frames before them whose grids aren't, and `number`, which it draws.
+    fn lacking(
+        &self,
+        s: &RenderSettings,
+        oldest: i64,
+        number: i64,
+        background: i64,
+    ) -> BTreeSet<i64> {
+        let detection = detection(s);
+        let mut wanted = BTreeSet::from([number]);
+        for target in (number - targets(s) + 1).max(oldest)..=number {
+            if !self.complete(target, &detection, s) {
+                wanted.insert(target);
+                let before = (target - background).max(oldest)..target;
+                wanted.extend(before.filter(|k| !self.grids.contains_key(k)));
+            }
+        }
+        wanted
     }
 
     /// Draws frame `number`, the last of `count`, from what is kept. `frame` is its pixels,

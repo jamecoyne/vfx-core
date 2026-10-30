@@ -319,6 +319,16 @@ impl Depth for f32 {
 pub trait FrameSource {
     /// Calls `f` with frame `index`, or with `None` if that frame isn't there.
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>));
+
+    /// Whether a frame's pixels stay as they were handed over, so an effect that keeps work
+    /// between renders needn't read an earlier frame again: true for a host's own copies of
+    /// the frames it was given ([`History`]), false where the host renders earlier frames
+    /// on request and an edit upstream can change them (OpenFX, After Effects). A source
+    /// that starts its numbering over hands out a different current frame, which an effect
+    /// still checks.
+    fn fixed(&self) -> bool {
+        false
+    }
 }
 
 /// For hosts that hand over one frame at a time (Resolume, the preview): the last few
@@ -395,6 +405,11 @@ impl<C: Depth> FrameSource for History<C> {
             .frames
             .get(index)
             .map(|p| C::image(View::from_pixels(p, self.width, self.height))));
+    }
+
+    /// Frames go in through [`History::next`] only, so earlier ones never change.
+    fn fixed(&self) -> bool {
+        true
     }
 }
 
