@@ -430,12 +430,41 @@ pub fn frame_tiles<C: Channel>(
     canvas_h: i32,
     mirrored: bool,
 ) -> Vec<Tile> {
-    (motion.blobs.iter().enumerate())
-        .map(|(b, blob)| {
-            let title = format!("LO.FI.SCI.FI {}", segment_label(blob.kind, number, b));
-            swarm::make_tile(blob, frame, title, canvas_w, canvas_h, mirrored)
-        })
-        .collect()
+    let make = |b: usize| {
+        let blob = &motion.blobs[b];
+        let title = format!("LO.FI.SCI.FI {}", segment_label(blob.kind, number, b));
+        swarm::make_tile(blob, frame, title, canvas_w, canvas_h, mirrored)
+    };
+    let count = motion.blobs.len();
+    // A camera move makes big segments, each copied whole, so they're shared out over a
+    // few threads, as the swarm's drawing is.
+    const THREADS: usize = 6;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(THREADS)
+        .min(count);
+    if threads < 2 {
+        return (0..count).map(make).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let tiles = std::sync::Mutex::new(vec![Tile::default(); count]);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let b = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if b >= count {
+                        break;
+                    }
+                    let tile = make(b);
+                    if let Ok(mut tiles) = tiles.lock() {
+                        tiles[b] = tile;
+                    }
+                }
+            });
+        }
+    });
+    tiles.into_inner().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A tile in a [`Pile`]: owned, so a buried one can drop its pixels, or borrowed from a cache.

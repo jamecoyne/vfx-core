@@ -122,10 +122,20 @@ pub fn make_tile<C: Channel>(
             (crop.x + sample(tx, crop.w, r.w)) as usize
         })
         .collect();
-    tile.pixels.reserve((stored.w * stored.h) as usize);
+    let width = stored.w as usize;
+    tile.pixels.reserve(width * stored.h as usize);
+    let mut last = None;
     for y in 0..stored.h {
         let ty = stored.y + y - r.y;
-        let input = frame.row(crop.y + sample(ty, crop.h, r.h));
+        let source = crop.y + sample(ty, crop.h, r.h);
+        // A tile taller than its crop shows some source rows twice: copy the row above.
+        if last == Some(source) {
+            let above = tile.pixels.len() - width;
+            tile.pixels.extend_from_within(above..);
+            continue;
+        }
+        last = Some(source);
+        let input = frame.row(source);
         tile.pixels
             .extend(columns.iter().map(|&sx| convert(&input[sx])));
     }
@@ -739,6 +749,11 @@ pub fn draw_window_with<C: Channel>(
     let full = (radius + 0.5 - 0f64.hypot(0.0)).clamp(0.0, 1.0) as f32;
     let first = (area.x - plan.area.x) as usize;
     let columns = first..first + area.w as usize;
+    // Where the mask covers a frozen tile's pixel whole, the window hides the shadow and
+    // whatever was under it. At 8 bits the colour maths gives back the tile's own level, so
+    // that is written straight away; at other depths it can land a rounding step off.
+    let whole_levels = C::MAX == 255.0 && live.is_none() && !tile.pixels.is_empty();
+    let level = |v: u8| C::from_unit(UNIT[usize::from(v)]);
 
     for y in area.y..area.y + area.h {
         let i = (y - plan.area.y) as usize;
@@ -748,6 +763,31 @@ pub fn draw_window_with<C: Channel>(
         let corners = plan.corner_x[columns.clone()].iter();
         for ((j, (&px_profile, &ox)), px) in (0..).zip(profiles.zip(corners)).zip(row.iter_mut()) {
             let x = area.x + j;
+            if whole_levels {
+                let (lx, ly) = (x - frame.x, y - frame.y);
+                let (vx, vy, s) = (x - tile.stored.x, y - tile.stored.y, tile.stored);
+                let (dx, dy) = (plan.mask_x[first + j as usize], plan.mask_y[i]);
+                if ly > m.title_height
+                    && ly < frame.h
+                    && lx >= 0
+                    && lx < frame.w
+                    && vx >= 0
+                    && vx < s.w
+                    && vy >= 0
+                    && vy < s.h
+                    && (dx == 0.0 && dy == 0.0 && full == 1.0
+                        || (radius + 0.5 - dx.hypot(dy)).clamp(0.0, 1.0) as f32 == 1.0)
+                {
+                    let t = tile.pixels[(vy * s.w + vx) as usize];
+                    *px = Argb {
+                        alpha: C::from_unit(1.0),
+                        red: level(t.red),
+                        green: level(t.green),
+                        blue: level(t.blue),
+                    };
+                    continue;
+                }
+            }
             // Work premultiplied: the shadow is black laid over, the window is laid over that.
             let mut a = px.alpha.to_unit();
             let mut p = Color {
@@ -832,7 +872,21 @@ pub fn draw_swarm<'t, C: Channel>(
     const THREADS: usize = 6;
     const BANDS_PER_THREAD: usize = 4;
     let m = SwarmMetrics::new(out.height);
-    let shadow = ShadowKernel::new(m.scale);
+    // The kernel's corner table takes a while to make, and the scale rarely changes.
+    static SHADOW: std::sync::Mutex<Option<(f64, std::sync::Arc<ShadowKernel>)>> =
+        std::sync::Mutex::new(None);
+    let shadow = {
+        let mut kept = SHADOW.lock().unwrap_or_else(|e| e.into_inner());
+        match &*kept {
+            Some((scale, kernel)) if *scale == m.scale => kernel.clone(),
+            _ => {
+                let kernel = std::sync::Arc::new(ShadowKernel::new(m.scale));
+                *kept = Some((m.scale, kernel.clone()));
+                kernel
+            }
+        }
+    };
+    let shadow = &*shadow;
     let canvas = PixelRect::new(0, 0, out.width, out.height);
     let windows: Vec<(&Tile, Cow<TitleBar>, WindowPlan)> = tiles
         .into_iter()
@@ -840,7 +894,7 @@ pub fn draw_swarm<'t, C: Channel>(
             (
                 t,
                 TitleBar::of(t, &m),
-                WindowPlan::new(t, &m, &shadow, canvas),
+                WindowPlan::new(t, &m, shadow, canvas),
             )
         })
         .collect();
@@ -852,7 +906,7 @@ pub fn draw_swarm<'t, C: Channel>(
     let next = || bands.lock().ok().and_then(|mut bands| bands.pop());
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            let (next, windows, m, shadow, live) = (&next, &windows, &m, &shadow, live);
+            let (next, windows, m, live) = (&next, &windows, &m, live);
             scope.spawn(move || {
                 while let Some(mut band) = next() {
                     if clear {
