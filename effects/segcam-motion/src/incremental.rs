@@ -1,6 +1,8 @@
-//! segcam Motion worked out incrementally: each frame's grid, motion and tiles are kept, so a
-//! render only reads the frames it doesn't have yet. Results come from each frame and the
-//! settings alone, so render order doesn't change the output.
+//! segcam Motion worked out incrementally: each frame's grid, motion and tiles are kept, with
+//! a hash of the pixels they came from. A render still reads every frame it depends on, but
+//! works out again only what a changed frame feeds, so an edit upstream reaches it however
+//! far back it is. Results come from each frame and the settings alone, so render order
+//! doesn't change the output.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
@@ -32,15 +34,6 @@ struct Detection {
     faces: FaceParts,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[must_use]
-pub enum Advance {
-    Drawn,
-    /// The source changed upstream: everything kept was dropped and nothing drawn. Render
-    /// again from cold.
-    Discontinuity,
-}
-
 #[derive(Default)]
 pub struct Incremental {
     canvas: Option<Canvas>,
@@ -53,9 +46,8 @@ pub struct Incremental {
 }
 
 impl Incremental {
-    /// Renders the last of `count` frames, frame `number`, into `out`, reading only the frames
-    /// [`Incremental::lacking`] names. The current frame is always read, last, since its grid
-    /// shows whether the source changed.
+    /// Renders the last of `count` frames, frame `number`, into `out`. Reads each frame the
+    /// render depends on once, oldest first, and works out again only what changed.
     pub fn advance<C: Depth>(
         &mut self,
         s: &RenderSettings,
@@ -63,14 +55,14 @@ impl Incremental {
         count: usize,
         number: i64,
         out: &mut ViewMut<C>,
-    ) -> Advance {
+    ) {
         if out.is_empty() {
-            return Advance::Drawn;
+            return;
         }
         if count == 0 {
             let all = PixelRect::new(0, 0, out.width, out.height);
             fill_rect(out, all, Argb::default());
-            return Advance::Drawn;
+            return;
         }
         let (w, h) = (out.width, out.height);
         let canvas = Canvas {
@@ -89,25 +81,33 @@ impl Incremental {
         let targets = targets(s);
         let first = number - count as i64 + 1;
 
-        let mut changed = false;
-        for frame in self.lacking(s, count, number) {
+        // Frames the host didn't hand over count as empty, as in a cold render, but nothing
+        // worked out from one is kept, so it is read again next time. Nor is motion whose
+        // background was cut short by the start of this render's frames.
+        let mut missing = BTreeSet::new();
+        let mut short = BTreeSet::new();
+        let oldest = (number - targets + 1 - background).max(first);
+        for frame in oldest..=number {
             frames.with_frame((frame - first) as usize, &mut |image| {
                 let view = image.and_then(C::view);
-                let grid = view
-                    .as_ref()
-                    .map(|v| downsample(v, s.grid_width))
-                    .unwrap_or_default();
-                let print = view.as_ref().map_or(0, fingerprint);
-                if frame == number
-                    && (self.grids.get(&frame).is_some_and(|kept| *kept != grid)
-                        || self.prints.get(&frame).is_some_and(|kept| *kept != print))
-                {
-                    changed = true;
-                    return;
+                match &view {
+                    None => {
+                        self.forget(frame, background);
+                        missing.insert(frame);
+                    }
+                    Some(v) => {
+                        let print = fingerprint(v);
+                        if self.prints.get(&frame) != Some(&print) {
+                            self.forget(frame, background);
+                            self.grids.insert(frame, downsample(v, s.grid_width));
+                            self.prints.insert(frame, print);
+                        }
+                    }
                 }
-                self.grids.insert(frame, grid);
-                self.prints.insert(frame, print);
                 if frame > number - targets && !self.complete(frame, &detection, s) {
+                    if frame - background < first {
+                        short.insert(frame);
+                    }
                     let motion = match self.motion(frame, &detection) {
                         Some(motion) => motion.clone(),
                         None => {
@@ -147,31 +147,15 @@ impl Incremental {
                 }
             });
         }
-        if changed {
-            self.reset();
-            return Advance::Discontinuity;
+        for &frame in &missing {
+            self.forget(frame, background);
+        }
+        for frame in short {
+            self.motion.remove(&frame);
+            self.tiles.remove(&frame);
         }
         let reach = background + targets;
         self.keep(number - reach..=number + reach);
-        Advance::Drawn
-    }
-
-    /// The frames [`Incremental::advance`] would read for this render.
-    pub fn lacking(&self, s: &RenderSettings, count: usize, number: i64) -> BTreeSet<i64> {
-        let detection = detection(s);
-        let background = i64::from(history_frames(s));
-        let first = number - count as i64 + 1;
-        let mut wanted = BTreeSet::new();
-        for target in (number - targets(s) + 1).max(first)..=number {
-            if self.complete(target, &detection, s) {
-                continue;
-            }
-            wanted.insert(target);
-            let before = (target - background).max(first)..target;
-            wanted.extend(before.filter(|k| !self.grids.contains_key(k)));
-        }
-        wanted.insert(number);
-        wanted
     }
 
     /// Draws frame `number`, the last of `count`, from what is kept. `frame` is its pixels,
@@ -223,6 +207,17 @@ impl Incremental {
     fn tiles(&self, frame: i64, detection: &Detection, mirror: bool) -> Option<&[Tile]> {
         let (d, m, tiles) = self.tiles.get(&frame)?;
         (d == detection && *m == mirror).then_some(tiles.as_slice())
+    }
+
+    /// Drops what was kept for `frame`, and the motion and tiles of the frames whose
+    /// background it is part of.
+    fn forget(&mut self, frame: i64, background: i64) {
+        self.grids.remove(&frame);
+        self.prints.remove(&frame);
+        for later in frame..=frame + background {
+            self.motion.remove(&later);
+            self.tiles.remove(&later);
+        }
     }
 
     fn keep(&mut self, frames: RangeInclusive<i64>) {

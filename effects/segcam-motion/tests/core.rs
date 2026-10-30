@@ -9,7 +9,7 @@ use segcam_motion::pixel::make_pixel;
 use segcam_motion::render::{PixelRect, downsample, fit_text, text_width};
 use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, draw_window, make_tile};
 use segcam_motion::{
-    Advance, Argb, Blob, Channel, Color, Detect, FaceParts, Incremental, MotionSettings, NormRect,
+    Argb, Blob, Channel, Color, Detect, FaceParts, Incremental, MotionSettings, NormRect,
     OutputMode, RenderSettings, SegmentKind, SwarmBackground, ThresholdSettings, View, ViewMut,
     font, previous_frames_needed, render, segment_label,
 };
@@ -356,7 +356,7 @@ fn live_windows_show_the_current_frame() {
     for n in [20, 3, 29, 28, 4, 12, 29] {
         let mut out = Image::new(W, H);
         let mut source = MemoryFrames::new(&frames[..=n]);
-        let _ = state.advance(
+        state.advance(
             &live_settings,
             &mut source,
             n + 1,
@@ -596,8 +596,7 @@ fn threshold_swarm_renders_the_same_in_any_order() {
     for n in [20, 3, 29, 28, 4, 12, 29] {
         let mut out = Image::new(W, H);
         let mut source = MemoryFrames::new(&frames[..=n]);
-        let drawn = state.advance(&s, &mut source, n + 1, n as i64, &mut out.view_mut());
-        assert_eq!(drawn, segcam_motion::Advance::Drawn);
+        state.advance(&s, &mut source, n + 1, n as i64, &mut out.view_mut());
         assert!(out.pixels == cold(n), "frame {n}");
     }
 }
@@ -623,6 +622,110 @@ fn faces_on_a_frame_without_people_change_nothing() {
     }
 }
 
+/// Hands out images in memory, except the ones in `missing`, which come as `None`.
+struct GappyFrames<'a> {
+    images: &'a [Image<u8>],
+    missing: &'a [usize],
+}
+
+impl FrameSource for GappyFrames<'_> {
+    fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<CpuImage<'_>>)) {
+        if self.missing.contains(&index) {
+            f(None);
+        } else {
+            f(Some(u8::image(self.images[index].view())));
+        }
+    }
+}
+
+/// Renders the last of `frames` through `state`, with the frames in `missing` unavailable.
+fn render_kept(
+    state: &mut Incremental,
+    s: &RenderSettings,
+    frames: &[Image<u8>],
+    missing: &[usize],
+) -> Image<u8> {
+    let mut out = Image::new(frames[0].width, frames[0].height);
+    let mut source = GappyFrames {
+        images: frames,
+        missing,
+    };
+    let last = frames.len() - 1;
+    state.advance(
+        s,
+        &mut source,
+        frames.len(),
+        last as i64,
+        &mut out.view_mut(),
+    );
+    out
+}
+
+/// `frames` with the square painted out of every frame in `range`, so they show only grey.
+fn painted_out(frames: &[Image<u8>], range: std::ops::Range<usize>) -> Vec<Image<u8>> {
+    let mut edited = frames.to_vec();
+    let grey = edited[0].pixels[0];
+    for frame in &mut edited[range] {
+        frame.pixels.fill(grey);
+    }
+    edited
+}
+
+/// An edit upstream that only touches frames before the one rendered, as a keyframed grade
+/// or a paint fix can, reaches the render: kept work for those frames isn't trusted blindly.
+#[test]
+fn edits_to_earlier_frames_reach_the_render() {
+    for s in [RenderSettings::default(), swarm_settings()] {
+        let frames = crossing::<u8>();
+        let last = frames.len() - 1;
+        let edited = painted_out(&frames, last - 4..last);
+        let cold = render_frames(&s, &edited, last as i64).0;
+        assert!(
+            cold.pixels != render_frames(&s, &frames, last as i64).0.pixels,
+            "{:?}: the edit shows",
+            s.mode
+        );
+
+        let mut state = Incremental::default();
+        let _ = render_kept(&mut state, &s, &frames, &[]);
+        let again = render_kept(&mut state, &s, &edited, &[]);
+        assert!(again.pixels == cold.pixels, "{:?}: same frame", s.mode);
+
+        // Playback stepping onto a frame it hasn't seen, after the frames before it changed.
+        let mut state = Incremental::default();
+        let _ = render_kept(&mut state, &s, &frames[..last], &[]);
+        let next = render_kept(&mut state, &s, &edited, &[]);
+        assert!(next.pixels == cold.pixels, "{:?}: next frame", s.mode);
+    }
+}
+
+/// A frame the host couldn't hand over is read again next time, not kept as empty.
+#[test]
+fn a_missing_frame_is_read_again() {
+    for s in [RenderSettings::default(), swarm_settings()] {
+        let frames = crossing::<u8>();
+        let last = frames.len() - 1;
+        let full = render_frames(&s, &frames, last as i64).0;
+        let gap = [last - 4, last - 3, last - 2, last - 1];
+
+        let mut state = Incremental::default();
+        let without = render_kept(&mut state, &s, &frames, &gap);
+        let mut cold = Incremental::default();
+        assert!(
+            without.pixels == render_kept(&mut cold, &s, &frames, &gap).pixels,
+            "{:?}: the gap renders like a cold render with the gap",
+            s.mode
+        );
+        assert!(without.pixels != full.pixels, "{:?}: the gap shows", s.mode);
+        let back = render_kept(&mut state, &s, &frames, &[]);
+        assert!(
+            back.pixels == full.pixels,
+            "{:?}: the frame came back",
+            s.mode
+        );
+    }
+}
+
 /// A change upstream that leaves the luma grid as it was still drops the kept tiles.
 #[test]
 fn swarm_sees_edits_that_keep_the_grid() {
@@ -636,22 +739,7 @@ fn swarm_sees_edits_that_keep_the_grid() {
     assert!(grid(&edited[last]) == grid(&frames[last]));
 
     let mut state = Incremental::default();
-    let mut out = Image::new(W, H);
-    let advance = |state: &mut Incremental, frames: &[Image<u8>], out: &mut Image<u8>| {
-        let mut source = MemoryFrames::new(frames);
-        state.advance(
-            &s,
-            &mut source,
-            frames.len(),
-            last as i64,
-            &mut out.view_mut(),
-        )
-    };
-    assert_eq!(advance(&mut state, &frames, &mut out), Advance::Drawn);
-    assert_eq!(
-        advance(&mut state, &edited, &mut out),
-        Advance::Discontinuity
-    );
-    assert_eq!(advance(&mut state, &edited, &mut out), Advance::Drawn);
+    let _ = render_kept(&mut state, &s, &frames, &[]);
+    let out = render_kept(&mut state, &s, &edited, &[]);
     assert!(out.pixels == render_frames(&s, &edited, last as i64).0.pixels);
 }

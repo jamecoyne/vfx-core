@@ -574,5 +574,5 @@ pub fn render<C: Depth>(
     frame_number: i64,
     out: &mut ViewMut<C>,
 ) {
-    let _ = Incremental::default().advance(s, frames, frame_count, frame_number, out);
+    Incremental::default().advance(s, frames, frame_count, frame_number, out);
 }
