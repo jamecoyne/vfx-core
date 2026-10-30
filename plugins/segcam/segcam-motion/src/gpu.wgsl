@@ -391,8 +391,10 @@ fn covers(w: u32, x: i32, y: i32) -> bool {
     return clamp(g.radius + 0.5 - sqrt(dx * dx + dy * dy), 0.0, 1.0) == 1.0;
 }
 
-// Which windows of the current batch reach this workgroup's 16 x 16 pixels.
-var<workgroup> reaches: array<u32, 256>;
+// The windows of the current batch that reach this workgroup's 16 x 16 pixels, in order: a
+// running count of them, then the list.
+var<workgroup> counts: array<u32, 256>;
+var<workgroup> reaching: array<u32, 256>;
 
 @compute @workgroup_size(16, 16)
 fn swarm(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) li: u32,
@@ -416,20 +418,33 @@ fn swarm(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation
                 && area.y < block.y + block.h && block.y < area.y + area.h);
         }
         workgroupBarrier();
-        reaches[li] = hit;
+        counts[li] = hit;
         workgroupBarrier();
+        for (var d = 1u; d < 256u; d <<= 1u) {
+            var before = 0u;
+            if li >= d {
+                before = counts[li - d];
+            }
+            workgroupBarrier();
+            counts[li] += before;
+            workgroupBarrier();
+        }
+        if hit != 0u {
+            reaching[counts[li] - 1u] = first + li;
+        }
+        workgroupBarrier();
+        let n = counts[255];
         if on_canvas {
-            let n = min(256u, g.count - first);
             // Drawing starts at the newest window that covers the pixel whole.
             var start = 0u;
             for (var k = n; k > 0u; k--) {
-                if reaches[k - 1u] != 0u && covers(first + k - 1u, x, y) {
+                if covers(reaching[k - 1u], x, y) {
                     start = k - 1u;
                     break;
                 }
             }
             for (var k = start; k < n; k++) {
-                if reaches[k] != 0u && draw_window(first + k, x, y, &px) {
+                if draw_window(reaching[k], x, y, &px) {
                     touched = true;
                 }
             }
