@@ -135,6 +135,7 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     if !gpu.use_gpu(true) {
         return false;
     }
+    gpu.gpu_overlay(true);
     let mut a = vec![Argb::<C>::default(); (w * h) as usize];
     let mut b = a.clone();
     for n in 0..frames.len() {

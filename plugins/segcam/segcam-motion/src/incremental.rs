@@ -58,6 +58,7 @@ pub struct Incremental {
     /// Drawing on the GPU: then tiles keep their pixels in its atlas, cut by frame here.
     gpu: Option<Box<Drawer>>,
     cuts: BTreeMap<i64, Cut>,
+    gpu_overlay: bool,
 }
 
 /// A tile in the pile with its place in the GPU's atlas.
@@ -82,6 +83,12 @@ impl Incremental {
 
     pub fn gpu(&self) -> Option<&Drawer> {
         self.gpu.as_deref()
+    }
+
+    /// Draws Overlay on the GPU too. Off by default: while frames go through host memory, the
+    /// upload and readback cost more than the CPU's whole Overlay.
+    pub fn gpu_overlay(&mut self, on: bool) {
+        self.gpu_overlay = on;
     }
 
     /// Renders the last of `count` frames, frame `number`, into `out`. Reads the frames the
@@ -305,7 +312,7 @@ impl Incremental {
                 let windows = pile.shown_entries().map(|p| (p.tile, p.slot));
                 gpu.draw_swarm(out, windows, frame.as_ref(), number, s);
             }
-            (OutputMode::Overlay, Some(view)) => {
+            (OutputMode::Overlay, Some(view)) if self.gpu_overlay => {
                 gpu.draw_overlay(out, view, &motion.blobs, number, s);
             }
             _ => draw_output(out, s, frame, motion, number, std::iter::empty()),
