@@ -108,18 +108,21 @@ pub fn make_tile<C: Channel>(
         let at = (f64::from(t) + 0.5) * f64::from(crop_len) / f64::from(tile_len);
         (crop_len - 1).min(at as i32)
     };
-    tile.pixels.reserve((stored.w * stored.h) as usize);
-    for y in 0..stored.h {
-        let ty = stored.y + y - r.y;
-        let input = frame.row(crop.y + sample(ty, crop.h, r.h));
-        for x in 0..stored.w {
+    let columns: Vec<usize> = (0..stored.w)
+        .map(|x| {
             let mut tx = stored.x + x - r.x;
             if mirrored {
                 tx = r.w - 1 - tx;
             }
-            let sx = crop.x + sample(tx, crop.w, r.w);
-            tile.pixels.push(convert(&input[sx as usize]));
-        }
+            (crop.x + sample(tx, crop.w, r.w)) as usize
+        })
+        .collect();
+    tile.pixels.reserve((stored.w * stored.h) as usize);
+    for y in 0..stored.h {
+        let ty = stored.y + y - r.y;
+        let input = frame.row(crop.y + sample(ty, crop.h, r.h));
+        tile.pixels
+            .extend(columns.iter().map(|&sx| convert(&input[sx])));
     }
     tile
 }
