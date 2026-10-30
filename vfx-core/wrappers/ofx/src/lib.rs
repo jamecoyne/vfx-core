@@ -658,7 +658,8 @@ fn render_cpu_with(
     let source_props = clip_props(source)?;
     let start = source_props.get_double(PROP_FRAME_RANGE, 0)?;
     let values = values(effect, time)?;
-    let count = cpu_effect.frames_before(&values) + 1;
+    // Frames go back to the clip's first: earlier ones aren't missing, there are none.
+    let count = (cpu_effect.frames_before(&values) + 1).min((time - start).max(0.0) as usize + 1);
     let ctx = Context {
         time: seconds(effect, time)?,
         frame: time.round() as i64,
