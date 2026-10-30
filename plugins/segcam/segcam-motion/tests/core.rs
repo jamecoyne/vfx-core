@@ -743,3 +743,85 @@ fn swarm_sees_edits_that_keep_the_grid() {
     let out = render_kept(&mut state, &s, &edited, &[]);
     assert!(out.pixels == render_frames(&s, &edited, last as i64).0.pixels);
 }
+
+/// A host's own history of frames: fixed once handed over. Counts what is read.
+struct FixedFrames<'a> {
+    images: &'a [Image<u8>],
+    reads: usize,
+}
+
+impl FrameSource for FixedFrames<'_> {
+    fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<CpuImage<'_>>)) {
+        self.reads += 1;
+        f(self.images.get(index).map(|i| u8::image(i.view())));
+    }
+
+    fn fixed(&self) -> bool {
+        true
+    }
+}
+
+/// Renders frame `n` of `frames` through `state` from a fixed source: the output, and how
+/// many frames were read.
+fn render_fixed(
+    state: &mut Incremental,
+    s: &RenderSettings,
+    frames: &[Image<u8>],
+    n: usize,
+) -> (Image<u8>, usize) {
+    let mut out = Image::new(W, H);
+    let mut source = FixedFrames {
+        images: &frames[..=n],
+        reads: 0,
+    };
+    state.advance(s, &mut source, n + 1, n as i64, &mut out.view_mut());
+    (out, source.reads)
+}
+
+/// From a fixed source a kept state reads only what it lacks, and still renders what a cold
+/// render does, in any order.
+#[test]
+fn a_fixed_source_reads_only_new_frames() {
+    for s in [RenderSettings::default(), swarm_settings()] {
+        let frames = crossing::<u8>();
+        let cold = |n: usize| render_frames(&s, &frames[..=n], n as i64).0.pixels;
+        let mut state = Incremental::default();
+        for n in 0..frames.len() {
+            let (out, reads) = render_fixed(&mut state, &s, &frames, n);
+            assert!(out.pixels == cold(n), "{:?}: frame {n}", s.mode);
+            // Once a full background (and trail) is behind it: the current frame, checked and
+            // then drawn, and nothing earlier. Before that, frames whose background runs past
+            // the start aren't kept, so they're worked out again.
+            let warm = previous_frames_needed(&s) as usize;
+            if n >= warm {
+                assert!(reads <= 2, "{:?}: frame {n} read {reads}", s.mode);
+            }
+        }
+        let mut state = Incremental::default();
+        for n in [29, 3, 17, 18, 2, 29, 0, 12] {
+            let (out, _) = render_fixed(&mut state, &s, &frames, n);
+            assert!(out.pixels == cold(n), "{:?}: shuffled, frame {n}", s.mode);
+        }
+    }
+}
+
+/// A fixed source that starts its numbering over (a seek back, a new clip) hands over a
+/// different current frame, and what was kept goes.
+#[test]
+fn a_fixed_source_that_starts_over_is_noticed() {
+    for s in [RenderSettings::default(), swarm_settings()] {
+        let frames = crossing::<u8>();
+        let other: Vec<Image<u8>> = (0..frames.len() as i32)
+            .map(|f| frame_with_square(W, H, 300 - f * 9, 20, 30))
+            .collect();
+        let mut state = Incremental::default();
+        for n in 0..12 {
+            let _ = render_fixed(&mut state, &s, &frames, n);
+        }
+        for n in 0..12 {
+            let (out, _) = render_fixed(&mut state, &s, &other, n);
+            let cold = render_frames(&s, &other[..=n], n as i64).0;
+            assert!(out.pixels == cold.pixels, "{:?}: frame {n}", s.mode);
+        }
+    }
+}
