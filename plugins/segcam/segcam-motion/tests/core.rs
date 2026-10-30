@@ -789,18 +789,46 @@ fn a_fixed_source_reads_only_new_frames() {
         for n in 0..frames.len() {
             let (out, reads) = render_fixed(&mut state, &s, &frames, n);
             assert!(out.pixels == cold(n), "{:?}: frame {n}", s.mode);
-            // Once a full background (and trail) is behind it: the current frame, checked and
-            // then drawn, and nothing earlier. Before that, frames whose background runs past
-            // the start aren't kept, so they're worked out again.
-            let warm = previous_frames_needed(&s) as usize;
-            if n >= warm {
-                assert!(reads <= 2, "{:?}: frame {n} read {reads}", s.mode);
-            }
+            // The current frame, checked and then drawn, and nothing earlier.
+            assert!(reads <= 2, "{:?}: frame {n} read {reads}", s.mode);
         }
         let mut state = Incremental::default();
         for n in [29, 3, 17, 18, 2, 29, 0, 12] {
             let (out, _) = render_fixed(&mut state, &s, &frames, n);
             assert!(out.pixels == cold(n), "{:?}: shuffled, frame {n}", s.mode);
+        }
+    }
+}
+
+/// The start of a clip isn't a missing frame. With the defaults a render reads 40 frames, and
+/// each of the first 40, whose background runs past the start, is worked out once: every
+/// render after the first reads only its own frame, and matches a cold render.
+#[test]
+fn the_start_of_a_clip_is_worked_out_once() {
+    let swarm = RenderSettings {
+        mode: OutputMode::Swarm,
+        ..RenderSettings::default()
+    };
+    assert_eq!(previous_frames_needed(&swarm) + 1, 40);
+    let frames: Vec<Image<u8>> = (0..48)
+        .map(|f| frame_with_square(W, H, 10 + f * 6, 60 + f % 5 * 4, 40))
+        .collect();
+    for s in [RenderSettings::default(), swarm] {
+        let needed = previous_frames_needed(&s) as usize;
+        let mut state = Incremental::default();
+        for n in 0..frames.len() {
+            // What an OpenFX host hands over: the frames asked for, from the start of the clip.
+            let clip = &frames[n.saturating_sub(needed)..=n];
+            let mut out = Image::new(W, H);
+            let mut source = FixedFrames {
+                images: clip,
+                reads: 0,
+            };
+            state.advance(&s, &mut source, clip.len(), n as i64, &mut out.view_mut());
+            let reads = source.reads;
+            let cold = render_frames(&s, clip, n as i64).0;
+            assert!(out.pixels == cold.pixels, "{:?}: frame {n}", s.mode);
+            assert!(reads <= 2, "{:?}: frame {n} read {reads}", s.mode);
         }
     }
 }
