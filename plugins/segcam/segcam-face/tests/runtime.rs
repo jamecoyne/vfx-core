@@ -21,16 +21,25 @@ fn devices() -> Vec<Device> {
     devices
 }
 
+/// Whether the display adapter is a GPU DirectML can run on: hardware that Direct3D 12 opens.
+/// A display-only adapter, as on CI's virtual machines, isn't one.
 #[cfg(windows)]
 fn has_gpu() -> bool {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
     };
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
         return false;
     };
-    unsafe { factory.EnumAdapters1(0).and_then(|a| a.GetDesc1()) }
-        .is_ok_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
+    let Ok(adapter) = (unsafe { factory.EnumAdapters1(0) }) else {
+        return false;
+    };
+    let hardware = unsafe { adapter.GetDesc1() }
+        .is_ok_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0);
+    let mut device: Option<ID3D12Device> = None;
+    hardware && unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device) }.is_ok()
 }
 
 const ALL: Parts = Parts {

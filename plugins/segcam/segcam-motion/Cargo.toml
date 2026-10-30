@@ -41,7 +41,12 @@ vfx-build = { path = "../../../vfx-core/wrappers/build" }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 libm = "0.2"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Faces and bodies: Vision on macOS, so no ONNX Runtime there (it has no build for Intel Macs);
+# the models on ONNX Runtime elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+segcam-face = { path = "../segcam-face", default-features = false }
+
+[target.'cfg(not(any(target_os = "macos", target_arch = "wasm32")))'.dependencies]
 segcam-face = { path = "../segcam-face" }
 
 [dev-dependencies]

@@ -903,7 +903,8 @@ pub fn render_legacy(
     }
 }
 
-#[cfg(test)]
+// For the Metal tests (src/metal.rs), which run on macOS only.
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) mod tests {
     use vfx_core::effects::PixelConvert;
     use vfx_host::{Info, Plugin};

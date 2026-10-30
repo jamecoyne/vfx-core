@@ -670,17 +670,14 @@ impl Interop {
             gl::finish_shared();
             gl::check_error("GL to Vulkan handoff")?;
         }
-        let mut lease = Lease::new(
-            gpu,
-            self.device.raw.handle().as_raw() as usize,
-            &Spec {
-                values,
-                ctx,
-                width: w,
-                height: h,
-                has_layer: false,
-            },
-        );
+        let spec = Spec {
+            values,
+            ctx,
+            width: w,
+            height: h,
+            has_layer: false,
+        };
+        let mut lease = Lease::new(gpu, self.device.raw.handle().as_raw() as usize, &spec);
         let extent = wgpu::Extent3d {
             width: w,
             height: h,
