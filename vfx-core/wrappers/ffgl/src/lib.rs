@@ -19,6 +19,7 @@ mod params;
 mod shared;
 #[cfg(target_os = "macos")]
 mod surface;
+mod timing;
 mod transfer;
 
 use std::ffi::{CString, c_char, c_void};
@@ -136,6 +137,8 @@ struct Cpu {
     ram: Option<transfer::Canvas>,
     history: History<u8>,
     rendered: Vec<Argb<u8>>,
+    /// Per-stage frame times, when `VFX_FFGL_TIMING` is set.
+    timing: Option<timing::Timing>,
 }
 
 struct Instance {
@@ -165,6 +168,7 @@ impl Instance {
             ram: None,
             history: History::default(),
             rendered: Vec::new(),
+            timing: timing::enabled().then(timing::Timing::default),
         });
         Self {
             values: table().iter().map(|p| p.default).collect(),
@@ -474,6 +478,11 @@ unsafe fn process_cpu(
     }
     let before = cpu.effect.frames_before(&values);
     let canvas = cpu.ram.as_ref().expect("made above");
+    if cpu.timing.is_some() {
+        // SAFETY: the host's context is current.
+        unsafe { timing::sync() };
+    }
+    let started = std::time::Instant::now();
     // SAFETY: the context is current and the canvas has the declared image size.
     unsafe {
         canvas.read(
@@ -483,6 +492,7 @@ unsafe fn process_cpu(
             cpu.history.next(before),
         )
     };
+    let read = started.elapsed();
     let ctx = Context {
         frame: cpu.history.frame_number(),
         ..Context::at(time)
@@ -496,11 +506,18 @@ unsafe fn process_cpu(
         LOG.note("warning: CPU render failed");
         return false;
     }
+    let render = started.elapsed() - read;
     // SAFETY: the output storage holds the full straight, top-down image.
     unsafe {
         me.output
             .upload_bytes((w, h), transfer::bytes(&cpu.rendered));
         canvas.draw(me.output.handle);
+    }
+    if let Some(timing) = cpu.timing.as_mut() {
+        // SAFETY: the host's context is current.
+        unsafe { timing::sync() };
+        let upload = started.elapsed() - read - render;
+        timing.record([read, render, upload], (w, h), &me.values);
     }
     LOG.note("render path: CPU effect through RAM (texture readback)");
     true

@@ -52,6 +52,10 @@ The pipeline reuses its readback buffer and copies straight into float storage.
 
 `~/Library/Logs/VfxPreview-FFGL.log` records which path ran on macOS. On Windows the
 log is `%TEMP%\VfxPreview-FFGL.log`. `VFX_FFGL_PATH=ram` forces the RAM path.
+`VFX_FFGL_TIMING=1` times a CPU effect inside the host: every 300 frames it appends the
+median and p95 milliseconds of the readback, the render and the upload, with the parameter
+values, to `vfx-ffgl-timing.log` in the temp directory. It waits for the host's GL work around
+each frame, so leave it off outside measurements.
 
 Measured on an Apple M5 with blur radius 8 and the vignette on:
 
