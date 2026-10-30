@@ -1,0 +1,48 @@
+[package]
+name = "segcam-motion"
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Motion segmentation from segcam: overlay, mattes and the swarm collage."
+
+# The plugin's identity in every host. Hosts find a plugin in saved projects by its IDs
+# (id, ae-match-name, ffgl-code): choose them once and keep them across versions. The
+# match name differs from segcam's C++ effect's, so both can be installed side by side.
+[package.metadata.vfx]
+name = "segcam Motion (Rust)"
+short-name = "segcam Motion"          # FFGL hosts show 16 bytes of a name
+category = "LO.FI.SCI.FI"
+file = "SegcamMotionRust"
+id = "com.lofiscifi.SegcamMotionRust"
+ae-match-name = "LOFISCIFI segcam Motion Rust"
+ffgl-code = "SGCM"
+processor = "cpu"                     # a CpuEffect: frames in RAM, earlier frames fetched
+windows-dlls = ["DirectML.dll"]       # segcam-face loads this copy, not the host's
+windows-installer-id = "EA131C10-B8DF-4E13-B2B7-B56AB79BD0A6"
+
+# The host targets. `cargo vfx build` switches them on and bundles the one binary for each.
+[features]
+ae = ["vfx-plugin/ae"]
+ofx = ["vfx-plugin/ofx"]
+ffgl = ["vfx-plugin/ffgl"]
+
+# The rlib is the effect (for the preview app, tests and tools); the cdylib is the plugin.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vfx-core = { path = "../../../vfx-core" }
+vfx-plugin = { path = "../../../vfx-core/wrappers/plugin" }
+
+[build-dependencies]
+vfx-build = { path = "../../../vfx-core/wrappers/build" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+libm = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+segcam-face = { path = "../segcam-face" }
+
+[dev-dependencies]
+vfx-host = { path = "../../../vfx-core/wrappers/common" }

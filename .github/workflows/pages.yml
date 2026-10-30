@@ -39,7 +39,7 @@ jobs:
           tool: wasm-bindgen@${{ steps.wasm-bindgen.outputs.version }}
 
       - name: Build the web preview
-        run: ./examples/preview/web/build.sh
+        run: ./vfx-core/examples/preview/web/build.sh
 
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -12,7 +12,7 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     env:
-      WGPU_BACKEND: ${{ runner.os == 'Linux' && 'vulkan' || '' }}
+      WGPU_BACKEND: ${{ matrix.os == 'ubuntu-latest' && 'vulkan' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -77,8 +77,8 @@ jobs:
           git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
           export OFX_INCLUDE="$RUNNER_TEMP/openfx/include"
           [ "$RUNNER_OS" = Windows ] && export CC=clang
-          ./wrappers/ofx/minihost/run.sh
-          SEGCAM_TEST_DIR="$RUNNER_TEMP/segcam-ofx" ./effects/segcam-motion/ofx-tests/run.sh
+          ./vfx-core/wrappers/ofx/minihost/run.sh
+          SEGCAM_TEST_DIR="$RUNNER_TEMP/segcam-ofx" ./plugins/segcam/segcam-motion/ofx-tests/run.sh
 
       # FFGL needs an OpenGL context: macOS runners provide Apple's software renderer.
       # The Windows FFGL mini host runs locally only; runners have no OpenGL 4.1 GPU.
@@ -87,8 +87,8 @@ jobs:
         env:
           FFGL_MINIHOST_SOFTWARE: 1
         run: |
-          ./wrappers/ffgl/minihost/run.sh
-          ./effects/segcam-motion/ffgl-tests/run.sh
+          ./vfx-core/wrappers/ffgl/minihost/run.sh
+          ./plugins/segcam/segcam-motion/ffgl-tests/run.sh
 
       - name: Build every plugin
         shell: bash

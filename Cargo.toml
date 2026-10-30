@@ -1,29 +1,8 @@
-[package]
-name = "vfx-core"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-
-[dependencies]
-bytemuck = { version = "1.25.2", features = ["derive"] }
-wgpu = "=30.0.1"
-
-# Browsers are single-threaded: lets wgpu's web types satisfy the `Send` bound on effects,
-# so any web build of the core compiles, not just the preview's. Safe without wasm threads
-# (atomics), which no build here uses.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wgpu = { version = "=30.0.1", features = ["fragile-send-sync-non-atomic-wasm"] }
-
-[features]
-# wgpu's WebGL2 backend, for browsers: off by default, so native builds and the WebGPU web
-# build are unchanged.
-webgl = ["wgpu/webgl"]
-
-[dev-dependencies]
-bytemuck = { version = "1.25.2", features = ["derive"] }
-pollster = "1.0.1"
-
+# One workspace for two folders: vfx-core/, the toolchain (the core crate, the host targets,
+# cargo vfx, the preview and the VFX Preview demo effect), and plugins/, effects built with it.
+# Nothing in vfx-core/ depends on plugins/ except the preview's list of effects.
 [workspace]
-members = [".", "effects/vfx-chain", "effects/segcam-motion", "examples/preview", "wrappers/common", "wrappers/build", "wrappers/plugin", "tools/cargo-vfx", "crates/segcam-face", "wrappers/adobe", "wrappers/ofx", "wrappers/ffgl", "wrappers/ffgl-common"]
+resolver = "3"
+members = ["vfx-core", "vfx-core/effects/vfx-chain", "vfx-core/examples/preview", "vfx-core/wrappers/common", "vfx-core/wrappers/build", "vfx-core/wrappers/plugin", "vfx-core/tools/cargo-vfx", "vfx-core/wrappers/adobe", "vfx-core/wrappers/ofx", "vfx-core/wrappers/ffgl", "vfx-core/wrappers/ffgl-common", "plugins/segcam/segcam-motion", "plugins/segcam/segcam-face"]
 # Plain `cargo test` builds only the core, so windowing never enters CI on Linux.
-default-members = ["."]
+default-members = ["vfx-core"]
