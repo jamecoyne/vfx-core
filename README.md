@@ -8,25 +8,26 @@ plugins, and `cargo vfx` builds and packages them:
 
 | Host target | Crate | Hosts | Checked with the generic target |
 |---|---|---|---|
-| After Effects | `wrappers/adobe` (`vfx-ae`) | After Effects 2026 (Premiere untested) | builds and unit tests; checked in After Effects with the earlier per-effect wrappers |
-| OpenFX | `wrappers/ofx` (`vfx-ofx`) | DaVinci Resolve, Nuke, Natron… | both effects pass their mini-host checks; Resolve 21 and Natron 2.5 were checked with the earlier wrappers |
-| FFGL | `wrappers/ffgl` (`vfx-ffgl`) | Resolume Avenue / Arena | both effects pass the mini host (GPU sharing, RAM and software GL); Avenue was checked with the earlier wrappers |
-| Preview app | `examples/preview` (`vfx-preview`) | desktop and browser (WebGPU) | shows any one effect, with expressions and MP4 export; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
+| After Effects | `vfx-core/wrappers/adobe` (`vfx-ae`) | After Effects 2026 (Premiere untested) | builds and unit tests; checked in After Effects with the earlier per-effect wrappers |
+| OpenFX | `vfx-core/wrappers/ofx` (`vfx-ofx`) | DaVinci Resolve, Nuke, Natron… | both effects pass their mini-host checks; Resolve 21 and Natron 2.5 were checked with the earlier wrappers |
+| FFGL | `vfx-core/wrappers/ffgl` (`vfx-ffgl`) | Resolume Avenue / Arena | both effects pass the mini host (GPU sharing, RAM and software GL); Avenue was checked with the earlier wrappers |
+| Preview app | `vfx-core/examples/preview` (`vfx-preview`) | desktop and browser (WebGPU) | shows any one effect, with expressions and MP4 export; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
 
 The effects in this repository:
 
 | Effect | Crate | What |
 |---|---|---|
-| VFX Preview | `effects/vfx-chain` | colour adjust, vignette, a blend with a second layer and Gaussian blur, chained, on the GPU |
-| segcam Motion (Rust) | `effects/segcam-motion` | segcam's motion segmentation on the CPU: overlay, mattes and the swarm collage; byte-identical to segcam's C++ effect |
-| core effects | `vfx-core` (`src/effects`) | colour adjust, blur, vignette, blend, flip, feedback trail: building blocks, and tryable alone in the preview |
+| VFX Preview | `vfx-core/effects/vfx-chain` | colour adjust, vignette, a blend with a second layer and Gaussian blur, chained, on the GPU |
+| segcam Motion (Rust) | `plugins/segcam/segcam-motion` | segcam's motion segmentation on the CPU: overlay, mattes and the swarm collage; byte-identical to segcam's C++ effect |
+| core effects | `vfx-core` (`vfx-core/src/effects`) | colour adjust, blur, vignette, blend, flip, feedback trail: building blocks, and tryable alone in the preview |
 
 Licensed MIT OR Apache-2.0.
 
 ## An effect crate
 
-`cargo vfx new my-glow` makes one in `effects/my-glow`: a CPU effect to start from, already
-in the workspace and the preview. `effects/segcam-motion` and `effects/vfx-chain` are
+`cargo vfx new my-glow` makes one in `vfx-core/effects/my-glow`: a CPU effect to start from,
+already in the workspace and the preview. `plugins/segcam/segcam-motion` and
+`vfx-core/effects/vfx-chain` are
 complete examples. The parts:
 
 ```toml
@@ -88,37 +89,45 @@ A `CpuEffect` that keeps work between renders says so with `keeps_state`. OpenFX
 and the preview then keep one per instance (`vfx_host::CpuInstance`, which also starts it
 over after a panic, a seek back or a resize); After Effects never does. Either way every
 frame must match a fresh effect's, even after earlier frames change upstream or a host
-misses one: test it with `vfx_host::contract::check`, as `effects/segcam-motion` does.
+misses one: test it with `vfx_host::contract::check`, as `plugins/segcam/segcam-motion` does.
 
 ## Layout
 
+One Cargo workspace (`Cargo.toml` at the root) in two folders: `vfx-core/`, the toolchain,
+and `plugins/`, effects built with it. Nothing in `vfx-core/` depends on `plugins/` except the
+preview's list of effects.
+
 ```
-src/                    vfx-core: Effect and CpuEffect, typed params, Frame, EffectChain, WGSL passes
-  cpu.rs                frames in RAM for CPU effects: ARGB at 8/16/32 bits, strided views, history
-  effects/              the core effects
-tests/                  headless GPU tests for the core
-effects/
-  vfx-chain/            VFX Preview, the chain of core effects
-    examples/ae_reference.rs   its After Effects render path without After Effects
-  segcam-motion/        segcam Motion, ported from C++ (own README)
-    ae-tests/ ofx-tests/ ffgl-tests/   host checks against the C++ effect and its CLI
-wrappers/
-  common/               vfx-host: the registered plugin, the GPU, the render pool, the log,
+vfx-core/
+  src/                  vfx-core: Effect and CpuEffect, typed params, Frame, EffectChain, WGSL passes
+    cpu.rs              frames in RAM for CPU effects: ARGB at 8/16/32 bits, strided views, history
+    effects/            the core effects
+  tests/                headless GPU tests for the core
+  effects/
+    vfx-chain/          VFX Preview, the chain of core effects: the demo effect
+      examples/ae_reference.rs   its After Effects render path without After Effects
+  wrappers/
+    common/             vfx-host: the registered plugin, the GPU, the render pool, the log,
                         control layout, kept CPU effects and their contract
-  plugin/               vfx-plugin: an effect crate's one `export!`
-  build/                vfx-build: the effect crate's build script (identity and its checks, PiPL)
-  adobe/                vfx-ae: After Effects SmartFX, Metal interop
-    ae-tests/           harness that renders VFX Preview inside After Effects
-  ofx/                  vfx-ofx: OpenFX, hand-written bindings to the OpenFX 1.4 C API
-    minihost/           a small OpenFX host in C for testing without an application
-  ffgl/                 vfx-ffgl: FFGL 2.1, OpenGL + IOSurface / Vulkan interop
-    minihost/           a small FFGL host in C with a headless OpenGL context
-  ffgl-common/          FFGL bindings, GL transfers and pixel repacking
-  package-win.sh        an effect's Windows installer (Inno Setup)
-tools/cargo-vfx/        cargo vfx: builds, packages and installs effect crates
-examples/preview/       the preview: a library host (`vfx_preview::run`) and the repository's app
-  src/catalog.rs        the effects it offers (effect crates listed by build.rs)
-  web/                  index.html and build.sh for the WebGPU build
+    plugin/             vfx-plugin: an effect crate's one `export!`
+    build/              vfx-build: the effect crate's build script (identity and its checks, PiPL)
+    adobe/              vfx-ae: After Effects SmartFX, Metal interop
+      ae-tests/         harness that renders VFX Preview inside After Effects
+    ofx/                vfx-ofx: OpenFX, hand-written bindings to the OpenFX 1.4 C API
+      minihost/         a small OpenFX host in C for testing without an application
+    ffgl/               vfx-ffgl: FFGL 2.1, OpenGL + IOSurface / Vulkan interop
+      minihost/         a small FFGL host in C with a headless OpenGL context
+    ffgl-common/        FFGL bindings, GL transfers and pixel repacking
+    package-win.sh      an effect's Windows installer (Inno Setup)
+  tools/cargo-vfx/      cargo vfx: builds, packages and installs effect crates
+  examples/preview/     the preview: a library host (`vfx_preview::run`) and the repository's app
+    src/catalog.rs      the effects it offers (effect crates listed by build.rs)
+    web/                index.html and build.sh for the WebGPU build
+plugins/
+  segcam/
+    segcam-motion/      segcam Motion, ported from C++ (own README)
+      ae-tests/ ofx-tests/ ffgl-tests/   host checks against the C++ effect and its CLI
+    segcam-face/        faces, eyes, mouths and bodies for segcam (own README)
 .github/workflows/      ci.yml (tests, every plugin), pages.yml (web preview), release.yml
 ```
 
@@ -137,14 +146,14 @@ acts on every effect crate; output goes to `target/vfx-plugin/`.
 | What | Command | Result |
 |---|---|---|
 | The effects | `cargo vfx list` | each effect crate and its identity |
-| A new effect | `cargo vfx new my-glow` | `effects/my-glow`, added to the workspace and the preview |
+| A new effect | `cargo vfx new my-glow` | `vfx-core/effects/my-glow`, added to the workspace and the preview |
 | Checks | `cargo vfx check` | effects missing from the preview, and installed After Effects plugins that share a match name |
 | Plugins | `cargo vfx build [-p segcam-motion] [--hosts ae,ofx,ffgl] [--native]` | `<file>.plugin`, `.ofx.bundle` and `.bundle` on macOS (one universal binary; `--native` builds this Mac's architecture only); `.aex`, `.ofx.bundle` and `.dll` on Windows |
 | macOS installers | `cargo vfx package` | `<file>-adobe.pkg` (Adobe's MediaCore folder) and `<file>-ofx.pkg` (`/Library/OFX/Plugins`) |
 | Install | `cargo vfx install [--hosts ffgl]` | copies FFGL bundles into Resolume's Extra Effects; for After Effects and OpenFX, prints the `sudo installer` commands |
-| Windows installer | `EFFECT=segcam-motion wrappers/package-win.sh` | `<file>-<version>-Windows-Setup.exe` and a `.zip` (needs [Inno Setup](https://jrsoftware.org/isinfo.php)) |
+| Windows installer | `EFFECT=segcam-motion vfx-core/wrappers/package-win.sh` | `<file>-<version>-Windows-Setup.exe` and a `.zip` (needs [Inno Setup](https://jrsoftware.org/isinfo.php)) |
 | Preview (desktop) | `cargo vfx preview [-p segcam-motion] [-- clip.mp4]` | the preview, opened on the effect; drop an image or video on it |
-| Preview (web) | `examples/preview/web/build.sh --serve` | http://localhost:8123, or `?effect=segcam-motion` to open on an effect (needs `wasm-bindgen-cli` at the lockfile's version) |
+| Preview (web) | `vfx-core/examples/preview/web/build.sh --serve` | http://localhost:8123, or `?effect=segcam-motion` to open on an effect (needs `wasm-bindgen-cli` at the lockfile's version) |
 | Tests | `cargo test -p vfx-core -p vfx-host -p vfx-chain -p segcam-motion` | headless GPU and CPU tests |
 
 `cargo vfx package` signs and notarizes only when `SIGN_IDENTITY`, `NOTARY_PROFILE` and
@@ -161,7 +170,7 @@ parameter has an expression box (`sin(time/4)`, `bass * 2`, face tracking), and 
 renders to MP4 through it. It links the effects it offers, so the same build runs on the
 desktop and in the browser. Its build script lists every effect crate among its
 dependencies, as `Entry::plugin(&segcam_motion::VFX_PLUGIN)` (the crate as its plugins see
-it); `examples/preview/src/catalog.rs` adds the core effects.
+it); `vfx-core/examples/preview/src/catalog.rs` adds the core effects.
 
 Another crate's effect can use the preview as a library:
 `vfx_preview::run(vec![Entry::plugin(&my_effect::VFX_PLUGIN)])`.
@@ -202,21 +211,21 @@ The Windows installer is unsigned, so Windows SmartScreen asks before running it
 Unit tests cover the core, each effect, and each target's parameter mapping and pixel
 conversions. Beyond those, each host has a harness, run against the effects:
 
-- **After Effects**: `python3 wrappers/adobe/ae-tests/run.py` builds fixture projects
+- **After Effects**: `python3 vfx-core/wrappers/adobe/ae-tests/run.py` builds fixture projects
   for VFX Preview in the running After Effects (8, 16, 32 bpc; CPU and Metal), renders
   them with `aerender` (MFR on and off), and compares against `ae_reference`, the same
-  render path without After Effects. `python3 effects/segcam-motion/ae-tests/run.py`
+  render path without After Effects. `python3 plugins/segcam/segcam-motion/ae-tests/run.py`
   renders segcam beside segcam's C++ effect. Both test the *installed* plugins and need
   After Effects, so they aren't in CI.
-- **OpenFX**: `wrappers/ofx/minihost/run.sh` loads VFX Preview into a C host built on the
+- **OpenFX**: `vfx-core/wrappers/ofx/minihost/run.sh` loads VFX Preview into a C host built on the
   real OpenFX headers and checks pixels, depths, row order, premultiplication, render
-  scale, regions of definition and interest. `effects/segcam-motion/ofx-tests/run.sh`
+  scale, regions of definition and interest. `plugins/segcam/segcam-motion/ofx-tests/run.sh`
   renders segcam through the same host's suites at every depth, row order and alpha
   convention, and compares 36 sequences with its CLI. Both run in CI on macOS and
   Windows (from Git Bash with `CC` and `OFX_INCLUDE` set).
-- **FFGL**: `wrappers/ffgl/minihost/run.sh` does the same for FFGL with a headless OpenGL
+- **FFGL**: `vfx-core/wrappers/ffgl/minihost/run.sh` does the same for FFGL with a headless OpenGL
   context: metadata, pixels, padded textures, GL state left behind, and frame times.
-  `EFFECT=<crate>` checks another effect; `effects/segcam-motion/ffgl-tests/run.sh` adds
+  `EFFECT=<crate>` checks another effect; `plugins/segcam/segcam-motion/ffgl-tests/run.sh` adds
   segcam's cases and compares 960 frames with its CLI. `FFGL_MINIHOST_SOFTWARE=1` uses
   Apple's software renderer, as on macOS CI runners; `VFX_FFGL_PATH=ram` forces the RAM
   path.
@@ -244,7 +253,7 @@ conversions. Beyond those, each host has a harness, run against the effects:
   else (and any setup failure) goes through RAM, and a GPU failure passes the frame
   through unchanged rather than failing the host's render.
 - **Hand-written host bindings.** OpenFX and FFGL are small C ABIs, transcribed from
-  their headers (BSD-licensed; FFGL's notice is kept in `wrappers/ffgl-common/src/ffi.rs`).
+  their headers (BSD-licensed; FFGL's notice is kept in `vfx-core/wrappers/ffgl-common/src/ffi.rs`).
   The `ffgl-core` crate was avoided because it's GPL-3.0.
 - **Host quirks found by testing**, now handled and covered by tests or the harnesses:
   After Effects needs PiPL spec version 13.25+ for MFR and sequence-data flattening flags
@@ -266,11 +275,13 @@ conversions. Beyond those, each host has a harness, run against the effects:
 
 ## Notes for agents working on this repo
 
-- Effect logic belongs in an effect crate (`effects/`) or the core (`src/effects`). A
-  target crate (`wrappers/`) only translates parameters and moves pixels, for any effect;
-  what two targets share belongs in `wrappers/common`.
-- Read the README in each target or effect (`wrappers/ffgl/`, `wrappers/adobe/ae-tests/`,
-  `effects/segcam-motion/`) before changing it, and run its harness afterwards. The After
+- Effect logic belongs in an effect crate (`vfx-core/effects/`, `plugins/`) or the core
+  (`vfx-core/src/effects`). A target crate (`vfx-core/wrappers/`) only translates parameters
+  and moves pixels, for any effect; what two targets share belongs in
+  `vfx-core/wrappers/common`. Nothing in `vfx-core/` depends on `plugins/` except the
+  preview's list of effects.
+- Read the README in each target or effect (`vfx-core/wrappers/ffgl/`,
+  `vfx-core/wrappers/adobe/ae-tests/`, `plugins/segcam/segcam-motion/`) before changing it, and run its harness afterwards. The After
   Effects harnesses test the *installed* plugins, so `cargo vfx package` and reinstall
   first (installing to system folders needs the user's password).
 - Keep labels under 16 bytes: FFGL hosts cut longer ones, and each effect crate has a test.
@@ -281,4 +292,4 @@ conversions. Beyond those, each host has a harness, run against the effects:
   and features) must pass; CI runs latest stable, whose clippy can be stricter.
 - wgpu is pinned to `=30.0.1`; the Metal interop uses `wgpu-hal` types and must be checked
   when it moves. The web build needs wgpu's `fragile-send-sync-non-atomic-wasm` feature
-  (set in `examples/preview/Cargo.toml`) because effects are `Send`.
+  (set in `vfx-core/examples/preview/Cargo.toml`) because effects are `Send`.

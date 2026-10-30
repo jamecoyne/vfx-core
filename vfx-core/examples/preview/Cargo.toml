@@ -1,0 +1,50 @@
+[package]
+name = "vfx-preview"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+vfx-core = { path = "../.." }
+vfx-host = { path = "../../wrappers/common" }
+# The repository's effect crates, which the preview offers alongside the core effects. Its
+# build script lists every path dependency with [package.metadata.vfx]; `cargo vfx new` adds
+# a new effect here, and `cargo vfx check` reports one that's missing.
+vfx-chain = { path = "../../effects/vfx-chain" }
+segcam-motion = { path = "../../../plugins/segcam/segcam-motion" }
+wgpu = "=30.0.1"
+# egui's winit backend targets winit 0.30.
+winit = "0.30.13"
+egui = { version = "0.37.0", features = ["default_fonts"] }
+egui-wgpu = { version = "0.37.0", default-features = false }
+egui-winit = { version = "0.37.0", default-features = false }
+bytemuck = "1.25.2"
+# std::time::Instant panics in browsers; web-time is the same type on native.
+web-time = "1.1.0"
+
+[build-dependencies]
+vfx-build = { path = "../../wrappers/build" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "links"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+pollster = "1.0.1"
+# Native file picker for "Import…".
+rfd = "0.17.2"
+# Runs the face model (models/face_detection_yunet_2023mar.onnx).
+ort = "=2.0.0-rc.15"
+
+[target.'cfg(windows)'.dependencies]
+# A job object, so ffmpeg and ffplay close with the app.
+windows-sys = { version = "0.61.2", features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+# The web build (GitHub Pages): WebGPU in the browser, started from JavaScript.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Browsers are single-threaded: lets wgpu's WebGPU types satisfy vfx-core's `Send`
+# bound on effects. Safe without wasm threads (atomics), which this build doesn't use.
+wgpu = { version = "=30.0.1", features = ["fragile-send-sync-non-atomic-wasm"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "Element", "HtmlElement", "Location", "Window"] }
+console_error_panic_hook = "0.1"

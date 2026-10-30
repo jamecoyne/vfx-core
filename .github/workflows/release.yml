@@ -90,7 +90,7 @@ jobs:
         shell: bash
         run: |
           for crate in $(cargo vfx list | awk '{print $1}'); do
-            EFFECT="$crate" VERSION="${VERSION#v}" ./wrappers/package-win.sh
+            EFFECT="$crate" VERSION="${VERSION#v}" ./vfx-core/wrappers/package-win.sh
           done
 
       - uses: actions/upload-artifact@v4
