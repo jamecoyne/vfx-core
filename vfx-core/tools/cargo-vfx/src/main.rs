@@ -524,6 +524,7 @@ fn package(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), Str
         rest: Vec::new(),
     };
     let m = &e.meta;
+    fs::create_dir_all(out).map_err(|err| err.to_string())?;
     for bundle in build_mac(e, &release, target, out)? {
         sign_and_notarize(&bundle, out)?;
         let name = bundle

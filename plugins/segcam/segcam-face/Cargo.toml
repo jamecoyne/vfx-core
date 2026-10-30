@@ -29,5 +29,4 @@ objc2 = "0.6.5"
 # DirectML runs the models on any Direct3D 12 GPU.
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["directml"] }
-# Direct3D 12 only for the tests, which check that an adapter can run DirectML.
-windows = { version = "0.62.2", optional = true, features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D12"] }
+windows = { version = "0.62.2", optional = true, features = ["Win32_Graphics_Dxgi"] }

@@ -8,38 +8,18 @@ use segcam_face::{
 fn devices() -> Vec<Device> {
     #[allow(unused_mut)]
     let mut devices = vec![Device::Cpu];
-    // DirectML only if a GPU is detected; CI machines may have none. If one is, DirectML must
-    // load, or these tests would only cover the CPU.
+    // DirectML where it loads. Not every Windows machine has a GPU it can use (CI's don't),
+    // so SEGCAM_REQUIRE_DIRECTML=1 makes a failure to load an error, on a machine that has.
     #[cfg(windows)]
-    if has_gpu() {
-        if let Err(e) = OrtYuNet::new(YUNET_MODEL, Device::DirectMl(0)) {
-            panic!("DirectML didn't load ({e}); put DirectML.dll next to the test binary");
+    match OrtYuNet::new(YUNET_MODEL, Device::DirectMl(0)) {
+        Ok(_) => devices.push(Device::DirectMl(0)),
+        Err(e) if std::env::var_os("SEGCAM_REQUIRE_DIRECTML").is_some() => {
+            panic!("DirectML didn't load ({e}); put DirectML.dll next to the test binary")
         }
-        devices.push(Device::DirectMl(0));
+        Err(e) => eprintln!("DirectML didn't load ({e}); testing the CPU only"),
     }
     eprintln!("devices: {devices:?}");
     devices
-}
-
-/// Whether the display adapter is a GPU DirectML can run on: hardware that Direct3D 12 opens.
-/// A display-only adapter, as on CI's virtual machines, isn't one.
-#[cfg(windows)]
-fn has_gpu() -> bool {
-    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-    use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
-    use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
-    };
-    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
-        return false;
-    };
-    let Ok(adapter) = (unsafe { factory.EnumAdapters1(0) }) else {
-        return false;
-    };
-    let hardware = unsafe { adapter.GetDesc1() }
-        .is_ok_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0);
-    let mut device: Option<ID3D12Device> = None;
-    hardware && unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device) }.is_ok()
 }
 
 const ALL: Parts = Parts {

@@ -23,5 +23,6 @@ DirectML isn't compatible with newer ONNX Runtime, so it has to be bundled to av
 to CPU.
 
 `cargo test -p segcam-face` passes on Windows (CPU, and DirectML on NVIDIA and AMD), Linux and
-macOS. On Windows the tests fail if a GPU is detected but DirectML doesn't load; Cargo runs them
-from `target/<profile>/deps`, so copy `DirectML.dll` there from `target/<profile>`.
+macOS. On Windows they also run on DirectML where it loads; set `SEGCAM_REQUIRE_DIRECTML=1` on a
+machine with a GPU to make a failure to load an error. Cargo runs them from
+`target/<profile>/deps`, so copy `DirectML.dll` there from `target/<profile>`.
