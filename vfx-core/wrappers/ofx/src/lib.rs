@@ -522,6 +522,8 @@ struct Source<'a, C> {
     error: Option<OfxStatus>,
     /// Where each frame is decoded.
     frame: &'a mut Vec<Argb<C>>,
+    /// The frame `frame` holds, which isn't fetched again if asked for again.
+    decoded: Option<usize>,
     /// Resolve is streaming renders, so earlier frames are taken as unchanged until it pauses.
     fixed: bool,
 }
@@ -533,11 +535,17 @@ impl<C: CpuDepth> FrameSource for Source<'_, C> {
             f(None);
             return;
         }
+        let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
+        if self.decoded == Some(index) {
+            f(Some(C::image(View::from_pixels(self.frame, w, h))));
+            return;
+        }
+        self.decoded = None;
         match fetch(self.clip, time) {
             Ok(Some(frame)) => {
                 // SAFETY: the fetched image stays alive through the closure.
                 unsafe { cpu::decode_into(&frame.image, self.canvas, self.frame) };
-                let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
+                self.decoded = Some(index);
                 f(Some(C::image(View::from_pixels(self.frame, w, h))));
             }
             Ok(None) => {
@@ -763,6 +771,7 @@ fn draw<C: Scratch>(
             canvas,
             error: None,
             frame,
+            decoded: None,
             fixed,
         };
         let (w, h) = (canvas.width() as i32, canvas.height() as i32);
