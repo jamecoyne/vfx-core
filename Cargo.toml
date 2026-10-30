@@ -8,6 +8,17 @@ license = "MIT OR Apache-2.0"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 wgpu = "=30.0.1"
 
+# Browsers are single-threaded: lets wgpu's web types satisfy the `Send` bound on effects,
+# so any web build of the core compiles, not just the preview's. Safe without wasm threads
+# (atomics), which no build here uses.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "=30.0.1", features = ["fragile-send-sync-non-atomic-wasm"] }
+
+[features]
+# wgpu's WebGL2 backend, for browsers: off by default, so native builds and the WebGPU web
+# build are unchanged.
+webgl = ["wgpu/webgl"]
+
 [dev-dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
 pollster = "1.0.1"
