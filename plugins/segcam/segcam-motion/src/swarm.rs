@@ -514,10 +514,13 @@ impl ShadowKernel {
         }
     }
 
-    /// The correction at a pixel centre `ox`, `oy` in from a corner (negative: outside).
-    fn corner_loss(&self, ox: f64, oy: f64) -> f32 {
-        let i = ox.floor() as i32 - self.lo;
-        let j = oy.floor() as i32 - self.lo;
+    /// Where a pixel centre `o` in from a corner (negative: outside) falls in the corner table.
+    fn corner_index(&self, o: f64) -> i32 {
+        o.floor() as i32 - self.lo
+    }
+
+    /// The correction at corner table indices `i`, `j`.
+    fn corner_loss(&self, i: i32, j: i32) -> f32 {
         if i < 0 || j < 0 || i >= self.size || j >= self.size {
             return 0.0;
         }
@@ -536,7 +539,10 @@ pub fn draw_window<C: Channel>(
     straight_alpha: bool,
 ) {
     let bar = TitleBar::of(tile, m);
-    draw_window_with(out, tile, &bar, m, shadow, straight_alpha, None);
+    let rows = out.rows();
+    let canvas = PixelRect::new(0, rows.start, out.width, rows.len() as i32);
+    let plan = WindowPlan::new(tile, m, shadow, canvas);
+    draw_window_with(out, tile, &bar, &plan, m, shadow, straight_alpha, None);
 }
 
 /// The frame live windows show, laid on the canvas as [`crate::render::copy_scaled`] lays
@@ -593,20 +599,116 @@ impl TitleBar {
     }
 }
 
-/// [`draw_window`] with its title bar already made. With `live`, the window shows that frame
-/// where it sits instead of the tile's own pixels.
+/// What drawing a window takes that is the same in every band of rows: where it reaches, its
+/// shadow's profiles, and for each column and row its offsets from the corners and the mask.
+pub struct WindowPlan {
+    frame: PixelRect,
+    /// The window and its shadow, clipped to the canvas.
+    area: PixelRect,
+    profile_x: Vec<f32>,
+    profile_y: Vec<f32>,
+    /// Indices into the shadow's corner table, by column and row of `area`.
+    corner_x: Vec<i32>,
+    corner_y: Vec<i32>,
+    /// How far each column and row of the frame lies outside the mask's straight edges.
+    mask_x: Vec<f64>,
+    mask_y: Vec<f64>,
+    radius: f64,
+}
+
+impl WindowPlan {
+    pub fn new(tile: &Tile, m: &SwarmMetrics, shadow: &ShadowKernel, canvas: PixelRect) -> Self {
+        let frame = tile_extent(tile.video, m.title_height);
+        let radius = f64::from(chrome::CORNER_RADIUS) * m.scale;
+        let (sigma, drop, reach) = (shadow.sigma, shadow.drop, shadow.reach);
+        let area = intersect(
+            PixelRect::new(
+                frame.x - reach,
+                frame.y - reach,
+                frame.w + 2 * reach,
+                frame.h + 2 * reach,
+            ),
+            canvas,
+        );
+        let (fx0, fy0) = (f64::from(frame.x), f64::from(frame.y));
+        let (fw, fh) = (f64::from(frame.w), f64::from(frame.h));
+        let mid_x = fx0 + fw / 2.0;
+        let mid_y = fy0 + drop + fh / 2.0;
+        let columns = || (0..area.w.max(0)).map(|i| f64::from(area.x + i) + 0.5);
+        let rows = || (0..area.h.max(0)).map(|i| f64::from(area.y + i) + 0.5);
+        // In from the nearest edge, as the shadow's corner table is laid out.
+        let corner = |o: f64| shadow.corner_index(o);
+        let mask = |c: f64, len: f64| c - c.max(radius).min(len - radius);
+        Self {
+            frame,
+            area,
+            profile_x: columns()
+                .map(|x| {
+                    (normal_cdf((x - fx0) / sigma) - normal_cdf((x - fx0 - fw) / sigma)) as f32
+                })
+                .collect(),
+            profile_y: rows()
+                .map(|y| {
+                    (normal_cdf((y - fy0 - drop) / sigma)
+                        - normal_cdf((y - fy0 - fh - drop) / sigma)) as f32
+                })
+                .collect(),
+            corner_x: columns()
+                .map(|cx| {
+                    corner(if cx < mid_x {
+                        cx - fx0
+                    } else {
+                        f64::from(frame.x + frame.w) - cx
+                    })
+                })
+                .collect(),
+            corner_y: rows()
+                .map(|cy| {
+                    corner(if cy < mid_y {
+                        cy - fy0 - drop
+                    } else {
+                        fy0 + drop + fh - cy
+                    })
+                })
+                .collect(),
+            mask_x: (0..frame.w.max(0))
+                .map(|x| mask(f64::from(x) + 0.5, fw))
+                .collect(),
+            mask_y: (0..frame.h.max(0))
+                .map(|y| mask(f64::from(y) + 0.5, fh))
+                .collect(),
+            radius,
+        }
+    }
+}
+
+/// Tile channels as units, as [`rgb`] reads them.
+const UNIT: [f32; 256] = {
+    let mut unit = [0.0; 256];
+    let mut i = 0;
+    while i < 256 {
+        unit[i] = i as f32 / 255.0;
+        i += 1;
+    }
+    unit
+};
+
+/// [`draw_window`] with its title bar and plan already made. With `live`, the window shows that
+/// frame where it sits instead of the tile's own pixels.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_window_with<C: Channel>(
     out: &mut ViewMut<C>,
     tile: &Tile,
     bar: &TitleBar,
+    plan: &WindowPlan,
     m: &SwarmMetrics,
     shadow: &ShadowKernel,
     straight_alpha: bool,
     live: Option<LiveFrame<'_, C>>,
 ) {
     let (canvas_w, canvas_h) = (out.width, out.height);
-    let frame = tile_extent(tile.video, m.title_height);
-    let radius = f64::from(chrome::CORNER_RADIUS) * m.scale;
+    let frame = plan.frame;
+    let radius = plan.radius;
     let bar_h = chrome::TITLE_BAR_HEIGHT;
 
     // The title bar at 1x, sampled at the canvas's scale.
@@ -624,49 +726,26 @@ pub fn draw_window_with<C: Channel>(
     };
 
     // The shadow's box blur: one profile per row and per column, then the corners.
-    let (sigma, drop, reach) = (shadow.sigma, shadow.drop, shadow.reach);
     let area = intersect(
-        PixelRect::new(
-            frame.x - reach,
-            frame.y - reach,
-            frame.w + 2 * reach,
-            frame.h + 2 * reach,
-        ),
+        plan.area,
         PixelRect::new(0, out.rows().start, out.width, out.rows().len() as i32),
     );
     if area.is_empty() {
         return;
     }
-    let (fx0, fy0) = (f64::from(frame.x), f64::from(frame.y));
-    let (fw, fh) = (f64::from(frame.w), f64::from(frame.h));
-    let profile_x: Vec<f32> = (0..area.w)
-        .map(|i| {
-            let x = f64::from(area.x + i) + 0.5;
-            (normal_cdf((x - fx0) / sigma) - normal_cdf((x - fx0 - fw) / sigma)) as f32
-        })
-        .collect();
-    let profile_y: Vec<f32> = (0..area.h)
-        .map(|i| {
-            let y = f64::from(area.y + i) + 0.5;
-            (normal_cdf((y - fy0 - drop) / sigma) - normal_cdf((y - fy0 - fh - drop) / sigma))
-                as f32
-        })
-        .collect();
-    let mid_x = fx0 + fw / 2.0;
-    let mid_y = fy0 + drop + fh / 2.0;
     let opacity = chrome::SHADOW_OPACITY as f32;
+    // The mask keeps all of a pixel off the arcs, as `mask_coverage` works out.
+    let full = (radius + 0.5 - 0f64.hypot(0.0)).clamp(0.0, 1.0) as f32;
+    let first = (area.x - plan.area.x) as usize;
+    let columns = first..first + area.w as usize;
 
-    for (i, &py) in (0..).zip(&profile_y) {
-        let y = area.y + i;
-        let cy = f64::from(y) + 0.5;
-        // In from the nearest horizontal edge.
-        let oy = if cy < mid_y {
-            cy - fy0 - drop
-        } else {
-            fy0 + drop + fh - cy
-        };
+    for y in area.y..area.y + area.h {
+        let i = (y - plan.area.y) as usize;
+        let (py, oy) = (plan.profile_y[i], plan.corner_y[i]);
         let row = &mut out.row_mut(y)[area.x as usize..(area.x + area.w) as usize];
-        for ((j, &px_profile), px) in (0..).zip(&profile_x).zip(row.iter_mut()) {
+        let profiles = plan.profile_x[columns.clone()].iter();
+        let corners = plan.corner_x[columns.clone()].iter();
+        for ((j, (&px_profile, &ox)), px) in (0..).zip(profiles.zip(corners)).zip(row.iter_mut()) {
             let x = area.x + j;
             // Work premultiplied: the shadow is black laid over, the window is laid over that.
             let mut a = px.alpha.to_unit();
@@ -678,12 +757,6 @@ pub fn draw_window_with<C: Channel>(
             if straight_alpha {
                 p = shade(p, a);
             }
-            let cx = f64::from(x) + 0.5;
-            let ox = if cx < mid_x {
-                cx - fx0
-            } else {
-                f64::from(frame.x + frame.w) - cx
-            };
             let cast = 0f32.max(opacity * (px_profile * py - shadow.corner_loss(ox, oy)));
             p = shade(p, 1.0 - cast);
             a += cast * (1.0 - a);
@@ -704,7 +777,11 @@ pub fn draw_window_with<C: Channel>(
                     } else if !tile.pixels.is_empty() && vx >= 0 && vx < s.w && vy >= 0 && vy < s.h
                     {
                         let t = &tile.pixels[(vy * s.w + vx) as usize];
-                        c = rgb(&[t.red, t.green, t.blue]);
+                        c = Color {
+                            r: UNIT[usize::from(t.red)],
+                            g: UNIT[usize::from(t.green)],
+                            b: UNIT[usize::from(t.blue)],
+                        };
                     }
                     // The title bar's bottom edge: the content's first row is shaded under it.
                     if ly - m.title_height < 1 {
@@ -712,7 +789,12 @@ pub fn draw_window_with<C: Channel>(
                     }
                     c
                 };
-                let cov = mask_coverage(lx, ly, frame.w, frame.h, radius);
+                let (dx, dy) = (plan.mask_x[lx as usize], plan.mask_y[ly as usize]);
+                let cov = if dx == 0.0 && dy == 0.0 {
+                    full
+                } else {
+                    (radius + 0.5 - dx.hypot(dy)).clamp(0.0, 1.0) as f32
+                };
                 p = mix(p, c, cov);
                 a += cov * (1.0 - a);
             }
@@ -750,9 +832,16 @@ pub fn draw_swarm<'t, C: Channel>(
     const BANDS_PER_THREAD: usize = 4;
     let m = SwarmMetrics::new(out.height);
     let shadow = ShadowKernel::new(m.scale);
-    let windows: Vec<(&Tile, Cow<TitleBar>)> = tiles
+    let canvas = PixelRect::new(0, 0, out.width, out.height);
+    let windows: Vec<(&Tile, Cow<TitleBar>, WindowPlan)> = tiles
         .into_iter()
-        .map(|t| (t, TitleBar::of(t, &m)))
+        .map(|t| {
+            (
+                t,
+                TitleBar::of(t, &m),
+                WindowPlan::new(t, &m, &shadow, canvas),
+            )
+        })
         .collect();
     let threads = std::thread::available_parallelism()
         .map_or(1, usize::from)
@@ -769,8 +858,17 @@ pub fn draw_swarm<'t, C: Channel>(
                         let all = PixelRect::new(0, 0, band.width, band.height);
                         fill_rect(&mut band, all, Argb::default());
                     }
-                    for (tile, bar) in windows {
-                        draw_window_with(&mut band, tile, bar, m, shadow, straight_alpha, live);
+                    for (tile, bar, plan) in windows {
+                        draw_window_with(
+                            &mut band,
+                            tile,
+                            bar,
+                            plan,
+                            m,
+                            shadow,
+                            straight_alpha,
+                            live,
+                        );
                     }
                 }
             });
