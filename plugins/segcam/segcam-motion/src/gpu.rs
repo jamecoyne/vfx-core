@@ -27,14 +27,15 @@ pub struct Device {
     max_binding: u64,
 }
 
-/// The shared device, or `None` where there is no adapter. `SEGCAM_GPU_ADAPTER=fallback` asks
-/// for the software one (WARP, lavapipe).
+/// The shared device, or `None` where there is no adapter. `SEGCAM_GPU_ADAPTER` picks another
+/// than the fastest: `low` for the low power one (an integrated GPU), `fallback` for the
+/// software one (WARP, lavapipe).
 pub fn device() -> Option<Arc<Device>> {
     static DEVICE: OnceLock<Option<Arc<Device>>> = OnceLock::new();
     DEVICE
         .get_or_init(|| {
-            let fallback = std::env::var("SEGCAM_GPU_ADAPTER").is_ok_and(|v| v == "fallback");
-            let made = open(fallback);
+            let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+            let made = open(&choice);
             if let Err(e) = &made {
                 eprintln!("segcam Motion: drawing on the CPU ({e})");
             }
@@ -44,15 +45,18 @@ pub fn device() -> Option<Arc<Device>> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn open(fallback: bool) -> Result<Device, String> {
+fn open(choice: &str) -> Result<Device, String> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
+        power_preference: match choice {
+            "low" => wgpu::PowerPreference::LowPower,
+            _ => wgpu::PowerPreference::HighPerformance,
+        },
         compatible_surface: None,
-        force_fallback_adapter: fallback,
+        force_fallback_adapter: choice == "fallback",
         apply_limit_buckets: false,
     }))
     .map_err(|e| e.to_string())?;
@@ -81,7 +85,7 @@ fn open(fallback: bool) -> Result<Device, String> {
 
 // Browsers can't wait on the GPU inside a render.
 #[cfg(target_arch = "wasm32")]
-fn open(_fallback: bool) -> Result<Device, String> {
+fn open(_choice: &str) -> Result<Device, String> {
     Err("no blocking GPU access in browsers".into())
 }
 
