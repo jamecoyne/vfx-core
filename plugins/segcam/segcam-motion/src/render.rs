@@ -547,10 +547,12 @@ impl<T: PiledTile> Pile<T> {
 
     /// The tiles still drawn, oldest first.
     pub fn shown(&self) -> impl Iterator<Item = &Tile> {
-        self.tiles
-            .iter()
-            .filter(|(_, b, _)| !b)
-            .map(|(t, _, _)| t.tile())
+        self.shown_entries().map(PiledTile::tile)
+    }
+
+    /// The entries still drawn, oldest first.
+    pub fn shown_entries(&self) -> impl Iterator<Item = &T> {
+        self.tiles.iter().filter(|(_, b, _)| !b).map(|(t, _, _)| t)
     }
 }
 
