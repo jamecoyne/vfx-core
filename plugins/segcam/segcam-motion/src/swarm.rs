@@ -610,7 +610,8 @@ pub struct WindowPlan {
     /// Indices into the shadow's corner table, by column and row of `area`.
     corner_x: Vec<i32>,
     corner_y: Vec<i32>,
-    /// How far each column and row of the frame lies outside the mask's straight edges.
+    /// How far each column and row of `area` lies outside the mask's straight edges, read only
+    /// inside the frame.
     mask_x: Vec<f64>,
     mask_y: Vec<f64>,
     radius: f64,
@@ -671,11 +672,11 @@ impl WindowPlan {
                     })
                 })
                 .collect(),
-            mask_x: (0..frame.w.max(0))
-                .map(|x| mask(f64::from(x) + 0.5, fw))
+            mask_x: (0..area.w.max(0))
+                .map(|i| mask(f64::from(area.x + i - frame.x) + 0.5, fw))
                 .collect(),
-            mask_y: (0..frame.h.max(0))
-                .map(|y| mask(f64::from(y) + 0.5, fh))
+            mask_y: (0..area.h.max(0))
+                .map(|i| mask(f64::from(area.y + i - frame.y) + 0.5, fh))
                 .collect(),
             radius,
         }
@@ -789,7 +790,7 @@ pub fn draw_window_with<C: Channel>(
                     }
                     c
                 };
-                let (dx, dy) = (plan.mask_x[lx as usize], plan.mask_y[ly as usize]);
+                let (dx, dy) = (plan.mask_x[first + j as usize], plan.mask_y[i]);
                 let cov = if dx == 0.0 && dy == 0.0 {
                     full
                 } else {
