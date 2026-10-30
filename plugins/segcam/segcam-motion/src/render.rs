@@ -452,6 +452,7 @@ impl PiledTile for Tile {
     fn bury(&mut self) {
         self.hidden = true;
         self.pixels = Vec::new();
+        self.bar = None;
     }
 }
 

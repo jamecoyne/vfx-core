@@ -4,6 +4,8 @@
 //! real one (`chrome.rs`). The title bar is laid out at 1x and sampled up or down for other
 //! canvas sizes.
 
+use std::borrow::Cow;
+
 use crate::chrome::{self, Glyph};
 use crate::font;
 use crate::motion::Blob;
@@ -30,6 +32,8 @@ pub struct Tile {
     pub title: String,
     /// Buried under a later tile: still in the pile, never drawn.
     pub hidden: bool,
+    /// Its title bar, made when it was cut, so renders that draw it again needn't.
+    pub bar: Option<TitleBar>,
 }
 
 /// Everything a tile paints: its picture and the title bar above it, as one opaque rect.
@@ -90,6 +94,7 @@ pub fn make_tile<C: Channel>(
         title,
         ..Tile::default()
     };
+    tile.bar = Some(TitleBar::new(&tile, &m));
     let Some(frame) = frame.filter(|f| !f.is_empty()) else {
         return tile;
     };
@@ -530,7 +535,7 @@ pub fn draw_window<C: Channel>(
     shadow: &ShadowKernel,
     straight_alpha: bool,
 ) {
-    let bar = TitleBar::new(tile, m);
+    let bar = TitleBar::of(tile, m);
     draw_window_with(out, tile, &bar, m, shadow, straight_alpha, None);
 }
 
@@ -559,6 +564,7 @@ impl<C: Channel> LiveFrame<'_, C> {
 }
 
 /// A tile's title bar, made once and shared by every band of rows.
+#[derive(Clone, Debug, Default)]
 pub struct TitleBar {
     width: i32,
     pixels: Vec<Color>,
@@ -566,12 +572,24 @@ pub struct TitleBar {
 
 impl TitleBar {
     pub fn new(tile: &Tile, m: &SwarmMetrics) -> Self {
-        let frame = tile_extent(tile.video, m.title_height);
-        let width = 1.max((f64::from(frame.w) / m.scale).round() as i32);
+        let width = Self::width(tile, m);
         Self {
             width,
             pixels: render_title_bar(width, &tile.title),
         }
+    }
+
+    /// The tile's own bar if it was made at this width, which makes it the same bar.
+    pub fn of<'t>(tile: &'t Tile, m: &SwarmMetrics) -> Cow<'t, Self> {
+        match &tile.bar {
+            Some(bar) if bar.width == Self::width(tile, m) => Cow::Borrowed(bar),
+            _ => Cow::Owned(Self::new(tile, m)),
+        }
+    }
+
+    fn width(tile: &Tile, m: &SwarmMetrics) -> i32 {
+        let frame = tile_extent(tile.video, m.title_height);
+        1.max((f64::from(frame.w) / m.scale).round() as i32)
     }
 }
 
@@ -732,9 +750,9 @@ pub fn draw_swarm<'t, C: Channel>(
     const BANDS_PER_THREAD: usize = 4;
     let m = SwarmMetrics::new(out.height);
     let shadow = ShadowKernel::new(m.scale);
-    let windows: Vec<(&Tile, TitleBar)> = tiles
+    let windows: Vec<(&Tile, Cow<TitleBar>)> = tiles
         .into_iter()
-        .map(|t| (t, TitleBar::new(t, &m)))
+        .map(|t| (t, TitleBar::of(t, &m)))
         .collect();
     let threads = std::thread::available_parallelism()
         .map_or(1, usize::from)
