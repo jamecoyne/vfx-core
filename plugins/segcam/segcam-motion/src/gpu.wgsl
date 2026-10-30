@@ -372,6 +372,25 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
     return true;
 }
 
+/// Whether window `w` covers the pixel whole, so nothing under it shows: exactly at 8 and 16
+/// bits, within a rounding step at float.
+fn covers(w: u32, x: i32, y: i32) -> bool {
+    let o = g.items + w * WINDOW_WORDS;
+    if !inside(rect(o), x, y) {
+        return false;
+    }
+    let area = rect(o + 4u);
+    let plan = data[o + 12u];
+    let aw = u32(area.w);
+    let ah = u32(area.h);
+    let dx = bitcast<f32>(atlas[plan + 2u * aw + u32(x - area.x)]);
+    let dy = bitcast<f32>(atlas[plan + 3u * aw + 2u * ah + u32(y - area.y)]);
+    if dx == 0.0 && dy == 0.0 {
+        return g.full == 1.0;
+    }
+    return clamp(g.radius + 0.5 - sqrt(dx * dx + dy * dy), 0.0, 1.0) == 1.0;
+}
+
 // Which windows of the current batch reach this workgroup's 16 x 16 pixels.
 var<workgroup> reaches: array<u32, 256>;
 
@@ -401,7 +420,15 @@ fn swarm(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation
         workgroupBarrier();
         if on_canvas {
             let n = min(256u, g.count - first);
-            for (var k = 0u; k < n; k++) {
+            // Drawing starts at the newest window that covers the pixel whole.
+            var start = 0u;
+            for (var k = n; k > 0u; k--) {
+                if reaches[k - 1u] != 0u && covers(first + k - 1u, x, y) {
+                    start = k - 1u;
+                    break;
+                }
+            }
+            for (var k = start; k < n; k++) {
                 if reaches[k] != 0u && draw_window(first + k, x, y, &px) {
                     touched = true;
                 }
