@@ -528,7 +528,31 @@ pub fn draw_window<C: Channel>(
     straight_alpha: bool,
 ) {
     let bar = TitleBar::new(tile, m);
-    draw_window_with(out, tile, &bar, m, shadow, straight_alpha);
+    draw_window_with(out, tile, &bar, m, shadow, straight_alpha, None);
+}
+
+/// The frame live windows show, laid on the canvas as [`crate::render::copy_scaled`] lays
+/// the source backdrop: scaled to the canvas and mirrored with it.
+#[derive(Clone, Copy)]
+pub struct LiveFrame<'a, C> {
+    pub frame: &'a View<'a, C>,
+    pub mirrored: bool,
+}
+
+impl<C: Channel> LiveFrame<'_, C> {
+    /// The frame's colour under canvas pixel (`x`, `y`) of a `w` x `h` canvas.
+    fn at(&self, x: i32, y: i32, w: i32, h: i32) -> Color {
+        let f = self.frame;
+        let dx = if self.mirrored { w - 1 - x } else { x };
+        let sx = (i64::from(dx) * i64::from(f.width) / i64::from(w)) as usize;
+        let sy = (i64::from(y) * i64::from(f.height) / i64::from(h)) as i32;
+        let p = &f.row(sy)[sx];
+        Color {
+            r: p.red.to_unit(),
+            g: p.green.to_unit(),
+            b: p.blue.to_unit(),
+        }
+    }
 }
 
 /// A tile's title bar, made once and shared by every band of rows.
@@ -548,7 +572,8 @@ impl TitleBar {
     }
 }
 
-/// [`draw_window`] with its title bar already made.
+/// [`draw_window`] with its title bar already made. With `live`, the window shows that frame
+/// where it sits instead of the tile's own pixels.
 pub fn draw_window_with<C: Channel>(
     out: &mut ViewMut<C>,
     tile: &Tile,
@@ -556,7 +581,9 @@ pub fn draw_window_with<C: Channel>(
     m: &SwarmMetrics,
     shadow: &ShadowKernel,
     straight_alpha: bool,
+    live: Option<LiveFrame<'_, C>>,
 ) {
+    let (canvas_w, canvas_h) = (out.width, out.height);
     let frame = tile_extent(tile.video, m.title_height);
     let radius = f64::from(chrome::CORNER_RADIUS) * m.scale;
     let bar_h = chrome::TITLE_BAR_HEIGHT;
@@ -651,7 +678,10 @@ pub fn draw_window_with<C: Channel>(
                     let (vx, vy) = (x - tile.stored.x, y - tile.stored.y);
                     let s = tile.stored;
                     let mut c = Color::default();
-                    if !tile.pixels.is_empty() && vx >= 0 && vx < s.w && vy >= 0 && vy < s.h {
+                    if let Some(live) = &live {
+                        c = live.at(x, y, canvas_w, canvas_h);
+                    } else if !tile.pixels.is_empty() && vx >= 0 && vx < s.w && vy >= 0 && vy < s.h
+                    {
                         let t = &tile.pixels[(vy * s.w + vx) as usize];
                         c = rgb(&[t.red, t.green, t.blue]);
                     }
@@ -683,13 +713,17 @@ pub fn draw_window_with<C: Channel>(
 }
 
 /// Clears the canvas, then draws each shown tile oldest first as segcam's window. Bands of
-/// rows are drawn on a few threads, each band drawing every window in order.
+/// rows are drawn on a few threads, each band drawing every window in order. With `live`,
+/// windows show that frame (mirrored with `mirrored`) where they sit.
 pub fn draw_swarm<'t, C: Channel>(
     out: &mut ViewMut<C>,
     tiles: impl IntoIterator<Item = &'t Tile>,
     straight_alpha: bool,
     clear: bool,
+    live: Option<&View<C>>,
+    mirrored: bool,
 ) {
+    let live = live.map(|frame| LiveFrame { frame, mirrored });
     // More threads only compete with the host's own render threads.
     const THREADS: usize = 6;
     const BANDS_PER_THREAD: usize = 4;
@@ -707,7 +741,7 @@ pub fn draw_swarm<'t, C: Channel>(
     let next = || bands.lock().ok().and_then(|mut bands| bands.pop());
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            let (next, windows, m, shadow) = (&next, &windows, &m, &shadow);
+            let (next, windows, m, shadow, live) = (&next, &windows, &m, &shadow, live);
             scope.spawn(move || {
                 while let Some(mut band) = next() {
                     if clear {
@@ -715,7 +749,7 @@ pub fn draw_swarm<'t, C: Channel>(
                         fill_rect(&mut band, all, Argb::default());
                     }
                     for (tile, bar) in windows {
-                        draw_window_with(&mut band, tile, bar, m, shadow, straight_alpha);
+                        draw_window_with(&mut band, tile, bar, m, shadow, straight_alpha, live);
                     }
                 }
             });

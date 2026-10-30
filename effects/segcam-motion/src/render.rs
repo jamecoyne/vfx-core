@@ -99,6 +99,9 @@ pub struct RenderSettings {
     /// Swarm: the pile size, oldest recycled first.
     pub max_tiles: i32,
     pub swarm_background: SwarmBackground,
+    /// Swarm: windows show the current frame where they sit, rather than the frame they
+    /// were cut from.
+    pub live_windows: bool,
 }
 
 impl Default for RenderSettings {
@@ -123,6 +126,7 @@ impl Default for RenderSettings {
             trail_frames: 24,
             max_tiles: 100,
             swarm_background: SwarmBackground::Clear,
+            live_windows: false,
         }
     }
 }
@@ -544,7 +548,8 @@ pub fn draw_output<'t, C: Channel>(
                 }
                 _ => true,
             };
-            swarm::draw_swarm(out, tiles, s.straight_alpha, clear);
+            let live = frame.as_ref().filter(|_| s.live_windows);
+            swarm::draw_swarm(out, tiles, s.straight_alpha, clear, live, s.mirror);
         }
         (_, None) => fill_rect(out, canvas, Argb::default()),
         (mode, Some(frame)) => {

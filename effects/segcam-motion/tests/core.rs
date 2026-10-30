@@ -310,6 +310,63 @@ fn swarm_piles_frozen_tiles_on_a_clear_canvas() {
     assert!(white > 0 && bar > 0, "white {white} bar {bar}");
 }
 
+/// Live windows show the current frame where they sit: the square is white only where it is
+/// now, while frozen tiles keep it where each window was cut.
+#[test]
+fn live_windows_show_the_current_frame() {
+    // The square crosses, then stops, so the windows it left behind stay uncovered.
+    let frames: Vec<Image<u8>> = (0..30)
+        .map(|f| frame_with_square(W, H, 10 + f.min(24) * 11, 80, 40))
+        .collect();
+    let (x0, y0, size) = (10 + 24 * 11, 80, 40);
+    let now = |x: i32, y: i32| x >= x0 && x < x0 + size && y >= y0 && y < y0 + size;
+    let white_outside = |out: &Image<u8>| {
+        (0..H)
+            .flat_map(|y| (0..W).map(move |x| (x, y)))
+            .filter(|&(x, y)| out.at(x, y).red == 255 && !now(x, y))
+            .count()
+    };
+    let frozen = render_frames(&swarm_settings(), &frames, 29).0;
+    let live_settings = RenderSettings {
+        live_windows: true,
+        ..swarm_settings()
+    };
+    let live = render_frames(&live_settings, &frames, 29).0;
+    assert!(
+        white_outside(&frozen) > 0,
+        "frozen tiles keep the square where it was"
+    );
+    assert_eq!(
+        white_outside(&live),
+        0,
+        "live windows show it only where it is now"
+    );
+    assert!(
+        live.pixels.iter().any(|p| p.red == 255),
+        "and there it shows"
+    );
+
+    // Still the same in any render order.
+    let cold = |n: usize| {
+        render_frames(&live_settings, &frames[..=n], n as i64)
+            .0
+            .pixels
+    };
+    let mut state = Incremental::default();
+    for n in [20, 3, 29, 28, 4, 12, 29] {
+        let mut out = Image::new(W, H);
+        let mut source = MemoryFrames::new(&frames[..=n]);
+        let _ = state.advance(
+            &live_settings,
+            &mut source,
+            n + 1,
+            n as i64,
+            &mut out.view_mut(),
+        );
+        assert!(out.pixels == cold(n), "frame {n}");
+    }
+}
+
 #[test]
 fn swarm_trail_survives_frame_sized_segments() {
     // A band flashing black and white over most of each frame is one huge blob every frame;

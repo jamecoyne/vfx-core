@@ -31,6 +31,7 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --face  --eyes  --mouth  --body       (off; segcam-face's models)
   --level 0..255  --auto-level  --invert   (170; threshold)
   --swarm-background clear|source|black (clear)
+  --live-windows                       (swarm windows show the current frame)
   --mirror  --no-boxes  --no-labels
   --float                              (render in float, still raw 8-bit I/O)
   --straight-alpha                     (input and output use straight alpha)";
@@ -101,6 +102,7 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
             "--max-tiles" => s.max_tiles = value()?.parse().ok()?,
             "--straight-alpha" => s.straight_alpha = true,
             "--mirror" => s.mirror = true,
+            "--live-windows" => s.live_windows = true,
             "--no-boxes" => s.boxes = false,
             "--no-labels" => s.labels = false,
             _ => return None,

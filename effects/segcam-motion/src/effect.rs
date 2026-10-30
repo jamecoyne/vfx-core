@@ -84,6 +84,9 @@ pub const PARAMS: &[ParamSpec] = &[
     ParamSpec::choice("swarm_background", &["Clear", "Source", "Black"], 0)
         .label("Swarm backdrop")
         .group("Swarm"),
+    ParamSpec::toggle("live_windows", false)
+        .label("Live windows")
+        .group("Swarm"),
 ];
 
 /// One frame's settings. `premultiplied` says how the host's frames store colour.
@@ -127,6 +130,7 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
             2 => SwarmBackground::Black,
             _ => SwarmBackground::Clear,
         },
+        live_windows: p.bool("live_windows"),
     }
 }
 
