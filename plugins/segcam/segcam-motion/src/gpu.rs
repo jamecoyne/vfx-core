@@ -761,13 +761,33 @@ impl Drawer {
         let t = Instant::now();
         {
             let mapped = slice.get_mapped_range().expect("readback range is mapped");
-            for (y, src) in (0..out.height).zip(mapped.chunks_exact(row)) {
-                pixel_bytes_mut(out.row_mut(y)).copy_from_slice(src);
-            }
+            let mapped: &[u8] = &mapped;
+            let count = bands(out.height).len();
+            std::thread::scope(|scope| {
+                for mut band in out.bands(count) {
+                    scope.spawn(move || {
+                        for y in band.rows() {
+                            let at = y as usize * row;
+                            pixel_bytes_mut(band.row_mut(y)).copy_from_slice(&mapped[at..at + row]);
+                        }
+                    });
+                }
+            });
         }
         staging.unmap();
         self.timings.read += ms(t);
     }
+}
+
+/// Rows split for copying on a few threads, as `ViewMut::bands` splits them. More threads only
+/// compete with the host's own render threads.
+fn bands(height: i32) -> Vec<std::ops::Range<i32>> {
+    const THREADS: usize = 6;
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let count = threads.min(THREADS).clamp(1, height.max(1) as usize) as i32;
+    (0..count)
+        .map(|i| i * height / count..(i + 1) * height / count)
+        .collect()
 }
 
 /// Appends the 8-bit levels as units, as `Channel::to_unit` makes them; where they start.
