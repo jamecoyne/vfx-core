@@ -11,11 +11,12 @@ use std::ops::RangeInclusive;
 
 use vfx_core::cpu::FrameSource;
 
+use crate::gpu::{Cut, Drawer, Slot};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
-    Detect, FaceParts, OutputMode, Pile, PixelRect, RenderSettings, downsample, draw_output,
-    fill_rect, frame_tiles, history_frames,
+    Detect, FaceParts, OutputMode, Pile, PiledTile, PixelRect, RenderSettings, downsample,
+    draw_output, fill_rect, frame_tiles, history_frames,
 };
 use crate::swarm::Tile;
 
@@ -54,9 +55,35 @@ pub struct Incremental {
     motion: BTreeMap<i64, (Basis, Motion)>,
     /// Tiles by frame, with the basis and mirroring they were cut for.
     tiles: BTreeMap<i64, (Basis, bool, Vec<Tile>)>,
+    /// Drawing on the GPU: then tiles keep their pixels in its atlas, cut by frame here.
+    gpu: Option<Box<Drawer>>,
+    cuts: BTreeMap<i64, Cut>,
+}
+
+/// A tile in the pile with its place in the GPU's atlas.
+struct Placed<'a> {
+    tile: &'a Tile,
+    slot: Slot,
+}
+
+impl PiledTile for Placed<'_> {
+    fn tile(&self) -> &Tile {
+        self.tile
+    }
 }
 
 impl Incremental {
+    /// Draws Overlay and Swarm on the GPU, or back on the CPU. False if there is no GPU.
+    pub fn use_gpu(&mut self, on: bool) -> bool {
+        self.reset();
+        self.gpu = on.then(Drawer::new).flatten().map(Box::new);
+        self.gpu.is_some()
+    }
+
+    pub fn gpu(&self) -> Option<&Drawer> {
+        self.gpu.as_deref()
+    }
+
     /// Renders the last of `count` frames, frame `number`, into `out`. Reads the frames the
     /// render depends on (only those it lacks, from a fixed source) once each, oldest first,
     /// and works out again only what changed.
@@ -75,6 +102,9 @@ impl Incremental {
             let all = PixelRect::new(0, 0, out.width, out.height);
             fill_rect(out, all, Argb::default());
             return;
+        }
+        if let Some(gpu) = &mut self.gpu {
+            gpu.begin();
         }
         let (w, h) = (out.width, out.height);
         let canvas = Canvas {
@@ -95,6 +125,7 @@ impl Incremental {
         // Frames the host didn't hand over count as empty, as in a cold render, but nothing
         // worked out from one is kept, so it is read again next time.
         let mut missing = BTreeSet::new();
+        let mut atlas_full = false;
         let oldest = (number - targets + 1 - background).max(first);
         // A fixed source's earlier frames are as they were, so only the current frame is
         // checked: a different one means the source started over.
@@ -170,7 +201,15 @@ impl Incremental {
                         }
                     };
                     if swarm {
-                        let tiles = frame_tiles(&motion, view.as_ref(), frame, w, h, s.mirror);
+                        let pixels = view.as_ref().filter(|_| self.gpu.is_none());
+                        let tiles = frame_tiles(&motion, pixels, frame, w, h, s.mirror);
+                        if let Some(gpu) = &mut self.gpu {
+                            let blobs = &motion.blobs;
+                            match gpu.cut(view.as_ref(), frame, blobs, &tiles, h, s.mirror) {
+                                Some(cut) => _ = self.cuts.insert(frame, cut),
+                                None => atlas_full = true,
+                            }
+                        }
                         self.tiles.insert(frame, (basis, s.mirror, tiles));
                     }
                 }
@@ -178,6 +217,11 @@ impl Incremental {
                     self.draw(s, count, number, view, out);
                 }
             });
+        }
+        if atlas_full {
+            eprintln!("segcam Motion: the GPU's tiles are full; drawing on the CPU");
+            self.use_gpu(false);
+            return self.advance(s, frames, count, number, out);
         }
         for &frame in &missing {
             self.forget(frame, background);
@@ -204,13 +248,18 @@ impl Incremental {
     /// Draws frame `number`, the last of `count`, from what is kept. `frame` is its pixels,
     /// which every output but the swarm draws over.
     pub fn draw<C: Channel>(
-        &self,
+        &mut self,
         s: &RenderSettings,
         count: usize,
         number: i64,
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
     ) {
+        if let Some(mut gpu) = self.gpu.take() {
+            self.draw_gpu(&mut gpu, s, count, number, frame, out);
+            self.gpu = Some(gpu);
+            return;
+        }
         let first = number - count as i64 + 1;
         let mut pile = Pile::<&Tile>::new(out.width, out.height, s.max_tiles);
         if s.mode == OutputMode::Swarm {
@@ -228,11 +277,47 @@ impl Incremental {
         draw_output(out, s, frame, motion, number, pile.shown());
     }
 
+    fn draw_gpu<C: Channel>(
+        &self,
+        gpu: &mut Drawer,
+        s: &RenderSettings,
+        count: usize,
+        number: i64,
+        frame: Option<View<C>>,
+        out: &mut ViewMut<C>,
+    ) {
+        let first = number - count as i64 + 1;
+        let empty = Motion::default();
+        let motion = self
+            .motion(number, &basis(s, number, first))
+            .unwrap_or(&empty);
+        match (s.mode, frame.as_ref()) {
+            (OutputMode::Swarm, _) => {
+                let mut pile = Pile::<Placed>::new(out.width, out.height, s.max_tiles);
+                for target in (number - targets(s) + 1).max(first)..=number {
+                    let tiles = self.tiles(target, &basis(s, target, first), s.mirror);
+                    if let (Some(tiles), Some(cut)) = (tiles, self.cuts.get(&target)) {
+                        for (tile, &slot) in tiles.iter().zip(&cut.slots) {
+                            pile.push(Placed { tile, slot });
+                        }
+                    }
+                }
+                let windows = pile.shown_entries().map(|p| (p.tile, p.slot));
+                gpu.draw_swarm(out, windows, frame.as_ref(), number, s);
+            }
+            (OutputMode::Overlay, Some(view)) => {
+                gpu.draw_overlay(out, view, &motion.blobs, number, s);
+            }
+            _ => draw_output(out, s, frame, motion, number, std::iter::empty()),
+        }
+    }
+
     pub fn reset(&mut self) {
         self.grids.clear();
         self.prints.clear();
         self.motion.clear();
         self.tiles.clear();
+        self.cuts.clear();
     }
 
     /// Whether `frame` has its motion and, for the swarm, its tiles.
@@ -261,6 +346,7 @@ impl Incremental {
         for later in frame..=frame + background {
             self.motion.remove(&later);
             self.tiles.remove(&later);
+            self.cuts.remove(&later);
         }
     }
 
@@ -269,6 +355,7 @@ impl Incremental {
         self.prints.retain(|f, _| frames.contains(f));
         self.motion.retain(|f, _| frames.contains(f));
         self.tiles.retain(|f, _| frames.contains(f));
+        self.cuts.retain(|f, _| frames.contains(f));
     }
 }
 

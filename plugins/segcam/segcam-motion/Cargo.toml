@@ -32,6 +32,7 @@ ffgl = ["vfx-plugin/ffgl"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
 vfx-core = { path = "../../../vfx-core" }
 vfx-plugin = { path = "../../../vfx-core/wrappers/plugin" }
 
@@ -40,6 +41,9 @@ vfx-build = { path = "../../../vfx-core/wrappers/build" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 libm = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "1.0.1"
 
 # Faces and bodies: Vision on macOS, so no ONNX Runtime there (it has no build for Intel Macs);
 # the models on ONNX Runtime elsewhere.
