@@ -25,7 +25,9 @@ Licensed MIT OR Apache-2.0.
 
 ## An effect crate
 
-`effects/segcam-motion` and `effects/vfx-chain` are complete examples. The parts:
+`cargo vfx new my-glow` makes one in `effects/my-glow`: a CPU effect to start from, already
+in the workspace and the preview. `effects/segcam-motion` and `effects/vfx-chain` are
+complete examples. The parts:
 
 ```toml
 # Cargo.toml
@@ -39,6 +41,9 @@ ae-match-name = "VFXPreview"
 ffgl-code = "VFXP"                  # exactly 4 characters
 processor = "gpu"                   # "gpu" (Effect) or "cpu" (CpuEffect)
 windows-installer-id = "…a GUID…"
+
+# optional: the crate's own features `cargo vfx` turns on per OS (all, macos, windows, linux)
+features = { windows = ["onnx"], linux = ["onnx"] }
 
 [features]
 ae = ["vfx-plugin/ae"]
@@ -67,7 +72,8 @@ vfx_plugin::export!(gpu: VfxPreview);    // or `cpu: SegcamMotion`
 ```
 
 Hosts find a plugin in saved projects by `id`, `ae-match-name` and `ffgl-code`, so pick
-them once and keep them. A parameter's `name` is its saved identifier too (After Effects'
+them once and keep them. The build script checks them against each host's limits (lengths,
+characters, a GUID), and every `cargo vfx` command checks that no two effects share one. A parameter's `name` is its saved identifier too (After Effects'
 disk IDs are hashes of it); its `label` is what hosts show and can change.
 
 The target crates read the effect's `ParamSpec`s and map them onto each host: groups,
@@ -76,6 +82,13 @@ FFGL), points (in each host's coordinates), and the effect's second layer as a c
 layer picker. Parameters that need a second layer or a growing output are left out where
 a host has neither. An effect's `region` tells hosts how far it reads past each pixel and
 whether its output grows; `Context` gives it the time, frame number and render scale.
+`vfx_host::controls::layout` decides the layout for every target, so it is tested once.
+
+A `CpuEffect` that keeps work between renders says so with `keeps_state`. OpenFX, FFGL
+and the preview then keep one per instance (`vfx_host::CpuInstance`, which also starts it
+over after a panic, a seek back or a resize); After Effects never does. Either way every
+frame must match a fresh effect's, even after earlier frames change upstream or a host
+misses one: test it with `vfx_host::contract::check`, as `effects/segcam-motion` does.
 
 ## Layout
 
@@ -90,9 +103,10 @@ effects/
   segcam-motion/        segcam Motion, ported from C++ (own README)
     ae-tests/ ofx-tests/ ffgl-tests/   host checks against the C++ effect and its CLI
 wrappers/
-  common/               vfx-host: the registered plugin, the GPU, the render pool, the log
+  common/               vfx-host: the registered plugin, the GPU, the render pool, the log,
+                        control layout, kept CPU effects and their contract
   plugin/               vfx-plugin: an effect crate's one `export!`
-  build/                vfx-build: the effect crate's build script (identity, PiPL)
+  build/                vfx-build: the effect crate's build script (identity and its checks, PiPL)
   adobe/                vfx-ae: After Effects SmartFX, Metal interop
     ae-tests/           harness that renders VFX Preview inside After Effects
   ofx/                  vfx-ofx: OpenFX, hand-written bindings to the OpenFX 1.4 C API
@@ -103,7 +117,7 @@ wrappers/
   package-win.sh        an effect's Windows installer (Inno Setup)
 tools/cargo-vfx/        cargo vfx: builds, packages and installs effect crates
 examples/preview/       the preview: a library host (`vfx_preview::run`) and the repository's app
-  src/catalog.rs        the effects it offers
+  src/catalog.rs        the effects it offers (effect crates listed by build.rs)
   web/                  index.html and build.sh for the WebGPU build
 .github/workflows/      ci.yml (tests, every plugin), pages.yml (web preview), release.yml
 ```
@@ -123,6 +137,8 @@ acts on every effect crate; output goes to `target/vfx-plugin/`.
 | What | Command | Result |
 |---|---|---|
 | The effects | `cargo vfx list` | each effect crate and its identity |
+| A new effect | `cargo vfx new my-glow` | `effects/my-glow`, added to the workspace and the preview |
+| Checks | `cargo vfx check` | effects missing from the preview, and installed After Effects plugins that share a match name |
 | Plugins | `cargo vfx build [-p segcam-motion] [--hosts ae,ofx,ffgl] [--native]` | `<file>.plugin`, `.ofx.bundle` and `.bundle` on macOS (one universal binary; `--native` builds this Mac's architecture only); `.aex`, `.ofx.bundle` and `.dll` on Windows |
 | macOS installers | `cargo vfx package` | `<file>-adobe.pkg` (Adobe's MediaCore folder) and `<file>-ofx.pkg` (`/Library/OFX/Plugins`) |
 | Install | `cargo vfx install [--hosts ffgl]` | copies FFGL bundles into Resolume's Extra Effects; for After Effects and OpenFX, prints the `sudo installer` commands |
@@ -143,11 +159,9 @@ The preview hosts one effect at a time: test patterns, images, video files or a 
 go in, a panel made from the effect's parameters drives it, every float and integer
 parameter has an expression box (`sin(time/4)`, `bass * 2`, face tracking), and a video
 renders to MP4 through it. It links the effects it offers, so the same build runs on the
-desktop and in the browser. `examples/preview/src/catalog.rs` lists the repository's:
-
-```rust
-Entry::plugin(&segcam_motion::VFX_PLUGIN)     // an effect crate, as its plugins see it
-```
+desktop and in the browser. Its build script lists every effect crate among its
+dependencies, as `Entry::plugin(&segcam_motion::VFX_PLUGIN)` (the crate as its plugins see
+it); `examples/preview/src/catalog.rs` adds the core effects.
 
 Another crate's effect can use the preview as a library:
 `vfx_preview::run(vec![Entry::plugin(&my_effect::VFX_PLUGIN)])`.
@@ -239,10 +253,9 @@ conversions. Beyond those, each host has a harness, run against the effects:
 
 ## Known gaps
 
-- The generic target crates have been checked in the OpenFX and FFGL mini hosts and by
-  unit tests. The generic After Effects target hasn't yet run in After Effects or its
-  harnesses. The apps (After Effects, Resolve, Natron, Resolume) were last checked with
-  the earlier per-effect wrappers.
+- The generic target crates have been checked in the OpenFX and FFGL mini hosts, by unit
+  tests and, for After Effects 26.5 on macOS, by both effects' harnesses. Resolve, Natron
+  and Resolume were last checked with the earlier per-effect wrappers.
 - Windows: the `.aex` builds in CI but hasn't been tested in After Effects; OpenFX hasn't
   been tried in Resolve on Windows; FFGL's Windows paths pass the mini host on an RX 5700
   XT but haven't been tried in Resolume on Windows with VFX Preview.
@@ -262,7 +275,8 @@ conversions. Beyond those, each host has a harness, run against the effects:
   first (installing to system folders needs the user's password).
 - Keep labels under 16 bytes: FFGL hosts cut longer ones, and each effect crate has a test.
   Never rename a parameter's `name` once shipped; change its `label` instead.
-- To make an effect tryable in the preview, add one entry to `examples/preview/src/catalog.rs`.
+- A new effect crate: `cargo vfx new NAME`. An effect crate the preview's `Cargo.toml`
+  depends on shows up in it with no code; `cargo vfx check` reports one it doesn't.
 - `cargo fmt --all -- --check` and clippy with `-D warnings` (see `ci.yml` for the crates
   and features) must pass; CI runs latest stable, whose clippy can be stricter.
 - wgpu is pinned to `=30.0.1`; the Metal interop uses `wgpu-hal` types and must be checked

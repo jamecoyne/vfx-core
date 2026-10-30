@@ -2,8 +2,9 @@
 //! repository's preview runs [`repository`]: every effect crate here (through its
 //! `VFX_PLUGIN`, the same static its plugins export) and each core effect.
 //!
-//! The panel, expressions and export all come from an effect's parameter list, so making
-//! a new effect tryable is one entry here.
+//! The effect crates are listed by the build script, from this crate's dependencies that
+//! have `[package.metadata.vfx]`, and the panel, expressions and export all come from an
+//! effect's parameter list: a new effect crate needs no code here.
 
 use std::sync::OnceLock;
 
@@ -59,11 +60,13 @@ impl Entry {
     }
 }
 
-/// Every effect in this repository.
+// `effect_crates()`: an `Entry::plugin` for each effect crate this crate depends on.
+include!(concat!(env!("OUT_DIR"), "/effect_crates.rs"));
+
+/// Every effect in this repository: the effect crates, then the core effects.
 pub fn repository() -> Vec<Entry> {
-    vec![
-        Entry::plugin(&vfx_chain::VFX_PLUGIN),
-        Entry::plugin(&segcam_motion::VFX_PLUGIN),
+    let mut all = effect_crates();
+    all.extend([
         Entry::new(
             "Colour Adjust",
             "Brightness, contrast and saturation.",
@@ -96,7 +99,8 @@ pub fn repository() -> Vec<Entry> {
             "Keeps the brighter of each frame and a fading copy of the last result.",
             || Processor::Gpu(Box::<FeedbackTrail>::default()),
         ),
-    ]
+    ]);
+    all
 }
 
 static ENTRIES: OnceLock<Vec<Entry>> = OnceLock::new();

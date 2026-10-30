@@ -24,52 +24,47 @@ fn group_key(prefix: &str, group: &str) -> Key {
     Key(Box::leak(format!("{prefix}:{group}").into_boxed_str()))
 }
 
-/// Defines every control: `specs` in order, consecutive ones with a group inside it, and
-/// the layer picker (when `layer_name` is given) before the first control that needs it.
+/// Defines every control, laid out by [`vfx_host::controls::layout`]: consecutive ones of a
+/// group inside it, unless a control has the group's name (scripts and expressions find
+/// properties by name, and the group would hide it), and the layer picker, when
+/// `layer_name` is given, before the first control that needs it.
 pub fn setup(
     params: &mut ae::Parameters<Key>,
     specs: &'static [ParamSpec],
     layer_name: Option<&str>,
 ) -> Result<(), ae::Error> {
-    let mut layer_added = false;
-    let mut i = 0;
-    while i < specs.len() {
-        let group = specs[i].group;
-        let end = specs[i..]
-            .iter()
-            .position(|s| s.group != group)
-            .map_or(specs.len(), |n| i + n);
-        let run = &specs[i..end];
-        let mut add_run = |params: &mut ae::Parameters<Key>| -> Result<(), ae::Error> {
-            for spec in run {
-                if let Some(name) = layer_name
-                    && !layer_added
-                    && spec.requires == vfx_core::Requires::Layer
-                {
-                    params.add(LAYER, name, ae::LayerDef::new())?;
-                    layer_added = true;
-                }
-                add(params, spec)?;
-            }
-            Ok(())
-        };
-        if group.is_empty() {
-            add_run(params)?;
-        } else {
-            params.add_group(
-                group_key("group", group),
-                group_key("end", group),
-                group,
+    use vfx_host::controls::{Groups, Host, layout};
+    let host = Host {
+        layer: true,
+        region: true,
+        layer_picker: layer_name,
+        groups: Groups::UnlessNamedLikeAControl,
+    };
+    add_items(
+        params,
+        &layout(specs, &host),
+        layer_name.unwrap_or_default(),
+    )
+}
+
+fn add_items(
+    params: &mut ae::Parameters<Key>,
+    items: &[vfx_host::controls::Item<'static>],
+    layer_name: &str,
+) -> Result<(), ae::Error> {
+    use vfx_host::controls::Item;
+    for item in items {
+        match item {
+            Item::Control(spec) => add(params, spec)?,
+            Item::Layer => params.add(LAYER, layer_name, ae::LayerDef::new())?,
+            Item::Group { name, items } => params.add_group(
+                group_key("group", name),
+                group_key("end", name),
+                name,
                 false,
-                |params| add_run(params),
-            )?;
+                |params| add_items(params, items, layer_name),
+            )?,
         }
-        i = end;
-    }
-    if let Some(name) = layer_name
-        && !layer_added
-    {
-        params.add(LAYER, name, ae::LayerDef::new())?;
     }
     Ok(())
 }

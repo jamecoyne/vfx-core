@@ -51,10 +51,18 @@ fn base<'a>(label: &'a str, words: &[&str]) -> &'a str {
     label
 }
 
-/// The FFGL parameters for `specs`, in order.
+/// The FFGL parameters for `specs`, in order: FFGL has no groups, second layer or region
+/// ([`vfx_host::controls::layout`]).
 pub fn table(specs: &[ParamSpec]) -> Vec<Param> {
+    use vfx_host::controls::{Host, Item, layout};
     let mut out = Vec::new();
-    for spec in specs.iter().filter(|s| vfx_host::served(s, false, false)) {
+    let controls = layout(specs, &Host::default())
+        .into_iter()
+        .filter_map(|item| match item {
+            Item::Control(spec) => Some(spec),
+            Item::Layer | Item::Group { .. } => None,
+        });
+    for spec in controls {
         let label = spec.display_label();
         let one = |kind, default: f32, min, max, part, name: String| Param {
             name: c_string(&name),

@@ -6,8 +6,16 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "Faces, eyes, mouths and bodies for segcam: Vision on macOS, YuNet, MediaPipe Face Mesh and PicoDet-S on ONNX Runtime on other platforms"
 
+# `onnx`: the models on ONNX Runtime, which every platform but macOS needs (macOS uses Vision).
+# It adds ONNX Runtime and about 10 MB of models to a binary, so an effect that only ships on
+# macOS, or wants Vision alone there, turns it off; `cargo vfx` can switch it per OS from the
+# effect's `[package.metadata.vfx.features]`.
+[features]
+default = ["onnx"]
+onnx = ["dep:ort", "dep:windows"]
+
 [dependencies]
-ort = { version = "=2.0.0-rc.15", default-features = false, features = [
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = [
     "std",
     "download-binaries",
     "tls-native",
@@ -20,5 +28,5 @@ objc2 = "0.6.5"
 
 # DirectML runs the models on any Direct3D 12 GPU.
 [target.'cfg(windows)'.dependencies]
-ort = { version = "=2.0.0-rc.15", default-features = false, features = ["directml"] }
-windows = { version = "0.62.2", features = ["Win32_Graphics_Dxgi"] }
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["directml"] }
+windows = { version = "0.62.2", optional = true, features = ["Win32_Graphics_Dxgi"] }

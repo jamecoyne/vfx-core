@@ -43,3 +43,6 @@ libm = "0.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 segcam-face = { path = "../../crates/segcam-face" }
+
+[dev-dependencies]
+vfx-host = { path = "../../wrappers/common" }

@@ -3,10 +3,14 @@
 //! `[package.metadata.vfx]`, and each host wrapper reads it back with [`plugin`]. The
 //! wrappers then only translate parameters and move pixels.
 
+pub mod contract;
+pub mod controls;
 pub mod diag;
+mod kept;
 pub mod pipeline;
 mod plugin;
 
+pub use kept::{CpuInstance, Panicked};
 pub use plugin::{Info, Kind, Outline, Plugin, gpu, map_points, plugin, register, same, served};
 
 /// The plugin's identity, from the effect crate's `[package.metadata.vfx]`, which its

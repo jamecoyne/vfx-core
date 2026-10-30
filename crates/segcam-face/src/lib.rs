@@ -3,12 +3,13 @@
 //!
 //! On macOS they come from Apple's Vision, as in segcam 1.1. Other platforms get YuNet faces,
 //! Face Mesh V2 eyes and mouths (or YuNet's landmarks without it) and PicoDet-S bodies, on ONNX
-//! Runtime ([`runtime`]). [`Segmenter::best`] picks the right one.
+//! Runtime ([`runtime`], with the `onnx` feature). [`Segmenter::best`] picks the right one.
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "onnx"))]
 pub mod directml;
 pub mod mesh;
 pub mod picodet;
+#[cfg(feature = "onnx")]
 pub mod runtime;
 #[cfg(target_os = "macos")]
 pub mod vision;
@@ -18,12 +19,15 @@ pub use picodet::Body;
 pub use yunet::Face;
 
 /// The bundled YuNet model, `face_detection_yunet_2023mar.onnx`.
+#[cfg(feature = "onnx")]
 pub const YUNET_MODEL: &[u8] = include_bytes!("../models/yunet.onnx");
 
 /// The bundled MediaPipe Face Mesh V2 landmark model, converted to ONNX.
+#[cfg(feature = "onnx")]
 pub const FACE_MESH_MODEL: &[u8] = include_bytes!("../models/face_mesh.onnx");
 
 /// The bundled PicoDet-S 416 person detector, `picodet_s_416_coco_lcnet.onnx`.
+#[cfg(feature = "onnx")]
 pub const PICODET_MODEL: &[u8] = include_bytes!("../models/picodet.onnx");
 
 /// Four-channel pixels, top row first.
@@ -136,17 +140,22 @@ pub struct Parts {
 pub enum Segmenter {
     #[cfg(target_os = "macos")]
     Vision(vision::VisionSegmenter),
+    #[cfg(feature = "onnx")]
     Ort(Box<runtime::OrtSegmenter>),
 }
 
 impl Segmenter {
-    /// Vision on macOS, or the models on the fastest device, or `None` if neither loads.
+    /// Vision on macOS, or the models on the fastest device, or `None` if neither loads (or,
+    /// without the `onnx` feature, outside macOS).
     pub fn best() -> Option<Self> {
         #[cfg(target_os = "macos")]
         if vision::VisionSegmenter::available() {
             return Some(Self::Vision(vision::VisionSegmenter::default()));
         }
-        runtime::fastest(true, true).map(|(segmenter, _)| Self::Ort(Box::new(segmenter)))
+        #[cfg(feature = "onnx")]
+        return runtime::fastest(true, true).map(|(segmenter, _)| Self::Ort(Box::new(segmenter)));
+        #[cfg(not(feature = "onnx"))]
+        None
     }
 
     /// The `parts` in `image`: each face and then its parts, then the bodies, each with a new number.
@@ -154,7 +163,10 @@ impl Segmenter {
         match self {
             #[cfg(target_os = "macos")]
             Self::Vision(segmenter) => segmenter.find(image, parts),
+            #[cfg(feature = "onnx")]
             Self::Ort(segmenter) => segmenter.find(image, parts),
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => unreachable!("without a backend, best() makes no segmenter: {image:?} {parts:?}"),
         }
     }
 
@@ -163,7 +175,10 @@ impl Segmenter {
         match self {
             #[cfg(target_os = "macos")]
             Self::Vision(segmenter) => segmenter.continue_after(last),
+            #[cfg(feature = "onnx")]
             Self::Ort(segmenter) => segmenter.continue_after(last),
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => unreachable!("without a backend, best() makes no segmenter: {last}"),
         }
     }
 }

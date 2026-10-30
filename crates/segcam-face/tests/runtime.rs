@@ -1,3 +1,4 @@
+#![cfg(feature = "onnx")]
 use segcam_face::runtime::{self, Device, OrtFaceMesh, OrtPicoDet, OrtYuNet};
 use segcam_face::{
     BodyDetector, Detector, FACE_MESH_MODEL, FaceSegmenter, Image, PICODET_MODEL, Parts, Pixels,

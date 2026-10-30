@@ -110,8 +110,10 @@ pub trait CpuEffect: Send {
         0
     }
 
-    /// Whether the effect keeps what it worked out between renders. A host then keeps one
-    /// effect per instance. What it keeps must not change any frame.
+    /// Whether the effect keeps what it worked out between renders. Hosts that can keep one
+    /// effect per instance then do (OpenFX, FFGL, the preview); After Effects never does. What
+    /// it keeps must not change any frame, even when earlier frames change upstream or a host
+    /// can't hand one over: `vfx_host::contract::check` tests an effect for that.
     fn keeps_state(&self) -> bool {
         false
     }

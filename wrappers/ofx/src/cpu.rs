@@ -62,101 +62,74 @@ fn by_rows<T: Send>(rows: &mut [T], width: usize, f: impl Fn(usize, &mut [T]) + 
     });
 }
 
-/// Host row `y` from column `x` into `row`, through `byte` for 8-bit channels.
+/// The bytes of `pixels` pixels of host row `y`, from column `x`.
 ///
 /// # Safety
-/// The row's pixels must lie inside the live host image.
-unsafe fn decode_row<C: Channel>(
-    image: &Image,
-    x: i32,
-    y: i32,
-    row: &mut [Argb<C>],
-    byte: &[C; 256],
-) {
-    // SAFETY: the caller confines the row to the host image.
-    let p = unsafe { address(image, x, y) };
-    match image.depth {
+/// The pixels must lie inside the live host image, and no other slice of them be in use.
+#[expect(
+    clippy::mut_from_ref,
+    reason = "an Image describes host memory it doesn't own; rows are handed out one per thread"
+)]
+unsafe fn row_bytes(image: &Image, x: i32, y: i32, pixels: usize) -> &mut [u8] {
+    let len = pixels * 4 * channel_bytes(image.depth);
+    // SAFETY: the caller confines the row to the host image and uses it alone.
+    unsafe { std::slice::from_raw_parts_mut(address(image, x, y), len) }
+}
+
+/// One host row's bytes (`depth`, RGBA, native byte order) into `row`, through `byte` for
+/// 8-bit channels.
+fn decode_row<C: Channel>(src: &[u8], depth: Depth, row: &mut [Argb<C>], byte: &[C; 256]) {
+    let argb = |[r, g, b, a]: [C; 4]| Argb {
+        alpha: a,
+        red: r,
+        green: g,
+        blue: b,
+    };
+    match depth {
         Depth::Byte => {
-            // SAFETY: the row's pixels, four bytes each.
-            let src = unsafe { std::slice::from_raw_parts(p, row.len() * 4) };
             for (px, c) in row.iter_mut().zip(src.as_chunks::<4>().0) {
-                let at = |i: usize| byte[usize::from(c[i])];
-                *px = Argb {
-                    alpha: at(3),
-                    red: at(0),
-                    green: at(1),
-                    blue: at(2),
-                };
+                *px = argb(c.map(|v| byte[usize::from(v)]));
             }
         }
         Depth::Short => {
-            for (i, px) in row.iter_mut().enumerate() {
-                // SAFETY: channel `k` of pixel `i` in this row, possibly unaligned.
-                let read = |k: usize| unsafe {
-                    C::from_unit(
-                        f32::from(p.add((i * 4 + k) * 2).cast::<u16>().read_unaligned()) / 65535.0,
-                    )
-                };
-                *px = Argb {
-                    alpha: read(3),
-                    red: read(0),
-                    green: read(1),
-                    blue: read(2),
-                };
+            for (px, c) in row.iter_mut().zip(src.as_chunks::<8>().0) {
+                let channels = c.as_chunks::<2>().0;
+                *px = argb(std::array::from_fn(|k| {
+                    C::from_unit(f32::from(u16::from_ne_bytes(channels[k])) / 65535.0)
+                }));
             }
         }
         Depth::Float => {
-            for (i, px) in row.iter_mut().enumerate() {
-                // SAFETY: as above, four bytes a channel.
-                let read = |k: usize| unsafe {
-                    C::from_unit(p.add((i * 4 + k) * 4).cast::<f32>().read_unaligned())
-                };
-                *px = Argb {
-                    alpha: read(3),
-                    red: read(0),
-                    green: read(1),
-                    blue: read(2),
-                };
+            for (px, c) in row.iter_mut().zip(src.as_chunks::<16>().0) {
+                let channels = c.as_chunks::<4>().0;
+                *px = argb(std::array::from_fn(|k| {
+                    C::from_unit(f32::from_ne_bytes(channels[k]))
+                }));
             }
         }
     }
 }
 
-/// `row` into host row `y` from column `x`.
-///
-/// # Safety
-/// The row's pixels must lie inside the live host image.
-unsafe fn encode_row<C: Channel>(row: &[Argb<C>], image: &Image, x: i32, y: i32) {
-    // SAFETY: the caller confines the row to the host image.
-    let p = unsafe { address(image, x, y) };
-    match image.depth {
+/// `row` into one host row's bytes (`depth`, RGBA, native byte order).
+fn encode_row<C: Channel>(row: &[Argb<C>], depth: Depth, dst: &mut [u8]) {
+    let rgba = |v: &Argb<C>| [v.red, v.green, v.blue, v.alpha].map(Channel::to_unit);
+    match depth {
         Depth::Byte => {
-            // SAFETY: the row's pixels, four bytes each.
-            let dst = unsafe { std::slice::from_raw_parts_mut(p, row.len() * 4) };
             for (v, d) in row.iter().zip(dst.as_chunks_mut::<4>().0) {
-                for (out, c) in d.iter_mut().zip([v.red, v.green, v.blue, v.alpha]) {
-                    *out = (c.to_unit().clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                }
+                *d = rgba(v).map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
             }
         }
         Depth::Short => {
-            for (i, v) in row.iter().enumerate() {
-                for (k, c) in [v.red, v.green, v.blue, v.alpha].into_iter().enumerate() {
-                    let c = (c.to_unit().clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
-                    // SAFETY: channel `k` of pixel `i` in this row, possibly unaligned.
-                    unsafe { p.add((i * 4 + k) * 2).cast::<u16>().write_unaligned(c) };
+            for (v, d) in row.iter().zip(dst.as_chunks_mut::<8>().0) {
+                for (out, c) in d.as_chunks_mut::<2>().0.iter_mut().zip(rgba(v)) {
+                    *out = ((c.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16).to_ne_bytes();
                 }
             }
         }
         Depth::Float => {
-            for (i, v) in row.iter().enumerate() {
-                for (k, c) in [v.red, v.green, v.blue, v.alpha].into_iter().enumerate() {
-                    // SAFETY: as above, four bytes a channel.
-                    unsafe {
-                        p.add((i * 4 + k) * 4)
-                            .cast::<f32>()
-                            .write_unaligned(c.to_unit())
-                    };
+            for (v, d) in row.iter().zip(dst.as_chunks_mut::<16>().0) {
+                for (out, c) in d.as_chunks_mut::<4>().0.iter_mut().zip(rgba(v)) {
+                    *out = c.to_ne_bytes();
                 }
             }
         }
@@ -190,8 +163,11 @@ pub unsafe fn decode_into<C: Channel>(image: &Image, canvas: Rect, out: &mut Vec
         let y = canvas.y2 - 1 - row as i32;
         if (r.y1..r.y2).contains(&y) {
             let pixels = &mut pixels[skip..skip + r.width()];
-            // SAFETY: the intersection confines the row to the host image.
-            unsafe { decode_row(shared.image(), r.x1, y, pixels, &byte) };
+            let image = shared.image();
+            // SAFETY: the intersection confines the row to the host image, read by this
+            // thread alone.
+            let src = unsafe { row_bytes(image, r.x1, y, pixels.len()) };
+            decode_row(src, image.depth, pixels, &byte);
         }
     });
 }
@@ -207,15 +183,11 @@ pub unsafe fn encode<C: Channel>(pixels: &[Argb<C>], canvas: Rect, image: &Image
     by_rows(&mut rows, 1, |_, y| {
         let y = y[0];
         let start = (canvas.y2 - 1 - y) as usize * canvas.width() + skip;
-        // SAFETY: the caller confines the window to both canvas and output bounds.
-        unsafe {
-            encode_row(
-                &pixels[start..start + window.width()],
-                shared.image(),
-                window.x1,
-                y,
-            )
-        };
+        let image = shared.image();
+        // SAFETY: the caller confines the window to both canvas and output bounds, and each
+        // row is written by one thread.
+        let dst = unsafe { row_bytes(image, window.x1, y, window.width()) };
+        encode_row(&pixels[start..start + window.width()], image.depth, dst);
     });
 }
 
@@ -286,6 +258,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The conversions themselves, on bytes alone.
+    #[test]
+    fn rows_convert_without_a_host() {
+        let byte: [f32; 256] = std::array::from_fn(|v| v as f32 / 255.0);
+        let mut row = [Argb::<f32>::default(); 2];
+        let shorts: Vec<u8> = [0u16, 65535, 32768, 65535, 65535, 0, 0, 13107]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        decode_row(&shorts, Depth::Short, &mut row, &byte);
+        assert_eq!((row[0].red, row[0].green, row[0].alpha), (0.0, 1.0, 1.0));
+        assert_eq!((row[1].red, row[1].alpha), (1.0, 0.2));
+        let mut back = vec![0u8; shorts.len()];
+        encode_row(&row, Depth::Short, &mut back);
+        assert_eq!(back, shorts);
+        let mut floats = vec![0u8; 32];
+        encode_row(&row, Depth::Float, &mut floats);
+        let mut again = [Argb::<f32>::default(); 2];
+        decode_row(&floats, Depth::Float, &mut again, &byte);
+        assert_eq!(again, row);
     }
 
     /// Row conversions match the per-pixel ones.
