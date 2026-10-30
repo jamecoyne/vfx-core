@@ -38,7 +38,11 @@ fn crossing() -> Clip {
 }
 
 fn make() -> Processor {
-    Processor::Cpu(Box::new(SegcamMotion::default()))
+    Processor::Cpu(Box::new(SegcamMotion::with_gpu(false)))
+}
+
+fn make_gpu() -> Processor {
+    Processor::Cpu(Box::new(SegcamMotion::with_gpu(true)))
 }
 
 fn with(changes: &[(&str, ParamValue)]) -> ParamValues {
@@ -76,4 +80,22 @@ fn swarm_keeps_the_contract() {
         ])
     };
     check(make, &crossing(), &[swarm(false), swarm(true)]).unwrap();
+}
+
+/// The swarm on the GPU keeps it too; skipped where there is no adapter.
+#[test]
+fn swarm_on_the_gpu_keeps_the_contract() {
+    if !segcam_motion::gpu::available() {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    }
+    let swarm = |mirror| {
+        with(&[
+            ("output", ParamValue::Int(3)),
+            ("background", ParamValue::Int(4)),
+            ("trail", ParamValue::Int(8)),
+            ("mirror", ParamValue::Bool(mirror)),
+        ])
+    };
+    check(make_gpu, &crossing(), &[swarm(false), swarm(true)]).unwrap();
 }

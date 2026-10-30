@@ -140,12 +140,17 @@ pub struct SegcamMotion {
 }
 
 impl Default for SegcamMotion {
-    /// Draws on the CPU; `SEGCAM_GPU=1` draws Overlay and Swarm on the GPU where there is one.
+    /// Draws Swarm on the GPU where there is one, unless `SEGCAM_GPU=0`.
     fn default() -> Self {
+        Self::with_gpu(crate::gpu::wanted())
+    }
+}
+
+impl SegcamMotion {
+    /// With `gpu` false, always on the CPU.
+    pub fn with_gpu(gpu: bool) -> Self {
         let mut state = Incremental::default();
-        if std::env::var("SEGCAM_GPU").is_ok_and(|v| v == "1") {
-            state.use_gpu(true);
-        }
+        state.use_gpu(gpu);
         Self { state }
     }
 }

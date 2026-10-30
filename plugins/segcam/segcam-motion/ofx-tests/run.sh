@@ -2,6 +2,8 @@
 # segcam's OpenFX plugin against its CLI, using the VFX Preview mini host's suites.
 # Usage: SEGCAM_TEST_DIR=/tmp/segcam OFX_INCLUDE=... ./ofx-tests/run.sh
 set -euo pipefail
+# The CPU path, plugin and CLI alike: these checks are byte for byte.
+export SEGCAM_GPU=0
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$here/../../../.."
 : "${SEGCAM_TEST_DIR:?set SEGCAM_TEST_DIR to a scratch directory}"

@@ -37,7 +37,7 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --mirror  --no-boxes  --no-labels
   --float                              (render in float, still raw 8-bit I/O)
   --straight-alpha                     (input and output use straight alpha)
-  --gpu                                (draw Overlay and Swarm on the GPU)";
+  --cpu                                (draw Swarm on the CPU, the reference; or SEGCAM_GPU=0)";
 
 /// The last few frames, oldest first: ffmpeg's argb is `Argb<u8>` byte for byte.
 struct Ring<C> {
@@ -117,20 +117,19 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let float = args.iter().any(|a| a == "--float");
-    let gpu = args.iter().any(|a| a == "--gpu");
-    args.retain(|a| a != "--float" && a != "--gpu");
+    let cpu = args.iter().any(|a| a == "--cpu");
+    args.retain(|a| a != "--float" && a != "--cpu");
     let Some((width, height, settings)) = parse(&args) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
 
     // The GPU's state is kept between frames, which renders the same frames as a cold render.
-    let mut gpu = gpu.then(Incremental::default);
-    if let Some(state) = &mut gpu
-        && !state.use_gpu(true)
-    {
-        eprintln!("segcam-motion: no GPU, drawing on the CPU");
-    }
+    let gpu = (!cpu && segcam_motion::gpu::wanted()).then(|| {
+        let mut state = Incremental::default();
+        state.use_gpu(true);
+        state
+    });
     if float {
         run::<f32>(width, height, settings, gpu)
     } else {
