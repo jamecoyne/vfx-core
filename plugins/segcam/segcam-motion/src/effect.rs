@@ -135,9 +135,19 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
 
 /// segcam Motion. It keeps what it works out for each frame (see [`Incremental`]), so a host
 /// that keeps the instance works out only what changed since the last render.
-#[derive(Default)]
 pub struct SegcamMotion {
     state: Incremental,
+}
+
+impl Default for SegcamMotion {
+    /// Draws on the CPU; `SEGCAM_GPU=1` draws Overlay and Swarm on the GPU where there is one.
+    fn default() -> Self {
+        let mut state = Incremental::default();
+        if std::env::var("SEGCAM_GPU").is_ok_and(|v| v == "1") {
+            state.use_gpu(true);
+        }
+        Self { state }
+    }
 }
 
 impl CpuEffect for SegcamMotion {

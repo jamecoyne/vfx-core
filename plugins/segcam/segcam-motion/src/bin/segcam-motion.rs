@@ -15,7 +15,9 @@ use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use segcam_motion::pixel::Depth;
-use segcam_motion::{Argb, Detect, OutputMode, RenderSettings, SwarmBackground, View, ViewMut};
+use segcam_motion::{
+    Argb, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View, ViewMut,
+};
 use vfx_core::cpu::{FrameSource, Image};
 
 const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames > argb-frames
@@ -34,7 +36,8 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --live-windows                       (swarm windows show the current frame)
   --mirror  --no-boxes  --no-labels
   --float                              (render in float, still raw 8-bit I/O)
-  --straight-alpha                     (input and output use straight alpha)";
+  --straight-alpha                     (input and output use straight alpha)
+  --gpu                                (draw Overlay and Swarm on the GPU)";
 
 /// The last few frames, oldest first: ffmpeg's argb is `Argb<u8>` byte for byte.
 struct Ring<C> {
@@ -114,20 +117,33 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let float = args.iter().any(|a| a == "--float");
-    args.retain(|a| a != "--float");
+    let gpu = args.iter().any(|a| a == "--gpu");
+    args.retain(|a| a != "--float" && a != "--gpu");
     let Some((width, height, settings)) = parse(&args) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
 
+    // The GPU's state is kept between frames, which renders the same frames as a cold render.
+    let mut gpu = gpu.then(Incremental::default);
+    if let Some(state) = &mut gpu
+        && !state.use_gpu(true)
+    {
+        eprintln!("segcam-motion: no GPU, drawing on the CPU");
+    }
     if float {
-        run::<f32>(width, height, settings)
+        run::<f32>(width, height, settings, gpu)
     } else {
-        run::<u8>(width, height, settings)
+        run::<u8>(width, height, settings, gpu)
     }
 }
 
-fn run<C: Depth>(width: i32, height: i32, settings: RenderSettings) -> ExitCode {
+fn run<C: Depth>(
+    width: i32,
+    height: i32,
+    settings: RenderSettings,
+    mut gpu: Option<Incremental>,
+) -> ExitCode {
     let pixels = width as usize * height as usize;
     let keep = segcam_motion::previous_frames_needed(&settings) as usize + 1;
     let mut ring = Ring {
@@ -160,7 +176,10 @@ fn run<C: Depth>(width: i32, height: i32, settings: RenderSettings) -> ExitCode 
         // Like After Effects: every frame rendered from scratch out of the frames before it.
         let count = ring.frames.len();
         let mut view = ViewMut::from_pixels(&mut out, width, height);
-        segcam_motion::render(&settings, &mut ring, count, frame, &mut view);
+        match &mut gpu {
+            Some(state) => state.advance(&settings, &mut ring, count, frame, &mut view),
+            None => segcam_motion::render(&settings, &mut ring, count, frame, &mut view),
+        }
 
         for (dst, p) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&out) {
             *dst = [p.alpha, p.red, p.green, p.blue]
