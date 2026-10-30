@@ -132,9 +132,10 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     let needed = segcam_motion::previous_frames_needed(s) as usize;
     let mut cpu = Incremental::default();
     let mut gpu = Incremental::default();
-    if !gpu.use_gpu(true) {
+    if !segcam_motion::gpu::available() {
         return false;
     }
+    gpu.use_gpu(true);
     gpu.gpu_overlay(true);
     let mut a = vec![Argb::<C>::default(); (w * h) as usize];
     let mut b = a.clone();

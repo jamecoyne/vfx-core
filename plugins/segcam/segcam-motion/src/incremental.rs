@@ -11,7 +11,7 @@ use std::ops::RangeInclusive;
 
 use vfx_core::cpu::FrameSource;
 
-use crate::gpu::{Cut, Drawer, Slot};
+use crate::gpu::{Cut, Drawer, Fault, Slot};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
@@ -55,9 +55,11 @@ pub struct Incremental {
     motion: BTreeMap<i64, (Basis, Motion)>,
     /// Tiles by frame, with the basis and mirroring they were cut for.
     tiles: BTreeMap<i64, (Basis, bool, Vec<Tile>)>,
-    /// Drawing on the GPU: then tiles keep their pixels in its atlas, cut by frame here.
+    /// Drawing on the GPU: then tiles keep their pixels in its atlas, cut by frame here. The
+    /// drawer is made by the first render that draws on the GPU, as hosts make instances often.
     gpu: Option<Box<Drawer>>,
     cuts: BTreeMap<i64, Cut>,
+    gpu_wanted: bool,
     gpu_overlay: bool,
 }
 
@@ -74,15 +76,32 @@ impl PiledTile for Placed<'_> {
 }
 
 impl Incremental {
-    /// Draws Overlay and Swarm on the GPU, or back on the CPU. False if there is no GPU.
-    pub fn use_gpu(&mut self, on: bool) -> bool {
-        self.reset();
-        self.gpu = on.then(Drawer::new).flatten().map(Box::new);
-        self.gpu.is_some()
+    /// Draws Swarm on the GPU where there is one, or always on the CPU. Off by default, so the
+    /// library's renders are the CPU's; the plugin and the CLI turn it on.
+    pub fn use_gpu(&mut self, on: bool) {
+        self.gpu_wanted = on;
+        if !on {
+            self.set_drawer(None);
+        }
     }
 
+    /// The drawer, once a render has drawn on the GPU.
     pub fn gpu(&self) -> Option<&Drawer> {
         self.gpu.as_deref()
+    }
+
+    /// Draws with `drawer` from now on.
+    #[cfg(test)]
+    pub(crate) fn use_drawer(&mut self, drawer: Drawer) {
+        self.gpu_wanted = true;
+        self.set_drawer(Some(Box::new(drawer)));
+    }
+
+    /// Tiles cut for one path aren't drawn by the other: they are cut again.
+    fn set_drawer(&mut self, drawer: Option<Box<Drawer>>) {
+        self.gpu = drawer;
+        self.tiles.clear();
+        self.cuts.clear();
     }
 
     /// Draws Overlay on the GPU too. Off by default: while frames go through host memory, the
@@ -110,6 +129,13 @@ impl Incremental {
             fill_rect(out, all, Argb::default());
             return;
         }
+        let on_gpu =
+            s.mode == OutputMode::Swarm || s.mode == OutputMode::Overlay && self.gpu_overlay;
+        if self.gpu_wanted && self.gpu.is_none() && on_gpu {
+            let drawer = Drawer::new().map(Box::new);
+            self.gpu_wanted = drawer.is_some();
+            self.set_drawer(drawer);
+        }
         if let Some(gpu) = &mut self.gpu {
             gpu.begin();
         }
@@ -132,7 +158,7 @@ impl Incremental {
         // Frames the host didn't hand over count as empty, as in a cold render, but nothing
         // worked out from one is kept, so it is read again next time.
         let mut missing = BTreeSet::new();
-        let mut atlas_full = false;
+        let mut fault = None;
         let oldest = (number - targets + 1 - background).max(first);
         // A fixed source's earlier frames are as they were, so only the current frame is
         // checked: a different one means the source started over.
@@ -213,21 +239,20 @@ impl Incremental {
                         if let Some(gpu) = &mut self.gpu {
                             let blobs = &motion.blobs;
                             match gpu.cut(view.as_ref(), frame, blobs, &tiles, (w, h), s.mirror) {
-                                Some(cut) => _ = self.cuts.insert(frame, cut),
-                                None => atlas_full = true,
+                                Ok(cut) => _ = self.cuts.insert(frame, cut),
+                                Err(f) => fault = Some(f),
                             }
                         }
                         self.tiles.insert(frame, (basis, s.mirror, tiles));
                     }
                 }
-                if frame == number {
-                    self.draw(s, count, number, view, out);
+                if frame == number && fault.is_none() {
+                    fault = self.try_draw(s, count, number, view, out).err();
                 }
             });
         }
-        if atlas_full {
-            eprintln!("segcam Motion: the GPU's tiles are full; drawing on the CPU");
-            self.use_gpu(false);
+        if let Some(fault) = fault {
+            self.fall_back(&fault);
             return self.advance(s, frames, count, number, out);
         }
         for &frame in &missing {
@@ -253,7 +278,8 @@ impl Incremental {
     }
 
     /// Draws frame `number`, the last of `count`, from what is kept. `frame` is its pixels,
-    /// which every output but the swarm draws over.
+    /// which every output but the swarm draws over. If the GPU fails, the instance goes back
+    /// to the CPU, whose tiles the next render cuts.
     pub fn draw<C: Channel>(
         &mut self,
         s: &RenderSettings,
@@ -262,11 +288,47 @@ impl Incremental {
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
     ) {
-        if let Some(mut gpu) = self.gpu.take() {
-            self.draw_gpu(&mut gpu, s, count, number, frame, out);
-            self.gpu = Some(gpu);
-            return;
+        if let Err(fault) = self.try_draw(s, count, number, frame, out) {
+            self.fall_back(&fault);
+            self.draw_cpu(s, count, number, frame, out);
         }
+    }
+
+    fn try_draw<C: Channel>(
+        &mut self,
+        s: &RenderSettings,
+        count: usize,
+        number: i64,
+        frame: Option<View<C>>,
+        out: &mut ViewMut<C>,
+    ) -> Result<(), Fault> {
+        let Some(mut gpu) = self.gpu.take() else {
+            self.draw_cpu(s, count, number, frame, out);
+            return Ok(());
+        };
+        let drawn = self.draw_gpu(&mut gpu, s, count, number, frame, out);
+        self.gpu = Some(gpu);
+        drawn
+    }
+
+    /// The GPU failed: this instance draws on the CPU from now on. What was worked out on the
+    /// CPU is kept, so only the tiles are cut again.
+    fn fall_back(&mut self, fault: &Fault) {
+        eprintln!(
+            "segcam Motion: the GPU failed ({}); drawing on the CPU",
+            fault.0
+        );
+        self.use_gpu(false);
+    }
+
+    fn draw_cpu<C: Channel>(
+        &self,
+        s: &RenderSettings,
+        count: usize,
+        number: i64,
+        frame: Option<View<C>>,
+        out: &mut ViewMut<C>,
+    ) {
         let first = number - count as i64 + 1;
         let mut pile = Pile::<&Tile>::new(out.width, out.height, s.max_tiles);
         if s.mode == OutputMode::Swarm {
@@ -292,7 +354,7 @@ impl Incremental {
         number: i64,
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
-    ) {
+    ) -> Result<(), Fault> {
         let first = number - count as i64 + 1;
         let empty = Motion::default();
         let motion = self
@@ -310,12 +372,15 @@ impl Incremental {
                     }
                 }
                 let windows = pile.shown_entries().map(|p| (p.tile, p.slot));
-                gpu.draw_swarm(out, windows, frame.as_ref(), number, s);
+                gpu.draw_swarm(out, windows, frame.as_ref(), number, s)
             }
             (OutputMode::Overlay, Some(view)) if self.gpu_overlay => {
-                gpu.draw_overlay(out, view, &motion.blobs, number, s);
+                gpu.draw_overlay(out, view, &motion.blobs, number, s)
             }
-            _ => draw_output(out, s, frame, motion, number, std::iter::empty()),
+            _ => {
+                draw_output(out, s, frame, motion, number, std::iter::empty());
+                Ok(())
+            }
         }
     }
 
@@ -417,4 +482,98 @@ fn fingerprint<C: Channel>(view: &View<C>) -> u64 {
     lanes
         .iter()
         .fold(0, |h: u64, &l| (h ^ l).wrapping_mul(K).rotate_left(31))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vfx_core::cpu::Image;
+
+    use super::*;
+    use crate::gpu;
+
+    const W: i32 = 160;
+    const H: i32 = 90;
+
+    struct Frames<'a>(&'a [Vec<Argb<u8>>]);
+
+    impl FrameSource for Frames<'_> {
+        fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+            f(self
+                .0
+                .get(index)
+                .map(|p| Image::U8(View::from_pixels(p, W, H))));
+        }
+    }
+
+    /// A bright square crossing a grey frame.
+    fn crossing() -> Vec<Vec<Argb<u8>>> {
+        (0..14)
+            .map(|f| {
+                (0..W * H)
+                    .map(|i| {
+                        let (x, y) = (i % W, i / W);
+                        let inside = (6 + f * 9..30 + f * 9).contains(&x) && (30..54).contains(&y);
+                        let v = if inside { 240 } else { 70 };
+                        Argb {
+                            alpha: 255,
+                            red: v,
+                            green: v / 2 + 20,
+                            blue: v,
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn render(state: &mut Incremental, frames: &[Vec<Argb<u8>>], n: usize) -> Vec<Argb<u8>> {
+        let s = RenderSettings {
+            mode: OutputMode::Swarm,
+            background_frames: 4,
+            trail_frames: 8,
+            max_tiles: 20,
+            ..RenderSettings::default()
+        };
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let clip = &frames[n.saturating_sub(needed)..=n];
+        let mut out = vec![Argb::default(); (W * H) as usize];
+        let view = &mut ViewMut::from_pixels(&mut out, W, H);
+        state.advance(&s, &mut Frames(clip), clip.len(), n as i64, view);
+        out
+    }
+
+    /// A device lost between renders, as when a driver resets, leaves the instance drawing
+    /// what the CPU draws, and no new instance draws on that device. The device is a software
+    /// one of the test's own.
+    #[test]
+    fn a_lost_gpu_falls_back_to_the_cpu() {
+        let Ok(dev) = gpu::open("fallback") else {
+            eprintln!("no software adapter: skipped");
+            return;
+        };
+        let dev = Arc::new(dev);
+        let frames = crossing();
+        let mut cpu = Incremental::default();
+        let mut on_gpu = Incremental::default();
+        on_gpu.use_drawer(gpu::Drawer::on(dev.clone()).expect("a drawer on a working device"));
+        for n in 0..frames.len() {
+            if n == 7 {
+                assert!(on_gpu.gpu().is_some(), "drawing on the GPU before the loss");
+                dev.device.destroy();
+            }
+            let (a, b) = (
+                render(&mut cpu, &frames, n),
+                render(&mut on_gpu, &frames, n),
+            );
+            assert!(n < 7 || a == b, "frame {n} isn't the CPU's after the loss");
+        }
+        assert!(dev.failure().is_some(), "the loss went unnoticed");
+        assert!(on_gpu.gpu().is_none(), "the instance is still on the GPU");
+        assert!(
+            gpu::Drawer::on(dev).is_none(),
+            "a new instance draws on the lost device"
+        );
+    }
 }
