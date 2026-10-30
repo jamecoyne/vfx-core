@@ -311,13 +311,13 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
     let ah = u32(area.h);
     let j = u32(x - area.x);
     let i = u32(y - area.y);
-    let profile_x = float_at(plan + j);
-    let corner_x = bitcast<i32>(data[plan + aw + j]);
-    let dx = float_at(plan + 2u * aw + j);
+    let profile_x = bitcast<f32>(atlas[plan + j]);
+    let corner_x = bitcast<i32>(atlas[plan + aw + j]);
+    let dx = bitcast<f32>(atlas[plan + 2u * aw + j]);
     let rows = plan + 3u * aw;
-    let profile_y = float_at(rows + i);
-    let corner_y = bitcast<i32>(data[rows + ah + i]);
-    let dy = float_at(rows + 2u * ah + i);
+    let profile_y = bitcast<f32>(atlas[rows + i]);
+    let corner_y = bitcast<i32>(atlas[rows + ah + i]);
+    let dy = bitcast<f32>(atlas[rows + 2u * ah + i]);
 
     let lx = x - frame_r.x;
     let ly = y - frame_r.y;

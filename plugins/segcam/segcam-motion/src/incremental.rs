@@ -212,7 +212,7 @@ impl Incremental {
                         let tiles = frame_tiles(&motion, pixels, frame, w, h, s.mirror);
                         if let Some(gpu) = &mut self.gpu {
                             let blobs = &motion.blobs;
-                            match gpu.cut(view.as_ref(), frame, blobs, &tiles, h, s.mirror) {
+                            match gpu.cut(view.as_ref(), frame, blobs, &tiles, (w, h), s.mirror) {
                                 Some(cut) => _ = self.cuts.insert(frame, cut),
                                 None => atlas_full = true,
                             }

@@ -1,8 +1,9 @@
 //! segcam Motion's Overlay and Swarm drawn on the GPU with wgpu, frames through host memory.
-//! Detection, tile layout, title bars and the shadow's profiles stay on the CPU; tiles are cut
-//! from the uploaded frame into an atlas kept for the trail, and each output pixel replays what
-//! the CPU path does to it (`gpu.wgsl`), so the two agree within a level. The CPU path stays
-//! the reference and the fallback.
+//! Detection, tile layout, title bars and window plans stay on the CPU, made once per tile and
+//! kept in an atlas for the trail with the tiles cut from the uploaded frame. Each output pixel
+//! replays what the CPU path does to it (`gpu.wgsl`), so the two agree within a level. The CPU
+//! path stays the reference and the fallback; Overlay draws there unless asked
+//! ([`crate::Incremental::gpu_overlay`]).
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -124,7 +125,7 @@ const WINDOW_WORDS: usize = 20;
 const BLOB_WORDS: usize = 12;
 const JOB_WORDS: usize = 16;
 
-/// Where a tile's pixels and title bar sit in the atlas, in u32 words.
+/// Where a tile's pixels, title bar and window plan sit in the atlas, in u32 words.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Slot {
     pixels: u32,
@@ -132,6 +133,10 @@ pub struct Slot {
     cut: bool,
     bar: u32,
     bar_width: i32,
+    plan: u32,
+    /// The window, and the part of the canvas it and its shadow reach.
+    frame: PixelRect,
+    area: PixelRect,
 }
 
 /// One frame's tiles in the atlas; dropping it gives the space back.
@@ -368,17 +373,24 @@ impl Drawer {
     }
 
     /// Cuts frame `number`'s tiles (one per blob, from `frame` if there is one) into the atlas
-    /// and stores their title bars beside them. `None` if the atlas is full.
+    /// for a `canvas` (width, height) and stores their title bars and window plans beside them.
+    /// `None` if the atlas is full.
     pub fn cut<C: Channel>(
         &mut self,
         frame: Option<&View<C>>,
         number: i64,
         blobs: &[Blob],
         tiles: &[Tile],
-        canvas_h: i32,
+        canvas: (i32, i32),
         mirrored: bool,
     ) -> Option<Cut> {
-        let m = SwarmMetrics::new(canvas_h);
+        let m = SwarmMetrics::new(canvas.1);
+        let shadow = swarm::shadow_kernel(m.scale);
+        let whole = PixelRect::new(0, 0, canvas.0, canvas.1);
+        let plans: Vec<_> = tiles
+            .iter()
+            .map(|t| WindowPlan::new(t, &m, &shadow, whole))
+            .collect();
         let frame = frame.filter(|f| !f.is_empty());
         let crops: Vec<Option<PixelRect>> = blobs
             .iter()
@@ -397,13 +409,17 @@ impl Drawer {
             .map(|(t, _)| (t.stored.w * t.stored.h) as u64)
             .sum();
         let bar_words: u64 = bars.iter().map(|b| b.pixels.len() as u64 * 3).sum();
-        let len = pixel_words + bar_words;
+        let plan_words: u64 = plans
+            .iter()
+            .map(|p| 3 * (p.area.w.max(0) + p.area.h.max(0)) as u64)
+            .sum();
+        let len = pixel_words + bar_words + plan_words;
+        let mut tables = Vec::with_capacity((bar_words + plan_words) as usize);
         let shared = self.atlas.clone();
         let mut atlas = shared.lock().unwrap_or_else(|e| e.into_inner());
         let start = atlas.alloc(&self.dev, len)?;
 
         let (mut pixels, mut bar) = (start, start + pixel_words);
-        let mut bar_data = Vec::with_capacity(bar_words as usize);
         let mut jobs = Vec::new();
         let mut slots = Vec::with_capacity(tiles.len());
         let (mut most_w, mut most_h) = (0, 0);
@@ -413,6 +429,7 @@ impl Drawer {
                 cut: crop.is_some(),
                 bar: bar as u32,
                 bar_width: b.width,
+                ..Slot::default()
             };
             if let Some(crop) = crop {
                 let s = tile.stored;
@@ -423,7 +440,7 @@ impl Drawer {
                 pixels += (s.w * s.h) as u64;
                 (most_w, most_h) = (most_w.max(s.w), most_h.max(s.h));
             }
-            bar_data.extend(
+            tables.extend(
                 b.pixels
                     .iter()
                     .flat_map(|c| [c.r, c.g, c.b].map(f32::to_bits)),
@@ -431,11 +448,25 @@ impl Drawer {
             bar += b.pixels.len() as u64 * 3;
             slots.push(slot);
         }
-        if !bar_data.is_empty() {
+        // Each window's shadow profiles, corner indices and mask edges, by column then by row.
+        for (slot, plan) in slots.iter_mut().zip(&plans) {
+            slot.plan = start as u32 + pixel_words as u32 + tables.len() as u32;
+            (slot.frame, slot.area) = (plan.frame, plan.area);
+            let mask = |v: &[f64]| v.iter().map(|&f| (f as f32).to_bits()).collect::<Vec<_>>();
+            for (profile, corner, edge) in [
+                (&plan.profile_x, &plan.corner_x, &plan.mask_x),
+                (&plan.profile_y, &plan.corner_y, &plan.mask_y),
+            ] {
+                tables.extend(profile.iter().map(|f| f.to_bits()));
+                tables.extend(corner.iter().map(|&c| c as u32));
+                tables.extend(mask(edge));
+            }
+        }
+        if !tables.is_empty() {
             let at = (start + pixel_words) * 4;
             self.dev
                 .queue
-                .write_buffer(&atlas.buffer, at, bytemuck::cast_slice(&bar_data));
+                .write_buffer(&atlas.buffer, at, bytemuck::cast_slice(&tables));
         }
         if let (Some(frame), false) = (frame, jobs.is_empty()) {
             self.upload(frame, number);
@@ -487,30 +518,17 @@ impl Drawer {
         let (w, h) = (out.width, out.height);
         let m = SwarmMetrics::new(h);
         let shadow = swarm::shadow_kernel(m.scale);
-        let canvas = PixelRect::new(0, 0, w, h);
         let mut data: Vec<u32> = Vec::new();
-        let mut plans = Vec::new();
+        let mut widest = 0;
         for (tile, slot) in windows {
-            let plan = WindowPlan::new(tile, &m, &shadow, canvas);
-            data.extend(rect_words(plan.frame));
-            data.extend(rect_words(plan.area));
+            data.extend(rect_words(slot.frame));
+            data.extend(rect_words(slot.area));
             data.extend(rect_words(tile.stored));
-            data.extend([0, slot.pixels, u32::from(slot.cut), slot.bar]);
+            data.extend([slot.plan, slot.pixels, u32::from(slot.cut), slot.bar]);
             data.extend([slot.bar_width as u32, 0, 0, 0]);
-            plans.push(plan);
+            widest = widest.max(slot.frame.w);
         }
-        let count = plans.len();
-        for (i, plan) in plans.iter().enumerate() {
-            data[i * WINDOW_WORDS + 12] = data.len() as u32;
-            let floats = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
-            let mask = |v: &[f64]| v.iter().map(|&f| (f as f32).to_bits()).collect::<Vec<_>>();
-            data.extend(floats(&plan.profile_x));
-            data.extend(plan.corner_x.iter().map(|&c| c as u32));
-            data.extend(mask(&plan.mask_x));
-            data.extend(floats(&plan.profile_y));
-            data.extend(plan.corner_y.iter().map(|&c| c as u32));
-            data.extend(mask(&plan.mask_y));
-        }
+        let count = data.len() / WINDOW_WORDS;
         let corner = data.len() as u32;
         data.extend(shadow.corner.iter().map(|f| f.to_bits()));
         let units = units(&mut data);
@@ -522,7 +540,6 @@ impl Drawer {
                 ((f - f.floor()) as f32).to_bits(),
             ]
         };
-        let widest = plans.iter().map(|p| p.frame.w).max().unwrap_or(0);
         let bar_x = data.len() as u32;
         data.extend((0..widest).flat_map(|lx| place((f64::from(lx) + 0.5) / m.scale - 0.5)));
         let bar_y = data.len() as u32;
