@@ -118,6 +118,8 @@ struct Slot {
     error: Option<String>,
     /// What it evaluated to last frame, shown under the box.
     last: Option<f32>,
+    /// The F(x) toggle: the expression drives the parameter, in place of its slider.
+    on: bool,
 }
 
 impl Slot {
@@ -151,7 +153,11 @@ impl Expressions {
         dt: f32,
     ) -> ParamValues {
         let mut values = base.clone();
-        for (target, slot) in self.slots.iter_mut().filter(|(t, _)| t.effect == effect) {
+        for (target, slot) in self
+            .slots
+            .iter_mut()
+            .filter(|(t, s)| t.effect == effect && s.on)
+        {
             let (Some(expr), Some(value)) = (&mut slot.compiled, target.read(&values)) else {
                 continue;
             };
@@ -165,19 +171,80 @@ impl Expressions {
         values
     }
 
-    /// Forgets `smooth()` history, so an export starts from the source values.
-    pub fn reset(&mut self) {
-        for expr in self.slots.values_mut().filter_map(|s| s.compiled.as_mut()) {
-            expr.reset();
-        }
+    /// Whether `target` is driven by its expression (its F(x) toggle is on).
+    pub fn is_on(&self, target: Target) -> bool {
+        self.slots.get(&target).is_some_and(|s| s.on)
+    }
+
+    fn toggle(&mut self, target: Target) {
+        let slot = self.slots.entry(target).or_default();
+        slot.on = !slot.on;
     }
 
     #[cfg(test)]
     pub fn set(&mut self, target: Target, text: &str) {
         let slot = self.slots.entry(target).or_default();
         slot.text = text.into();
+        slot.on = true;
         slot.recompile();
     }
+}
+
+/// A parameter's label, with its F(x) toggle right after it. Toggling it on swaps the
+/// slider for the expression box (see [`field`]).
+pub fn header(ui: &mut Ui, exprs: &mut Expressions, target: Target, label: &str) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let on = exprs.is_on(target);
+        // A square button, so it's the height of a row's control.
+        let side = ui.spacing().interact_size.y;
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+        // No background: the icon is the accent colour when on, dimmed when off, and
+        // brighter under the pointer.
+        let visuals = ui.style().interact(&response);
+        let colour = if on {
+            ui.visuals().selection.stroke.color
+        } else if response.hovered() {
+            visuals.text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        stopwatch(ui.painter(), rect, egui::Stroke::new(1.5, colour));
+        if response
+            .on_hover_text("Drive this from an expression instead of the slider")
+            .clicked()
+        {
+            exprs.toggle(target);
+        }
+    });
+}
+
+/// After Effects' stopwatch, the icon that expressions hang from: a ring with a crown on top
+/// and a hand pointing up and to the right.
+fn stopwatch(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
+    // Drawn a little smaller than its square, so it sits well among the row's controls.
+    let side = rect.width() * 0.75;
+    let centre = rect.center() + egui::vec2(0.0, side * 0.06);
+    let r = side * 0.3;
+    painter.circle_stroke(centre, r, stroke);
+    // The crown: a stem up from the ring, and a bar across it.
+    let top = centre.y - r;
+    painter.line_segment(
+        [
+            egui::pos2(centre.x, top),
+            egui::pos2(centre.x, top - side * 0.12),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(centre.x - side * 0.1, top - side * 0.12),
+            egui::pos2(centre.x + side * 0.1, top - side * 0.12),
+        ],
+        stroke,
+    );
+    // The hand.
+    painter.line_segment([centre, centre + egui::vec2(r * 0.6, -r * 0.6)], stroke);
 }
 
 /// The expression box for `target`, drawn under its slider.
@@ -196,7 +263,13 @@ pub fn field(ui: &mut Ui, exprs: &mut Expressions, target: Target) {
     if ui.add(edit).changed() {
         slot.recompile();
     }
-    if let Some(error) = &slot.error {
+    if slot.text.trim().is_empty() {
+        ui.label(
+            RichText::new("Type an expression; the slider is hidden until then.")
+                .small()
+                .weak(),
+        );
+    } else if let Some(error) = &slot.error {
         ui.label(
             RichText::new(error)
                 .small()
@@ -381,28 +454,6 @@ impl Expr {
                 } else {
                     otherwise.eval(env)
                 }
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        match self {
-            Expr::Num(_) | Expr::Var(_) | Expr::Value => {}
-            Expr::Neg(e) => e.reset(),
-            Expr::Bin(_, a, b) => {
-                a.reset();
-                b.reset();
-            }
-            Expr::Call(_, args) => args.iter_mut().for_each(Expr::reset),
-            Expr::Smooth(x, amount, state) => {
-                *state = None;
-                x.reset();
-                amount.reset();
-            }
-            Expr::If(condition, then, otherwise) => {
-                condition.reset();
-                then.reset();
-                otherwise.reset();
             }
         }
     }
@@ -765,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn smooth_eases_and_resets() {
+    fn smooth_eases() {
         let mut exprs = Expressions::default();
         let (blur, base) = setup(BLUR);
         exprs.set(Target::new(blur, "radius"), "smooth(bass * 10, 0.9)");
@@ -775,11 +826,5 @@ mod tests {
         assert_eq!(radius(&quiet), 0.0);
         let eased = radius(&loud);
         assert!(eased > 0.5 && eased < 2.0, "{eased}");
-        drop(radius);
-        exprs.reset();
-        assert_eq!(
-            exprs.apply(blur, &base, &loud, 1.0 / 60.0).float("radius"),
-            10.0
-        );
     }
 }

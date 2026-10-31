@@ -12,8 +12,6 @@ use crate::modulation::{self, Expressions, Sources, Target};
 pub struct Controls {
     pub pattern: usize,
     pub animate: bool,
-    /// The webcam picked in the Input section.
-    pub camera: usize,
     /// The effect shown, an index into the catalog.
     pub effect: usize,
     /// Each effect's second layer, for effects that read one: a pattern, or `None` for no
@@ -33,7 +31,6 @@ impl Default for Controls {
         Self {
             pattern: 0,
             animate: true,
-            camera: 0,
             effect: 0,
             layers: catalog::entries()
                 .iter()
@@ -76,12 +73,18 @@ impl Controls {
 #[derive(Default)]
 pub struct Actions {
     pub clear_image: bool,
+    /// Open a file picker for a layer's video or image.
+    pub import_layer: bool,
+    /// Feed the layer from this index of `Status::cameras`.
+    pub start_layer_camera: Option<usize>,
+    /// Go back to a test pattern (or none) for the layer.
+    pub clear_layer: bool,
     /// Another effect was picked.
     pub effect_changed: bool,
     /// The video's sound was switched on or off.
     pub sound: Option<bool>,
-    pub start_export: bool,
-    pub cancel_export: bool,
+    /// Record was pressed: starts recording, or stops and asks where to save.
+    pub toggle_record: bool,
     /// Open a file picker for a video or image.
     pub import: bool,
     /// Start the camera at this index of `Status::cameras`.
@@ -105,21 +108,23 @@ pub struct Playback {
 
 /// Status shown at the top of the panel.
 pub struct Status<'a> {
-    pub fps: f32,
-    pub size: (u32, u32),
     pub image: Option<&'a str>,
     pub message: Option<&'a str>,
     /// The source is a video file (so it can play sound and be rendered).
     pub video: bool,
     pub sound_on: bool,
-    /// How far a running render is, 0–1.
-    pub export: Option<f32>,
+    /// Whether Record is on.
+    pub recording: bool,
+    /// How the last recording ended: saved, discarded or failed.
+    pub record_result: Option<&'a str>,
     pub cameras: &'a [String],
     pub face_tracking: bool,
     /// Set for video files.
     pub playback: Option<Playback>,
     /// How many extra layers the shown effect reads.
     pub layers: usize,
+    /// The fed layer's name, when a video, webcam or image is its source.
+    pub layer_name: Option<&'a str>,
 }
 
 /// Seconds as m:ss.s.
@@ -156,16 +161,23 @@ fn transport(ui: &mut Ui, playback: &Playback, actions: &mut Actions) {
     }
 }
 
-fn section(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
-    egui::CollapsingHeader::new(RichText::new(title).strong())
-        .default_open(true)
-        .show(ui, body);
+/// A boxed section across the sidebar's width, with a heading that opens and closes it.
+fn boxed(ui: &mut Ui, title: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        // No vertical line down the open section's left edge.
+        ui.visuals_mut().indent_has_left_vline = false;
+        egui::CollapsingHeader::new(RichText::new(title).strong())
+            .default_open(default_open)
+            .show(ui, body);
+    });
+    ui.add_space(4.0);
 }
 
 fn choice(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) -> bool {
     let before = *value;
     egui::ComboBox::from_id_salt(id)
-        .width(200.0)
+        .width(ui.available_width())
         .selected_text(options[*value])
         .show_ui(ui, |ui| {
             for (i, option) in options.iter().enumerate() {
@@ -176,6 +188,15 @@ fn choice(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) -> bool {
 }
 
 /// One parameter's control, with expression boxes under the ones expressions can drive.
+/// A slider across the whole row, with room left at its end for the value.
+fn full_slider(ui: &mut Ui, slider: egui::Slider) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_width = (ui.available_width() - 64.0).max(60.0);
+        ui.add(slider)
+    })
+    .inner
+}
+
 fn param(
     ui: &mut Ui,
     spec: &ParamSpec,
@@ -192,34 +213,36 @@ fn param(
     };
     match (spec.kind, value) {
         (ParamKind::Float { min, max, .. }, ParamValue::Float(mut v)) => {
-            if ui
-                .add(
-                    egui::Slider::new(&mut v, min..=max)
-                        .text(label)
-                        .fixed_decimals(2),
-                )
+            let target = Target::new(effect, spec.name);
+            modulation::header(ui, exprs, target, &label);
+            if exprs.is_on(target) {
+                modulation::field(ui, exprs, target);
+            } else if full_slider(ui, egui::Slider::new(&mut v, min..=max).fixed_decimals(2))
                 .changed()
             {
                 set(ParamValue::Float(v));
             }
-            modulation::field(ui, exprs, Target::new(effect, spec.name));
         }
         (ParamKind::Int { options, .. }, ParamValue::Int(v)) if !options.is_empty() => {
-            ui.label(label);
-            let mut i = v.clamp(0, options.len() as i32 - 1) as usize;
-            if choice(ui, spec.name, &mut i, options) {
-                set(ParamValue::Int(i as i32));
+            let target = Target::new(effect, spec.name);
+            modulation::header(ui, exprs, target, &label);
+            if exprs.is_on(target) {
+                modulation::field(ui, exprs, target);
+            } else {
+                let mut i = v.clamp(0, options.len() as i32 - 1) as usize;
+                if choice(ui, spec.name, &mut i, options) {
+                    set(ParamValue::Int(i as i32));
+                }
             }
-            modulation::field(ui, exprs, Target::new(effect, spec.name));
         }
         (ParamKind::Int { min, max, .. }, ParamValue::Int(mut v)) => {
-            if ui
-                .add(egui::Slider::new(&mut v, min..=max).text(label))
-                .changed()
-            {
+            let target = Target::new(effect, spec.name);
+            modulation::header(ui, exprs, target, &label);
+            if exprs.is_on(target) {
+                modulation::field(ui, exprs, target);
+            } else if full_slider(ui, egui::Slider::new(&mut v, min..=max)).changed() {
                 set(ParamValue::Int(v));
             }
-            modulation::field(ui, exprs, Target::new(effect, spec.name));
         }
         (ParamKind::Bool { .. }, ParamValue::Bool(mut v)) => {
             if ui.checkbox(&mut v, label).changed() {
@@ -227,32 +250,227 @@ fn param(
             }
         }
         (ParamKind::Color { .. }, ParamValue::Color(mut c)) => {
-            ui.horizontal(|ui| {
-                if ui.color_edit_button_rgba_unmultiplied(&mut c).changed() {
-                    set(ParamValue::Color(c));
-                }
-                ui.label(label);
-            });
+            ui.label(label);
+            if ui.color_edit_button_rgba_unmultiplied(&mut c).changed() {
+                set(ParamValue::Color(c));
+            }
         }
         (ParamKind::Point { .. }, ParamValue::Point(mut p)) => {
             for (axis, name) in ["x", "y"].into_iter().enumerate() {
-                let text = format!("{label} {name}");
-                if ui
-                    .add(
-                        egui::Slider::new(&mut p[axis], 0.0..=1.0)
-                            .text(text)
-                            .fixed_decimals(2),
-                    )
-                    .changed()
+                let target = Target::axis(effect, spec.name, axis);
+                modulation::header(ui, exprs, target, &format!("{label} {name}"));
+                if exprs.is_on(target) {
+                    modulation::field(ui, exprs, target);
+                } else if full_slider(
+                    ui,
+                    egui::Slider::new(&mut p[axis], 0.0..=1.0).fixed_decimals(2),
+                )
+                .changed()
                 {
                     set(ParamValue::Point(p));
                 }
-                modulation::field(ui, exprs, Target::axis(effect, spec.name, axis));
             }
             ui.label(RichText::new("Or click the image to place it.").weak());
         }
         _ => {}
     }
+}
+
+/// A refresh button drawn as a circular arrow, since the UI font has no such glyph.
+#[cfg(not(target_arch = "wasm32"))]
+fn refresh_button(ui: &mut Ui) -> egui::Response {
+    let side = ui.spacing().interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+    }
+
+    // An arc of about 300 degrees, with an arrowhead at its end.
+    let stroke = visuals.fg_stroke;
+    let centre = rect.center();
+    let r = side * 0.3;
+    let angle = |t: f32| (-60.0 + 300.0 * t).to_radians();
+    let point = |t: f32| centre + r * egui::vec2(angle(t).cos(), angle(t).sin());
+    let arc: Vec<egui::Pos2> = (0..=24).map(|i| point(i as f32 / 24.0)).collect();
+    let end = point(1.0);
+    // The arc's direction at its end, and the perpendicular to it.
+    let a = angle(1.0);
+    let forward = egui::vec2(-a.sin(), a.cos());
+    let side_dir = egui::vec2(a.cos(), a.sin());
+    let head = [
+        end + forward * r * 0.6,
+        end + side_dir * r * 0.5 - forward * r * 0.3,
+        end - side_dir * r * 0.5 - forward * r * 0.3,
+    ];
+    let painter = ui.painter();
+    painter.add(egui::Shape::line(arc, stroke));
+    painter.add(egui::Shape::convex_polygon(
+        head.to_vec(),
+        stroke.color,
+        egui::Stroke::NONE,
+    ));
+    response
+}
+
+/// The input box: one menu of test patterns, a video or image, and webcams, then the
+/// controls for whichever is running.
+fn input_box(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actions) {
+    ui.horizontal(|ui| {
+        let shown = match status.image {
+            Some(name) => name.to_string(),
+            None => PATTERNS[c.pattern].to_string(),
+        };
+        egui::ComboBox::from_id_salt("input")
+            // Leaves room for the refresh button beside it.
+            .width(ui.available_width() - 32.0)
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
+                if let Some(i) = pattern_items(ui, |i| status.image.is_none() && c.pattern == i) {
+                    c.pattern = i;
+                    if status.image.is_some() {
+                        actions.clear_image = true;
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                source_items(ui, status, &mut actions.import, &mut actions.start_camera);
+            });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if refresh_button(ui)
+                .on_hover_text("Refresh input options")
+                .clicked()
+            {
+                actions.refresh_cameras = true;
+            }
+        }
+    });
+
+    if status.image.is_some() {
+        if let Some(playback) = &status.playback {
+            transport(ui, playback, actions);
+        }
+        if status.video {
+            let mut sound = status.sound_on;
+            if ui.checkbox(&mut sound, "Play sound").changed() {
+                actions.sound = Some(sound);
+            }
+        }
+    }
+}
+
+/// The test patterns as rows, returning the one clicked this frame. `current` says which
+/// row is the shown one.
+fn pattern_items(ui: &mut Ui, current: impl Fn(usize) -> bool) -> Option<usize> {
+    ui.label(RichText::new("Test patterns").weak());
+    let mut picked = None;
+    for (i, name) in PATTERNS.iter().enumerate() {
+        if ui.selectable_label(current(i), *name).clicked() {
+            picked = Some(i);
+        }
+    }
+    picked
+}
+
+/// The video-or-image and webcam rows of the source menus. A click sets `import` or
+/// `camera` for the caller to act on.
+#[cfg(not(target_arch = "wasm32"))]
+fn source_items(ui: &mut Ui, status: &Status, import: &mut bool, camera: &mut Option<usize>) {
+    ui.separator();
+    if ui.selectable_label(false, "Video or image…").clicked() {
+        *import = true;
+    }
+    ui.separator();
+    ui.label(RichText::new("Webcams").weak());
+    if status.cameras.is_empty() {
+        ui.label(RichText::new("No webcam found").weak());
+    }
+    for (i, name) in status.cameras.iter().enumerate() {
+        if ui.selectable_label(false, name.as_str()).clicked() {
+            *camera = Some(i);
+        }
+    }
+}
+
+/// The layer menu: None, a test pattern, or a video, image or webcam (when one is fed).
+fn layer_menu(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actions) {
+    let shown = match (status.layer_name, c.layers[c.effect]) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(pattern)) => PATTERNS[pattern].to_string(),
+        (None, None) => "None".to_string(),
+    };
+    egui::ComboBox::from_id_salt("layer")
+        .width(ui.available_width())
+        .selected_text(shown)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(
+                    status.layer_name.is_none() && c.layers[c.effect].is_none(),
+                    "None",
+                )
+                .clicked()
+            {
+                c.layers[c.effect] = None;
+                actions.clear_layer = true;
+            }
+            if let Some(i) = pattern_items(ui, |i| {
+                status.layer_name.is_none() && c.layers[c.effect] == Some(i)
+            }) {
+                c.layers[c.effect] = Some(i);
+                actions.clear_layer = true;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            source_items(
+                ui,
+                status,
+                &mut actions.import_layer,
+                &mut actions.start_layer_camera,
+            );
+        });
+}
+
+/// The effect box: the effect to show, its layer and animation settings, and its parameters.
+fn effect_box(
+    ui: &mut Ui,
+    c: &mut Controls,
+    status: &Status,
+    exprs: &mut Expressions,
+    actions: &mut Actions,
+) {
+    let entries = catalog::entries();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    actions.effect_changed = choice(ui, "effect", &mut c.effect, &names);
+    ui.label(RichText::new(&entries[c.effect].about).weak());
+    if status.layers > 0 {
+        ui.label("Layer");
+        layer_menu(ui, c, status, actions);
+    }
+    ui.separator();
+
+    let effect = c.effect;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Parameters").strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Reset").clicked() {
+                c.params[effect] = ParamValues::new(&c.specs[effect]);
+            }
+        });
+    });
+
+    // Capped in height, so a long parameter list scrolls instead of pushing the rest of the
+    // panel off screen.
+    egui::ScrollArea::vertical()
+        .max_height(360.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for spec in &c.specs[effect] {
+                param(ui, spec, &mut c.params[effect], exprs, effect);
+            }
+            if c.specs[effect].is_empty() {
+                ui.label(RichText::new("No parameters.").weak());
+            }
+        });
 }
 
 /// Draws the control panel and returns what the app should do.
@@ -266,129 +484,69 @@ pub fn panel(
     let mut actions = Actions::default();
     ui.add_space(4.0);
     ui.heading("VFX Preview");
-    ui.label(
-        RichText::new(format!(
-            "{} × {}   {:.0} fps",
-            status.size.0, status.size.1, status.fps
-        ))
-        .weak(),
-    );
     if let Some(message) = status.message {
         ui.colored_label(Color32::from_rgb(230, 120, 90), message);
     }
     ui.separator();
 
+    boxed(ui, "Input", true, |ui| {
+        input_box(ui, c, status, &mut actions)
+    });
+    ui.add_space(4.0);
+
+    boxed(ui, "Effect", true, |ui| {
+        effect_box(ui, c, status, exprs, &mut actions)
+    });
+    ui.add_space(4.0);
+
     egui::ScrollArea::vertical().show(ui, |ui| {
-        section(ui, "Effect", |ui| {
-            let entries = catalog::entries();
-            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-            actions.effect_changed = choice(ui, "effect", &mut c.effect, &names);
-            ui.label(RichText::new(&entries[c.effect].about).weak());
-        });
-
-        section(ui, "Input", |ui| {
-            match status.image {
-                Some(name) => {
-                    ui.label(format!("Source: {name}"));
-                    if let Some(playback) = &status.playback {
-                        transport(ui, playback, &mut actions);
-                    }
-                    if status.video {
-                        let mut sound = status.sound_on;
-                        if ui.checkbox(&mut sound, "Play sound").changed() {
-                            actions.sound = Some(sound);
-                        }
-                    }
-                    if ui.button("Back to test patterns").clicked() {
-                        actions.clear_image = true;
-                    }
-                }
-                None => {
-                    choice(ui, "pattern", &mut c.pattern, PATTERNS);
-                }
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                if ui.button("Import video or image…").clicked() {
-                    actions.import = true;
-                }
-                ui.label(RichText::new("Or drop one on the window.").weak());
-                ui.horizontal(|ui| {
-                    if status.cameras.is_empty() {
-                        ui.label(RichText::new("No webcam found").weak());
-                    } else {
-                        c.camera = c.camera.min(status.cameras.len() - 1);
-                        let names: Vec<&str> =
-                            status.cameras.iter().map(String::as_str).collect();
-                        choice(ui, "camera", &mut c.camera, &names);
-                        if ui.button("Webcam").clicked() {
-                            actions.start_camera = Some(c.camera);
-                        }
-                    }
-                    if ui.small_button("⟳").on_hover_text("Look for cameras again").clicked() {
-                        actions.refresh_cameras = true;
-                    }
-                });
-                let mut tracking = status.face_tracking;
-                if ui
-                    .checkbox(&mut tracking, "Face tracking")
-                    .on_hover_text(
-                        "Finds a face in video or webcam frames for the face, eye, nose and \
-                         mouth variables in expressions",
-                    )
-                    .changed()
+        boxed(ui, "Expressions", false, |ui| {
+                ui.checkbox(&mut c.animate, "Animate")
+                    .on_hover_text("Advances the clock behind the time variable and test patterns");
+                #[cfg(not(target_arch = "wasm32"))]
                 {
-                    actions.face_tracking = Some(tracking);
+                    let mut tracking = status.face_tracking;
+                    if ui
+                        .checkbox(&mut tracking, "Detect faces")
+                        .on_hover_text(
+                            "Finds a face in video or webcam frames for the face, eye, nose \
+                             and mouth variables in expressions",
+                        )
+                        .changed()
+                    {
+                        actions.face_tracking = Some(tracking);
+                    }
                 }
-            }
-            if status.layers > 0 {
-                ui.label("Layer");
-                let options: Vec<&str> = std::iter::once("None").chain(PATTERNS.iter().copied()).collect();
-                let mut i = c.layers[c.effect].map_or(0, |p| p + 1);
-                if choice(ui, "layer_pattern", &mut i, &options) {
-                    c.layers[c.effect] = i.checked_sub(1);
-                }
-            }
-            ui.checkbox(&mut c.animate, "Animate");
-        });
-
-        egui::CollapsingHeader::new(RichText::new("Expressions").strong())
-            .default_open(false)
-            .show(ui, |ui| modulation::help(ui, sources));
-
-        let effect = c.effect;
-        section(ui, &catalog::entries()[effect].name, |ui| {
-            for spec in &c.specs[effect] {
-                param(ui, spec, &mut c.params[effect], exprs, effect);
-            }
-            if c.specs[effect].is_empty() {
-                ui.label(RichText::new("No parameters.").weak());
-            }
-            ui.add_space(4.0);
-            if ui.button("Reset").clicked() {
-                c.params[effect] = ParamValues::new(&c.specs[effect]);
-            }
-        });
+                ui.separator();
+                modulation::help(ui, sources);
+            });
 
         #[cfg(not(target_arch = "wasm32"))]
-        section(ui, "Render", |ui| match status.export {
-            Some(progress) => {
-                ui.add(egui::ProgressBar::new(progress).show_percentage());
-                if ui.button("Cancel").clicked() {
-                    actions.cancel_export = true;
-                }
+        boxed(ui, "Record", true, |ui| {
+            let (text, hint) = if status.recording {
+                (
+                    "Recording",
+                    "Click again to stop and choose where to save the MP4.",
+                )
+            } else {
+                (
+                    "Record",
+                    "Saves what the preview shows, with the effect, layers and expressions, to an MP4.",
+                )
+            };
+            let mut button = egui::Button::new(RichText::new(text).strong()).min_size(egui::vec2(
+                ui.available_width(),
+                ui.spacing().interact_size.y,
+            ));
+            if status.recording {
+                button = button.fill(Color32::from_rgb(190, 50, 50));
             }
-            None if status.video => {
-                if ui.button("Render to MP4").clicked() {
-                    actions.start_export = true;
-                }
-                ui.label(
-                    RichText::new("Saves every frame through this effect with these settings and expressions, plus the original sound, next to the video.")
-                        .weak(),
-                );
+            if ui.add(button).clicked() {
+                actions.toggle_record = true;
             }
-            None => {
-                ui.label(RichText::new("Drop a video on the window to render it.").weak());
+            ui.label(RichText::new(hint).weak());
+            if let Some(result) = status.record_result {
+                ui.label(result);
             }
         });
     });

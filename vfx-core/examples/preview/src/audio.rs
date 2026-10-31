@@ -64,11 +64,6 @@ impl Audio {
         Self { samples }
     }
 
-    /// Whether decoding has finished (with or without any sound).
-    pub fn ready(&self) -> bool {
-        self.samples.get().is_some()
-    }
-
     /// The levels in the FFT window centred on `time` seconds.
     pub fn levels(&self, time: f64) -> Levels {
         let Some(samples) = self.samples.get().filter(|s| !s.is_empty()) else {

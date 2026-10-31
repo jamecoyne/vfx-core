@@ -34,6 +34,7 @@ pollster = "1.0.1"
 rfd = "0.17.2"
 # Runs the face model (models/face_detection_yunet_2023mar.onnx).
 ort = "=2.0.0-rc.15"
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
 # A job object, so ffmpeg and ffplay close with the app.
