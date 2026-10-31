@@ -19,7 +19,7 @@ use crate::font;
 use crate::motion::Blob;
 use crate::pixel::{Argb, Channel, View, ViewMut};
 use crate::render::{
-    PixelRect, RenderSettings, SwarmBackground, segment_label, text_height, text_width, to_pixels,
+    PixelRect, RenderSettings, SwarmBackground, blob_label, text_height, text_width, to_pixels,
 };
 use crate::swarm::{ShadowKernel, SwarmMetrics, Tile, TitleBar, WindowPlan};
 
@@ -194,6 +194,10 @@ fn settle(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<Device, NoGpu
 pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
+        // The D3D12 validation layer changes what DirectML finds in the same process, so it
+        // is on only with WGPU_VALIDATION=1.
+        flags: (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION)
+            .with_env(),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -846,7 +850,7 @@ impl Drawer {
         let mut glyphs = Vec::new();
         for (i, blob) in blobs.iter().enumerate() {
             let r = to_pixels(&blob.bounds, w, h, s.mirror);
-            let label = segment_label(blob.kind, number, i);
+            let label = blob_label(blob, number, i);
             let pad = 2 * scale;
             let mut chip = PixelRect::new(
                 r.x,
