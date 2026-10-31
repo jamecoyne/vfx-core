@@ -135,9 +135,32 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
 
 /// segcam Motion. It keeps what it works out for each frame (see [`Incremental`]), so a host
 /// that keeps the instance works out only what changed since the last render.
-#[derive(Default)]
 pub struct SegcamMotion {
     state: Incremental,
+}
+
+impl Default for SegcamMotion {
+    /// Draws Swarm on the GPU where there is one, unless `SEGCAM_GPU=0`.
+    fn default() -> Self {
+        Self::with_gpu(crate::gpu::wanted())
+    }
+}
+
+impl SegcamMotion {
+    /// With `gpu` false, always on the CPU.
+    pub fn with_gpu(gpu: bool) -> Self {
+        let mut state = Incremental::default();
+        state.use_gpu(gpu);
+        Self { state }
+    }
+
+    /// On the GPU from `share` of the canvas in window pixels (see
+    /// [`Incremental::gpu_threshold`]); 0 draws every swarm render there.
+    pub fn with_gpu_threshold(share: f64) -> Self {
+        let mut effect = Self::with_gpu(true);
+        effect.state.gpu_threshold(share);
+        effect
+    }
 }
 
 impl CpuEffect for SegcamMotion {

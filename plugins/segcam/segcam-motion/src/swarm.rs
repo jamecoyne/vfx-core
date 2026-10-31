@@ -70,6 +70,15 @@ impl SwarmMetrics {
     }
 }
 
+/// The part of a `frame_w` x `frame_h` frame a blob's tile shows: the segment's own box,
+/// stretched over the (possibly grown) tile, as segcam draws its snapshot into the window.
+pub fn tile_crop(blob: &Blob, frame_w: i32, frame_h: i32) -> PixelRect {
+    intersect(
+        to_pixels(&blob.bounds, frame_w, frame_h, false),
+        PixelRect::new(0, 0, frame_w, frame_h),
+    )
+}
+
 pub fn make_tile<C: Channel>(
     blob: &Blob,
     frame: Option<&View<C>>,
@@ -98,12 +107,7 @@ pub fn make_tile<C: Channel>(
     let Some(frame) = frame.filter(|f| !f.is_empty()) else {
         return tile;
     };
-    // The crop is the segment's own box in the source frame, stretched over the (possibly
-    // grown) tile, as segcam draws its snapshot into the window.
-    let crop = intersect(
-        to_pixels(&blob.bounds, frame.width, frame.height, false),
-        PixelRect::new(0, 0, frame.width, frame.height),
-    );
+    let crop = tile_crop(blob, frame.width, frame.height);
     let stored = tile.stored;
     if stored.is_empty() || crop.is_empty() {
         return tile;
@@ -136,8 +140,14 @@ pub fn make_tile<C: Channel>(
         }
         last = Some(source);
         let input = frame.row(source);
-        tile.pixels
-            .extend(columns.iter().map(|&sx| convert(&input[sx])));
+        // An 8-bit frame's pixels are already tile pixels: converting gives back the same bytes.
+        if std::any::TypeId::of::<C>() == std::any::TypeId::of::<u8>() {
+            let input: &[TilePixel] = bytemuck::cast_slice(input);
+            tile.pixels.extend(columns.iter().map(|&sx| input[sx]));
+        } else {
+            tile.pixels
+                .extend(columns.iter().map(|&sx| convert(&input[sx])));
+        }
     }
     tile
 }
@@ -472,9 +482,9 @@ pub struct ShadowKernel {
     /// How far the shadow is drawn past the frame.
     pub reach: i32,
     /// The corner table covers offsets `lo..lo + size` from a corner.
-    lo: i32,
-    size: i32,
-    corner: Vec<f32>,
+    pub(crate) lo: i32,
+    pub(crate) size: i32,
+    pub(crate) corner: Vec<f32>,
 }
 
 impl ShadowKernel {
@@ -582,8 +592,8 @@ impl<C: Channel> LiveFrame<'_, C> {
 /// A tile's title bar, made once and shared by every band of rows.
 #[derive(Clone, Debug, Default)]
 pub struct TitleBar {
-    width: i32,
-    pixels: Vec<Color>,
+    pub(crate) width: i32,
+    pub(crate) pixels: Vec<Color>,
 }
 
 impl TitleBar {
@@ -612,18 +622,18 @@ impl TitleBar {
 /// What drawing a window takes that is the same in every band of rows: where it reaches, its
 /// shadow's profiles, and for each column and row its offsets from the corners and the mask.
 pub struct WindowPlan {
-    frame: PixelRect,
+    pub(crate) frame: PixelRect,
     /// The window and its shadow, clipped to the canvas.
-    area: PixelRect,
-    profile_x: Vec<f32>,
-    profile_y: Vec<f32>,
+    pub(crate) area: PixelRect,
+    pub(crate) profile_x: Vec<f32>,
+    pub(crate) profile_y: Vec<f32>,
     /// Indices into the shadow's corner table, by column and row of `area`.
-    corner_x: Vec<i32>,
-    corner_y: Vec<i32>,
+    pub(crate) corner_x: Vec<i32>,
+    pub(crate) corner_y: Vec<i32>,
     /// How far each column and row of `area` lies outside the mask's straight edges, read only
     /// inside the frame.
-    mask_x: Vec<f64>,
-    mask_y: Vec<f64>,
+    pub(crate) mask_x: Vec<f64>,
+    pub(crate) mask_y: Vec<f64>,
     radius: f64,
 }
 
@@ -856,6 +866,24 @@ pub fn draw_window_with<C: Channel>(
     }
 }
 
+/// The shadow kernel at `scale`. Its corner table takes a while to make, and a host draws at
+/// a few canvas sizes in turn (its viewer's and its output's), so the last few are kept.
+pub fn shadow_kernel(scale: f64) -> std::sync::Arc<ShadowKernel> {
+    const KEPT: usize = 4;
+    static SHADOW: std::sync::Mutex<Vec<(f64, std::sync::Arc<ShadowKernel>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut kept = SHADOW.lock().unwrap_or_else(|e| e.into_inner());
+    let kernel = match kept.iter().position(|(s, _)| *s == scale) {
+        Some(i) => kept.remove(i).1,
+        None => std::sync::Arc::new(ShadowKernel::new(scale)),
+    };
+    if kept.len() == KEPT {
+        kept.remove(0);
+    }
+    kept.push((scale, kernel.clone()));
+    kernel
+}
+
 /// Clears the canvas, then draws each shown tile oldest first as segcam's window. Bands of
 /// rows are drawn on a few threads, each band drawing every window in order. With `live`,
 /// windows show that frame (mirrored with `mirrored`) where they sit.
@@ -872,20 +900,7 @@ pub fn draw_swarm<'t, C: Channel>(
     const THREADS: usize = 6;
     const BANDS_PER_THREAD: usize = 4;
     let m = SwarmMetrics::new(out.height);
-    // The kernel's corner table takes a while to make, and the scale rarely changes.
-    static SHADOW: std::sync::Mutex<Option<(f64, std::sync::Arc<ShadowKernel>)>> =
-        std::sync::Mutex::new(None);
-    let shadow = {
-        let mut kept = SHADOW.lock().unwrap_or_else(|e| e.into_inner());
-        match &*kept {
-            Some((scale, kernel)) if *scale == m.scale => kernel.clone(),
-            _ => {
-                let kernel = std::sync::Arc::new(ShadowKernel::new(m.scale));
-                *kept = Some((m.scale, kernel.clone()));
-                kernel
-            }
-        }
-    };
+    let shadow = shadow_kernel(m.scale);
     let shadow = &*shadow;
     let canvas = PixelRect::new(0, 0, out.width, out.height);
     let windows: Vec<(&Tile, Cow<TitleBar>, WindowPlan)> = tiles
