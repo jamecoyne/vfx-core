@@ -47,6 +47,33 @@ only** shows just the face and body segments. On Windows the models take about 2
 load the first time, then add about 12 ms to a 1080p frame, and the plugin ships its own
 `DirectML.dll`. The face modes don't run in the web build yet.
 
+## Parameters
+
+| | Choices or range | Default |
+| --- | --- | --- |
+| Output | Overlay, Motion matte, Box matte, Swarm | Overlay |
+| Detect | Motion, Threshold, Faces only | Motion |
+| Mirror | on or off | off |
+| Sensitivity (Motion) | 0 to 100 percent | 86.4 |
+| Adaptation (Motion) | 0.1 to 50 percent | 6 |
+| Background (Motion) | 1 to 120 frames | 16 |
+| Minimum size (Motion) | 0 to 25 percent | 0.25 |
+| Max segments (Motion) | 1 to 256 | 16 |
+| Grid width (Motion) | 32 to 1024 | 192 |
+| Level (Threshold) | 0 to 255 | 170 |
+| Auto level (Threshold) | on or off | off |
+| Invert (Threshold) | on or off | off |
+| Face, Eyes, Mouth, Body (Faces) | on or off each | off |
+| Boxes (Overlay) | on or off | on |
+| Labels (Overlay) | on or off | on |
+| Box color (Overlay) | red, green, blue | 0.25, 1.0, 0.4 |
+| Trail frames (Swarm) | 1 to 120 | 24 |
+| Swarm max tiles (Swarm) | 1 to 1000 | 100 |
+| Swarm backdrop (Swarm) | Clear, Source, Black | Clear |
+| Live windows (Swarm) | on or off | off |
+
+The group is in brackets. Some sliders show a narrower range than the limit.
+
 ## How it renders
 
 It asks for the **Background** frames before the current one (plus **Trail frames** - 1 in
