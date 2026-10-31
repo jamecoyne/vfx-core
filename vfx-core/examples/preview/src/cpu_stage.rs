@@ -42,17 +42,25 @@ impl CpuStage {
         }
     }
 
-    /// Adds the frame the reader holds to the history as the frame at `time`.
-    fn push(&mut self, time: f64, values: &ParamValues) {
-        if self.last_time.is_some_and(|last| time < last) {
-            self.history.clear();
-            self.effect.reset();
-        }
-        self.last_time = Some(time);
-        let before = self.effect.frames_before(values);
-        let frame = self.history.next(before);
-        let width = self.size.0 as usize;
-        self.reader.take(|rgba, pitch| {
+    /// Reads the input back if it is a new frame and adds it to the history.
+    fn push(&mut self, gpu: &Gpu, input: &Frame, time: f64, values: &ParamValues) {
+        let Self {
+            reader,
+            history,
+            effect,
+            last_time,
+            rendered_with,
+            size,
+            ..
+        } = self;
+        let width = size.0 as usize;
+        let read = reader.read(gpu, input, time, *last_time, |time, rgba, pitch| {
+            if last_time.is_some_and(|last| time < last) {
+                history.clear();
+                effect.reset();
+            }
+            *last_time = Some(time);
+            let frame = history.next(effect.frames_before(values));
             by_rows(frame, width, |y, dst| {
                 let src = &rgba[y * pitch..][..width * 4];
                 for (dst, &[r, g, b, a]) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
@@ -65,7 +73,9 @@ impl CpuStage {
                 }
             });
         });
-        self.rendered_with = None;
+        if read {
+            *rendered_with = None;
+        }
     }
 
     /// Renders the newest frame again if anything changed since the last render.
@@ -103,9 +113,7 @@ impl CpuStage {
         values: &ParamValues,
         time: f64,
     ) {
-        if let Some(t) = self.reader.read(gpu, input, time, self.last_time) {
-            self.push(t, values);
-        }
+        self.push(gpu, input, time, values);
         self.refresh(values, time);
         if self.history.is_empty() {
             // Nothing read back yet (the web build reads a frame late): show the input.
@@ -134,11 +142,19 @@ struct Reader {
     in_flight: Option<InFlight>,
 }
 
+/// A frame copied and being mapped: its time, and how the map went.
 #[cfg(target_arch = "wasm32")]
 struct InFlight {
     time: f64,
-    mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
+
+#[cfg(target_arch = "wasm32")]
+const PENDING: u8 = 0;
+#[cfg(target_arch = "wasm32")]
+const MAPPED: u8 = 1;
+#[cfg(target_arch = "wasm32")]
+const FAILED: u8 = 2;
 
 impl Reader {
     fn new(gpu: &Gpu, size: (u32, u32)) -> Self {
@@ -175,24 +191,33 @@ impl Reader {
         gpu.queue.submit(Some(encoder.finish()));
     }
 
-    /// Hands `f` the mapped buffer as float RGBA rows `pitch` floats apart, then unmaps it.
-    fn take(&self, f: impl FnOnce(&[f32], usize)) {
+    /// Hands `f` the mapped buffer as float RGBA rows `pitch` floats apart, with the time
+    /// of the frame in it, then unmaps it.
+    fn take(&self, time: f64, f: impl FnOnce(f64, &[f32], usize)) {
         let data = self
             .buffer
             .slice(..)
             .get_mapped_range()
             .expect("readback is mapped");
-        f(bytemuck::cast_slice(&data), self.pitch as usize / 4);
+        f(time, bytemuck::cast_slice(&data), self.pitch as usize / 4);
         drop(data);
         self.buffer.unmap();
     }
 
-    /// Maps the input for [`Reader::take`] and returns the time it was rendered at, if it
-    /// is a new frame (a time other than `last`).
+    /// Reads the input back if it is a new frame (a time other than `last`) and hands it
+    /// to `f` as float RGBA rows `pitch` floats apart, with the time it was rendered at.
+    /// The buffer is unmapped again when this returns. True when `f` ran.
     #[cfg(not(target_arch = "wasm32"))]
-    fn read(&mut self, gpu: &Gpu, input: &Frame, time: f64, last: Option<f64>) -> Option<f64> {
+    fn read(
+        &mut self,
+        gpu: &Gpu,
+        input: &Frame,
+        time: f64,
+        last: Option<f64>,
+        f: impl FnOnce(f64, &[f32], usize),
+    ) -> bool {
         if last == Some(time) {
-            return None;
+            return false;
         }
         self.copy(gpu, input);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -207,32 +232,45 @@ impl Reader {
         rx.recv()
             .expect("map callback dropped")
             .expect("readback failed to map");
-        Some(time)
+        self.take(time, f);
+        true
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn read(&mut self, gpu: &Gpu, input: &Frame, time: f64, last: Option<f64>) -> Option<f64> {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        if let Some(flight) = &self.in_flight {
-            if !flight.mapped.load(Ordering::Acquire) {
-                return None; // still on its way; the next render looks again
+    fn read(
+        &mut self,
+        gpu: &Gpu,
+        input: &Frame,
+        time: f64,
+        last: Option<f64>,
+        f: impl FnOnce(f64, &[f32], usize),
+    ) -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        if let Some(flight) = self.in_flight.take() {
+            match flight.state.load(Ordering::Acquire) {
+                MAPPED => {
+                    self.take(flight.time, f);
+                    return true;
+                }
+                FAILED => {} // a new frame is read below; the lost one is skipped
+                _ => {
+                    self.in_flight = Some(flight);
+                    return false; // still on its way; the next render looks again
+                }
             }
-            let time = flight.time;
-            self.in_flight = None;
-            return Some(time);
         }
         if last == Some(time) {
-            return None;
+            return false;
         }
         self.copy(gpu, input);
-        let mapped = std::sync::Arc::new(AtomicBool::new(false));
-        let done = mapped.clone();
+        let state = std::sync::Arc::new(AtomicU8::new(PENDING));
+        let done = state.clone();
         self.buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |r| {
-                done.store(r.is_ok(), Ordering::Release);
+                done.store(if r.is_ok() { MAPPED } else { FAILED }, Ordering::Release);
             });
-        self.in_flight = Some(InFlight { time, mapped });
-        None
+        self.in_flight = Some(InFlight { time, state });
+        false
     }
 }
