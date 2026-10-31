@@ -248,7 +248,8 @@ impl Preview {
         let name = input.name();
         self.message = match video::Video::open(input, effects::MAX_IMAGE_SIDE) {
             Ok(video) => {
-                self.effects.start_stream(&self.gpu, name, video.info.size);
+                self.effects
+                    .start_stream(&self.gpu, name, video.info.size, video.info.fps);
                 let file = video.info.file();
                 self.media = Some(Media {
                     sound: self

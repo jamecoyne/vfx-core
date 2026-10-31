@@ -96,6 +96,7 @@ fn drifting(p: &Portrait) -> Clip {
         width: W,
         height: H,
         frames,
+        frame_rate: None,
     }
 }
 

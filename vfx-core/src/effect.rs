@@ -13,6 +13,8 @@ pub struct Context {
     pub scale: [f32; 2],
     /// Whether CPU frames hold premultiplied colour. GPU frames are always straight.
     pub premultiplied: bool,
+    /// Frames a second of the clip or stream, where the host says.
+    pub frame_rate: Option<f64>,
 }
 
 impl Context {
@@ -23,6 +25,7 @@ impl Context {
             frame: 0,
             scale: [1.0, 1.0],
             premultiplied: false,
+            frame_rate: None,
         }
     }
 }
