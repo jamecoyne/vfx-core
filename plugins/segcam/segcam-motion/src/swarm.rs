@@ -140,8 +140,16 @@ pub fn make_tile<C: Channel>(
         }
         last = Some(source);
         let input = frame.row(source);
-        tile.pixels
-            .extend(columns.iter().map(|&sx| convert(&input[sx])));
+        // An 8-bit frame's pixels are already tile pixels: converting gives back the same bytes.
+        if std::any::TypeId::of::<C>() == std::any::TypeId::of::<u8>() {
+            // SAFETY: C is u8, so the row's pixels are TilePixels.
+            let input: &[TilePixel] =
+                unsafe { std::slice::from_raw_parts(input.as_ptr().cast(), input.len()) };
+            tile.pixels.extend(columns.iter().map(|&sx| input[sx]));
+        } else {
+            tile.pixels
+                .extend(columns.iter().map(|&sx| convert(&input[sx])));
+        }
     }
     tile
 }
