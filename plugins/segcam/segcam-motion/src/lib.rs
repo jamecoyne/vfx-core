@@ -12,6 +12,7 @@ mod chrome;
 pub mod effect;
 pub mod faces;
 pub mod font;
+pub mod gpu;
 pub mod incremental;
 pub mod motion;
 pub mod pixel;
