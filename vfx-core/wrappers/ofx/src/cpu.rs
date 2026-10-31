@@ -2,6 +2,7 @@
 //! canvases at the effect's depth, keeping the host's alpha convention.
 
 use vfx_core::cpu::{Argb, Channel};
+use vfx_host::by_rows;
 
 use crate::image::{Depth, Image, Rect};
 
@@ -31,35 +32,6 @@ impl Shared<'_> {
     fn image(&self) -> &Image {
         self.0
     }
-}
-
-/// Runs `f` on each row of `rows` (`width` items each) with its row number, a band of rows
-/// at a time on up to six threads.
-fn by_rows<T: Send>(rows: &mut [T], width: usize, f: impl Fn(usize, &mut [T]) + Sync) {
-    const THREADS: usize = 6;
-    if width == 0 {
-        return;
-    }
-    let height = rows.len() / width;
-    let threads = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(THREADS)
-        .min(height.div_ceil(32))
-        .max(1);
-    let band = height.div_ceil(threads * 4).max(1);
-    let bands = std::sync::Mutex::new(rows.chunks_mut(band * width).enumerate());
-    let next = || bands.lock().ok().and_then(|mut bands| bands.next());
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                while let Some((i, chunk)) = next() {
-                    for (j, row) in chunk.chunks_mut(width).enumerate() {
-                        f(i * band + j, row);
-                    }
-                }
-            });
-        }
-    });
 }
 
 /// The bytes of `pixels` pixels of host row `y`, from column `x`.
