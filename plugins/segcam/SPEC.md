@@ -77,6 +77,7 @@ first full benchmark table. The tiers include the CPU, since faces, decoding and
 | N7 | Resolve playback | no freeze over 1 s | smooth at half playback resolution |
 | N8 | Resolume over 30 minutes | memory flat, no stall over 100 ms after the first 40 frames | same |
 | N9 | After Effects, `aerender` of the show preset at 8 bit | no slower than 3x jamecoyne's C++ effect on the same machine; MFR on no slower per frame than off | same |
+| N10 | Web preview, Swarm at the default size, in Chrome on a 2020 laptop GPU | 30 fps, no freeze over 1 s on an effect or mode switch | same |
 
 ## 6. Verification
 
@@ -100,7 +101,7 @@ keep F3; its PR says so and updates the reference outputs.
 | R2 | macOS installers signed and notarized by `release.yml` | todo, never run |
 | R3 | Windows plugins as zips, each with a readme naming its folder ([ADR 5](decisions/0005-windows-release.md)) | todo |
 | R4 | User docs: install per host, every control, the editing promise, the floor, known limits | todo |
-| R5 | Before the tag: full checks, the benchmark table, a smoke test in each host on each platform | todo |
+| R5 | Before the tag: full checks, the benchmark table, a smoke test in each host on each platform and in the web preview | todo |
 
 ## 8. Non goals for 1.0
 
