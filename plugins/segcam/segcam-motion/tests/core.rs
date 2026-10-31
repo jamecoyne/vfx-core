@@ -466,6 +466,7 @@ fn window_tile(video: PixelRect) -> Tile {
             (video.w * video.h) as usize
         ],
         hidden: false,
+        bar: None,
     }
 }
 

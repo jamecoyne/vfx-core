@@ -23,12 +23,24 @@ pub fn find<C: Channel>(frame: &View<C>, parts: FaceParts, cells: usize) -> Vec<
     }
     let (w, h) = (frame.width.max(0) as usize, frame.height.max(0) as usize);
     let byte = |c: C| (c.to_unit().clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-    let mut rgba = Vec::with_capacity(w * h * 4);
-    for y in 0..frame.height {
-        for p in frame.row(y) {
-            rgba.extend([byte(p.red), byte(p.green), byte(p.blue), 255]);
+    // A whole frame takes a few ms on one thread, so bands of rows go to a few threads.
+    let mut rgba = vec![0u8; w * h * 4];
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(6);
+    let band_rows = h.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (b, band) in rgba.chunks_mut((band_rows * w * 4).max(1)).enumerate() {
+            scope.spawn(move || {
+                for (r, row) in band.chunks_exact_mut((w * 4).max(1)).enumerate() {
+                    let y = (b * band_rows + r) as i32;
+                    for (out, p) in row.as_chunks_mut::<4>().0.iter_mut().zip(frame.row(y)) {
+                        *out = [byte(p.red), byte(p.green), byte(p.blue), 255];
+                    }
+                }
+            });
         }
-    }
+    });
     let image = Image {
         pixels: Pixels::Rgba8(&rgba),
         width: w,
