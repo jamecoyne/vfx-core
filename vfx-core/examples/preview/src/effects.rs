@@ -296,6 +296,8 @@ pub struct Effects {
     /// The fed layer's name, when a video, webcam or image is its source; its pixels are
     /// written into `frames.layer` (see [`Effects::write_layer`]).
     layer_name: Option<String>,
+    /// The streamed video's frames a second, for effects that pace their work by it.
+    frame_rate: Option<f64>,
     /// Reads results back for exports; made on first use for the current size.
     readback: Option<Readback>,
     generator: Pass,
@@ -331,6 +333,7 @@ impl Effects {
             frames: Frames::new(gpu, PATTERN_SIZE),
             image: None,
             layer_name: None,
+            frame_rate: None,
             readback: None,
             generator,
             display_pass,
@@ -412,6 +415,7 @@ impl Effects {
         let rgba = img.to_rgba32f();
         let size = rgba.dimensions();
         self.set_size(gpu, size);
+        self.frame_rate = None;
         let frame = Frame::new(gpu, size.0, size.1, FRAME_FORMAT);
         frame.write(gpu, bytemuck::cast_slice(rgba.as_raw()));
         let name = path
@@ -425,8 +429,9 @@ impl Effects {
     /// Makes a `size` source called `name` that the caller fills with
     /// [`Effects::write_source`], as video does. Black until the first write.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn start_stream(&mut self, gpu: &Gpu, name: String, size: (u32, u32)) {
+    pub fn start_stream(&mut self, gpu: &Gpu, name: String, size: (u32, u32), frame_rate: f64) {
         self.set_size(gpu, size);
+        self.frame_rate = Some(frame_rate);
         let frame = Frame::new(gpu, size.0, size.1, FRAME_FORMAT);
         self.image = Some((name, frame));
     }
@@ -441,6 +446,7 @@ impl Effects {
 
     /// Goes back to the generated patterns.
     pub fn clear_image(&mut self, gpu: &Gpu) {
+        self.frame_rate = None;
         if self.image.take().is_some() {
             self.set_size(gpu, self.pattern_size);
         }
@@ -531,7 +537,7 @@ impl Effects {
                 *chain.params_mut(*index) = values.clone();
                 chain.render_with_layers(gpu, source, layers, result, time);
             }
-            Run::Cpu(stage) => stage.render(gpu, source, result, values, time),
+            Run::Cpu(stage) => stage.render(gpu, source, result, values, time, self.frame_rate),
         }
 
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {

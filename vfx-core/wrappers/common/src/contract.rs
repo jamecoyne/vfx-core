@@ -7,12 +7,14 @@
 use vfx_core::cpu::{Argb, FrameSource, Image, ImageMut, View, ViewMut};
 use vfx_core::{Context, CpuEffect, ParamValues, Processor};
 
-/// Frames of one size, oldest first, as 8-bit ARGB.
+/// Frames of one size, oldest first, as 8-bit ARGB, at `frame_rate` frames a second where
+/// the host would say.
 #[derive(Clone)]
 pub struct Clip {
     pub width: i32,
     pub height: i32,
     pub frames: Vec<Vec<Argb<u8>>>,
+    pub frame_rate: Option<f64>,
 }
 
 impl Clip {
@@ -68,7 +70,8 @@ fn render(
     let count = (effect.frames_before(values) as i64 + 1).min(number + 1);
     let ctx = Context {
         frame: number,
-        ..Context::at(number as f64 / 30.0)
+        frame_rate: clip.frame_rate,
+        ..Context::at(number as f64 / clip.frame_rate.unwrap_or(30.0))
     };
     for _ in 0..TRIES {
         let mut source = Source {
@@ -259,6 +262,7 @@ mod tests {
             width: 1,
             height: 1,
             frames,
+            frame_rate: None,
         }
     }
 

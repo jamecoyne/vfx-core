@@ -280,7 +280,8 @@ impl Preview {
         };
         self.message = match opened {
             Ok(video) => {
-                self.effects.start_stream(&self.gpu, name, video.info.size);
+                self.effects
+                    .start_stream(&self.gpu, name, video.info.size, video.info.fps);
                 let file = video.info.file();
                 self.media = Some(Media {
                     sound: self

@@ -35,6 +35,7 @@ fn crossing() -> Clip {
         width,
         height,
         frames,
+        frame_rate: None,
     }
 }
 
