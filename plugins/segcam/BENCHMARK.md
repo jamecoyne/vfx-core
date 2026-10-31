@@ -51,6 +51,23 @@ How a host hands over frames changes the cost, so each run names its source.
 
 | Machine | Host | Preset | Depth | Path | First 40 median | Past 40 median | p95 | fps or renders/s | Matches |
 |---|---|---|---|---|---|---|---|---|---|
+| i7-12700K, RTX 4070 (display), NVIDIA 621.01, Windows 11 26300 | CLI, F7 | overlay | 8 bit | CPU | 54.2 ms | 63.5 ms | 72.7 ms | 15.8 fps | main 9d0c221, 300 of 300 |
+| same | CLI, F7 | overlay | float | CPU | 51.7 ms | 63.5 ms | 80.5 ms | 15.8 fps | main 9d0c221, 300 of 300 |
+| same | CLI, F7 | overlay faces | 8 bit | CPU | 66.6 ms | 70.3 ms | 80.6 ms | 14.2 fps | main 9d0c221 on even frames, 150 of 150 |
+| same | CLI, F7 | overlay faces | float | CPU | 63.9 ms | 72.5 ms | 91.7 ms | 13.8 fps | main 9d0c221 on even frames, 150 of 150 |
+| same | CLI, F7 | show | 8 bit | CPU | 102.8 ms | 229.9 ms | 432.4 ms | 4.4 fps | main 9d0c221, 300 of 300 |
+| same | CLI, F7 | show | float | CPU | 96.4 ms | 221.0 ms | 413.8 ms | 4.5 fps | main 9d0c221, 300 of 300 |
+| same | CLI, F7 | show faces | 8 bit | CPU | 240.5 ms | 350.2 ms | 571.4 ms | 2.9 fps | changed on purpose (F7) |
+| same | CLI, F7 | show faces | float | CPU | 218.0 ms | 342.1 ms | 726.7 ms | 2.9 fps | changed on purpose (F7) |
+| same | CLI kept, F7 on PR 39 | overlay faces | 8 bit | CPU | 60.6 ms | 63.9 ms | 74.0 ms | 15.7 fps | PR 39 998dc33 on even frames, 150 of 150 |
+| same | CLI kept, F7 on PR 39 | overlay faces | float | CPU | 59.9 ms | 63.2 ms | 82.1 ms | 15.8 fps | PR 39 998dc33 on even frames, 150 of 150 |
+| same | CLI kept, F7 on PR 39 | show faces | 8 bit | GPU or CPU per render | 70.5 ms | 99.5 ms | 122.8 ms | 10.0 fps | changed on purpose (F7) |
+| same | CLI kept, F7 on PR 39 | show faces | float | GPU or CPU per render | 73.8 ms | 115.3 ms | 227.3 ms | 8.7 fps | changed on purpose (F7) |
+
+F7 rows: jamecoyne's clip (DNxHR HQ transcode, 1080p, 59.94 fps), frames 0 to 299, two runs pooled,
+raw ARGB in from a file. Faces run on DirectML on the RTX 4070. The CLI renders each frame fresh;
+"CLI kept" is the CLI of PR 39 (998dc33), which keeps one instance, with F7 merged on top. Times
+run from frame to frame out of the CLI, so they include its conversion of each frame in and out.
 
 ## When
 
