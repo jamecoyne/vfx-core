@@ -31,8 +31,9 @@ the two render byte-identical frames (see [Checking it](#checking-it)).
 - **Box matte**: the layer cut out by the segments' boxes.
 - **Swarm**: segcam's desktop collage. Every segment of every recent frame becomes a frozen
   tile of the frame it was cut from, drawn as the macOS window segcam makes for it (title
-  bar, buttons, rounded corners and shadow), newest on top, oldest recycled after
-  **Swarm max tiles**.
+  bar, buttons, rounded corners and shadow), newest on top. As in segcam 1.1, a window
+  stays until **Swarm max tiles** newer ones push it out; **Trail frames** is how far back
+  windows can come from, which segcam 1.1 has no limit for.
 
 **Mirror** flips the picture and the boxes, as segcam does for a selfie camera.
 
@@ -69,7 +70,7 @@ doesn't hand that frame over. The face modes don't run in the web build yet.
 | Boxes (Overlay) | on or off | on |
 | Labels (Overlay) | on or off | on |
 | Box color (Overlay) | red, green, blue | 0.25, 1.0, 0.4 |
-| Trail frames (Swarm) | 1 to 120 | 24 |
+| Trail frames (Swarm) | 1 to 120 | 60 |
 | Swarm max tiles (Swarm) | 1 to 1000 | 100 |
 | Swarm backdrop (Swarm) | Transparent, Source, Black | Transparent |
 | Live windows (Swarm) | on or off | off |
@@ -137,11 +138,12 @@ runs segcam's core checks, and the effect through vfx-core's `CpuEffect` interfa
 - The swarm caps its pile, and the window chrome matches the bake.
 
 `segcam-motion` takes the same options as segcam's own CLI, so the two can be compared on
-any clip:
+any clip. Its Trail frames default is 60 where segcam's is 24, so pass `--trail 24` to
+compare Swarm:
 
 ```bash
 ffmpeg -i in.mov -vf scale=960:540 -f rawvideo -pix_fmt argb - |
-  target/release/segcam-motion 960 540 --mode swarm |
+  target/release/segcam-motion 960 540 --mode swarm --trail 24 |
   ffmpeg -f rawvideo -pix_fmt argb -s 960x540 -r 30 -i - -pix_fmt yuv420p out.mp4
 ```
 

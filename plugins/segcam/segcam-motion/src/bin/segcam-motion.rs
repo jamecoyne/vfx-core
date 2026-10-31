@@ -28,7 +28,7 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --min-size percent                    (0.25)
   --max-segments n                      (16)
   --grid columns                        (192)
-  --trail frames  --max-tiles n         (24, 100)
+  --trail frames  --max-tiles n         (60, 100)
   --detect motion|threshold|faces       (motion)
   --face  --eyes  --mouth  --body       (off; segcam-face's models)
   --level 0..255  --auto-level  --invert   (170; threshold)

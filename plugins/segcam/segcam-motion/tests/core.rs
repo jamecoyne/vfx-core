@@ -612,6 +612,51 @@ fn threshold_swarm_renders_the_same_in_any_order() {
     }
 }
 
+/// One square a frame, each in a place of its own, so every frame spawns one window that no
+/// later one covers.
+fn squares_in_rows(count: i32) -> Vec<Image<u8>> {
+    (0..count)
+        .map(|f| frame_with_square(W, H, 10 + f % 8 * 44, 20 + f / 8 * 48, 16))
+        .collect()
+}
+
+/// Whether frame 0's window is in the swarm at frame `number`: a trail that just reaches it
+/// renders differently from one that stops short.
+fn first_window_shown(s: &RenderSettings, frames: &[Image<u8>], number: i64) -> bool {
+    let reaching = RenderSettings {
+        trail_frames: number as i32 + 1,
+        ..*s
+    };
+    let short = RenderSettings {
+        trail_frames: number as i32,
+        ..*s
+    };
+    let frames = &frames[..=number as usize];
+    render_frames(&reaching, frames, number).0.pixels
+        != render_frames(&short, frames, number).0.pixels
+}
+
+#[test]
+fn a_window_stays_until_newer_ones_push_it_out() {
+    let frames = squares_in_rows(32);
+    let s = RenderSettings {
+        mode: OutputMode::Swarm,
+        max_tiles: 6,
+        ..threshold_settings(ThresholdSettings::default())
+    };
+    assert!(first_window_shown(&s, &frames, 5), "five newer windows");
+    assert!(!first_window_shown(&s, &frames, 6), "six newer windows");
+
+    // By default the trail reaches far enough back that windows go by count.
+    let s = RenderSettings {
+        mode: OutputMode::Swarm,
+        ..threshold_settings(ThresholdSettings::default())
+    };
+    assert_eq!(RenderSettings::default().max_tiles, 100);
+    assert!(RenderSettings::default().trail_frames > 30);
+    assert!(first_window_shown(&s, &frames, 30), "30 frames on");
+}
+
 #[test]
 fn faces_on_a_frame_without_people_change_nothing() {
     let frames = jump();
@@ -811,8 +856,8 @@ fn a_fixed_source_reads_only_new_frames() {
     }
 }
 
-/// The start of a clip isn't a missing frame. With the defaults a render reads 40 frames, and
-/// each of the first 40, whose background runs past the start, is worked out once: every
+/// The start of a clip isn't a missing frame. With the defaults a render reads 76 frames, and
+/// each of the first 76, whose background runs past the start, is worked out once: every
 /// render after the first reads only its own frame, and matches a cold render.
 #[test]
 fn the_start_of_a_clip_is_worked_out_once() {
@@ -820,9 +865,9 @@ fn the_start_of_a_clip_is_worked_out_once() {
         mode: OutputMode::Swarm,
         ..RenderSettings::default()
     };
-    assert_eq!(previous_frames_needed(&swarm) + 1, 40);
-    let frames: Vec<Image<u8>> = (0..48)
-        .map(|f| frame_with_square(W, H, 10 + f * 6, 60 + f % 5 * 4, 40))
+    assert_eq!(previous_frames_needed(&swarm) + 1, 76);
+    let frames: Vec<Image<u8>> = (0..84)
+        .map(|f| frame_with_square(W, H, 10 + f % 48 * 6, 60 + f % 5 * 4, 40))
         .collect();
     for s in [RenderSettings::default(), swarm] {
         let needed = previous_frames_needed(&s) as usize;
