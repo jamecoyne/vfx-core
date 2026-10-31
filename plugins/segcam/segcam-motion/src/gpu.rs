@@ -848,8 +848,9 @@ impl Drawer {
         });
         let polled = self.dev.device.poll(wgpu::PollType::wait_indefinitely());
         polled.map_err(|e| self.dev.fail(&e.to_string()))?;
-        // A lost device may never call back: that is a failure too, not a wait.
-        match rx.try_recv() {
+        // Another instance's poll may be the one that calls back, a moment later; a lost device
+        // may never call back, which is a failure, not a hang.
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(self.dev.fail(&e.to_string())),
             Err(_) => return Err(self.dev.fail("the readback never finished")),
