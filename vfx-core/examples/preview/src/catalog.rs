@@ -65,7 +65,12 @@ include!(concat!(env!("OUT_DIR"), "/effect_crates.rs"));
 
 /// Every effect in this repository: the effect crates, then the core effects.
 pub fn repository() -> Vec<Entry> {
-    let mut all = effect_crates();
+    // VFX Preview chains every effect in this list, so it duplicates them here. It stays a
+    // host plugin; only the preview leaves it out.
+    let mut all: Vec<Entry> = effect_crates()
+        .into_iter()
+        .filter(|e| e.name != "VFX Preview")
+        .collect();
     all.extend([
         Entry::new(
             "Colour Adjust",
@@ -153,7 +158,7 @@ mod tests {
         assert_eq!(slug("segcam Motion"), "segcam-motion");
         assert_eq!(slug("segcam Motion (Rust)"), "segcam-motion-rust");
         assert!(find_slug("segcam-motion").is_some());
-        assert!(find_slug("vfx-preview").is_some());
+        assert!(find_slug("vfx-preview").is_none());
         assert!(find_slug("gaussian-blur").is_some());
     }
 

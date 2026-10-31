@@ -192,6 +192,11 @@ impl Pass {
     }
 }
 
+/// Whether `pixels` is one float RGBA frame of `size`.
+pub fn frame_fits(pixels: &[f32], size: (u32, u32)) -> bool {
+    pixels.len() == (size.0 * size.1 * 4) as usize
+}
+
 /// Size-dependent frames, rebuilt when the source size changes.
 struct Frames {
     size: (u32, u32),
@@ -288,6 +293,9 @@ pub struct Effects {
     frames: Frames,
     /// A dropped image, uploaded once, used instead of the generated pattern.
     image: Option<(String, Frame)>,
+    /// The fed layer's name, when a video, webcam or image is its source; its pixels are
+    /// written into `frames.layer` (see [`Effects::write_layer`]).
+    layer_name: Option<String>,
     /// Reads results back for exports; made on first use for the current size.
     readback: Option<Readback>,
     generator: Pass,
@@ -320,6 +328,7 @@ impl Effects {
         Self {
             frames: Frames::new(gpu, PATTERN_SIZE),
             image: None,
+            layer_name: None,
             readback: None,
             generator,
             display_pass,
@@ -353,6 +362,30 @@ impl Effects {
     /// The texture egui shows. Changes identity when the size changes.
     pub fn display_view(&self) -> &wgpu::TextureView {
         &self.frames.display_view
+    }
+
+    /// The fed layer's name (a video, webcam or image), if one is set.
+    pub fn layer_name(&self) -> Option<&str> {
+        self.layer_name.as_deref()
+    }
+
+    /// Names the fed layer, which the next frames' writes fill. Its frames are the
+    /// current size (see [`Effects::size`]), so a feed must be fitted to that.
+    pub fn set_layer_name(&mut self, name: String) {
+        self.layer_name = Some(name);
+    }
+
+    /// Goes back to the generated patterns for the layer.
+    pub fn clear_layer(&mut self) {
+        self.layer_name = None;
+    }
+
+    /// Replaces the fed layer's pixels (float RGBA at the current size).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn write_layer(&self, gpu: &Gpu, pixels: &[f32]) {
+        if frame_fits(pixels, self.frames.size) {
+            self.frames.layer.write(gpu, bytemuck::cast_slice(pixels));
+        }
     }
 
     pub fn image_name(&self) -> Option<&str> {
@@ -466,14 +499,16 @@ impl Effects {
                 target
             }
         };
-        let layer = controls.layer().filter(|_| self.stage.layers > 0);
+        // A fed layer (a video, webcam or image) takes the place of a generated pattern.
+        let fed = self.layer_name.is_some() && self.stage.layers > 0;
+        let layer = controls.layer().filter(|_| self.stage.layers > 0 && !fed);
         if let Some(pattern) = layer {
             let target = &self.frames.layer;
             self.generate(gpu, &mut encoder, pattern, time, target);
         }
         gpu.queue.submit(Some(encoder.finish()));
 
-        let layers: &[&Frame] = if layer.is_some() {
+        let layers: &[&Frame] = if fed || layer.is_some() {
             &[&self.frames.layer]
         } else {
             &[]
@@ -581,5 +616,17 @@ mod tests {
         let alpha: Vec<f32> = out.iter().skip(3).step_by(4).copied().collect();
         assert!(alpha.contains(&1.0), "nothing moved");
         assert!(alpha.contains(&0.0), "everything moved");
+    }
+}
+
+#[cfg(test)]
+mod frame_size_tests {
+    use super::frame_fits;
+
+    #[test]
+    fn a_frame_fits_its_size_in_pixels() {
+        let frame = vec![0.0f32; 4 * 3 * 4];
+        assert!(frame_fits(&frame, (4, 3)));
+        assert!(!frame_fits(&frame, (4, 2)));
     }
 }
