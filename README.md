@@ -275,6 +275,9 @@ conversions. Beyond those, each host has a harness, run against the effects:
 
 ## Notes for agents working on this repo
 
+- Working on segcam: read [`plugins/segcam/SPEC.md`](plugins/segcam/SPEC.md) first, the 1.0
+  requirements with their status. Decisions are in `plugins/segcam/decisions/`, the work order in
+  `ROADMAP.md`, and speed numbers follow `BENCHMARK.md`, all in the same folder.
 - Effect logic belongs in an effect crate (`vfx-core/effects/`, `plugins/`) or the core
   (`vfx-core/src/effects`). A target crate (`vfx-core/wrappers/`) only translates parameters
   and moves pixels, for any effect; what two targets share belongs in
