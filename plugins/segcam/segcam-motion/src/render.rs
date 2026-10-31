@@ -171,6 +171,26 @@ impl Default for RenderSettings {
     }
 }
 
+impl RenderSettings {
+    /// segcam 1.1's own look, for comparing with the app: Swarm of motion and every face part,
+    /// on a transparent canvas, with the longest trail so windows go by count. Give it the
+    /// clip's frame rate to analyse as often as 1.1 does.
+    pub fn look_1_1(frame_rate: Option<f64>) -> Self {
+        Self {
+            mode: OutputMode::Swarm,
+            faces: FaceParts {
+                face: true,
+                eyes: true,
+                mouth: true,
+                body: true,
+            },
+            trail_frames: 120,
+            cadence: Cadence::at(frame_rate),
+            ..Self::default()
+        }
+    }
+}
+
 /// How many frames before the current one [`render`] wants to see: the background and the
 /// swarm's trail, or for the other outputs the background of the analysis the frame shows,
 /// at any frame rate. With faces on, one more: an odd frame reuses the faces of the frame

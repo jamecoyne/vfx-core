@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
-    Argb, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View, ViewMut,
+    Argb, Cadence, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, Image};
 
@@ -29,6 +29,8 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --max-segments n                      (16)
   --grid columns                        (192)
   --trail frames  --max-tiles n         (60, 100)
+  --preset 1.1                          (segcam 1.1's look; later options change it)
+  --fps rate                            (the clip's; analyses about 30 a second)
   --detect motion|threshold|faces       (motion)
   --face  --eyes  --mouth  --body       (off; segcam-face's models)
   --level 0..255  --auto-level  --invert   (170; threshold)
@@ -102,6 +104,16 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
             "--max-segments" => s.motion.max_segments = value()?.parse().ok()?,
             "--grid" => s.grid_width = value()?.parse().ok()?,
             "--trail" => s.trail_frames = value()?.parse().ok()?,
+            "--preset" => {
+                s = match value()? {
+                    "1.1" => RenderSettings {
+                        cadence: s.cadence,
+                        ..RenderSettings::look_1_1(None)
+                    },
+                    _ => return None,
+                }
+            }
+            "--fps" => s.cadence = Cadence::at(Some(value()?.parse().ok()?)),
             "--max-tiles" => s.max_tiles = value()?.parse().ok()?,
             "--straight-alpha" => s.straight_alpha = true,
             "--mirror" => s.mirror = true,

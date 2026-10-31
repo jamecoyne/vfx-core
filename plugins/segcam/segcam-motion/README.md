@@ -161,6 +161,10 @@ against the C++ CLI as normally built, a few soft-edge pixels in Motion matte an
 one level apart. The CLI's `--straight-alpha` selects the straight-alpha convention and
 `--float` renders the same 8-bit stream with the float core, for the host comparisons.
 
+Two options aren't in segcam's CLI. `--preset 1.1` renders segcam 1.1's look (the
+benchmark's "1.1 look"), and `--fps` gives the clip's frame rate, so it analyses about 30
+frames a second as the plugins do.
+
 ### After Effects
 
 With the plugin installed (and segcam's C++ effect, for the comparison):

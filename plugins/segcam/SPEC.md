@@ -45,6 +45,7 @@ Status: done (on `main`), PR (written, in review), todo.
 | F10 | Overlay draws on the CPU | Overlay output byte for byte with the CLI | done |
 | F11 | Parameter `name`s are frozen from 1.0 | a test listing the shipped `name`s fails if one changes (to add with the tag) | todo |
 | F12 | Windows plugins load the DirectML that ships next to them, not the system's | faces use DirectML on Windows 10 with an old system32 copy; the tests check the same | done; test fix in PR |
+| F13 | Swarm as in segcam 1.1: a window stays until Swarm max tiles newer ones push it out, within Trail frames; analysis about 30 frames a second from the host's frame rate, the frames between showing the last ([ADR 6](decisions/0006-swarm-as-in-1-1.md)) | F3 passes at 60 fps, with the analysis a frame shows missing, shuffled and backwards; the benchmark's 1.1 look preset | PR |
 
 ## 4. Host behaviour
 
@@ -54,6 +55,7 @@ Status: done (on `main`), PR (written, in review), todo.
 | Depth | float | 8, 16 and 32 bit | 8 bit |
 | Kept state | a cache under F3, F4 | none between renders (each is fresh) | kept for the run; history bounded |
 | Frame number | timeline frame | time divided by frame length | frames received, back to 0 on a seek back or resize |
+| Analysis (F13) | about 30 a second, from the project's frame rate | same, from the frame length | every frame: no frame rate |
 | Faces every 2nd frame (F7) | halves face cost | same output, same cost as today: one detection per render, since every render is fresh | halves face cost |
 
 ## 5. Non functional requirements
