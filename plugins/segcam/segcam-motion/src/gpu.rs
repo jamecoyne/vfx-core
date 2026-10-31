@@ -834,13 +834,15 @@ impl Drawer {
         self.run(&pipeline, &globals, &data, out)
     }
 
-    /// Draws the overlay of `blobs` over `frame`, frame `number`, into `out`.
+    /// Draws the overlay of `blobs`, found in frame `analysis`, over `frame`, frame `number`,
+    /// into `out`.
     pub fn draw_overlay<C: Channel>(
         &mut self,
         out: &mut ViewMut<C>,
         frame: &View<C>,
         blobs: &[Blob],
         number: i64,
+        analysis: i64,
         s: &RenderSettings,
     ) -> Result<(), Fault> {
         let (w, h) = (out.width, out.height);
@@ -850,7 +852,7 @@ impl Drawer {
         let mut glyphs = Vec::new();
         for (i, blob) in blobs.iter().enumerate() {
             let r = to_pixels(&blob.bounds, w, h, s.mirror);
-            let label = blob_label(blob, number, i);
+            let label = blob_label(blob, analysis, i);
             let pad = 2 * scale;
             let mut chip = PixelRect::new(
                 r.x,

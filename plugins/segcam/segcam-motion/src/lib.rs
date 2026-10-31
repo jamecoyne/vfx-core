@@ -28,6 +28,6 @@ pub use motion::{
 };
 pub use pixel::{Argb, Channel, Color, View, ViewMut};
 pub use render::{
-    Detect, FaceParts, OutputMode, RenderSettings, SwarmBackground, previous_frames_needed, render,
-    segment_label,
+    Cadence, Detect, FaceParts, OutputMode, RenderSettings, SwarmBackground,
+    previous_frames_needed, render, segment_label,
 };

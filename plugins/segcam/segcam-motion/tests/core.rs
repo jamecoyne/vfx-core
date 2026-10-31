@@ -9,7 +9,7 @@ use segcam_motion::pixel::make_pixel;
 use segcam_motion::render::{PixelRect, blob_label, downsample, fit_text, text_width};
 use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, draw_window, make_tile};
 use segcam_motion::{
-    Argb, Blob, Channel, Color, Detect, FaceParts, Incremental, MotionSettings, NormRect,
+    Argb, Blob, Cadence, Channel, Color, Detect, FaceParts, Incremental, MotionSettings, NormRect,
     OutputMode, RenderSettings, SegmentKind, SwarmBackground, ThresholdSettings, View, ViewMut,
     font, previous_frames_needed, render, segment_label,
 };
@@ -560,7 +560,8 @@ fn threshold_finds_bright_regions_in_a_single_frame() {
     let frame = frame_with_square::<u8>(W, H, 100, 60, 48);
     let grid = downsample(&frame.view(), 192);
     let s = threshold_settings(ThresholdSettings::default());
-    assert_eq!(previous_frames_needed(&s), 0);
+    // No background, only the frames back to the analysis a frame may show.
+    assert_eq!(previous_frames_needed(&s), Cadence::MAX_STRIDE as i32 - 1);
 
     let found = motion::threshold(&grid, &s.threshold, &s.motion);
     assert_eq!(found.blobs.len(), 1);
