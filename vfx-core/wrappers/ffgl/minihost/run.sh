@@ -17,6 +17,7 @@ p = next(p for p in json.load(sys.stdin)["packages"] if p["name"] == sys.argv[1]
 v = p["metadata"]["vfx"]
 print(v.get("short-name", v["name"]).replace(" ", "\x1f"), v["file"])' "$effect")
 name="${name//$'\x1f'/ }"
+file="${file%$'\r'}" # Python on Windows ends its line with \r\n.
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*)
     plugin="$target/release/$lib.dll" host="$target/ffgl-minihost/minihost.exe"

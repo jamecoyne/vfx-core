@@ -5,7 +5,37 @@ use segcam_face::{
     YUNET_MODEL,
 };
 
+/// Cargo copies DirectML.dll to target/<profile>, but tests run from its deps folder, where Windows
+/// would fall back to system32's copy, too old on Windows 10. Loads the build's copy first.
+#[cfg(windows)]
+fn load_directml() {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut std::ffi::c_void;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let Some(dll) = exe
+            .ancestors()
+            .skip(1)
+            .take(2)
+            .map(|dir| dir.join("DirectML.dll"))
+            .find(|dll| dll.exists())
+        else {
+            return;
+        };
+        let name: Vec<u16> = dll.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a null-terminated path; the library stays loaded for the whole test run.
+        unsafe { LoadLibraryW(name.as_ptr()) };
+    });
+}
+
+#[cfg(not(windows))]
+fn load_directml() {}
+
 fn devices() -> Vec<Device> {
+    load_directml();
     #[allow(unused_mut)]
     let mut devices = vec![Device::Cpu];
     // DirectML where it loads. Not every Windows machine has a GPU it can use (CI's don't),
@@ -14,7 +44,7 @@ fn devices() -> Vec<Device> {
     match OrtYuNet::new(YUNET_MODEL, Device::DirectMl(0)) {
         Ok(_) => devices.push(Device::DirectMl(0)),
         Err(e) if std::env::var_os("SEGCAM_REQUIRE_DIRECTML").is_some() => {
-            panic!("DirectML didn't load ({e}); put DirectML.dll next to the test binary")
+            panic!("DirectML didn't load ({e})")
         }
         Err(e) => eprintln!("DirectML didn't load ({e}); testing the CPU only"),
     }
@@ -77,6 +107,7 @@ fn odd_frames_find_nothing_and_do_not_panic() {
 
 #[test]
 fn the_fastest_device_loads_everything() {
+    load_directml();
     let (mut segmenter, device) = runtime::fastest(true, true).expect("a device");
     assert!(
         segmenter.mesh.is_some() && segmenter.bodies.is_some(),
@@ -94,6 +125,7 @@ fn the_fastest_device_loads_everything() {
 
 #[test]
 fn the_best_segmenter_finds_nothing_in_a_flat_frame() {
+    load_directml();
     let mut segmenter = segcam_face::Segmenter::best().expect("a segmenter");
     let data = vec![128u8; 320 * 180 * 4];
     let image = Image {
