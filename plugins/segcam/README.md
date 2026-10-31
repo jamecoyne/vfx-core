@@ -9,14 +9,16 @@ the subject.
 Download it from the [releases](https://github.com/jamecoyne/vfx-core/releases), then restart the
 host.
 
-| Host | macOS | Windows: copy the plugin to |
-|---|---|---|
-| After Effects | run the After Effects installer | `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore` |
-| DaVinci Resolve | run the OpenFX installer | `C:\Program Files\Common Files\OFX\Plugins` |
-| Resolume Avenue and Arena | unzip into `Documents/Resolume Arena/Extra Effects` | `Documents\Resolume Arena\Extra Effects` |
+| Host | macOS | Windows: copy from the zip | Find it under |
+|---|---|---|---|
+| After Effects | `SegcamMotionRust-<version>-macOS-AfterEffects.pkg` | `SegcamMotionRust.aex` to `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore` | Effect, LO.FI.SCI.FI |
+| DaVinci Resolve | `SegcamMotionRust-<version>-macOS-OpenFX.pkg` | `SegcamMotionRust.ofx.bundle` to `C:\Program Files\Common Files\OFX\Plugins` | OpenFX, LO.FI.SCI.FI |
+| Resolume | unzip `SegcamMotionRust-<version>-macOS-Resolume.zip` into `~/Documents/Resolume Avenue/Extra Effects` | `SegcamMotionRust.dll` to `Documents\Resolume Avenue\Extra Effects` | segcam Motion |
 
-On Windows, keep `DirectML.dll` next to the plugin: faces use it to run on the GPU. The two Program
-Files folders ask for an administrator once. Avenue uses its own `Extra Effects` folder.
+For Resolume Arena, use `Resolume Arena` in the folder name. On Windows, keep `DirectML.dll` next
+to the plugin: faces use it to run on the GPU. The two Program Files folders ask for an
+administrator once. If Windows blocks the zip, right click it, open Properties, tick Unblock and
+press OK before unpacking.
 
 ## Using it
 
