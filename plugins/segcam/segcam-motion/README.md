@@ -38,8 +38,8 @@ the two render byte-identical frames (see [Checking it](#checking-it)).
 
 **Detect** picks Motion, Threshold or Faces only. Threshold finds areas brighter than
 **Level**, or darker with **Invert**, and **Auto level** picks the level for each frame. Its
-segments are labelled `blob#…`. **Swarm backdrop** puts the windows on a clear canvas (the
-default), the source frame, or black.
+segments are labelled `blob#…`. **Swarm backdrop** puts the windows on a transparent canvas
+(the default), the source frame, or black.
 
 **Face**, **Eyes**, **Mouth** and **Body** add those segments from `plugins/segcam/segcam-face`, which
 uses Apple's Vision on macOS and ONNX Runtime models on Windows and Linux. **Detect ▸ Faces
@@ -69,7 +69,7 @@ load the first time, then add about 12 ms to a 1080p frame, and the plugin ships
 | Box color (Overlay) | red, green, blue | 0.25, 1.0, 0.4 |
 | Trail frames (Swarm) | 1 to 120 | 24 |
 | Swarm max tiles (Swarm) | 1 to 1000 | 100 |
-| Swarm backdrop (Swarm) | Clear, Source, Black | Clear |
+| Swarm backdrop (Swarm) | Transparent, Source, Black | Transparent |
 | Live windows (Swarm) | on or off | off |
 
 The group is in brackets. Some sliders show a narrower range than the limit.
