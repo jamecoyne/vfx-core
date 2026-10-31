@@ -57,8 +57,7 @@ the design. Coding agents start at [AGENTS.md](AGENTS.md).
 
 ## Credits
 
-segcam is jamecoyne's. vfx-core was built by StopBanning, the preview by NicoWasHere, with work
-from Strongtut and everyone in the [contributors](https://github.com/jamecoyne/vfx-core/graphs/contributors).
+Made by jamecoyne and its [contributors](https://github.com/jamecoyne/vfx-core/graphs/contributors).
 Face detection uses YuNet, MediaPipe Face Mesh and PicoDet ([models and licenses](plugins/segcam/segcam-face/models/README.md)).
 
 Licensed under MIT or Apache 2.0, whichever you prefer.
