@@ -4,7 +4,8 @@
 //! feeds, so an edit reaches it however far back it is. Where they can't (a host's own history
 //! of frames, as in Resolume and the preview: [`FrameSource::fixed`]), it reads only the frames
 //! it hasn't worked out, and the current one. Results come from each frame and the settings
-//! alone, so render order doesn't change the output.
+//! alone, so render order doesn't change the output. Motion whose background is cut short by
+//! the start of the frames, as at the start of a clip, is kept with the frame it starts at.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
@@ -36,15 +37,23 @@ struct Detection {
     faces: FaceParts,
 }
 
+/// What a frame's motion and tiles were worked out from besides its own pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Basis {
+    detection: Detection,
+    /// The first frame of its background: later than usual near the start of the frames.
+    from: i64,
+}
+
 #[derive(Default)]
 pub struct Incremental {
     canvas: Option<Canvas>,
     grids: BTreeMap<i64, LumaGrid>,
     /// A hash of each frame's pixels, since edits upstream can leave the grid as it was.
     prints: BTreeMap<i64, u64>,
-    motion: BTreeMap<i64, (Detection, Motion)>,
-    /// Tiles by frame, with the detection and mirroring they were cut for.
-    tiles: BTreeMap<i64, (Detection, bool, Vec<Tile>)>,
+    motion: BTreeMap<i64, (Basis, Motion)>,
+    /// Tiles by frame, with the basis and mirroring they were cut for.
+    tiles: BTreeMap<i64, (Basis, bool, Vec<Tile>)>,
 }
 
 impl Incremental {
@@ -78,17 +87,14 @@ impl Incremental {
             self.reset();
             self.canvas = Some(canvas);
         }
-        let detection = detection(s);
         let swarm = s.mode == OutputMode::Swarm;
         let background = i64::from(history_frames(s));
         let targets = targets(s);
         let first = number - count as i64 + 1;
 
         // Frames the host didn't hand over count as empty, as in a cold render, but nothing
-        // worked out from one is kept, so it is read again next time. Nor is motion whose
-        // background was cut short by the start of this render's frames.
+        // worked out from one is kept, so it is read again next time.
         let mut missing = BTreeSet::new();
-        let mut short = BTreeSet::new();
         let oldest = (number - targets + 1 - background).max(first);
         // A fixed source's earlier frames are as they were, so only the current frame is
         // checked: a different one means the source started over.
@@ -103,7 +109,7 @@ impl Incremental {
             }
         }
         let visit = if fixed {
-            self.lacking(s, oldest, number, background)
+            self.lacking(s, first, number)
         } else {
             (oldest..=number).collect()
         };
@@ -132,18 +138,16 @@ impl Incremental {
                         }
                     }
                 }
-                if frame > number - targets && !self.complete(frame, &detection, s) {
-                    if frame - background < first {
-                        short.insert(frame);
-                    }
-                    let motion = match self.motion(frame, &detection) {
+                let basis = basis(s, frame, first);
+                if frame > number - targets && !self.complete(frame, &basis, s) {
+                    let motion = match self.motion(frame, &basis) {
                         Some(motion) => motion.clone(),
                         None => {
                             let empty = LumaGrid::default();
                             let grid = self.grids.get(&frame).unwrap_or(&empty);
                             let mut motion = match s.detect {
                                 Detect::Motion => {
-                                    let history = ((frame - background).max(first)..frame)
+                                    let history = (basis.from..frame)
                                         .map(|k| self.grids.get(&k).unwrap_or(&empty));
                                     motion::detect(history, grid, &s.motion)
                                 }
@@ -161,13 +165,13 @@ impl Incremental {
                                 let found = crate::faces::find(view, s.faces, grid.count());
                                 motion.blobs.extend(found);
                             }
-                            self.motion.insert(frame, (detection, motion.clone()));
+                            self.motion.insert(frame, (basis, motion.clone()));
                             motion
                         }
                     };
                     if swarm {
                         let tiles = frame_tiles(&motion, view.as_ref(), frame, w, h, s.mirror);
-                        self.tiles.insert(frame, (detection, s.mirror, tiles));
+                        self.tiles.insert(frame, (basis, s.mirror, tiles));
                     }
                 }
                 if frame == number {
@@ -178,29 +182,19 @@ impl Incremental {
         for &frame in &missing {
             self.forget(frame, background);
         }
-        for frame in short {
-            self.motion.remove(&frame);
-            self.tiles.remove(&frame);
-        }
         let reach = background + targets;
         self.keep(number - reach..=number + reach);
     }
 
-    /// The frames from `oldest` a render of `number` has to read: those whose motion or tiles
+    /// The frames from `first` a render of `number` has to read: those whose motion or tiles
     /// aren't kept, the frames before them whose grids aren't, and `number`, which it draws.
-    fn lacking(
-        &self,
-        s: &RenderSettings,
-        oldest: i64,
-        number: i64,
-        background: i64,
-    ) -> BTreeSet<i64> {
-        let detection = detection(s);
+    fn lacking(&self, s: &RenderSettings, first: i64, number: i64) -> BTreeSet<i64> {
         let mut wanted = BTreeSet::from([number]);
-        for target in (number - targets(s) + 1).max(oldest)..=number {
-            if !self.complete(target, &detection, s) {
+        for target in (number - targets(s) + 1).max(first)..=number {
+            let basis = basis(s, target, first);
+            if !self.complete(target, &basis, s) {
                 wanted.insert(target);
-                let before = (target - background).max(oldest)..target;
+                let before = basis.from..target;
                 wanted.extend(before.filter(|k| !self.grids.contains_key(k)));
             }
         }
@@ -217,19 +211,20 @@ impl Incremental {
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
     ) {
-        let detection = detection(s);
+        let first = number - count as i64 + 1;
         let mut pile = Pile::<&Tile>::new(out.width, out.height, s.max_tiles);
         if s.mode == OutputMode::Swarm {
-            let first = number - count as i64 + 1;
             for target in (number - targets(s) + 1).max(first)..=number {
-                self.tiles(target, &detection, s.mirror)
+                self.tiles(target, &basis(s, target, first), s.mirror)
                     .into_iter()
                     .flatten()
                     .for_each(|t| pile.push(t));
             }
         }
         let empty = Motion::default();
-        let motion = self.motion(number, &detection).unwrap_or(&empty);
+        let motion = self
+            .motion(number, &basis(s, number, first))
+            .unwrap_or(&empty);
         draw_output(out, s, frame, motion, number, pile.shown());
     }
 
@@ -241,21 +236,21 @@ impl Incremental {
     }
 
     /// Whether `frame` has its motion and, for the swarm, its tiles.
-    fn complete(&self, frame: i64, detection: &Detection, s: &RenderSettings) -> bool {
-        self.motion(frame, detection).is_some()
-            && (s.mode != OutputMode::Swarm || self.tiles(frame, detection, s.mirror).is_some())
+    fn complete(&self, frame: i64, basis: &Basis, s: &RenderSettings) -> bool {
+        self.motion(frame, basis).is_some()
+            && (s.mode != OutputMode::Swarm || self.tiles(frame, basis, s.mirror).is_some())
     }
 
-    fn motion(&self, frame: i64, detection: &Detection) -> Option<&Motion> {
+    fn motion(&self, frame: i64, basis: &Basis) -> Option<&Motion> {
         self.motion
             .get(&frame)
-            .filter(|(d, _)| d == detection)
+            .filter(|(b, _)| b == basis)
             .map(|(_, m)| m)
     }
 
-    fn tiles(&self, frame: i64, detection: &Detection, mirror: bool) -> Option<&[Tile]> {
-        let (d, m, tiles) = self.tiles.get(&frame)?;
-        (d == detection && *m == mirror).then_some(tiles.as_slice())
+    fn tiles(&self, frame: i64, basis: &Basis, mirror: bool) -> Option<&[Tile]> {
+        let (b, m, tiles) = self.tiles.get(&frame)?;
+        (b == basis && *m == mirror).then_some(tiles.as_slice())
     }
 
     /// Drops what was kept for `frame`, and the motion and tiles of the frames whose
@@ -284,6 +279,14 @@ fn detection(s: &RenderSettings) -> Detection {
         background_frames: s.background_frames,
         threshold: s.threshold,
         faces: s.faces,
+    }
+}
+
+/// What `frame` is worked out from in a render whose frames start at `first`.
+fn basis(s: &RenderSettings, frame: i64, first: i64) -> Basis {
+    Basis {
+        detection: detection(s),
+        from: (frame - i64::from(history_frames(s))).max(first),
     }
 }
 

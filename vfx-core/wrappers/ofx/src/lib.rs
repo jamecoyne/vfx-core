@@ -522,6 +522,10 @@ struct Source<'a, C> {
     error: Option<OfxStatus>,
     /// Where each frame is decoded.
     frame: &'a mut Vec<Argb<C>>,
+    /// The frame `frame` holds, which isn't fetched again if asked for again.
+    decoded: Option<usize>,
+    /// Resolve is streaming renders, so earlier frames are taken as unchanged until it pauses.
+    fixed: bool,
 }
 
 impl<C: CpuDepth> FrameSource for Source<'_, C> {
@@ -531,11 +535,17 @@ impl<C: CpuDepth> FrameSource for Source<'_, C> {
             f(None);
             return;
         }
+        let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
+        if self.decoded == Some(index) {
+            f(Some(C::image(View::from_pixels(self.frame, w, h))));
+            return;
+        }
+        self.decoded = None;
         match fetch(self.clip, time) {
             Ok(Some(frame)) => {
                 // SAFETY: the fetched image stays alive through the closure.
                 unsafe { cpu::decode_into(&frame.image, self.canvas, self.frame) };
-                let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
+                self.decoded = Some(index);
                 f(Some(C::image(View::from_pixels(self.frame, w, h))));
             }
             Ok(None) => {
@@ -547,6 +557,10 @@ impl<C: CpuDepth> FrameSource for Source<'_, C> {
                 f(None);
             }
         }
+    }
+
+    fn fixed(&self) -> bool {
+        self.fixed
     }
 }
 
@@ -561,8 +575,26 @@ fn keeps_state() -> bool {
 }
 
 /// An instance's CPU effect, kept between renders under the shared policy
-/// ([`vfx_host::CpuInstance`]) when the effect keeps state.
-type Kept = vfx_host::CpuInstance;
+/// ([`vfx_host::CpuInstance`]) when the effect keeps state, and its last render.
+struct Kept {
+    effect: vfx_host::CpuInstance,
+    last: std::sync::Mutex<Option<Rendered>>,
+}
+
+/// A frame rendered and when it finished.
+#[derive(Clone, Copy)]
+struct Rendered {
+    frame: i64,
+    ended: std::time::Instant,
+}
+
+/// Whether a render of `frame` continues a stream of renders, as playback and Deliver make:
+/// a step forward soon after the last. Nothing upstream is edited mid-stream, so its earlier
+/// frames are taken as unchanged; the first render after a pause checks them all again.
+fn streaming(last: Option<Rendered>, frame: i64) -> bool {
+    const GAP: std::time::Duration = std::time::Duration::from_secs(1);
+    last.is_some_and(|last| last.ended.elapsed() < GAP && (1..=120).contains(&(frame - last.frame)))
+}
 
 fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     let Some(instance) = vfx_host::CpuInstance::new(vfx_host::plugin().make, true) else {
@@ -571,7 +603,10 @@ fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     if !instance.is_kept() {
         return Ok(());
     }
-    let kept: *mut Kept = Box::into_raw(Box::new(instance));
+    let kept: *mut Kept = Box::into_raw(Box::new(Kept {
+        effect: instance,
+        last: std::sync::Mutex::new(None),
+    }));
     // SAFETY: an instance handle; the pointer is freed in destroy-instance.
     check(unsafe {
         (suites().prop.propSetPointer)(
@@ -605,16 +640,25 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         .unwrap_or(ptr::null_mut());
     // SAFETY: set from a Box in create-instance and freed only in destroy-instance.
     if let Some(kept) = unsafe { kept.cast::<Kept>().as_ref() } {
-        return render_cpu_with(kept, effect, in_args);
+        let frame = in_args.get_double(PROP_TIME, 0)?.round() as i64;
+        let last = *kept.last.lock().unwrap_or_else(|p| p.into_inner());
+        let fixed = host::is_resolve() && streaming(last, frame);
+        let rendered = render_cpu_with(&kept.effect, effect, in_args, fixed);
+        *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Rendered {
+            frame,
+            ended: std::time::Instant::now(),
+        });
+        return rendered;
     }
     let fresh = vfx_host::CpuInstance::new(vfx_host::plugin().make, false).ok_or(STAT_FAILED)?;
-    render_cpu_with(&fresh, effect, in_args)
+    render_cpu_with(&fresh, effect, in_args, false)
 }
 
 fn render_cpu_with(
     cpu_effect: &vfx_host::CpuInstance,
     effect: ImageEffect,
     in_args: Props,
+    fixed: bool,
 ) -> Result<(), OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
     let output = fetch(clip(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?.ok_or(STAT_FAILED)?;
@@ -622,7 +666,8 @@ fn render_cpu_with(
     let source_props = clip_props(source)?;
     let start = source_props.get_double(PROP_FRAME_RANGE, 0)?;
     let values = values(effect, time)?;
-    let count = cpu_effect.frames_before(&values) + 1;
+    // Frames go back to the clip's first: earlier ones aren't missing, there are none.
+    let count = (cpu_effect.frames_before(&values) + 1).min((time - start).max(0.0) as usize + 1);
     let ctx = Context {
         time: seconds(effect, time)?,
         frame: time.round() as i64,
@@ -651,6 +696,7 @@ fn render_cpu_with(
             &ctx,
             &output.image,
             window,
+            fixed,
         )
     } else {
         draw::<f32>(
@@ -664,6 +710,7 @@ fn render_cpu_with(
             &ctx,
             &output.image,
             window,
+            fixed,
         )
     };
     error.map_or(Ok(()), Err)
@@ -714,6 +761,7 @@ fn draw<C: Scratch>(
     ctx: &Context,
     output: &Image,
     window: Rect,
+    fixed: bool,
 ) -> Option<OfxStatus> {
     C::with_scratch(|frame, pixels| {
         let mut frames = Source::<C> {
@@ -723,6 +771,8 @@ fn draw<C: Scratch>(
             canvas,
             error: None,
             frame,
+            decoded: None,
+            fixed,
         };
         let (w, h) = (canvas.width() as i32, canvas.height() as i32);
         pixels.clear();
@@ -738,4 +788,35 @@ fn draw<C: Scratch>(
         unsafe { cpu::encode(pixels, canvas, output, window) };
         frames.error
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which renders of `frames`, in this order, continue a stream.
+    fn streamed(frames: &[i64]) -> Vec<bool> {
+        let mut last = None;
+        frames
+            .iter()
+            .map(|&frame| {
+                let streaming = streaming(last, frame);
+                last = Some(Rendered {
+                    frame,
+                    ended: std::time::Instant::now(),
+                });
+                streaming
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forward_steps_stream_and_anything_else_checks_again() {
+        // How Resolve 21 starts a Deliver, then playback skipping, a seek back and a jump.
+        let frames = [0, 0, 0, 2, 1, 3, 4, 7, 5, 200];
+        let expected = [
+            false, false, false, true, false, true, true, true, false, false,
+        ];
+        assert_eq!(streamed(&frames), expected);
+    }
 }
