@@ -9,7 +9,7 @@
 
 use vfx_core::cpu::{Argb, Channel, History, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, Gpu, ParamValues};
-use vfx_host::CpuInstance;
+use vfx_host::{CpuInstance, by_rows};
 
 pub struct CpuStage {
     effect: CpuInstance,
@@ -53,7 +53,8 @@ impl CpuStage {
         let frame = self.history.next(before);
         let width = self.size.0 as usize;
         self.reader.take(|rgba, pitch| {
-            by_rows(frame, width, rgba, pitch, |dst, src| {
+            by_rows(frame, width, |y, dst| {
+                let src = &rgba[y * pitch..][..width * 4];
                 for (dst, &[r, g, b, a]) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
                     *dst = Argb {
                         alpha: u8::from_unit(a),
@@ -85,17 +86,13 @@ impl CpuStage {
             .render(&mut self.history, count, out, values, &ctx);
         self.rendered_with = Some(values.clone());
         let width = self.size.0 as usize;
-        by_rows(
-            &mut self.upload,
-            width * 4,
-            &self.rendered,
-            width,
-            |dst, src| {
-                for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
-                    *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
-                }
-            },
-        );
+        let rendered = &self.rendered;
+        by_rows(&mut self.upload, width * 4, |y, dst| {
+            let src = &rendered[y * width..][..width];
+            for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
+            }
+        });
     }
 
     pub fn render(
@@ -122,47 +119,6 @@ impl CpuStage {
         } else {
             output.write(gpu, bytemuck::cast_slice(&self.upload));
         }
-    }
-}
-
-/// Runs `f` on each row of `dst` with the matching row of `src`, in one band of rows per
-/// core. Rows are `dst_row` and `src_row` elements long.
-#[cfg(not(target_arch = "wasm32"))]
-fn by_rows<D: Send, S: Sync>(
-    dst: &mut [D],
-    dst_row: usize,
-    src: &[S],
-    src_row: usize,
-    f: impl Fn(&mut [D], &[S]) + Sync,
-) {
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let band = (dst.len() / dst_row).div_ceil(cores).max(1);
-    std::thread::scope(|scope| {
-        for (dst, src) in dst
-            .chunks_mut(band * dst_row)
-            .zip(src.chunks(band * src_row))
-        {
-            let f = &f;
-            scope.spawn(move || {
-                for (d, s) in dst.chunks_mut(dst_row).zip(src.chunks(src_row)) {
-                    f(d, s);
-                }
-            });
-        }
-    });
-}
-
-/// Browsers run the preview on one thread.
-#[cfg(target_arch = "wasm32")]
-fn by_rows<D, S>(
-    dst: &mut [D],
-    dst_row: usize,
-    src: &[S],
-    src_row: usize,
-    f: impl Fn(&mut [D], &[S]),
-) {
-    for (d, s) in dst.chunks_mut(dst_row).zip(src.chunks(src_row)) {
-        f(d, s);
     }
 }
 
