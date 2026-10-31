@@ -94,7 +94,8 @@ pub struct RenderSettings {
     /// The host's pixels are straight, so a matte touches alpha only.
     pub straight_alpha: bool,
     pub box_color: Color,
-    /// Swarm: how many frames back tiles are spawned from.
+    /// Swarm: how many frames back tiles are spawned from. Within them a window stays until
+    /// `max_tiles` newer ones push it out, as in segcam 1.1.
     pub trail_frames: i32,
     /// Swarm: the pile size, oldest recycled first.
     pub max_tiles: i32,
@@ -123,7 +124,7 @@ impl Default for RenderSettings {
                 g: 1.0,
                 b: 0.4,
             },
-            trail_frames: 24,
+            trail_frames: 60,
             max_tiles: 100,
             swarm_background: SwarmBackground::Transparent,
             live_windows: false,

@@ -72,7 +72,7 @@ pub const PARAMS: &[ParamSpec] = &[
     ParamSpec::color("box_color", [0.25, 1.0, 0.4, 1.0])
         .label("Box color")
         .group("Overlay"),
-    ParamSpec::int("trail", 1, 120, 24)
+    ParamSpec::int("trail", 1, 120, 60)
         .label("Trail frames")
         .group("Swarm")
         .slider(1.0, 60.0),
