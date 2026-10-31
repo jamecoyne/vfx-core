@@ -204,8 +204,13 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     if let Err(e) = segcam_motion::gpu::status() {
         panic!("{name}: {e}");
     }
-    let drawn = gpu.gpu().map_or(0, |d| d.drawn);
-    assert!(drawn > 0, "{name}: nothing was drawn on the GPU");
+    let (drawn, faults) = gpu.gpu().map_or((0, 0), |d| (d.drawn, d.faults));
+    assert_eq!(faults, 0, "{name}: renders fell back to the CPU");
+    assert_eq!(
+        drawn,
+        frames.len() as u64,
+        "{name}: renders drawn on the GPU"
+    );
     true
 }
 

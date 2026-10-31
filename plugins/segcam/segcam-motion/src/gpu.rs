@@ -3,11 +3,12 @@
 //! goes into an atlas kept for the trail when a render first draws it on the GPU. Each output
 //! pixel replays what the CPU path does to it (`gpu.wgsl`), so the two agree within a level. The CPU
 //! path stays the reference and the fallback; Overlay draws there unless asked
-//! ([`crate::Incremental::gpu_overlay`]). A render the GPU fails, or a lost device, is drawn on
-//! the CPU, and that instance stays there.
+//! ([`crate::Incremental::gpu_overlay`]). The device opens in the background, and renders draw
+//! on the CPU until it is ready. A render the GPU fails is drawn on the CPU and the next one
+//! tries the GPU again; a lost device is given up by every instance.
 
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::time::{Duration, Instant};
 
 use vfx_core::wgpu;
 
@@ -18,7 +19,7 @@ use crate::pixel::{Argb, Channel, View, ViewMut};
 use crate::render::{
     PixelRect, RenderSettings, SwarmBackground, segment_label, text_height, text_width, to_pixels,
 };
-use crate::swarm::{self, SwarmMetrics, Tile, TitleBar, WindowPlan};
+use crate::swarm::{ShadowKernel, SwarmMetrics, Tile, TitleBar, WindowPlan};
 
 /// The device every instance draws with, made on first use, and its pipelines.
 pub struct Device {
@@ -29,31 +30,43 @@ pub struct Device {
     layout: wgpu::BindGroupLayout,
     overlay: wgpu::ComputePipeline,
     swarm: wgpu::ComputePipeline,
-    /// The first error or loss the device reported; from then on nothing draws on it.
-    failure: Arc<Mutex<Option<String>>>,
+    /// Why the device was lost; from then on nothing draws on it.
+    lost: Arc<Mutex<Option<String>>>,
+    /// How many errors the device has reported and the last one. A render that sees the count
+    /// move falls back; the device stays.
+    errors: Arc<Mutex<(u64, String)>>,
+    /// An atlas made ahead for the first instance, so its first render needn't.
+    spare: Mutex<Option<Atlas>>,
 }
 
 impl Device {
-    pub(crate) fn failure(&self) -> Option<String> {
-        self.failure.lock().ok().and_then(|f| f.clone())
+    pub(crate) fn lost(&self) -> Option<String> {
+        self.lost.lock().ok().and_then(|f| f.clone())
     }
 
-    fn check(&self) -> Result<(), Fault> {
-        self.failure().map_or(Ok(()), |e| Err(Fault(e)))
+    pub(crate) fn errors(&self) -> (u64, String) {
+        self.errors.lock().map_or((0, String::new()), |e| e.clone())
     }
 
-    /// The device failed `e`: no instance draws on it again.
-    fn fail(&self, e: &str) -> Fault {
-        if let Ok(mut f) = self.failure.lock() {
-            f.get_or_insert_with(|| e.to_string());
-        }
-        Fault(e.to_string())
+    /// Makes the device report a validation error: a write at an odd offset.
+    #[cfg(test)]
+    pub(crate) fn misuse(&self) {
+        let scratch = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("segcam misuse"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&scratch, 1, &[0; 4]);
     }
 }
 
 /// Why a render couldn't be drawn on the GPU.
 #[derive(Clone, Debug)]
 pub struct Fault(pub String);
+
+/// How long a render waits for its draw before drawing on the CPU instead.
+const WAIT: Duration = Duration::from_secs(1);
 
 /// Whether to draw on the GPU where there is one: yes, unless `SEGCAM_GPU=0`.
 pub fn wanted() -> bool {
@@ -83,34 +96,62 @@ pub fn available() -> bool {
     status().is_ok()
 }
 
-/// Whether there is a working GPU, or why not.
+/// Whether there is a working GPU, or why not. Waits for the device to open.
 pub fn status() -> Result<(), NoGpu> {
-    match shared() {
-        Ok(dev) => dev.failure().map_or(Ok(()), |e| Err(NoGpu::Failed(e))),
+    start();
+    match DEVICE.wait() {
+        Ok(dev) => dev.lost().map_or(Ok(()), |e| Err(NoGpu::Failed(e))),
         Err(e) => Err(e.clone()),
     }
 }
 
-/// The shared device, or `None` where there is no adapter or it failed.
-pub fn device() -> Option<Arc<Device>> {
-    let dev = shared().as_ref().ok()?;
-    dev.failure().is_none().then(|| dev.clone())
+/// Whether the shared device is still opening: no answer yet from [`device`].
+pub fn opening() -> bool {
+    start();
+    DEVICE.get().is_none()
 }
 
-/// The device every instance shares, opened on first use. Software adapters (WARP, lavapipe)
-/// are left out unless `SEGCAM_GPU_ADAPTER=fallback` asks for one; `SEGCAM_GPU_ADAPTER=low`
-/// picks the low power adapter (an integrated GPU).
-fn shared() -> &'static Result<Arc<Device>, NoGpu> {
-    static DEVICE: OnceLock<Result<Arc<Device>, NoGpu>> = OnceLock::new();
-    DEVICE.get_or_init(|| {
-        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-        let opened = open(&choice).map(Arc::new);
-        match &opened {
-            Ok(dev) => eprintln!("segcam Motion: drawing on the GPU ({})", dev.info.name),
-            Err(e) => eprintln!("segcam Motion: drawing on the CPU ({e})"),
+/// The shared device, or `None` while it opens, where there is no adapter, or once it is lost.
+pub fn device() -> Option<Arc<Device>> {
+    start();
+    let dev = DEVICE.get()?.as_ref().ok()?;
+    dev.lost().is_none().then(|| dev.clone())
+}
+
+static DEVICE: OnceLock<Result<Arc<Device>, NoGpu>> = OnceLock::new();
+
+/// Opens the device every instance shares, on first use, in the background: opening it and
+/// compiling its pipelines would stall a render. Software adapters (WARP, lavapipe) are left
+/// out unless `SEGCAM_GPU_ADAPTER=fallback` asks for one; `SEGCAM_GPU_ADAPTER=low` picks the
+/// low power adapter (an integrated GPU).
+fn start() {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        let load = || {
+            let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+            let opened = open(&choice).map(Arc::new);
+            match &opened {
+                Ok(dev) => {
+                    eprintln!("segcam Motion: drawing on the GPU ({})", dev.info.name);
+                    if let Ok(mut spare) = dev.spare.lock() {
+                        *spare = Some(Atlas::new(dev));
+                    }
+                }
+                Err(e) => eprintln!("segcam Motion: drawing on the CPU ({e})"),
+            }
+            let _ = DEVICE.set(opened);
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let spawned = std::thread::Builder::new()
+            .name("segcam GPU".into())
+            .spawn(load)
+            .is_ok();
+        #[cfg(target_arch = "wasm32")]
+        let spawned = false;
+        if !spawned {
+            load();
         }
-        opened
-    })
+    });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -146,19 +187,20 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| NoGpu::Failed(e.to_string()))?;
-    let failure = Arc::new(Mutex::new(None));
-    let note = |failure: &Arc<Mutex<Option<String>>>| {
-        let failure = failure.clone();
-        move |e: String| {
-            if let Ok(mut f) = failure.lock() {
-                f.get_or_insert(e);
-            }
+    let errors = Arc::new(Mutex::new((0, String::new())));
+    let noted = errors.clone();
+    device.on_uncaptured_error(Arc::new(move |e| {
+        if let Ok(mut n) = noted.lock() {
+            *n = (n.0 + 1, e.to_string());
         }
-    };
-    let on_error = note(&failure);
-    device.on_uncaptured_error(Arc::new(move |e| on_error(e.to_string())));
-    let on_lost = note(&failure);
-    device.set_device_lost_callback(move |reason, e| on_lost(format!("{reason:?}: {e}")));
+    }));
+    let lost = Arc::new(Mutex::new(None));
+    let noted = lost.clone();
+    device.set_device_lost_callback(move |reason, e| {
+        if let Ok(mut l) = noted.lock() {
+            l.get_or_insert(format!("{reason:?}: {e}"));
+        }
+    });
 
     let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
         binding,
@@ -218,11 +260,13 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
         device,
         queue,
         info,
-        failure,
+        lost,
+        errors,
+        spare: Mutex::new(None),
     };
-    match dev.failure() {
-        Some(e) => Err(NoGpu::Failed(e)),
-        None => Ok(dev),
+    match (dev.lost(), dev.errors()) {
+        (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
+        _ => Ok(dev),
     }
 }
 
@@ -316,14 +360,19 @@ impl Atlas {
     const FIRST_WORDS: u64 = 1 << 20;
 
     fn new(dev: &Device) -> Self {
+        Self::with(dev, Self::FIRST_WORDS)
+    }
+
+    fn with(dev: &Device, words: u64) -> Self {
         Self {
-            buffer: atlas_buffer(dev, Self::FIRST_WORDS),
-            words: Self::FIRST_WORDS,
-            free: vec![(0, Self::FIRST_WORDS)],
+            buffer: atlas_buffer(dev, words),
+            words,
+            free: vec![(0, words)],
         }
     }
 
-    fn alloc(&mut self, dev: &Device, len: u64) -> Option<u64> {
+    /// Room for `len` words, growing the atlas up to `limit` bytes; `None` when it is full.
+    fn alloc(&mut self, dev: &Device, len: u64, limit: u64) -> Option<u64> {
         let len = len.max(1);
         loop {
             if let Some(i) = self.free.iter().position(|&(_, n)| n >= len) {
@@ -335,7 +384,7 @@ impl Atlas {
                 }
                 return Some(start);
             }
-            let limit = dev.max_binding / 4;
+            let limit = limit / 4;
             let words = (self.words * 2).max(self.words + len).min(limit);
             if words <= self.words {
                 return None;
@@ -404,8 +453,16 @@ impl Grown {
         }
     }
 
-    fn get(&mut self, dev: &Device, bytes: u64) -> &wgpu::Buffer {
+    /// The buffer, at least `bytes` long; a fault where that is more than `limit`, the most the
+    /// device binds.
+    fn get(&mut self, dev: &Device, limit: u64, bytes: u64) -> Result<&wgpu::Buffer, Fault> {
         let bytes = bytes.max(16).next_multiple_of(16);
+        if bytes > limit {
+            return Err(Fault(format!(
+                "the {} needs {bytes} bytes, more than the GPU binds",
+                self.label
+            )));
+        }
         if self.buffer.as_ref().is_none_or(|b| b.size() < bytes) {
             self.buffer = Some(dev.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(self.label),
@@ -414,7 +471,7 @@ impl Grown {
                 mapped_at_creation: false,
             }));
         }
-        self.buffer.as_ref().expect("made above")
+        Ok(self.buffer.as_ref().expect("made above"))
     }
 }
 
@@ -427,22 +484,26 @@ pub struct Drawer {
     staging: Grown,
     data: Grown,
     atlas: Arc<Mutex<Atlas>>,
+    /// The most a buffer may take: what the device binds.
+    limit: u64,
+    wait: Duration,
+    /// The device's error count as this render began.
+    seen: u64,
     /// Which frame the frame buffer holds, this render.
     loaded: Option<i64>,
     pub timings: Timings,
     /// Renders drawn on the GPU.
     pub drawn: u64,
+    /// Renders the GPU failed, drawn on the CPU instead.
+    pub faults: u64,
 }
 
 impl Drawer {
-    /// On the shared device, if there is one that works.
-    pub fn new() -> Option<Self> {
-        Self::on(device()?)
-    }
-
-    pub(crate) fn on(dev: Arc<Device>) -> Option<Self> {
-        dev.failure().is_none().then_some(())?;
+    /// On `dev`, unless it is lost.
+    pub fn on(dev: Arc<Device>) -> Option<Self> {
+        dev.lost().is_none().then_some(())?;
         use wgpu::BufferUsages as U;
+        let spare = dev.spare.lock().ok().and_then(|mut s| s.take());
         let drawer = Self {
             globals: dev.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("segcam globals"),
@@ -454,35 +515,82 @@ impl Drawer {
             out: Grown::new("segcam output", U::STORAGE | U::COPY_SRC),
             staging: Grown::new("segcam readback", U::MAP_READ | U::COPY_DST),
             data: Grown::new("segcam tables", U::STORAGE | U::COPY_DST),
-            atlas: Arc::new(Mutex::new(Atlas::new(&dev))),
+            atlas: Arc::new(Mutex::new(spare.unwrap_or_else(|| Atlas::new(&dev)))),
+            limit: dev.max_binding,
+            wait: WAIT,
+            seen: dev.errors().0,
             loaded: None,
             timings: Timings::default(),
             drawn: 0,
+            faults: 0,
             dev,
         };
-        drawer.dev.failure().is_none().then_some(drawer)
+        Some(drawer)
     }
 
     pub fn adapter(&self) -> &wgpu::AdapterInfo {
         &self.dev.info
     }
 
-    /// Called as a render starts: the frame buffer's contents are from an earlier one.
+    /// Whether the device is lost, which it says when polled.
+    pub fn lost(&self) -> bool {
+        let _ = self.dev.device.poll(wgpu::PollType::Poll);
+        self.dev.lost().is_some()
+    }
+
+    /// Called as a render starts: the frame buffer's contents are from an earlier one, and
+    /// errors reported before it aren't its own.
     pub fn begin(&mut self) {
         self.loaded = None;
         self.timings = Timings::default();
+        self.seen = self.dev.errors().0;
+    }
+
+    /// A smaller atlas than usual, for a new drawer.
+    #[cfg(test)]
+    pub(crate) fn small_atlas(&mut self, words: u64) {
+        self.atlas = Arc::new(Mutex::new(Atlas::with(&self.dev, words)));
+    }
+
+    /// Buffers no larger than `bytes`, as on a device that binds less.
+    #[cfg(test)]
+    pub(crate) fn set_limit(&mut self, bytes: u64) {
+        self.limit = bytes;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_wait(&mut self, wait: Duration) {
+        self.wait = wait;
+    }
+
+    /// A fault where the device is lost or reported an error since this render began.
+    fn check(&mut self) -> Result<(), Fault> {
+        if let Some(e) = self.dev.lost() {
+            return Err(Fault(e));
+        }
+        let (count, last) = self.dev.errors();
+        if count != self.seen {
+            self.seen = count;
+            return Err(Fault(last));
+        }
+        Ok(())
     }
 
     /// Puts a frame's tiles in the atlas: their pixels as the CPU cut them, their title bars and
-    /// their window plans for a `canvas` (width, height). Fails if the atlas is full.
-    pub fn upload_tiles(&mut self, tiles: &[Tile], canvas: (i32, i32)) -> Result<Cut, Fault> {
+    /// their window plans for a `canvas` (width, height), with `shadow` the kernel at its scale.
+    /// `None` if the atlas is full.
+    pub fn upload_tiles(
+        &mut self,
+        tiles: &[Tile],
+        canvas: (i32, i32),
+        shadow: &ShadowKernel,
+    ) -> Result<Option<Cut>, Fault> {
         let t = Instant::now();
         let m = SwarmMetrics::new(canvas.1);
-        let shadow = swarm::shadow_kernel(m.scale);
         let whole = PixelRect::new(0, 0, canvas.0, canvas.1);
         let plans: Vec<_> = tiles
             .iter()
-            .map(|t| WindowPlan::new(t, &m, &shadow, whole))
+            .map(|t| WindowPlan::new(t, &m, shadow, whole))
             .collect();
         let bars: Vec<_> = tiles.iter().map(|t| TitleBar::of(t, &m)).collect();
         let pixel_words: u64 = tiles.iter().map(|t| t.pixels.len() as u64).sum();
@@ -494,9 +602,9 @@ impl Drawer {
         let len = pixel_words + bar_words + plan_words;
         let shared = self.atlas.clone();
         let mut atlas = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let start = atlas
-            .alloc(&self.dev, len)
-            .ok_or_else(|| Fault("the GPU's tiles are full".into()))?;
+        let Some(start) = atlas.alloc(&self.dev, len, self.limit) else {
+            return Ok(None);
+        };
 
         let mut pixels = start;
         let mut slots = Vec::with_capacity(tiles.len());
@@ -542,17 +650,20 @@ impl Drawer {
         }
         drop(atlas);
         self.timings.upload += ms(t);
-        self.dev.check()?;
-        Ok(Cut {
+        // Made before the check, so a fault gives the room back.
+        let cut = Cut {
             atlas: self.atlas.clone(),
             start,
             len,
             slots,
-        })
+        };
+        self.check()?;
+        Ok(Some(cut))
     }
 
     /// Draws the swarm of `windows` (shown tiles, oldest first) into `out`. `frame` is frame
-    /// `number`, for the source backdrop and live windows.
+    /// `number`, for the source backdrop and live windows; `shadow` the kernel at the canvas's
+    /// scale.
     pub fn draw_swarm<'t, C: Channel>(
         &mut self,
         out: &mut ViewMut<C>,
@@ -560,11 +671,11 @@ impl Drawer {
         frame: Option<&View<C>>,
         number: i64,
         s: &RenderSettings,
+        shadow: &ShadowKernel,
     ) -> Result<(), Fault> {
         let t = Instant::now();
         let (w, h) = (out.width, out.height);
         let m = SwarmMetrics::new(h);
-        let shadow = swarm::shadow_kernel(m.scale);
         let mut data: Vec<u32> = Vec::new();
         let mut widest = 0;
         for (tile, slot) in windows {
@@ -722,13 +833,13 @@ impl Drawer {
         let t = Instant::now();
         let row = frame.width as usize * size_of::<Argb<C>>();
         let bytes = (row * frame.height as usize) as u64;
-        let buffer = self.frame.get(&self.dev, bytes).clone();
+        let buffer = self.frame.get(&self.dev, self.limit, bytes)?.clone();
         let size = wgpu::BufferSize::new(bytes).expect("frames aren't empty");
         let mut staged = self
             .dev
             .queue
             .write_buffer_with(&buffer, 0, size)
-            .ok_or_else(|| self.dev.fail("no staging memory for the frame"))?;
+            .ok_or_else(|| Fault("no staging memory for the frame".into()))?;
         for y in 0..frame.height {
             let at = y as usize * row;
             staged
@@ -747,15 +858,18 @@ impl Drawer {
         data: &[u32],
         atlas: &wgpu::Buffer,
         out_bytes: u64,
-    ) -> wgpu::BindGroup {
+    ) -> Result<wgpu::BindGroup, Fault> {
         let q = &self.dev.queue;
         q.write_buffer(&self.globals, 0, bytemuck::bytes_of(globals));
-        let data_buffer = self.data.get(&self.dev, data.len() as u64 * 4).clone();
+        let data_buffer = self
+            .data
+            .get(&self.dev, self.limit, data.len() as u64 * 4)?
+            .clone();
         if !data.is_empty() {
             q.write_buffer(&data_buffer, 0, bytemuck::cast_slice(data));
         }
-        let frame = self.frame.get(&self.dev, 16).clone();
-        let out = self.out.get(&self.dev, out_bytes).clone();
+        let frame = self.frame.get(&self.dev, self.limit, 16)?.clone();
+        let out = self.out.get(&self.dev, self.limit, out_bytes)?.clone();
         let entries = [
             self.globals.as_entire_binding(),
             frame.as_entire_binding(),
@@ -767,16 +881,18 @@ impl Drawer {
             .zip(entries)
             .map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource })
             .collect();
-        self.dev
+        Ok(self
+            .dev
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("segcam draw"),
                 layout: &self.dev.layout,
                 entries: &entries,
-            })
+            }))
     }
 
-    /// Runs a draw over the whole of `out` and reads it back into `out`.
+    /// Runs a draw over the whole of `out` and reads it back into `out`. Waits only for this
+    /// render's work, and not for long: a render that isn't back in time is a fault.
     fn run<C: Channel>(
         &mut self,
         pipeline: &wgpu::ComputePipeline,
@@ -784,7 +900,7 @@ impl Drawer {
         data: &[u32],
         out: &mut ViewMut<C>,
     ) -> Result<(), Fault> {
-        self.dev.check()?;
+        self.check()?;
         let t = Instant::now();
         let row = out.width as usize * size_of::<Argb<C>>();
         let bytes = (row * out.height as usize) as u64;
@@ -792,8 +908,9 @@ impl Drawer {
         let atlas = atlas.lock().unwrap_or_else(|e| e.into_inner());
         let bind = self.bind(globals, data, &atlas.buffer, bytes);
         drop(atlas);
-        let output = self.out.get(&self.dev, bytes).clone();
-        let staging = self.staging.get(&self.dev, bytes).clone();
+        let bind = bind?;
+        let output = self.out.get(&self.dev, self.limit, bytes)?.clone();
+        let staging = self.staging.get(&self.dev, self.limit, bytes)?.clone();
         let mut encoder = self.dev.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
@@ -806,7 +923,7 @@ impl Drawer {
             );
         }
         encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, bytes);
-        self.dev.queue.submit(Some(encoder.finish()));
+        let submitted = self.dev.queue.submit(Some(encoder.finish()));
         self.timings.prepare += ms(t);
 
         let t = Instant::now();
@@ -815,23 +932,34 @@ impl Drawer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        let polled = self.dev.device.poll(wgpu::PollType::wait_indefinitely());
-        polled.map_err(|e| self.dev.fail(&e.to_string()))?;
-        // Another instance's poll may be the one that calls back, a moment later; a lost device
-        // may never call back, which is a failure, not a hang.
-        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(self.dev.fail(&e.to_string())),
-            Err(_) => return Err(self.dev.fail("the readback never finished")),
+        let wait = wgpu::PollType::Wait {
+            submission_index: Some(submitted),
+            timeout: Some(self.wait),
+        };
+        // Another instance's poll may be the one that calls back, a moment later.
+        let mapped = match self.dev.device.poll(wait) {
+            Ok(_) => match rx.recv_timeout(self.wait) {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => Err("the readback never finished".into()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = mapped {
+            // The map may still be pending on the buffer: the next render takes a new one.
+            self.staging.buffer = None;
+            return Err(Fault(e));
         }
-        self.dev.check()?;
         self.timings.wait += ms(t);
 
         let t = Instant::now();
         {
-            let mapped = slice
-                .get_mapped_range()
-                .map_err(|e| self.dev.fail(&e.to_string()))?;
+            let mapped = match slice.get_mapped_range() {
+                Ok(mapped) => mapped,
+                Err(e) => {
+                    self.staging.buffer = None;
+                    return Err(Fault(e.to_string()));
+                }
+            };
             let mapped: &[u8] = &mapped;
             let count = bands(out.height).len();
             std::thread::scope(|scope| {
@@ -847,6 +975,7 @@ impl Drawer {
         }
         staging.unmap();
         self.timings.read += ms(t);
+        self.check()?;
         self.drawn += 1;
         Ok(())
     }

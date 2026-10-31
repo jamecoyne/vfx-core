@@ -125,11 +125,13 @@ fn main() -> ExitCode {
     };
 
     // The GPU's state is kept between frames, which renders the same frames as a cold render.
-    let gpu = (!cpu && segcam_motion::gpu::wanted()).then(|| {
-        let mut state = Incremental::default();
-        state.use_gpu(true);
-        state
-    });
+    // Waiting for the device here puts every frame on it.
+    let gpu =
+        (!cpu && segcam_motion::gpu::wanted() && segcam_motion::gpu::status().is_ok()).then(|| {
+            let mut state = Incremental::default();
+            state.use_gpu(true);
+            state
+        });
     if float {
         run::<f32>(width, height, settings, gpu)
     } else {

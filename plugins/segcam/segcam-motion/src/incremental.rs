@@ -11,7 +11,7 @@ use std::ops::RangeInclusive;
 
 use vfx_core::cpu::FrameSource;
 
-use crate::gpu::{Cut, Drawer, Fault};
+use crate::gpu::{self, Cut, Drawer, Fault};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
@@ -56,12 +56,14 @@ pub struct Incremental {
     /// Tiles by frame, with the basis and mirroring they were cut for.
     tiles: BTreeMap<i64, (Basis, bool, Vec<Tile>)>,
     /// Drawing on the GPU: a frame's tiles go into its atlas when a render first draws them
-    /// there. The drawer is made by the first render that draws on the GPU, as hosts make
-    /// instances often.
+    /// there. The drawer is made by the first render that draws on the GPU once the device is
+    /// open, as hosts make instances often.
     gpu: Option<Box<Drawer>>,
     cuts: BTreeMap<i64, Cut>,
     gpu_wanted: bool,
     gpu_overlay: bool,
+    /// The last fault told of, so a fault that repeats every render is told of once.
+    told: Option<String>,
     /// From what share of the canvas in window pixels the swarm draws on the GPU.
     gpu_from: Option<f64>,
     window_share: f64,
@@ -152,13 +154,11 @@ impl Incremental {
         }
         let on_gpu =
             s.mode == OutputMode::Swarm || s.mode == OutputMode::Overlay && self.gpu_overlay;
-        if self.gpu_wanted && self.gpu.is_none() && on_gpu {
-            let drawer = Drawer::new().map(Box::new);
+        // While the device opens, renders draw on the CPU.
+        if self.gpu_wanted && self.gpu.is_none() && on_gpu && !gpu::opening() {
+            let drawer = gpu::device().and_then(Drawer::on).map(Box::new);
             self.gpu_wanted = drawer.is_some();
             self.set_drawer(drawer);
-        }
-        if let Some(gpu) = &mut self.gpu {
-            gpu.begin();
         }
         let (w, h) = (out.width, out.height);
         let canvas = Canvas {
@@ -179,7 +179,6 @@ impl Incremental {
         // Frames the host didn't hand over count as empty, as in a cold render, but nothing
         // worked out from one is kept, so it is read again next time.
         let mut missing = BTreeSet::new();
-        let mut fault = None;
         let oldest = (number - targets + 1 - background).max(first);
         // A fixed source's earlier frames are as they were, so only the current frame is
         // checked: a different one means the source started over.
@@ -260,14 +259,10 @@ impl Incremental {
                         self.cuts.remove(&frame);
                     }
                 }
-                if frame == number && fault.is_none() {
-                    fault = self.try_draw(s, count, number, view, out).err();
+                if frame == number {
+                    self.draw(s, count, number, view, out);
                 }
             });
-        }
-        if let Some(fault) = fault {
-            self.fall_back(&fault);
-            return self.advance(s, frames, count, number, out);
         }
         for &frame in &missing {
             self.forget(frame, background);
@@ -292,8 +287,8 @@ impl Incremental {
     }
 
     /// Draws frame `number`, the last of `count`, from what is kept. `frame` is its pixels,
-    /// which every output but the swarm draws over. If the GPU fails, the instance goes back
-    /// to the CPU, whose tiles the next render cuts.
+    /// which every output but the swarm draws over. A render the GPU fails is drawn on the
+    /// CPU from the same kept state.
     pub fn draw<C: Channel>(
         &mut self,
         s: &RenderSettings,
@@ -320,18 +315,27 @@ impl Incremental {
             self.draw_cpu(s, count, number, frame, out);
             return Ok(());
         };
+        gpu.begin();
         let drawn = self.draw_gpu(&mut gpu, s, count, number, frame, out);
         self.gpu = Some(gpu);
         drawn
     }
 
-    /// The GPU failed: this instance draws on the CPU from now on, from what is kept.
+    /// The GPU failed this render. A lost device is given up; after anything else the next
+    /// render tries the GPU again.
     fn fall_back(&mut self, fault: &Fault) {
-        eprintln!(
-            "segcam Motion: the GPU failed ({}); drawing on the CPU",
-            fault.0
-        );
-        self.use_gpu(false);
+        if self.told.as_ref() != Some(&fault.0) {
+            eprintln!(
+                "segcam Motion: the GPU failed ({}); drawing on the CPU",
+                fault.0
+            );
+            self.told = Some(fault.0.clone());
+        }
+        match &mut self.gpu {
+            Some(gpu) if gpu.lost() => self.set_drawer(None),
+            Some(gpu) => gpu.faults += 1,
+            None => {}
+        }
     }
 
     fn draw_cpu<C: Channel>(
@@ -343,37 +347,12 @@ impl Incremental {
         out: &mut ViewMut<C>,
     ) {
         let first = number - count as i64 + 1;
-        let pile = self.pile(s, count, number, out);
+        let pile = pile(&self.tiles, s, count, number, out.width, out.height);
         let empty = Motion::default();
         let motion = self
             .motion(number, &basis(s, number, first))
             .unwrap_or(&empty);
         draw_output(out, s, frame, motion, number, pile.shown());
-    }
-
-    /// The pile of the tiles a swarm render draws from; empty for other outputs.
-    fn pile<C: Channel>(
-        &self,
-        s: &RenderSettings,
-        count: usize,
-        number: i64,
-        out: &ViewMut<C>,
-    ) -> Pile<Placed<'_>> {
-        let first = number - count as i64 + 1;
-        let mut pile = Pile::new(out.width, out.height, s.max_tiles);
-        if s.mode == OutputMode::Swarm {
-            for target in (number - targets(s) + 1).max(first)..=number {
-                let tiles = self.tiles(target, &basis(s, target, first), s.mirror);
-                for (index, tile) in tiles.into_iter().flatten().enumerate() {
-                    pile.push(Placed {
-                        tile,
-                        frame: target,
-                        index,
-                    });
-                }
-            }
-        }
-        pile
     }
 
     fn draw_gpu<C: Channel>(
@@ -400,38 +379,49 @@ impl Incremental {
         }
         // The swarm draws where its windows draw faster: the choice depends on this render's
         // windows alone, so a kept render draws what a cold one does.
-        let canvas = i64::from(out.width) * i64::from(out.height);
+        let (w, h) = (out.width, out.height);
+        let canvas = i64::from(w) * i64::from(h);
         let default = if size_of::<C>() == 1 {
             GPU_FROM_8_BIT
         } else {
             GPU_FROM_DEEPER
         };
         let from = (self.gpu_from.unwrap_or(default) * 1000.0).round() as i64;
-        let (drawn, uploads) = {
-            let pile = self.pile(s, count, number, out);
-            let shown: Vec<&Placed> = pile.shown_entries().collect();
-            let drawn = window_pixels(shown.iter().map(|p| p.tile), out.width, out.height);
-            let mut uploads: Vec<i64> = shown.iter().map(|p| p.frame).collect();
-            uploads.retain(|f| !self.cuts.contains_key(f));
-            uploads.dedup();
-            (drawn, uploads)
-        };
+        let m = SwarmMetrics::new(h);
+        let shadow = swarm::shadow_kernel(m.scale);
+        let pile = pile(&self.tiles, s, count, number, w, h);
+        let shown: Vec<&Placed> = pile.shown_entries().collect();
+        let drawn = window_pixels(shown.iter().map(|p| p.tile), &m, &shadow, w, h);
         self.window_share = drawn as f64 / canvas as f64;
+        let empty = Motion::default();
+        let motion = motion_of(&self.motion, number, &basis(s, number, first)).unwrap_or(&empty);
         if drawn * 1000 < canvas * from {
-            self.draw_cpu(s, count, number, frame, out);
+            draw_output(out, s, frame, motion, number, shown.iter().map(|p| p.tile));
             return Ok(());
         }
-        for f in uploads {
-            if let Some((_, _, tiles)) = self.tiles.get(&f) {
-                let cut = gpu.upload_tiles(tiles, (out.width, out.height))?;
-                self.cuts.insert(f, cut);
+        // Only frames with a shown tile keep their place in the atlas. A full atlas draws this
+        // render on the CPU; the frames the trail drops free it for the next.
+        let wanted: BTreeSet<i64> = shown.iter().map(|p| p.frame).collect();
+        self.cuts.retain(|f, _| wanted.contains(f));
+        for f in wanted {
+            if self.cuts.contains_key(&f) {
+                continue;
             }
+            let Some((_, _, tiles)) = self.tiles.get(&f) else {
+                continue;
+            };
+            match gpu.upload_tiles(tiles, (w, h), &shadow)? {
+                Some(cut) => self.cuts.insert(f, cut),
+                None => {
+                    draw_output(out, s, frame, motion, number, shown.iter().map(|p| p.tile));
+                    return Ok(());
+                }
+            };
         }
-        let pile = self.pile(s, count, number, out);
-        let windows = pile
-            .shown_entries()
+        let windows = shown
+            .iter()
             .map(|p| (p.tile, self.cuts[&p.frame].slots[p.index]));
-        gpu.draw_swarm(out, windows, frame.as_ref(), number, s)
+        gpu.draw_swarm(out, windows, frame.as_ref(), number, s, &shadow)
     }
 
     pub fn reset(&mut self) {
@@ -449,15 +439,11 @@ impl Incremental {
     }
 
     fn motion(&self, frame: i64, basis: &Basis) -> Option<&Motion> {
-        self.motion
-            .get(&frame)
-            .filter(|(b, _)| b == basis)
-            .map(|(_, m)| m)
+        motion_of(&self.motion, frame, basis)
     }
 
     fn tiles(&self, frame: i64, basis: &Basis, mirror: bool) -> Option<&[Tile]> {
-        let (b, m, tiles) = self.tiles.get(&frame)?;
-        (b == basis && *m == mirror).then_some(tiles.as_slice())
+        tiles_of(&self.tiles, frame, basis, mirror)
     }
 
     /// Drops what was kept for `frame`, and the motion and tiles of the frames whose
@@ -481,11 +467,63 @@ impl Incremental {
     }
 }
 
+/// The motion kept for `frame`, if it was worked out for `basis`.
+fn motion_of<'a>(
+    kept: &'a BTreeMap<i64, (Basis, Motion)>,
+    frame: i64,
+    basis: &Basis,
+) -> Option<&'a Motion> {
+    kept.get(&frame).filter(|(b, _)| b == basis).map(|(_, m)| m)
+}
+
+/// The tiles kept for `frame`, if they were cut for `basis` and `mirror`.
+fn tiles_of<'a>(
+    kept: &'a BTreeMap<i64, (Basis, bool, Vec<Tile>)>,
+    frame: i64,
+    basis: &Basis,
+    mirror: bool,
+) -> Option<&'a [Tile]> {
+    let (b, m, tiles) = kept.get(&frame)?;
+    (b == basis && *m == mirror).then_some(tiles.as_slice())
+}
+
+/// The pile of the `kept` tiles a swarm render of frame `number`, the last of `count`, draws
+/// from on a `width` x `height` canvas; empty for other outputs.
+fn pile<'a>(
+    kept: &'a BTreeMap<i64, (Basis, bool, Vec<Tile>)>,
+    s: &RenderSettings,
+    count: usize,
+    number: i64,
+    width: i32,
+    height: i32,
+) -> Pile<Placed<'a>> {
+    let first = number - count as i64 + 1;
+    let mut pile = Pile::new(width, height, s.max_tiles);
+    if s.mode == OutputMode::Swarm {
+        for target in (number - targets(s) + 1).max(first)..=number {
+            let tiles = tiles_of(kept, target, &basis(s, target, first), s.mirror);
+            for (index, tile) in tiles.into_iter().flatten().enumerate() {
+                pile.push(Placed {
+                    tile,
+                    frame: target,
+                    index,
+                });
+            }
+        }
+    }
+    pile
+}
+
 /// The pixels the swarm's windows draw: each with its shadow, clipped to the canvas, overlaps
 /// counted.
-fn window_pixels<'t>(tiles: impl Iterator<Item = &'t Tile>, width: i32, height: i32) -> i64 {
-    let m = SwarmMetrics::new(height);
-    let reach = swarm::shadow_kernel(m.scale).reach;
+fn window_pixels<'t>(
+    tiles: impl Iterator<Item = &'t Tile>,
+    m: &SwarmMetrics,
+    shadow: &swarm::ShadowKernel,
+    width: i32,
+    height: i32,
+) -> i64 {
+    let reach = shadow.reach;
     let canvas = PixelRect::new(0, 0, width, height);
     tiles
         .map(|t| {
@@ -552,6 +590,7 @@ mod tests {
     use std::sync::Arc;
 
     use vfx_core::cpu::Image;
+    use vfx_core::wgpu;
 
     use super::*;
     use crate::gpu;
@@ -607,25 +646,59 @@ mod tests {
         out
     }
 
-    /// A device lost between renders, as when a driver resets, leaves the instance drawing
-    /// what the CPU draws, and no new instance draws on that device. The device is one of the
-    /// test's own on the GPU, or on a software adapter where there is no GPU.
-    #[test]
-    fn a_lost_gpu_falls_back_to_the_cpu() {
-        let Ok(dev) = gpu::open("").or_else(|_| gpu::open("fallback")) else {
-            eprintln!("no adapter: skipped");
-            return;
-        };
-        let dev = Arc::new(dev);
-        let frames = crossing();
-        let mut cpu = Incremental::default();
+    /// A device of the test's own, on the GPU or on a software adapter where there is none;
+    /// `None` where there is no adapter at all.
+    fn own_device() -> Option<Arc<gpu::Device>> {
+        match gpu::open("").or_else(|_| gpu::open("fallback")) {
+            Ok(dev) => Some(Arc::new(dev)),
+            Err(e) => {
+                eprintln!("no adapter ({e}): skipped");
+                None
+            }
+        }
+    }
+
+    /// An instance drawing every swarm render on `dev`.
+    fn on_device(dev: &Arc<gpu::Device>) -> Incremental {
         let mut on_gpu = Incremental::default();
         on_gpu.use_drawer(gpu::Drawer::on(dev.clone()).expect("a drawer on a working device"));
         on_gpu.gpu_threshold(0.0);
+        on_gpu
+    }
+
+    fn drawn(state: &Incremental) -> u64 {
+        state.gpu().map_or(0, |d| d.drawn)
+    }
+
+    fn faults(state: &Incremental) -> u64 {
+        state.gpu().map_or(0, |d| d.faults)
+    }
+
+    /// Whether every channel of `b` is within a level of `a`'s: what the GPU's drawing promises.
+    fn within_a_level(a: &[Argb<u8>], b: &[Argb<u8>]) -> bool {
+        a.iter().zip(b).all(|(p, q)| {
+            [
+                (p.alpha, q.alpha),
+                (p.red, q.red),
+                (p.green, q.green),
+                (p.blue, q.blue),
+            ]
+            .iter()
+            .all(|&(x, y)| x.abs_diff(y) <= 1)
+        })
+    }
+
+    /// A device lost between renders, as when a driver resets, leaves the instance drawing
+    /// what the CPU draws, and no new instance draws on that device.
+    #[test]
+    fn a_lost_gpu_falls_back_to_the_cpu() {
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut cpu = Incremental::default();
+        let mut on_gpu = on_device(&dev);
         for n in 0..frames.len() {
             if n == 7 {
-                let drawn = on_gpu.gpu().map_or(0, |d| d.drawn);
-                assert!(drawn > 0, "drawing on the GPU before the loss");
+                assert!(drawn(&on_gpu) > 0, "drawing on the GPU before the loss");
                 dev.device.destroy();
             }
             let (a, b) = (
@@ -634,11 +707,159 @@ mod tests {
             );
             assert!(n < 7 || a == b, "frame {n} isn't the CPU's after the loss");
         }
-        assert!(dev.failure().is_some(), "the loss went unnoticed");
+        assert!(dev.lost().is_some(), "the loss went unnoticed");
         assert!(on_gpu.gpu().is_none(), "the instance is still on the GPU");
         assert!(
             gpu::Drawer::on(dev).is_none(),
             "a new instance draws on the lost device"
         );
+    }
+
+    /// A validation error leaves the device usable: it is counted, not kept as a failure, so
+    /// new instances still draw on it and a render that didn't cause it isn't charged with it.
+    #[test]
+    fn an_error_leaves_the_device_usable() {
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        dev.misuse();
+        let _ = dev.device.poll(wgpu::PollType::Poll);
+        assert_eq!(dev.errors().0, 1, "the error went unreported");
+        assert!(dev.lost().is_none(), "an error lost the device");
+        let mut on_gpu = on_device(&dev);
+        render(&mut on_gpu, &frames, 0);
+        assert_eq!(drawn(&on_gpu), 1, "the render didn't draw on the GPU");
+        assert_eq!(
+            faults(&on_gpu),
+            0,
+            "an earlier error was charged to the render"
+        );
+    }
+
+    /// An instance taken off the GPU mid sequence draws from then on what a CPU only instance
+    /// draws, byte for byte, from what it kept.
+    #[test]
+    fn leaving_the_gpu_keeps_the_cpu_output() {
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut cpu = Incremental::default();
+        let mut on_gpu = on_device(&dev);
+        for n in 0..frames.len() {
+            if n == 7 {
+                assert!(drawn(&on_gpu) > 0, "drawing on the GPU before the switch");
+                on_gpu.use_gpu(false);
+            }
+            let (a, b) = (
+                render(&mut cpu, &frames, n),
+                render(&mut on_gpu, &frames, n),
+            );
+            assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
+            assert!(
+                n < 7 || a == b,
+                "frame {n} isn't the CPU's after the switch"
+            );
+        }
+        assert!(on_gpu.gpu().is_none(), "the instance is still on the GPU");
+        assert!(dev.lost().is_none(), "the device was given up");
+    }
+
+    /// A render the GPU can't take, here a canvas larger than the device binds, is drawn on
+    /// the CPU byte for byte, and the next render is back on the GPU.
+    #[test]
+    fn a_fault_falls_back_for_one_render() {
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut cpu = Incremental::default();
+        let mut on_gpu = on_device(&dev);
+        for n in 0..frames.len() {
+            let limit = if n == 7 { 1024 } else { u64::MAX };
+            on_gpu.gpu.as_mut().expect("on the GPU").set_limit(limit);
+            let before = drawn(&on_gpu);
+            let (a, b) = (
+                render(&mut cpu, &frames, n),
+                render(&mut on_gpu, &frames, n),
+            );
+            assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
+            if n == 7 {
+                assert_eq!(a, b, "the faulted frame isn't the CPU's");
+                assert_eq!(drawn(&on_gpu), before, "the faulted frame counts as drawn");
+            } else {
+                assert_eq!(
+                    drawn(&on_gpu),
+                    before + 1,
+                    "frame {n} wasn't drawn on the GPU"
+                );
+            }
+        }
+        assert_eq!(faults(&on_gpu), 1);
+        assert!(on_gpu.gpu().is_some(), "the instance left the GPU");
+        assert!(dev.lost().is_none(), "the device was given up");
+    }
+
+    /// A draw that isn't back in time is drawn on the CPU, and the next render is back on
+    /// the GPU with a fresh readback buffer. Whether the first draw is in time depends on
+    /// the GPU, so only what must hold either way is checked.
+    #[test]
+    fn a_slow_readback_falls_back_for_one_render() {
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut cpu = Incremental::default();
+        let mut on_gpu = on_device(&dev);
+        for n in 0..frames.len() {
+            let wait = if n == 7 {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_secs(10)
+            };
+            on_gpu.gpu.as_mut().expect("on the GPU").set_wait(wait);
+            let before = drawn(&on_gpu);
+            let (a, b) = (
+                render(&mut cpu, &frames, n),
+                render(&mut on_gpu, &frames, n),
+            );
+            assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
+            if n != 7 {
+                assert_eq!(
+                    drawn(&on_gpu),
+                    before + 1,
+                    "frame {n} wasn't drawn on the GPU"
+                );
+            }
+        }
+        assert!(faults(&on_gpu) <= 1);
+        assert!(on_gpu.gpu().is_some(), "the instance left the GPU");
+        assert!(dev.lost().is_none(), "the device was given up");
+    }
+
+    /// An atlas too small for the trail draws the renders it can't hold on the CPU, and the
+    /// GPU draws again once the trail moves on; the instance never leaves it.
+    #[test]
+    fn a_full_atlas_falls_back_for_one_render() {
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut cpu = Incremental::default();
+        let mut drawer = gpu::Drawer::on(dev.clone()).expect("a drawer on a working device");
+        // Room for the canvas and a few frames' tiles, and no more.
+        let bytes = (W * H * 4) as u64 + 4096;
+        drawer.small_atlas(1024);
+        drawer.set_limit(bytes);
+        let mut on_gpu = Incremental::default();
+        on_gpu.use_drawer(drawer);
+        on_gpu.gpu_threshold(0.0);
+        for n in 0..frames.len() {
+            let (a, b) = (
+                render(&mut cpu, &frames, n),
+                render(&mut on_gpu, &frames, n),
+            );
+            assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
+        }
+        let drawn = drawn(&on_gpu);
+        assert!(drawn > 0, "nothing was drawn on the GPU");
+        assert!(
+            drawn < frames.len() as u64,
+            "every frame fit the atlas: the test proves nothing"
+        );
+        assert_eq!(faults(&on_gpu), 0, "a full atlas is not a fault");
+        assert!(on_gpu.gpu().is_some(), "the instance left the GPU");
+        assert!(dev.lost().is_none(), "the device was given up");
     }
 }
