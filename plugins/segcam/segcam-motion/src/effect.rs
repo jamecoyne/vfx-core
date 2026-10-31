@@ -197,6 +197,7 @@ impl CpuEffect for SegcamMotion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vfx_core::ParamKind;
     use vfx_core::cpu::{Argb, History, ViewMut};
 
     #[test]
@@ -217,6 +218,56 @@ mod tests {
         for p in PARAMS {
             assert!(p.display_label().len() < 16, "{}", p.display_label());
         }
+    }
+
+    #[test]
+    fn shipped_names_are_frozen() {
+        let shipped = [
+            ("output", "choice 4"),
+            ("detect", "choice 3"),
+            ("sensitivity", "float"),
+            ("adaptation", "float"),
+            ("background", "int"),
+            ("min_size", "float"),
+            ("max_segments", "int"),
+            ("grid", "int"),
+            ("mirror", "bool"),
+            ("level", "int"),
+            ("auto_level", "bool"),
+            ("invert", "bool"),
+            ("face", "bool"),
+            ("eyes", "bool"),
+            ("mouth", "bool"),
+            ("body", "bool"),
+            ("boxes", "bool"),
+            ("labels", "bool"),
+            ("box_color", "color"),
+            ("trail", "int"),
+            ("max_tiles", "int"),
+            ("swarm_background", "choice 3"),
+            ("live_windows", "bool"),
+        ];
+        let current: Vec<(&str, String)> = PARAMS
+            .iter()
+            .map(|p| {
+                let kind = match p.kind {
+                    ParamKind::Float { .. } => "float".to_string(),
+                    ParamKind::Int { options: [], .. } => "int".to_string(),
+                    ParamKind::Int { options, .. } => format!("choice {}", options.len()),
+                    ParamKind::Bool { .. } => "bool".to_string(),
+                    ParamKind::Color { .. } => "color".to_string(),
+                    _ => "other".to_string(),
+                };
+                (p.name, kind)
+            })
+            .collect();
+        let expected: Vec<(&str, String)> =
+            shipped.iter().map(|(n, k)| (*n, k.to_string())).collect();
+        assert_eq!(
+            current, expected,
+            "a shipped parameter name or kind may not change: hosts save projects by it. \
+             Change the label instead. New parameters go at the end, with this list updated."
+        );
     }
 
     /// Driven the way a streaming host drives it: one frame at a time, kept in a history.
