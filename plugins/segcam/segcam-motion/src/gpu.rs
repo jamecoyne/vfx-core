@@ -883,13 +883,11 @@ fn depth<C: Channel>() -> u32 {
 }
 
 fn pixel_bytes<C: Channel>(row: &[Argb<C>]) -> &[u8] {
-    // SAFETY: Argb is four channels with no padding, and a channel is plain data.
-    unsafe { std::slice::from_raw_parts(row.as_ptr().cast(), size_of_val(row)) }
+    bytemuck::cast_slice(row)
 }
 
 fn pixel_bytes_mut<C: Channel>(row: &mut [Argb<C>]) -> &mut [u8] {
-    // SAFETY: as above, and any bytes are a valid channel.
-    unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr().cast(), size_of_val(row)) }
+    bytemuck::cast_slice_mut(row)
 }
 
 fn ms(t: Instant) -> f64 {

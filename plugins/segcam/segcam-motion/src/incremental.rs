@@ -529,10 +529,7 @@ fn fingerprint<C: Channel>(view: &View<C>) -> u64 {
     const K: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut lanes = [0u64; 4];
     for y in 0..view.height {
-        let row = view.row(y);
-        // SAFETY: Argb is four channels with no padding, and a channel is plain data.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(row.as_ptr().cast::<u8>(), size_of_val(row)) };
+        let bytes: &[u8] = bytemuck::cast_slice(view.row(y));
         let (words, rest) = bytes.as_chunks::<8>();
         for chunk in words.chunks(4) {
             for (lane, word) in lanes.iter_mut().zip(chunk) {
