@@ -2,6 +2,8 @@
 # segcam as an FFGL plugin: the shared FFGL mini host's checks (which include segcam's own
 # cases), then its frames against the CLI's. Usage: ./ffgl-tests/run.sh [case] [compare args]
 set -euo pipefail
+# The CPU path, plugin and CLI alike: these checks are byte for byte.
+export SEGCAM_GPU=0
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$here/../../../.."
 target="$root/target"

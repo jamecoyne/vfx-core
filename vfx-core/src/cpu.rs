@@ -18,7 +18,7 @@ mod sealed {
 /// One channel type: `u8`, `u16` or `f32`, each valid for any bit pattern. Integer channels
 /// clamp when written; float channels keep any value.
 pub trait Channel:
-    sealed::Sealed + Copy + Default + PartialEq + Send + Sync + std::fmt::Debug + 'static
+    sealed::Sealed + Copy + Default + PartialEq + Send + Sync + std::fmt::Debug + bytemuck::Pod
 {
     /// The channel's white. After Effects' 16-bit white is 32768, not 65535.
     const MAX: f32;
@@ -64,6 +64,10 @@ pub struct Argb<C> {
     pub green: C,
     pub blue: C,
 }
+
+// SAFETY: four channels of one plain type, laid out in order with no padding.
+unsafe impl<C: bytemuck::Zeroable> bytemuck::Zeroable for Argb<C> {}
+unsafe impl<C: bytemuck::Pod> bytemuck::Pod for Argb<C> {}
 
 /// Converts between channel types through the unit range.
 pub fn convert<A: Channel, B: Channel>(p: &Argb<A>) -> Argb<B> {
