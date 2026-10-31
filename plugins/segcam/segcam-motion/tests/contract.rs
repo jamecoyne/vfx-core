@@ -42,6 +42,10 @@ fn make() -> Processor {
 }
 
 fn make_gpu() -> Processor {
+    Processor::Cpu(Box::new(SegcamMotion::with_gpu_threshold(0.0)))
+}
+
+fn make_gpu_or_cpu() -> Processor {
     Processor::Cpu(Box::new(SegcamMotion::with_gpu(true)))
 }
 
@@ -82,7 +86,8 @@ fn swarm_keeps_the_contract() {
     check(make, &crossing(), &[swarm(false), swarm(true)]).unwrap();
 }
 
-/// The swarm on the GPU keeps it too; skipped where there is no adapter.
+/// The swarm on the GPU keeps it too, and so does choosing the path by its windows; skipped
+/// where there is no adapter.
 #[test]
 fn swarm_on_the_gpu_keeps_the_contract() {
     if !segcam_motion::gpu::available() {
@@ -98,4 +103,5 @@ fn swarm_on_the_gpu_keeps_the_contract() {
         ])
     };
     check(make_gpu, &crossing(), &[swarm(false), swarm(true)]).unwrap();
+    check(make_gpu_or_cpu, &crossing(), &[swarm(false), swarm(true)]).unwrap();
 }

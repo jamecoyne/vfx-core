@@ -41,7 +41,6 @@ const LABELS: u32 = 16u;
 
 const WINDOW_WORDS: u32 = 20u;
 const BLOB_WORDS: u32 = 12u;
-const JOB_WORDS: u32 = 16u;
 
 @group(0) @binding(0) var<uniform> g: Globals;
 @group(0) @binding(1) var<storage, read> frame: array<u32>;
@@ -150,36 +149,6 @@ fn frame_index(x: i32, y: i32) -> u32 {
     let sx = dx * g.frame_w / g.width;
     let sy = y * g.frame_h / g.height;
     return u32(sy * g.frame_w + sx);
-}
-
-// ---------------------------------------------------------------------------------------
-// Tiles: each cut from the frame into the atlas at 8 bits, as `make_tile` cuts it.
-
-/// Which of a crop's `c` pixels tile pixel `t` of `l` shows: floor((t + 0.5) * c / l).
-fn sample(t: i32, c: i32, l: i32) -> i32 {
-    return min(c - 1, (2 * t + 1) * c / (2 * l));
-}
-
-@compute @workgroup_size(16, 16)
-fn cut(@builtin(global_invocation_id) id: vec3<u32>) {
-    let job = g.items + id.z * JOB_WORDS;
-    let video = rect(job);
-    let stored = rect(job + 4u);
-    let crop = rect(job + 8u);
-    let x = i32(id.x);
-    let y = i32(id.y);
-    if x >= stored.w || y >= stored.h {
-        return;
-    }
-    var tx = stored.x + x - video.x;
-    if has(MIRRORED) {
-        tx = video.w - 1 - tx;
-    }
-    let sx = crop.x + sample(tx, crop.w, video.w);
-    let sy = crop.y + sample(stored.y + y - video.y, crop.h, video.h);
-    let p = load_frame(u32(sy * g.frame_w + sx));
-    let n = vec4<u32>(clamp(p, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0 + 0.5);
-    atlas[data[job + 12u] + u32(y * stored.w + x)] = n.y | (n.z << 8u) | (n.w << 16u);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -331,7 +300,7 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
     var tile_color = vec3<f32>(0.0);
     if pixels && in_stored {
         let t = atlas[tile + u32(vy * stored.w + vx)];
-        tile_color = units8(vec4<u32>(0u, t, t >> 8u, t >> 16u) & vec4<u32>(255u)).yzw;
+        tile_color = units8(vec4<u32>(t, t >> 8u, t >> 16u, t >> 24u) & vec4<u32>(255u)).yzw;
     }
     // At 8 bits a frozen tile's pixel under the whole mask is the tile's own level.
     if g.depth == 0u && !has(LIVE) && pixels && ly > g.title_height && ly < frame_r.h

@@ -137,6 +137,7 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     }
     gpu.use_gpu(true);
     gpu.gpu_overlay(true);
+    gpu.gpu_threshold(0.0);
     let mut a = vec![Argb::<C>::default(); (w * h) as usize];
     let mut b = a.clone();
     for n in 0..frames.len() {
@@ -193,6 +194,8 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
         s.mode != OutputMode::Swarm || windows > 0,
         "{name}: no windows drawn"
     );
+    let drawn = gpu.gpu().map_or(0, |d| d.drawn);
+    assert!(drawn > 0, "{name}: nothing was drawn on the GPU");
     true
 }
 

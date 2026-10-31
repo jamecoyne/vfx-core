@@ -11,14 +11,14 @@ use std::ops::RangeInclusive;
 
 use vfx_core::cpu::FrameSource;
 
-use crate::gpu::{Cut, Drawer, Fault, Slot};
+use crate::gpu::{Cut, Drawer, Fault};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
     Detect, FaceParts, OutputMode, Pile, PiledTile, PixelRect, RenderSettings, downsample,
     draw_output, fill_rect, frame_tiles, history_frames,
 };
-use crate::swarm::Tile;
+use crate::swarm::{self, SwarmMetrics, Tile};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Canvas {
@@ -55,18 +55,23 @@ pub struct Incremental {
     motion: BTreeMap<i64, (Basis, Motion)>,
     /// Tiles by frame, with the basis and mirroring they were cut for.
     tiles: BTreeMap<i64, (Basis, bool, Vec<Tile>)>,
-    /// Drawing on the GPU: then tiles keep their pixels in its atlas, cut by frame here. The
-    /// drawer is made by the first render that draws on the GPU, as hosts make instances often.
+    /// Drawing on the GPU: a frame's tiles go into its atlas when a render first draws them
+    /// there. The drawer is made by the first render that draws on the GPU, as hosts make
+    /// instances often.
     gpu: Option<Box<Drawer>>,
     cuts: BTreeMap<i64, Cut>,
     gpu_wanted: bool,
     gpu_overlay: bool,
+    /// From what share of the canvas in window pixels the swarm draws on the GPU.
+    gpu_from: Option<f64>,
+    window_share: f64,
 }
 
-/// A tile in the pile with its place in the GPU's atlas.
+/// A tile in the pile, and where it is kept: frame and index.
 struct Placed<'a> {
     tile: &'a Tile,
-    slot: Slot,
+    frame: i64,
+    index: usize,
 }
 
 impl PiledTile for Placed<'_> {
@@ -74,6 +79,13 @@ impl PiledTile for Placed<'_> {
         self.tile
     }
 }
+
+/// Below these shares of the canvas in window pixels (each window with its shadow, overlaps
+/// counted, as the CPU draws them) the CPU draws the swarm faster than the GPU's copy back. On an
+/// RTX 4070 at 1080p the CPU took about 2.7 ms a canvas at 8 bits and 2.2 ms in float, the GPU
+/// about 1.2 and 3.6 ms whatever the windows; these sit a little above where they cross.
+const GPU_FROM_8_BIT: f64 = 0.5;
+const GPU_FROM_DEEPER: f64 = 1.5;
 
 impl Incremental {
     /// Draws Swarm on the GPU where there is one, or always on the CPU. Off by default, so the
@@ -90,6 +102,17 @@ impl Incremental {
         self.gpu.as_deref()
     }
 
+    /// From what share of the canvas in window pixels the swarm draws on the GPU; 0 draws every
+    /// render there. By default, what was measured to be faster at the canvas's depth.
+    pub fn gpu_threshold(&mut self, share: f64) {
+        self.gpu_from = Some(share);
+    }
+
+    /// The share of the canvas the last swarm render's windows covered, overlaps counted.
+    pub fn window_share(&self) -> f64 {
+        self.window_share
+    }
+
     /// Draws with `drawer` from now on.
     #[cfg(test)]
     pub(crate) fn use_drawer(&mut self, drawer: Drawer) {
@@ -97,10 +120,8 @@ impl Incremental {
         self.set_drawer(Some(Box::new(drawer)));
     }
 
-    /// Tiles cut for one path aren't drawn by the other: they are cut again.
     fn set_drawer(&mut self, drawer: Option<Box<Drawer>>) {
         self.gpu = drawer;
-        self.tiles.clear();
         self.cuts.clear();
     }
 
@@ -234,16 +255,9 @@ impl Incremental {
                         }
                     };
                     if swarm {
-                        let pixels = view.as_ref().filter(|_| self.gpu.is_none());
-                        let tiles = frame_tiles(&motion, pixels, frame, w, h, s.mirror);
-                        if let Some(gpu) = &mut self.gpu {
-                            let blobs = &motion.blobs;
-                            match gpu.cut(view.as_ref(), frame, blobs, &tiles, (w, h), s.mirror) {
-                                Ok(cut) => _ = self.cuts.insert(frame, cut),
-                                Err(f) => fault = Some(f),
-                            }
-                        }
+                        let tiles = frame_tiles(&motion, view.as_ref(), frame, w, h, s.mirror);
                         self.tiles.insert(frame, (basis, s.mirror, tiles));
+                        self.cuts.remove(&frame);
                     }
                 }
                 if frame == number && fault.is_none() {
@@ -311,8 +325,7 @@ impl Incremental {
         drawn
     }
 
-    /// The GPU failed: this instance draws on the CPU from now on. What was worked out on the
-    /// CPU is kept, so only the tiles are cut again.
+    /// The GPU failed: this instance draws on the CPU from now on, from what is kept.
     fn fall_back(&mut self, fault: &Fault) {
         eprintln!(
             "segcam Motion: the GPU failed ({}); drawing on the CPU",
@@ -330,15 +343,7 @@ impl Incremental {
         out: &mut ViewMut<C>,
     ) {
         let first = number - count as i64 + 1;
-        let mut pile = Pile::<&Tile>::new(out.width, out.height, s.max_tiles);
-        if s.mode == OutputMode::Swarm {
-            for target in (number - targets(s) + 1).max(first)..=number {
-                self.tiles(target, &basis(s, target, first), s.mirror)
-                    .into_iter()
-                    .flatten()
-                    .for_each(|t| pile.push(t));
-            }
-        }
+        let pile = self.pile(s, count, number, out);
         let empty = Motion::default();
         let motion = self
             .motion(number, &basis(s, number, first))
@@ -346,8 +351,33 @@ impl Incremental {
         draw_output(out, s, frame, motion, number, pile.shown());
     }
 
-    fn draw_gpu<C: Channel>(
+    /// The pile of the tiles a swarm render draws from; empty for other outputs.
+    fn pile<C: Channel>(
         &self,
+        s: &RenderSettings,
+        count: usize,
+        number: i64,
+        out: &ViewMut<C>,
+    ) -> Pile<Placed<'_>> {
+        let first = number - count as i64 + 1;
+        let mut pile = Pile::new(out.width, out.height, s.max_tiles);
+        if s.mode == OutputMode::Swarm {
+            for target in (number - targets(s) + 1).max(first)..=number {
+                let tiles = self.tiles(target, &basis(s, target, first), s.mirror);
+                for (index, tile) in tiles.into_iter().flatten().enumerate() {
+                    pile.push(Placed {
+                        tile,
+                        frame: target,
+                        index,
+                    });
+                }
+            }
+        }
+        pile
+    }
+
+    fn draw_gpu<C: Channel>(
+        &mut self,
         gpu: &mut Drawer,
         s: &RenderSettings,
         count: usize,
@@ -356,32 +386,52 @@ impl Incremental {
         out: &mut ViewMut<C>,
     ) -> Result<(), Fault> {
         let first = number - count as i64 + 1;
-        let empty = Motion::default();
-        let motion = self
-            .motion(number, &basis(s, number, first))
-            .unwrap_or(&empty);
-        match (s.mode, frame.as_ref()) {
-            (OutputMode::Swarm, _) => {
-                let mut pile = Pile::<Placed>::new(out.width, out.height, s.max_tiles);
-                for target in (number - targets(s) + 1).max(first)..=number {
-                    let tiles = self.tiles(target, &basis(s, target, first), s.mirror);
-                    if let (Some(tiles), Some(cut)) = (tiles, self.cuts.get(&target)) {
-                        for (tile, &slot) in tiles.iter().zip(&cut.slots) {
-                            pile.push(Placed { tile, slot });
-                        }
-                    }
-                }
-                let windows = pile.shown_entries().map(|p| (p.tile, p.slot));
-                gpu.draw_swarm(out, windows, frame.as_ref(), number, s)
-            }
-            (OutputMode::Overlay, Some(view)) if self.gpu_overlay => {
-                gpu.draw_overlay(out, view, &motion.blobs, number, s)
-            }
-            _ => {
-                draw_output(out, s, frame, motion, number, std::iter::empty());
-                Ok(())
+        if let (OutputMode::Overlay, Some(view), true) = (s.mode, frame.as_ref(), self.gpu_overlay)
+        {
+            let empty = Motion::default();
+            let motion = self
+                .motion(number, &basis(s, number, first))
+                .unwrap_or(&empty);
+            return gpu.draw_overlay(out, view, &motion.blobs, number, s);
+        }
+        if s.mode != OutputMode::Swarm {
+            self.draw_cpu(s, count, number, frame, out);
+            return Ok(());
+        }
+        // The swarm draws where its windows draw faster: the choice depends on this render's
+        // windows alone, so a kept render draws what a cold one does.
+        let canvas = i64::from(out.width) * i64::from(out.height);
+        let default = if size_of::<C>() == 1 {
+            GPU_FROM_8_BIT
+        } else {
+            GPU_FROM_DEEPER
+        };
+        let from = (self.gpu_from.unwrap_or(default) * 1000.0).round() as i64;
+        let (drawn, uploads) = {
+            let pile = self.pile(s, count, number, out);
+            let shown: Vec<&Placed> = pile.shown_entries().collect();
+            let drawn = window_pixels(shown.iter().map(|p| p.tile), out.width, out.height);
+            let mut uploads: Vec<i64> = shown.iter().map(|p| p.frame).collect();
+            uploads.retain(|f| !self.cuts.contains_key(f));
+            uploads.dedup();
+            (drawn, uploads)
+        };
+        self.window_share = drawn as f64 / canvas as f64;
+        if drawn * 1000 < canvas * from {
+            self.draw_cpu(s, count, number, frame, out);
+            return Ok(());
+        }
+        for f in uploads {
+            if let Some((_, _, tiles)) = self.tiles.get(&f) {
+                let cut = gpu.upload_tiles(tiles, (out.width, out.height))?;
+                self.cuts.insert(f, cut);
             }
         }
+        let pile = self.pile(s, count, number, out);
+        let windows = pile
+            .shown_entries()
+            .map(|p| (p.tile, self.cuts[&p.frame].slots[p.index]));
+        gpu.draw_swarm(out, windows, frame.as_ref(), number, s)
     }
 
     pub fn reset(&mut self) {
@@ -429,6 +479,22 @@ impl Incremental {
         self.tiles.retain(|f, _| frames.contains(f));
         self.cuts.retain(|f, _| frames.contains(f));
     }
+}
+
+/// The pixels the swarm's windows draw: each with its shadow, clipped to the canvas, overlaps
+/// counted.
+fn window_pixels<'t>(tiles: impl Iterator<Item = &'t Tile>, width: i32, height: i32) -> i64 {
+    let m = SwarmMetrics::new(height);
+    let reach = swarm::shadow_kernel(m.scale).reach;
+    let canvas = PixelRect::new(0, 0, width, height);
+    tiles
+        .map(|t| {
+            let f = swarm::tile_extent(t.video, m.title_height);
+            let area = PixelRect::new(f.x - reach, f.y - reach, f.w + 2 * reach, f.h + 2 * reach);
+            let r = crate::render::intersect(area, canvas);
+            i64::from(r.w) * i64::from(r.h)
+        })
+        .sum()
 }
 
 fn detection(s: &RenderSettings) -> Detection {
@@ -558,9 +624,11 @@ mod tests {
         let mut cpu = Incremental::default();
         let mut on_gpu = Incremental::default();
         on_gpu.use_drawer(gpu::Drawer::on(dev.clone()).expect("a drawer on a working device"));
+        on_gpu.gpu_threshold(0.0);
         for n in 0..frames.len() {
             if n == 7 {
-                assert!(on_gpu.gpu().is_some(), "drawing on the GPU before the loss");
+                let drawn = on_gpu.gpu().map_or(0, |d| d.drawn);
+                assert!(drawn > 0, "drawing on the GPU before the loss");
                 dev.device.destroy();
             }
             let (a, b) = (

@@ -1,7 +1,7 @@
 //! segcam Motion's Overlay and Swarm drawn on the GPU with wgpu, frames through host memory.
-//! Detection, tile layout, title bars and window plans stay on the CPU, made once per tile and
-//! kept in an atlas for the trail with the tiles cut from the uploaded frame. Each output pixel
-//! replays what the CPU path does to it (`gpu.wgsl`), so the two agree within a level. The CPU
+//! Detection, tile layout, cutting tiles, title bars and window plans stay on the CPU; a tile
+//! goes into an atlas kept for the trail when a render first draws it on the GPU. Each output
+//! pixel replays what the CPU path does to it (`gpu.wgsl`), so the two agree within a level. The CPU
 //! path stays the reference and the fallback; Overlay draws there unless asked
 //! ([`crate::Incremental::gpu_overlay`]). A render the GPU fails, or a lost device, is drawn on
 //! the CPU, and that instance stays there.
@@ -27,7 +27,6 @@ pub struct Device {
     pub info: wgpu::AdapterInfo,
     max_binding: u64,
     layout: wgpu::BindGroupLayout,
-    cut: wgpu::ComputePipeline,
     overlay: wgpu::ComputePipeline,
     swarm: wgpu::ComputePipeline,
     /// The first error or loss the device reported; from then on nothing draws on it.
@@ -188,7 +187,6 @@ pub(crate) fn open(choice: &str) -> Result<Device, String> {
         max_binding: supported
             .max_storage_buffer_binding_size
             .min(supported.max_buffer_size),
-        cut: pipeline("cut"),
         overlay: pipeline("overlay"),
         swarm: pipeline("swarm"),
         layout,
@@ -247,7 +245,6 @@ const BOXES: u32 = 8;
 const LABELS: u32 = 16;
 const WINDOW_WORDS: usize = 20;
 const BLOB_WORDS: usize = 12;
-const JOB_WORDS: usize = 16;
 
 /// Where a tile's pixels, title bar and window plan sit in the atlas, in u32 words.
 #[derive(Clone, Copy, Debug, Default)]
@@ -354,7 +351,7 @@ fn atlas_buffer(dev: &Device, words: u64) -> wgpu::Buffer {
 /// How long the last draw's parts took, in ms.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Timings {
-    /// Frames into the GPU's staging memory, for the cut and the draw.
+    /// Frames and new tiles into the GPU's staging memory.
     pub upload: f64,
     /// Tables and windows worked out on the CPU and written.
     pub prepare: f64,
@@ -406,6 +403,8 @@ pub struct Drawer {
     /// Which frame the frame buffer holds, this render.
     loaded: Option<i64>,
     pub timings: Timings,
+    /// Renders drawn on the GPU.
+    pub drawn: u64,
 }
 
 impl Drawer {
@@ -431,6 +430,7 @@ impl Drawer {
             atlas: Arc::new(Mutex::new(Atlas::new(&dev))),
             loaded: None,
             timings: Timings::default(),
+            drawn: 0,
             dev,
         };
         drawer.dev.failure().is_none().then_some(drawer)
@@ -446,18 +446,10 @@ impl Drawer {
         self.timings = Timings::default();
     }
 
-    /// Cuts frame `number`'s tiles (one per blob, from `frame` if there is one) into the atlas
-    /// for a `canvas` (width, height) and stores their title bars and window plans beside them.
-    /// Fails if the atlas is full or the GPU fails.
-    pub fn cut<C: Channel>(
-        &mut self,
-        frame: Option<&View<C>>,
-        number: i64,
-        blobs: &[Blob],
-        tiles: &[Tile],
-        canvas: (i32, i32),
-        mirrored: bool,
-    ) -> Result<Cut, Fault> {
+    /// Puts a frame's tiles in the atlas: their pixels as the CPU cut them, their title bars and
+    /// their window plans for a `canvas` (width, height). Fails if the atlas is full.
+    pub fn upload_tiles(&mut self, tiles: &[Tile], canvas: (i32, i32)) -> Result<Cut, Fault> {
+        let t = Instant::now();
         let m = SwarmMetrics::new(canvas.1);
         let shadow = swarm::shadow_kernel(m.scale);
         let whole = PixelRect::new(0, 0, canvas.0, canvas.1);
@@ -465,68 +457,47 @@ impl Drawer {
             .iter()
             .map(|t| WindowPlan::new(t, &m, &shadow, whole))
             .collect();
-        let frame = frame.filter(|f| !f.is_empty());
-        let crops: Vec<Option<PixelRect>> = blobs
-            .iter()
-            .zip(tiles)
-            .map(|(blob, tile)| {
-                let f = frame?;
-                let crop = swarm::tile_crop(blob, f.width, f.height);
-                (!tile.stored.is_empty() && !crop.is_empty()).then_some(crop)
-            })
-            .collect();
         let bars: Vec<_> = tiles.iter().map(|t| TitleBar::of(t, &m)).collect();
-        let pixel_words: u64 = tiles
-            .iter()
-            .zip(&crops)
-            .filter(|(_, c)| c.is_some())
-            .map(|(t, _)| (t.stored.w * t.stored.h) as u64)
-            .sum();
+        let pixel_words: u64 = tiles.iter().map(|t| t.pixels.len() as u64).sum();
         let bar_words: u64 = bars.iter().map(|b| b.pixels.len() as u64 * 3).sum();
         let plan_words: u64 = plans
             .iter()
             .map(|p| 3 * (p.area.w.max(0) + p.area.h.max(0)) as u64)
             .sum();
         let len = pixel_words + bar_words + plan_words;
-        let mut tables = Vec::with_capacity((bar_words + plan_words) as usize);
         let shared = self.atlas.clone();
         let mut atlas = shared.lock().unwrap_or_else(|e| e.into_inner());
         let start = atlas
             .alloc(&self.dev, len)
             .ok_or_else(|| Fault("the GPU's tiles are full".into()))?;
 
-        let (mut pixels, mut bar) = (start, start + pixel_words);
-        let mut jobs = Vec::new();
+        let mut pixels = start;
         let mut slots = Vec::with_capacity(tiles.len());
-        let (mut most_w, mut most_h) = (0, 0);
-        for ((tile, crop), b) in tiles.iter().zip(&crops).zip(&bars) {
-            let slot = Slot {
-                pixels: pixels as u32,
-                cut: crop.is_some(),
-                bar: bar as u32,
-                bar_width: b.width,
-                ..Slot::default()
-            };
-            if let Some(crop) = crop {
-                let s = tile.stored;
-                jobs.extend(rect_words(tile.video));
-                jobs.extend(rect_words(s));
-                jobs.extend(rect_words(*crop));
-                jobs.extend([slot.pixels, 0, 0, 0]);
-                pixels += (s.w * s.h) as u64;
-                (most_w, most_h) = (most_w.max(s.w), most_h.max(s.h));
+        for tile in tiles {
+            if !tile.pixels.is_empty() {
+                let q = &self.dev.queue;
+                q.write_buffer(&atlas.buffer, pixels * 4, pixel_bytes(&tile.pixels));
             }
+            slots.push(Slot {
+                pixels: pixels as u32,
+                cut: !tile.pixels.is_empty(),
+                ..Slot::default()
+            });
+            pixels += tile.pixels.len() as u64;
+        }
+        let tables_at = start + pixel_words;
+        let mut tables = Vec::with_capacity((bar_words + plan_words) as usize);
+        for (slot, b) in slots.iter_mut().zip(&bars) {
+            (slot.bar, slot.bar_width) = ((tables_at + tables.len() as u64) as u32, b.width);
             tables.extend(
                 b.pixels
                     .iter()
                     .flat_map(|c| [c.r, c.g, c.b].map(f32::to_bits)),
             );
-            bar += b.pixels.len() as u64 * 3;
-            slots.push(slot);
         }
         // Each window's shadow profiles, corner indices and mask edges, by column then by row.
         for (slot, plan) in slots.iter_mut().zip(&plans) {
-            slot.plan = start as u32 + pixel_words as u32 + tables.len() as u32;
+            slot.plan = (tables_at + tables.len() as u64) as u32;
             (slot.frame, slot.area) = (plan.frame, plan.area);
             let mask = |v: &[f64]| v.iter().map(|&f| (f as f32).to_bits()).collect::<Vec<_>>();
             for (profile, corner, edge) in [
@@ -539,47 +510,18 @@ impl Drawer {
             }
         }
         if !tables.is_empty() {
-            let at = (start + pixel_words) * 4;
-            self.dev
-                .queue
-                .write_buffer(&atlas.buffer, at, bytemuck::cast_slice(&tables));
-        }
-        if let (Some(frame), false) = (frame, jobs.is_empty()) {
-            self.upload(frame, number)?;
-            let count = (jobs.len() / JOB_WORDS) as u32;
-            let units = units(&mut jobs);
-            let globals = Globals {
-                units,
-                depth: depth::<C>(),
-                flags: if mirrored { MIRRORED } else { 0 },
-                frame_w: frame.width,
-                frame_h: frame.height,
-                items: 0,
-                ..Globals::default()
-            };
-            let bind = self.bind(&globals, &jobs, &atlas.buffer, 4);
-            let mut encoder = self.dev.device.create_command_encoder(&Default::default());
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.dev.cut);
-                pass.set_bind_group(0, &bind, &[]);
-                pass.dispatch_workgroups(
-                    (most_w as u32).div_ceil(16),
-                    (most_h as u32).div_ceil(16),
-                    count,
-                );
-            }
-            self.dev.queue.submit(Some(encoder.finish()));
+            let q = &self.dev.queue;
+            q.write_buffer(&atlas.buffer, tables_at * 4, bytemuck::cast_slice(&tables));
         }
         drop(atlas);
-        let cut = Cut {
+        self.timings.upload += ms(t);
+        self.dev.check()?;
+        Ok(Cut {
             atlas: self.atlas.clone(),
             start,
             len,
             slots,
-        };
-        self.dev.check()?;
-        Ok(cut)
+        })
     }
 
     /// Draws the swarm of `windows` (shown tiles, oldest first) into `out`. `frame` is frame
@@ -878,6 +820,7 @@ impl Drawer {
         }
         staging.unmap();
         self.timings.read += ms(t);
+        self.drawn += 1;
         Ok(())
     }
 }

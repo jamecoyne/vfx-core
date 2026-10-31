@@ -153,6 +153,14 @@ impl SegcamMotion {
         state.use_gpu(gpu);
         Self { state }
     }
+
+    /// On the GPU from `share` of the canvas in window pixels (see
+    /// [`Incremental::gpu_threshold`]); 0 draws every swarm render there.
+    pub fn with_gpu_threshold(share: f64) -> Self {
+        let mut effect = Self::with_gpu(true);
+        effect.state.gpu_threshold(share);
+        effect
+    }
 }
 
 impl CpuEffect for SegcamMotion {
