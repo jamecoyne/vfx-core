@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
         int window[4]={0,0,320,180}; setIntN(args,kOfxImageEffectPropRenderWindow,4,window);
         CHECK(action(kOfxImageEffectActionGetFramesNeeded,e,args,needed)==kOfxStatOK,"frames needed failed");
         Prop *range=find(needed,"OfxImageClipPropFrameRange_Source",0);
-        int back=mode==3?75:16;
+        int back=mode==3?75:19;
         CHECK(range && range->dbl[0]==t-back && range->dbl[1]==t,"wrong frame range");
         reads=0;
         CHECK(action(kOfxImageEffectActionRender,e,args,NULL)==kOfxStatOK,"render failed at %d",t);

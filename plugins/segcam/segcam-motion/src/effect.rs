@@ -6,7 +6,7 @@ use vfx_core::cpu::{FrameSource, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Unit};
 
 use crate::{
-    Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode, RenderSettings,
+    Cadence, Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode, RenderSettings,
     SwarmBackground, ThresholdSettings,
 };
 
@@ -88,7 +88,8 @@ pub const PARAMS: &[ParamSpec] = &[
         .group("Swarm"),
 ];
 
-/// One frame's settings. `premultiplied` says how the host's frames store colour.
+/// One frame's settings, analysing every frame. `premultiplied` says how the host's frames
+/// store colour.
 pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
     let [r, g, b, _] = p.color("box_color");
     RenderSettings {
@@ -130,6 +131,7 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
             _ => SwarmBackground::Transparent,
         },
         live_windows: p.bool("live_windows"),
+        cadence: Cadence::EVERY_FRAME,
     }
 }
 
@@ -184,7 +186,10 @@ impl CpuEffect for SegcamMotion {
         params: &ParamValues,
         ctx: &Context,
     ) {
-        let s = settings(params, ctx.premultiplied);
+        let s = RenderSettings {
+            cadence: Cadence::at(ctx.frame_rate),
+            ..settings(params, ctx.premultiplied)
+        };
         let (state, n) = (&mut self.state, ctx.frame);
         match output {
             ImageMut::U8(mut out) => state.advance(&s, frames, count, n, &mut out),

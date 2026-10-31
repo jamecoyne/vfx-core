@@ -78,6 +78,43 @@ pub enum SwarmBackground {
     Black,
 }
 
+/// Which frames are analysed: every `stride`th by frame number, so about 30 a second as in
+/// segcam 1.1. A frame between two analyses shows the last one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cadence {
+    pub stride: i64,
+}
+
+impl Cadence {
+    pub const EVERY_FRAME: Self = Self { stride: 1 };
+    /// The most analyses a second.
+    pub const RATE: f64 = 30.0;
+    /// The longest stride, which [`previous_frames_needed`] reaches back for.
+    pub const MAX_STRIDE: i64 = 4;
+
+    /// For a clip at `frame_rate` frames a second; every frame where that isn't known.
+    pub fn at(frame_rate: Option<f64>) -> Self {
+        // Just under the cap still counts as at it, so 29.97 analyses every frame.
+        let stride = frame_rate
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .map_or(1, |r| (r / Self::RATE - 0.01).ceil() as i64);
+        Self {
+            stride: stride.clamp(1, Self::MAX_STRIDE),
+        }
+    }
+
+    /// The analysis `frame` shows when frames start at `first`: its own, or the last before it.
+    pub fn analysis(self, frame: i64, first: i64) -> i64 {
+        (frame - frame.rem_euclid(self.stride)).max(first)
+    }
+}
+
+impl Default for Cadence {
+    fn default() -> Self {
+        Self::EVERY_FRAME
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderSettings {
     pub mode: OutputMode,
@@ -103,6 +140,7 @@ pub struct RenderSettings {
     /// Swarm: windows show the current frame where they sit, rather than the frame they
     /// were cut from.
     pub live_windows: bool,
+    pub cadence: Cadence,
 }
 
 impl Default for RenderSettings {
@@ -128,18 +166,21 @@ impl Default for RenderSettings {
             max_tiles: 100,
             swarm_background: SwarmBackground::Transparent,
             live_windows: false,
+            cadence: Cadence::EVERY_FRAME,
         }
     }
 }
 
-/// How many frames before the current one [`render`] wants to see. With faces on, one more:
-/// an odd frame reuses the faces of the frame before, with that frame's IDs.
+/// How many frames before the current one [`render`] wants to see: the background and the
+/// swarm's trail, or for the other outputs the background of the analysis the frame shows,
+/// at any frame rate. With faces on, one more: an odd frame reuses the faces of the frame
+/// before, with that frame's IDs.
 pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
     history_frames(s)
         + if s.mode == OutputMode::Swarm {
             s.trail_frames.max(1) - 1
         } else {
-            0
+            Cadence::MAX_STRIDE as i32 - 1
         }
         + i32::from(s.faces.any())
 }
