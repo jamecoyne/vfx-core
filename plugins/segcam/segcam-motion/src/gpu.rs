@@ -5,8 +5,10 @@
 //! path stays the reference and the fallback; Overlay draws there unless asked
 //! ([`crate::Incremental::gpu_overlay`]). The device opens in the background, and renders draw
 //! on the CPU until it is ready. A render the GPU fails is drawn on the CPU and the next one
-//! tries the GPU again; a lost device is given up by every instance.
+//! tries the GPU again, or after a few in a row, one a while later; a lost device is given up
+//! by every instance.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -68,6 +70,13 @@ pub struct Fault(pub String);
 /// How long a render waits for its draw before drawing on the CPU instead.
 const WAIT: Duration = Duration::from_secs(1);
 
+/// Faults in a row after which renders stay off the GPU for [`REST`].
+pub(crate) const TRIES: u32 = 3;
+
+/// Long next to a render's wait, so a GPU that hangs without being lost leaves a show on the
+/// CPU at its own speed, with a try now and then.
+const REST: Duration = Duration::from_secs(30);
+
 /// Whether to draw on the GPU where there is one: yes, unless `SEGCAM_GPU=0`.
 pub fn wanted() -> bool {
     std::env::var("SEGCAM_GPU").map_or(true, |v| v != "0")
@@ -99,7 +108,11 @@ pub fn available() -> bool {
 /// Whether there is a working GPU, or why not. Waits for the device to open.
 pub fn status() -> Result<(), NoGpu> {
     start();
-    match DEVICE.wait() {
+    status_of(&DEVICE)
+}
+
+fn status_of(opened: &OnceLock<Opened>) -> Result<(), NoGpu> {
+    match opened.wait() {
         Ok(dev) => dev.lost().map_or(Ok(()), |e| Err(NoGpu::Failed(e))),
         Err(e) => Err(e.clone()),
     }
@@ -118,7 +131,9 @@ pub fn device() -> Option<Arc<Device>> {
     dev.lost().is_none().then(|| dev.clone())
 }
 
-static DEVICE: OnceLock<Result<Arc<Device>, NoGpu>> = OnceLock::new();
+type Opened = Result<Arc<Device>, NoGpu>;
+
+static DEVICE: OnceLock<Opened> = OnceLock::new();
 
 /// Opens the device every instance shares, on first use, in the background: opening it and
 /// compiling its pipelines would stall a render. Software adapters (WARP, lavapipe) are left
@@ -129,17 +144,7 @@ fn start() {
     START.call_once(|| {
         let load = || {
             let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-            let opened = open(&choice).map(Arc::new);
-            match &opened {
-                Ok(dev) => {
-                    eprintln!("segcam Motion: drawing on the GPU ({})", dev.info.name);
-                    if let Ok(mut spare) = dev.spare.lock() {
-                        *spare = Some(Atlas::new(dev));
-                    }
-                }
-                Err(e) => eprintln!("segcam Motion: drawing on the CPU ({e})"),
-            }
-            let _ = DEVICE.set(opened);
+            settle(&DEVICE, || open(&choice));
         };
         #[cfg(not(target_arch = "wasm32"))]
         let spawned = std::thread::Builder::new()
@@ -152,6 +157,31 @@ fn start() {
             load();
         }
     });
+}
+
+/// Opens the device with `open` and gives the answer to `opened`. A broken driver can panic
+/// wgpu; that is a failed GPU, not an answer that never comes.
+fn settle(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<Device, NoGpu>) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let dev = Arc::new(open()?);
+        if let Ok(mut spare) = dev.spare.lock() {
+            *spare = Some(Atlas::new(&dev));
+        }
+        Ok(dev)
+    }))
+    .unwrap_or_else(|panic| {
+        let why = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "opening the device panicked".into());
+        Err(NoGpu::Failed(why))
+    });
+    match &result {
+        Ok(dev) => eprintln!("segcam Motion: drawing on the GPU ({})", dev.info.name),
+        Err(e) => eprintln!("segcam Motion: drawing on the CPU ({e})"),
+    }
+    let _ = opened.set(result);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -496,6 +526,11 @@ pub struct Drawer {
     pub drawn: u64,
     /// Renders the GPU failed, drawn on the CPU instead.
     pub faults: u64,
+    /// Faults since the last render drawn on the GPU.
+    streak: u32,
+    /// When the last of [`TRIES`] faults in a row sent renders to the CPU.
+    resting: Option<Instant>,
+    rest: Duration,
 }
 
 impl Drawer {
@@ -523,6 +558,9 @@ impl Drawer {
             timings: Timings::default(),
             drawn: 0,
             faults: 0,
+            streak: 0,
+            resting: None,
+            rest: REST,
             dev,
         };
         Some(drawer)
@@ -536,6 +574,21 @@ impl Drawer {
     pub fn lost(&self) -> bool {
         let _ = self.dev.device.poll(wgpu::PollType::Poll);
         self.dev.lost().is_some()
+    }
+
+    /// Counts a render the GPU failed. After [`TRIES`] in a row, renders stay off it for a while.
+    pub(crate) fn fault(&mut self) {
+        self.faults += 1;
+        self.streak += 1;
+        if self.streak >= TRIES {
+            self.resting = Some(Instant::now());
+        }
+    }
+
+    /// Whether renders stay off the GPU after too many faults in a row.
+    pub fn resting(&self) -> bool {
+        self.resting
+            .is_some_and(|since| since.elapsed() < self.rest)
     }
 
     /// Called as a render starts: the frame buffer's contents are from an earlier one, and
@@ -561,6 +614,11 @@ impl Drawer {
     #[cfg(test)]
     pub(crate) fn set_wait(&mut self, wait: Duration) {
         self.wait = wait;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_rest(&mut self, rest: Duration) {
+        self.rest = rest;
     }
 
     /// A fault where the device is lost or reported an error since this render began.
@@ -593,37 +651,21 @@ impl Drawer {
             .map(|t| WindowPlan::new(t, &m, shadow, whole))
             .collect();
         let bars: Vec<_> = tiles.iter().map(|t| TitleBar::of(t, &m)).collect();
-        let pixel_words: u64 = tiles.iter().map(|t| t.pixels.len() as u64).sum();
-        let bar_words: u64 = bars.iter().map(|b| b.pixels.len() as u64 * 3).sum();
-        let plan_words: u64 = plans
-            .iter()
-            .map(|p| 3 * (p.area.w.max(0) + p.area.h.max(0)) as u64)
-            .sum();
-        let len = pixel_words + bar_words + plan_words;
-        let shared = self.atlas.clone();
-        let mut atlas = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(start) = atlas.alloc(&self.dev, len, self.limit) else {
-            return Ok(None);
-        };
-
-        let mut pixels = start;
+        // Slots hold offsets from the start of the pixels and of the tables until the atlas
+        // has room for both.
+        let mut pixel_words = 0;
         let mut slots = Vec::with_capacity(tiles.len());
         for tile in tiles {
-            if !tile.pixels.is_empty() {
-                let q = &self.dev.queue;
-                q.write_buffer(&atlas.buffer, pixels * 4, pixel_bytes(&tile.pixels));
-            }
             slots.push(Slot {
-                pixels: pixels as u32,
+                pixels: pixel_words as u32,
                 cut: !tile.pixels.is_empty(),
                 ..Slot::default()
             });
-            pixels += tile.pixels.len() as u64;
+            pixel_words += tile.pixels.len() as u64;
         }
-        let tables_at = start + pixel_words;
-        let mut tables = Vec::with_capacity((bar_words + plan_words) as usize);
+        let mut tables = Vec::new();
         for (slot, b) in slots.iter_mut().zip(&bars) {
-            (slot.bar, slot.bar_width) = ((tables_at + tables.len() as u64) as u32, b.width);
+            (slot.bar, slot.bar_width) = (tables.len() as u32, b.width);
             tables.extend(
                 b.pixels
                     .iter()
@@ -632,7 +674,7 @@ impl Drawer {
         }
         // Each window's shadow profiles, corner indices and mask edges, by column then by row.
         for (slot, plan) in slots.iter_mut().zip(&plans) {
-            slot.plan = (tables_at + tables.len() as u64) as u32;
+            slot.plan = tables.len() as u32;
             (slot.frame, slot.area) = (plan.frame, plan.area);
             let mask = |v: &[f64]| v.iter().map(|&f| (f as f32).to_bits()).collect::<Vec<_>>();
             for (profile, corner, edge) in [
@@ -642,6 +684,24 @@ impl Drawer {
                 tables.extend(profile.iter().map(|f| f.to_bits()));
                 tables.extend(corner.iter().map(|&c| c as u32));
                 tables.extend(mask(edge));
+            }
+        }
+
+        let len = pixel_words + tables.len() as u64;
+        let shared = self.atlas.clone();
+        let mut atlas = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(start) = atlas.alloc(&self.dev, len, self.limit) else {
+            return Ok(None);
+        };
+        let tables_at = start + pixel_words;
+        for (slot, tile) in slots.iter_mut().zip(tiles) {
+            slot.pixels += start as u32;
+            slot.bar += tables_at as u32;
+            slot.plan += tables_at as u32;
+            if !tile.pixels.is_empty() {
+                let q = &self.dev.queue;
+                let at = u64::from(slot.pixels) * 4;
+                q.write_buffer(&atlas.buffer, at, pixel_bytes(&tile.pixels));
             }
         }
         if !tables.is_empty() {
@@ -977,6 +1037,7 @@ impl Drawer {
         self.timings.read += ms(t);
         self.check()?;
         self.drawn += 1;
+        self.streak = 0;
         Ok(())
     }
 }
@@ -1021,4 +1082,23 @@ fn pixel_bytes_mut<C: Channel>(row: &mut [Argb<C>]) -> &mut [u8] {
 
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic while the device opens, as a broken driver can cause, answers that the GPU
+    /// failed instead of leaving every caller waiting.
+    #[test]
+    fn a_panic_while_opening_is_a_failed_gpu() {
+        static OPENED: OnceLock<Opened> = OnceLock::new();
+        let opening = std::thread::spawn(|| settle(&OPENED, || panic!("a broken driver")));
+        opening.join().expect("the panic got out of the opening");
+        assert!(OPENED.get().is_some(), "still opening after the panic");
+        match status_of(&OPENED) {
+            Err(NoGpu::Failed(e)) => assert!(e.contains("a broken driver"), "{e}"),
+            other => panic!("not a failed GPU: {other:?}"),
+        }
+    }
 }

@@ -311,7 +311,7 @@ impl Incremental {
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
     ) -> Result<(), Fault> {
-        let Some(mut gpu) = self.gpu.take() else {
+        let Some(mut gpu) = self.gpu.take_if(|gpu| !gpu.resting()) else {
             self.draw_cpu(s, count, number, frame, out);
             return Ok(());
         };
@@ -322,7 +322,7 @@ impl Incremental {
     }
 
     /// The GPU failed this render. A lost device is given up; after anything else the next
-    /// render tries the GPU again.
+    /// render tries the GPU again, unless it has failed a few in a row.
     fn fall_back(&mut self, fault: &Fault) {
         if self.told.as_ref() != Some(&fault.0) {
             eprintln!(
@@ -333,7 +333,7 @@ impl Incremental {
         }
         match &mut self.gpu {
             Some(gpu) if gpu.lost() => self.set_drawer(None),
-            Some(gpu) => gpu.faults += 1,
+            Some(gpu) => gpu.fault(),
             None => {}
         }
     }
@@ -588,6 +588,7 @@ fn fingerprint<C: Channel>(view: &View<C>) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use vfx_core::cpu::Image;
     use vfx_core::wgpu;
@@ -827,6 +828,48 @@ mod tests {
         }
         assert!(faults(&on_gpu) <= 1);
         assert!(on_gpu.gpu().is_some(), "the instance left the GPU");
+        assert!(dev.lost().is_none(), "the device was given up");
+    }
+
+    /// A few faults in a row leave the GPU alone: the renders after them are the CPU's byte for
+    /// byte and don't touch the GPU, and once the rest is over the GPU draws again. A render
+    /// drawn there starts the count over.
+    #[test]
+    fn faults_in_a_row_rest_on_the_cpu() {
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut cpu = Incremental::default();
+        let mut on_gpu = on_device(&dev);
+        let tries = u64::from(gpu::TRIES);
+        for n in 0..frames.len() as u64 {
+            let drawer = on_gpu.gpu.as_mut().expect("on the GPU");
+            let failing = n < 7 || n == 10;
+            drawer.set_limit(if failing { 1024 } else { u64::MAX });
+            if n == 7 {
+                assert!(
+                    drawer.resting(),
+                    "still trying the GPU after {tries} faults"
+                );
+                drawer.set_rest(Duration::ZERO);
+            }
+            let resting = drawer.resting();
+            let (before, faulted) = (drawn(&on_gpu), faults(&on_gpu));
+            let (a, b) = (
+                render(&mut cpu, &frames, n as usize),
+                render(&mut on_gpu, &frames, n as usize),
+            );
+            assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
+            assert_eq!(resting, (tries..7).contains(&n), "frame {n}");
+            if resting {
+                assert_eq!(a, b, "resting frame {n} isn't the CPU's");
+                assert_eq!(drawn(&on_gpu), before, "resting frame {n} drew on the GPU");
+                assert_eq!(faults(&on_gpu), faulted, "resting frame {n} tried the GPU");
+            }
+            if !failing {
+                assert_eq!(drawn(&on_gpu), before + 1, "frame {n} wasn't on the GPU");
+            }
+        }
+        assert_eq!(faults(&on_gpu), tries + 1);
         assert!(dev.lost().is_none(), "the device was given up");
     }
 
