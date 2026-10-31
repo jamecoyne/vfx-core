@@ -2,6 +2,7 @@
 //! host relies on: whatever it keeps, a render gives what a fresh effect renders.
 
 use segcam_motion::SegcamMotion;
+use segcam_motion::gpu::NoGpu;
 use vfx_core::cpu::Argb;
 use vfx_core::{CpuEffect, ParamValue, ParamValues, Processor};
 use vfx_host::contract::{Clip, check};
@@ -90,9 +91,13 @@ fn swarm_keeps_the_contract() {
 /// where there is no adapter.
 #[test]
 fn swarm_on_the_gpu_keeps_the_contract() {
-    if !segcam_motion::gpu::available() {
-        eprintln!("no GPU adapter: skipped");
-        return;
+    match segcam_motion::gpu::status() {
+        Ok(()) => {}
+        Err(NoGpu::NoAdapter(e)) => {
+            eprintln!("no GPU adapter ({e}): skipped");
+            return;
+        }
+        Err(e) => panic!("{e}"),
     }
     let swarm = |mirror| {
         with(&[
@@ -104,4 +109,7 @@ fn swarm_on_the_gpu_keeps_the_contract() {
     };
     check(make_gpu, &crossing(), &[swarm(false), swarm(true)]).unwrap();
     check(make_gpu_or_cpu, &crossing(), &[swarm(false), swarm(true)]).unwrap();
+    if let Err(e) = segcam_motion::gpu::status() {
+        panic!("{e}");
+    }
 }

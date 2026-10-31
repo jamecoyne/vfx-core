@@ -611,12 +611,12 @@ mod tests {
     }
 
     /// A device lost between renders, as when a driver resets, leaves the instance drawing
-    /// what the CPU draws, and no new instance draws on that device. The device is a software
-    /// one of the test's own.
+    /// what the CPU draws, and no new instance draws on that device. The device is one of the
+    /// test's own on the GPU, or on a software adapter where there is no GPU.
     #[test]
     fn a_lost_gpu_falls_back_to_the_cpu() {
-        let Ok(dev) = gpu::open("fallback") else {
-            eprintln!("no software adapter: skipped");
+        let Ok(dev) = gpu::open("").or_else(|_| gpu::open("fallback")) else {
+            eprintln!("no adapter: skipped");
             return;
         };
         let dev = Arc::new(dev);

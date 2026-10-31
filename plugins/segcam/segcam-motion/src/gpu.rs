@@ -60,36 +60,61 @@ pub fn wanted() -> bool {
     std::env::var("SEGCAM_GPU").map_or(true, |v| v != "0")
 }
 
-/// Whether there is a working GPU to draw on.
-pub fn available() -> bool {
-    device().is_some()
+/// Why there is no GPU to draw on.
+#[derive(Clone, Debug)]
+pub enum NoGpu {
+    /// No adapter, software ones left out: the CPU is the path for this machine.
+    NoAdapter(String),
+    /// There is one, but making its device or drawing on it failed.
+    Failed(String),
 }
 
-/// The shared device, or `None` where there is no adapter or it failed. Software adapters
-/// (WARP, lavapipe) are left out unless `SEGCAM_GPU_ADAPTER=fallback` asks for one;
-/// `SEGCAM_GPU_ADAPTER=low` picks the low power adapter (an integrated GPU).
+impl std::fmt::Display for NoGpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoGpu::NoAdapter(e) => write!(f, "no GPU: {e}"),
+            NoGpu::Failed(e) => write!(f, "the GPU failed: {e}"),
+        }
+    }
+}
+
+/// Whether there is a working GPU to draw on.
+pub fn available() -> bool {
+    status().is_ok()
+}
+
+/// Whether there is a working GPU, or why not.
+pub fn status() -> Result<(), NoGpu> {
+    match shared() {
+        Ok(dev) => dev.failure().map_or(Ok(()), |e| Err(NoGpu::Failed(e))),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// The shared device, or `None` where there is no adapter or it failed.
 pub fn device() -> Option<Arc<Device>> {
-    static DEVICE: OnceLock<Option<Arc<Device>>> = OnceLock::new();
-    DEVICE
-        .get_or_init(|| {
-            let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-            match open(&choice) {
-                Ok(dev) => {
-                    eprintln!("segcam Motion: drawing on the GPU ({})", dev.info.name);
-                    Some(Arc::new(dev))
-                }
-                Err(e) => {
-                    eprintln!("segcam Motion: drawing on the CPU ({e})");
-                    None
-                }
-            }
-        })
-        .clone()
-        .filter(|dev| dev.failure().is_none())
+    let dev = shared().as_ref().ok()?;
+    dev.failure().is_none().then(|| dev.clone())
+}
+
+/// The device every instance shares, opened on first use. Software adapters (WARP, lavapipe)
+/// are left out unless `SEGCAM_GPU_ADAPTER=fallback` asks for one; `SEGCAM_GPU_ADAPTER=low`
+/// picks the low power adapter (an integrated GPU).
+fn shared() -> &'static Result<Arc<Device>, NoGpu> {
+    static DEVICE: OnceLock<Result<Arc<Device>, NoGpu>> = OnceLock::new();
+    DEVICE.get_or_init(|| {
+        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+        let opened = open(&choice).map(Arc::new);
+        match &opened {
+            Ok(dev) => eprintln!("segcam Motion: drawing on the GPU ({})", dev.info.name),
+            Err(e) => eprintln!("segcam Motion: drawing on the CPU ({e})"),
+        }
+        opened
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn open(choice: &str) -> Result<Device, String> {
+pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -103,10 +128,10 @@ pub(crate) fn open(choice: &str) -> Result<Device, String> {
         force_fallback_adapter: choice == "fallback",
         apply_limit_buckets: false,
     }))
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| NoGpu::NoAdapter(e.to_string()))?;
     let info = adapter.get_info();
     if info.device_type == wgpu::DeviceType::Cpu && choice != "fallback" {
-        return Err(format!("{} draws in software", info.name));
+        return Err(NoGpu::NoAdapter(format!("{} draws in software", info.name)));
     }
     // The atlas grows with the trail: take as much of a binding as the adapter allows.
     let supported = adapter.limits();
@@ -120,7 +145,7 @@ pub(crate) fn open(choice: &str) -> Result<Device, String> {
         required_limits,
         ..wgpu::DeviceDescriptor::default()
     }))
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| NoGpu::Failed(e.to_string()))?;
     let failure = Arc::new(Mutex::new(None));
     let note = |failure: &Arc<Mutex<Option<String>>>| {
         let failure = failure.clone();
@@ -196,15 +221,17 @@ pub(crate) fn open(choice: &str) -> Result<Device, String> {
         failure,
     };
     match dev.failure() {
-        Some(e) => Err(e),
+        Some(e) => Err(NoGpu::Failed(e)),
         None => Ok(dev),
     }
 }
 
 // Browsers can't wait on the GPU inside a render.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn open(_choice: &str) -> Result<Device, String> {
-    Err("no blocking GPU access in browsers".into())
+pub(crate) fn open(_choice: &str) -> Result<Device, NoGpu> {
+    Err(NoGpu::NoAdapter(
+        "no blocking GPU access in browsers".into(),
+    ))
 }
 
 /// Must match `Globals` in gpu.wgsl.

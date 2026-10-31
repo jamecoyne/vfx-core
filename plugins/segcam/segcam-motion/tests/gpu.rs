@@ -1,7 +1,9 @@
 //! The GPU path against the CPU path, which stays the reference: every pixel within one level
 //! (1/255 of white), and few pixels off by more than half of one. Skipped where there is no
-//! adapter; `SEGCAM_GPU_ADAPTER=fallback` runs it on a software one (WARP, lavapipe).
+//! adapter, failed where there is one but it can't draw; `SEGCAM_GPU_ADAPTER=fallback` runs it
+//! on a software one (WARP, lavapipe).
 
+use segcam_motion::gpu::NoGpu;
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
     Argb, Channel, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View, ViewMut,
@@ -132,8 +134,13 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     let needed = segcam_motion::previous_frames_needed(s) as usize;
     let mut cpu = Incremental::default();
     let mut gpu = Incremental::default();
-    if !segcam_motion::gpu::available() {
-        return false;
+    match segcam_motion::gpu::status() {
+        Ok(()) => {}
+        Err(NoGpu::NoAdapter(e)) => {
+            eprintln!("no GPU adapter ({e}): skipped");
+            return false;
+        }
+        Err(e) => panic!("{e}"),
     }
     gpu.use_gpu(true);
     gpu.gpu_overlay(true);
@@ -194,6 +201,9 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
         s.mode != OutputMode::Swarm || windows > 0,
         "{name}: no windows drawn"
     );
+    if let Err(e) = segcam_motion::gpu::status() {
+        panic!("{name}: {e}");
+    }
     let drawn = gpu.gpu().map_or(0, |d| d.drawn);
     assert!(drawn > 0, "{name}: nothing was drawn on the GPU");
     true
@@ -203,7 +213,6 @@ fn each_case<C: Depth>() {
     for (w, h) in [(320, 180), (640, 360)] {
         for (name, s) in cases() {
             if !compare::<C>(name, &s, w, h) {
-                eprintln!("no GPU adapter: skipped");
                 return;
             }
         }
