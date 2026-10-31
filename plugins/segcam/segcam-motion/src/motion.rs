@@ -64,6 +64,8 @@ pub struct Blob {
     pub bounds: NormRect,
     pub pixels: i32,
     pub kind: SegmentKind,
+    /// A face reused from an earlier frame keeps its ID: that frame and its index there.
+    pub reused: Option<(i64, usize)>,
 }
 
 /// 8-connected labelling. `mask` is 1 for foreground, 0 for background. Returns the largest
@@ -127,6 +129,7 @@ pub fn label(mask: &[u8], width: i32, height: i32, min_pixels: i32, max_count: i
             },
             pixels: count,
             kind: SegmentKind::Motion,
+            reused: None,
         });
     }
 

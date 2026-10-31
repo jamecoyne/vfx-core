@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use segcam_motion::motion::{self, LumaGrid};
 use segcam_motion::pixel::Depth;
 use segcam_motion::pixel::make_pixel;
-use segcam_motion::render::{PixelRect, downsample, fit_text, text_width};
+use segcam_motion::render::{PixelRect, blob_label, downsample, fit_text, text_width};
 use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, draw_window, make_tile};
 use segcam_motion::{
     Argb, Blob, Channel, Color, Detect, FaceParts, Incremental, MotionSettings, NormRect,
@@ -529,6 +529,16 @@ fn window_chrome_matches_the_bake() {
 fn labels_and_font() {
     assert_eq!(segment_label(SegmentKind::Motion, 412, 0), "motion#412.1");
     assert_eq!(segment_label(SegmentKind::Blob, 7, 1), "blob#7.2");
+    let face = Blob {
+        kind: SegmentKind::Face,
+        reused: Some((6, 2)),
+        ..Blob::default()
+    };
+    assert_eq!(
+        blob_label(&face, 7, 0),
+        "face#6.3",
+        "a reused face keeps its ID"
+    );
     assert!(font::glyph('m')[2] != 0 && font::glyph('#')[0] != 0);
     assert_eq!(font::glyph('~'), font::glyph('?'));
     assert_eq!(

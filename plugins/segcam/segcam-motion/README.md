@@ -45,7 +45,9 @@ segments are labelled `blob#…`. **Swarm backdrop** puts the windows on a trans
 uses Apple's Vision on macOS and ONNX Runtime models on Windows and Linux. **Detect ▸ Faces
 only** shows just the face and body segments. On Windows the models take about 2 seconds to
 load the first time, then add about 12 ms to a 1080p frame, and the plugin ships its own
-`DirectML.dll`. The face modes don't run in the web build yet.
+`DirectML.dll`. As in segcam 1.1, faces run on every 2nd frame, the even frame numbers: an odd
+frame shows the faces of the frame before, with their IDs, or finds its own when the host
+doesn't hand that frame over. The face modes don't run in the web build yet.
 
 ## Parameters
 

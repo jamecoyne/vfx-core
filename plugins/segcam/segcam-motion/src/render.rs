@@ -131,7 +131,8 @@ impl Default for RenderSettings {
     }
 }
 
-/// How many frames before the current one [`render`] wants to see.
+/// How many frames before the current one [`render`] wants to see. With faces on, one more:
+/// an odd frame reuses the faces of the frame before, with that frame's IDs.
 pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
     history_frames(s)
         + if s.mode == OutputMode::Swarm {
@@ -139,6 +140,7 @@ pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
         } else {
             0
         }
+        + i32::from(s.faces.any())
 }
 
 /// How many frames before a frame its detection reads: the background, for motion.
@@ -154,6 +156,12 @@ pub fn history_frames(s: &RenderSettings) -> i32 {
 /// segment on every frame.
 pub fn segment_label(kind: SegmentKind, frame: i64, index: usize) -> String {
     format!("{}#{frame}.{}", kind.name(), index + 1)
+}
+
+/// The label of `blob`, segment `index` of frame `frame`, or the one it had if it was reused.
+pub fn blob_label(blob: &Blob, frame: i64, index: usize) -> String {
+    let (frame, index) = blob.reused.unwrap_or((frame, index));
+    segment_label(blob.kind, frame, index)
 }
 
 /// Box-averages a frame down to `target_width` columns, preserving aspect: the same four
@@ -354,7 +362,7 @@ pub fn draw_overlay<C: Channel>(
         }
 
         // The ID chip sits on the box's top edge, outside it; inside if the box is at the top.
-        let label = segment_label(blob.kind, frame, i);
+        let label = blob_label(blob, frame, i);
         let pad = 2 * scale;
         let mut chip = PixelRect::new(
             r.x,
@@ -421,7 +429,9 @@ pub fn apply_matte<C: Channel>(
 
 // ---------------------------------------------------------------------------------------
 
-/// The tiles a frame's blobs become, biggest first, titled with their labels.
+/// The tiles a frame's blobs become, biggest first, titled with their labels. Reused faces,
+/// which come last, already have windows from their own frame, so they get tiles only if
+/// `reused` asks for them.
 pub fn frame_tiles<C: Channel>(
     motion: &Motion,
     frame: Option<&View<C>>,
@@ -429,13 +439,22 @@ pub fn frame_tiles<C: Channel>(
     canvas_w: i32,
     canvas_h: i32,
     mirrored: bool,
+    reused: bool,
 ) -> Vec<Tile> {
     let make = |b: usize| {
         let blob = &motion.blobs[b];
-        let title = format!("LO.FI.SCI.FI {}", segment_label(blob.kind, number, b));
+        let title = format!("LO.FI.SCI.FI {}", blob_label(blob, number, b));
         swarm::make_tile(blob, frame, title, canvas_w, canvas_h, mirrored)
     };
-    let count = motion.blobs.len();
+    let count = if reused {
+        motion.blobs.len()
+    } else {
+        motion
+            .blobs
+            .iter()
+            .take_while(|b| b.reused.is_none())
+            .count()
+    };
     // A camera move makes big segments, each copied whole, so they're shared out over a
     // few threads, as the swarm's drawing is.
     const THREADS: usize = 6;
