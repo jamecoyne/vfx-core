@@ -23,7 +23,7 @@ Always the first four. Overlay is the core effect, Swarm the mode. Runs compared
 | overlay faces | overlay, plus Face, Eyes, Mouth and Body |
 | show | Output Swarm, Detect Motion, Background 16, Trail 24, Swarm max tiles 100, backdrop Transparent, no face parts |
 | show faces | show, plus Face, Eyes, Mouth and Body |
-| 1.1 look | show faces with Trail 120, analysing about 30 frames a second at the clip's frame rate: `RenderSettings::look_1_1`, in the CLI `--preset 1.1 --fps RATE` |
+| 1.1 look | show faces with Trail 120, analysing about 30 frames a second at the clip's frame rate: `RenderSettings::look_1_1`, in the CLI `--preset 1.1 --fps RATE --keep` |
 
 A host that gives no frame rate (Resolume) analyses every frame, so its 1.1 look rows say so.
 
