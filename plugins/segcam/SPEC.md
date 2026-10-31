@@ -13,7 +13,7 @@ segcam 1.0 is the `segcam-motion` effect (with `segcam-face`) shipped as plugins
 | Resolume Avenue and Arena | FFGL | Windows, macOS |
 | After Effects | After Effects | Windows, macOS |
 
-The preview app and the web build stay working for development, with no 1.0 requirements.
+The preview app keeps working with every 1.0 effect, on the desktop and in the browser.
 
 ## 2. Definitions
 
@@ -109,10 +109,3 @@ Planned after 1.0 in [ROADMAP.md](ROADMAP.md).
 Premiere Pro, Nuke, Natron, Linux, iOS, the web; a draft playback mode; frames staying on the
 host's GPU; keeping work between renders in After Effects; Windows code signing; a live only build
 option; splitting or refactoring vfx-core for reuse.
-
-## 9. Working rules
-
-- Small PRs, one topic each. The owner of the touched code reviews: StopBanning for the OpenFX and FFGL
-  wrappers, NicoWasHere for the preview. Strongtut merges after review. jamecoyne rules on the decisions.
-- A PR that touches speed adds the benchmark rows for the hosts it changes.
-- A PR that finishes a requirement changes its status here.

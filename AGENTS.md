@@ -5,6 +5,9 @@ People start at [README.md](README.md); the developer guide is [docs/DEVELOPING.
 - Working on segcam: read [`plugins/segcam/SPEC.md`](plugins/segcam/SPEC.md) first, the 1.0
   requirements with their status. Decisions are in `plugins/segcam/decisions/`, the work order in
   `ROADMAP.md`, and speed numbers follow `BENCHMARK.md`, all in the same folder.
+- Pull requests: small, one topic each. Request review from jamecoyne, and from whoever wrote the
+  code you change (`git log` on its files). A PR that touches speed adds the benchmark rows for the
+  hosts it changes; one that finishes a segcam requirement changes its status in SPEC.md.
 - Effect logic belongs in an effect crate (`vfx-core/effects/`, `plugins/`) or the core
   (`vfx-core/src/effects`). A target crate (`vfx-core/wrappers/`) only translates parameters
   and moves pixels, for any effect; what two targets share belongs in
