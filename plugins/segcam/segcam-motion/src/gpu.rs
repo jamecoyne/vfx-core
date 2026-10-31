@@ -5,8 +5,8 @@
 //! path stays the reference and the fallback; Overlay draws there unless asked
 //! ([`crate::Incremental::gpu_overlay`]). The device opens in the background, and renders draw
 //! on the CPU until it is ready. A render the GPU fails is drawn on the CPU and the next one
-//! tries the GPU again, or after a few in a row, one a while later; a lost device is given up
-//! by every instance.
+//! tries the GPU again, or after a few close together, one a while later; a lost device is
+//! given up by every instance.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, Once, OnceLock};
@@ -70,8 +70,14 @@ pub struct Fault(pub String);
 /// How long a render waits for its draw before drawing on the CPU instead.
 const WAIT: Duration = Duration::from_secs(1);
 
-/// Faults in a row after which renders stay off the GPU for [`REST`].
+/// The wait on a software adapter, which draws on the CPU's cores beside the host's own work
+/// and can be slow without hanging.
+const SOFTWARE_WAIT: Duration = Duration::from_secs(10);
+
+/// Faults within the last [`WINDOW`] renders tried on the GPU after which renders stay off it
+/// for [`REST`].
 pub(crate) const TRIES: u32 = 3;
+const WINDOW: u32 = 10;
 
 /// Long next to a render's wait, so a GPU that hangs without being lost leaves a show on the
 /// CPU at its own speed, with a try now and then.
@@ -526,9 +532,9 @@ pub struct Drawer {
     pub drawn: u64,
     /// Renders the GPU failed, drawn on the CPU instead.
     pub faults: u64,
-    /// Faults since the last render drawn on the GPU.
-    streak: u32,
-    /// When the last of [`TRIES`] faults in a row sent renders to the CPU.
+    /// The last [`WINDOW`] renders tried on the GPU, newest in the lowest bit, set for a fault.
+    recent: u16,
+    /// When the last of [`TRIES`] faults in the window sent renders to the CPU.
     resting: Option<Instant>,
     rest: Duration,
 }
@@ -552,13 +558,17 @@ impl Drawer {
             data: Grown::new("segcam tables", U::STORAGE | U::COPY_DST),
             atlas: Arc::new(Mutex::new(spare.unwrap_or_else(|| Atlas::new(&dev)))),
             limit: dev.max_binding,
-            wait: WAIT,
+            wait: if dev.info.device_type == wgpu::DeviceType::Cpu {
+                SOFTWARE_WAIT
+            } else {
+                WAIT
+            },
             seen: dev.errors().0,
             loaded: None,
             timings: Timings::default(),
             drawn: 0,
             faults: 0,
-            streak: 0,
+            recent: 0,
             resting: None,
             rest: REST,
             dev,
@@ -576,16 +586,21 @@ impl Drawer {
         self.dev.lost().is_some()
     }
 
-    /// Counts a render the GPU failed. After [`TRIES`] in a row, renders stay off it for a while.
+    /// Counts a render the GPU failed. After [`TRIES`] within the window, renders stay off it
+    /// for a while.
     pub(crate) fn fault(&mut self) {
         self.faults += 1;
-        self.streak += 1;
-        if self.streak >= TRIES {
+        self.note(true);
+        if self.recent.count_ones() >= TRIES {
             self.resting = Some(Instant::now());
         }
     }
 
-    /// Whether renders stay off the GPU after too many faults in a row.
+    fn note(&mut self, fault: bool) {
+        self.recent = (self.recent << 1 | u16::from(fault)) & ((1 << WINDOW) - 1);
+    }
+
+    /// Whether renders stay off the GPU after too many faults.
     pub fn resting(&self) -> bool {
         self.resting
             .is_some_and(|since| since.elapsed() < self.rest)
@@ -1037,7 +1052,7 @@ impl Drawer {
         self.timings.read += ms(t);
         self.check()?;
         self.drawn += 1;
-        self.streak = 0;
+        self.note(false);
         Ok(())
     }
 }
