@@ -1,6 +1,6 @@
 # ADR 1: segcam 1.1 is the reference
 
-Status: proposed. Date: 2026-10-30. Decides: jamecoyne.
+Status: proposed. Date: 2026-10-30. Proposed by: Strongtut. Decides: jamecoyne.
 
 ## Context
 

@@ -1,6 +1,6 @@
 # ADR 5: Windows plugins ship as zips
 
-Status: proposed. Date: 2026-10-30. Decides: jamecoyne.
+Status: proposed. Date: 2026-10-30. Proposed by: Strongtut. Decides: jamecoyne.
 
 ## Context
 

@@ -1,6 +1,6 @@
 # ADR 2: faces every 2nd frame
 
-Status: proposed. Date: 2026-10-30. Decides: jamecoyne, in the PR that builds it.
+Status: proposed. Date: 2026-10-30. Proposed by: Strongtut. Decides: jamecoyne, in the PR that builds it.
 
 ## Context
 

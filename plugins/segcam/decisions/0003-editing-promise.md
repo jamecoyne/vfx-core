@@ -1,6 +1,6 @@
 # ADR 3: the editing promise
 
-Status: proposed. Date: 2026-10-30. Decides: Strongtut.
+Status: proposed. Date: 2026-10-30. Proposed by: Strongtut. Decides: jamecoyne.
 
 ## Context
 
