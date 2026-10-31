@@ -866,20 +866,22 @@ pub fn draw_window_with<C: Channel>(
     }
 }
 
-/// The shadow kernel at `scale`. Its corner table takes a while to make, and the scale rarely
-/// changes, so the last one is kept.
+/// The shadow kernel at `scale`. Its corner table takes a while to make, and a host draws at
+/// a few canvas sizes in turn (its viewer's and its output's), so the last few are kept.
 pub fn shadow_kernel(scale: f64) -> std::sync::Arc<ShadowKernel> {
-    static SHADOW: std::sync::Mutex<Option<(f64, std::sync::Arc<ShadowKernel>)>> =
-        std::sync::Mutex::new(None);
+    const KEPT: usize = 4;
+    static SHADOW: std::sync::Mutex<Vec<(f64, std::sync::Arc<ShadowKernel>)>> =
+        std::sync::Mutex::new(Vec::new());
     let mut kept = SHADOW.lock().unwrap_or_else(|e| e.into_inner());
-    match &*kept {
-        Some((s, kernel)) if *s == scale => kernel.clone(),
-        _ => {
-            let kernel = std::sync::Arc::new(ShadowKernel::new(scale));
-            *kept = Some((scale, kernel.clone()));
-            kernel
-        }
+    let kernel = match kept.iter().position(|(s, _)| *s == scale) {
+        Some(i) => kept.remove(i).1,
+        None => std::sync::Arc::new(ShadowKernel::new(scale)),
+    };
+    if kept.len() == KEPT {
+        kept.remove(0);
     }
+    kept.push((scale, kernel.clone()));
+    kernel
 }
 
 /// Clears the canvas, then draws each shown tile oldest first as segcam's window. Bands of
