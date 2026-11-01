@@ -36,28 +36,38 @@ impl Gpu {
         Ok(Self { device, queue })
     }
 
-    /// Lets CPU effects draw on this device. For browsers, where they can't open their own.
-    #[cfg(target_arch = "wasm32")]
+    /// Lets CPU effects draw on this device: in browsers, where they can't open their own, and
+    /// in hosts that offer their output a GPU frame on it ([`crate::CpuEffect::render_to`]).
+    /// Effects pick their device on first use, so a host shares it before they render.
     pub fn share(&self) {
-        SHARED.with(|s| *s.borrow_mut() = Some((self.device.clone(), self.queue.clone())));
+        let parts = Some((self.device.clone(), self.queue.clone()));
+        #[cfg(target_arch = "wasm32")]
+        SHARED.with(|s| *s.borrow_mut() = parts);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = parts;
+        }
     }
 
     /// The device a host shared with [`Gpu::share`].
-    #[cfg(target_arch = "wasm32")]
     pub fn shared() -> Option<Self> {
-        SHARED.with(|s| {
-            s.borrow()
-                .clone()
-                .map(|(device, queue)| Self { device, queue })
-        })
+        #[cfg(target_arch = "wasm32")]
+        let parts = SHARED.with(|s| s.borrow().clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        let parts = SHARED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        parts.map(|(device, queue)| Self { device, queue })
     }
 }
 
+// Browsers' wgpu objects stay on their thread.
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static SHARED: std::cell::RefCell<Option<(wgpu::Device, wgpu::Queue)>> =
         const { std::cell::RefCell::new(None) };
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+static SHARED: std::sync::Mutex<Option<(wgpu::Device, wgpu::Queue)>> = std::sync::Mutex::new(None);
 
 #[derive(Debug)]
 pub struct GpuError(String);
