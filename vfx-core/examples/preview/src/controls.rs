@@ -331,6 +331,8 @@ fn input_box(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actio
         egui::ComboBox::from_id_salt("input")
             // Leaves room for the refresh button beside it.
             .width(ui.available_width() - 32.0)
+            // A long file name would otherwise widen the panel past the window.
+            .truncate()
             .selected_text(shown)
             .show_ui(ui, |ui| {
                 if let Some(i) = pattern_items(ui, |i| status.image.is_none() && c.pattern == i) {
