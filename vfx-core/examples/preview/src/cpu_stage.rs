@@ -78,10 +78,11 @@ impl CpuStage {
         }
     }
 
-    /// Renders the newest frame again if anything changed since the last render.
-    fn refresh(&mut self, values: &ParamValues, time: f64, frame_rate: Option<f64>) {
+    /// Renders the newest frame again if anything changed since the last render. True when
+    /// a render finished.
+    fn refresh(&mut self, values: &ParamValues, time: f64, frame_rate: Option<f64>) -> bool {
         if self.rendered_with.as_ref() == Some(values) || self.history.is_empty() {
-            return;
+            return false;
         }
         let (w, h) = (self.size.0 as i32, self.size.1 as i32);
         let ctx = Context {
@@ -96,7 +97,7 @@ impl CpuStage {
             .effect
             .render(&mut self.history, count, out, values, &ctx);
         if self.effect.unfinished() {
-            return; // the next render of this frame finishes it
+            return false; // the next render of this frame finishes it
         }
         self.rendered_with = Some(values.clone());
         let width = self.size.0 as usize;
@@ -107,8 +108,10 @@ impl CpuStage {
                 *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
             }
         });
+        true
     }
 
+    /// True when a render finished, so `output` has a new picture.
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -117,14 +120,14 @@ impl CpuStage {
         values: &ParamValues,
         time: f64,
         frame_rate: Option<f64>,
-    ) {
+    ) -> bool {
         // A frame still waiting on the GPU keeps its place until it's done.
         if !self.effect.unfinished() {
             self.push(gpu, input, time, values);
         }
-        self.refresh(values, time, frame_rate);
+        let finished = self.refresh(values, time, frame_rate);
         if self.effect.unfinished() {
-            return; // the last output stays up
+            return false; // the last output stays up
         }
         if self.history.is_empty() {
             // Nothing read back yet (the web build reads a frame late): show the input.
@@ -138,6 +141,7 @@ impl CpuStage {
         } else {
             output.write(gpu, bytemuck::cast_slice(&self.upload));
         }
+        finished
     }
 }
 

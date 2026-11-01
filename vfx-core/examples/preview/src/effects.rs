@@ -249,6 +249,8 @@ enum Run {
         chain: Box<EffectChain>,
         /// The effect's own position in `chain`.
         index: usize,
+        /// What it last drew with: the same again is the same picture.
+        drawn: Option<(f64, ParamValues)>,
     },
     Cpu(Box<CpuStage>),
 }
@@ -274,6 +276,7 @@ impl Stage {
                     run: Run::Gpu {
                         chain: Box::new(chain),
                         index,
+                        drawn: None,
                     },
                 }
             }
@@ -289,7 +292,16 @@ impl Stage {
     }
 }
 
+/// What the last [`Effects::render`] did, for the stats.
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub struct Rendered {
+    pub finished: bool,
+    pub new_picture: bool,
+}
+
 pub struct Effects {
+    rendered: Rendered,
     frames: Frames,
     /// A dropped image, uploaded once, used instead of the generated pattern.
     image: Option<(String, Frame)>,
@@ -337,6 +349,7 @@ impl Effects {
             readback: None,
             generator,
             display_pass,
+            rendered: Rendered::default(),
             stage: Stage::new(gpu, 0, PATTERN_SIZE),
             pattern_size: PATTERN_SIZE,
         }
@@ -450,6 +463,12 @@ impl Effects {
         }
     }
 
+    /// What the last render did.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn rendered(&self) -> Rendered {
+        self.rendered
+    }
+
     /// Goes back to the generated patterns.
     pub fn clear_image(&mut self, gpu: &Gpu) {
         self.frame_rate = None;
@@ -539,11 +558,31 @@ impl Effects {
         };
         let result = &self.frames.output;
         match &mut self.stage.run {
-            Run::Gpu { chain, index } => {
+            Run::Gpu {
+                chain,
+                index,
+                drawn,
+            } => {
                 *chain.params_mut(*index) = values.clone();
                 chain.render_with_layers(gpu, source, layers, result, time);
+                let new_picture = drawn
+                    .as_ref()
+                    .is_none_or(|(at, with)| *at != time || with != values);
+                if new_picture {
+                    *drawn = Some((time, values.clone()));
+                }
+                self.rendered = Rendered {
+                    finished: true,
+                    new_picture,
+                };
             }
-            Run::Cpu(stage) => stage.render(gpu, source, result, values, time, self.frame_rate),
+            Run::Cpu(stage) => {
+                let finished = stage.render(gpu, source, result, values, time, self.frame_rate);
+                self.rendered = Rendered {
+                    finished,
+                    new_picture: finished,
+                };
+            }
         }
 
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {

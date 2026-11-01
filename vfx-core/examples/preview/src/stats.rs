@@ -1,5 +1,5 @@
-//! The bottom bar: frame rate, this process's and the whole machine's CPU, memory, and GPU
-//! load. Sampled about once a second, so the bar costs no frames.
+//! The bottom bar: what the preview did each second, this process's and the whole machine's
+//! CPU, memory, and GPU load. Sampled about once a second, so the bar costs no frames.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -9,10 +9,35 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 
 const INTERVAL: Duration = Duration::from_secs(1);
 
+/// Running totals of what the preview did.
+#[derive(Clone, Copy, Default)]
+pub struct Counts {
+    /// Times round the app's loop. A loop can show the same picture as the last one.
+    pub loops: u64,
+    /// Renders the effect finished.
+    pub finished: u64,
+    /// New pictures presented in the window.
+    pub shown: u64,
+}
+
+impl Counts {
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            loops: self.loops - earlier.loops,
+            finished: self.finished - earlier.finished,
+            shown: self.shown - earlier.shown,
+        }
+    }
+}
+
 /// What the bar shows.
 #[derive(Clone, Copy, Default)]
 pub struct Snapshot {
-    pub fps: f32,
+    pub counts: Counts,
+    /// `counts` per second, over the last second.
+    pub loops: f32,
+    pub finished: f32,
+    pub shown: f32,
     /// The effects output's size, in pixels.
     pub size: (u32, u32),
     /// This process, as a percentage of one core (so it can pass 100 on several).
@@ -28,6 +53,7 @@ pub struct Sampler {
     sys: Option<System>,
     pid: Pid,
     last: Option<Instant>,
+    last_counts: Counts,
     snapshot: Snapshot,
     /// Written by the GPU thread (macOS only).
     gpu: Arc<Mutex<Option<f32>>>,
@@ -52,16 +78,25 @@ impl Sampler {
             sys: System::new().ok(),
             pid: Pid::from_u32(std::process::id()),
             last: None,
+            last_counts: Counts::default(),
             snapshot: Snapshot::default(),
             gpu,
         }
     }
 
-    /// The latest numbers, with `fps` as the render loop measures it. CPU and memory are
-    /// only read again once a second.
-    pub fn sample(&mut self, fps: f32, size: (u32, u32)) -> Snapshot {
+    /// The latest numbers, with `counts` as the render loop keeps them. The rates, CPU and
+    /// memory are only worked out again once a second.
+    pub fn sample(&mut self, counts: Counts, size: (u32, u32)) -> Snapshot {
         if self.last.is_none_or(|t| t.elapsed() >= INTERVAL) {
+            if let Some(last) = self.last {
+                let seconds = last.elapsed().as_secs_f32();
+                let done = counts.since(self.last_counts);
+                self.snapshot.loops = done.loops as f32 / seconds;
+                self.snapshot.finished = done.finished as f32 / seconds;
+                self.snapshot.shown = done.shown as f32 / seconds;
+            }
             self.last = Some(Instant::now());
+            self.last_counts = counts;
             if let Some(sys) = self.sys.as_mut() {
                 sys.refresh_cpu_usage();
                 sys.refresh_memory();
@@ -74,7 +109,7 @@ impl Sampler {
             }
             self.snapshot.gpu = *self.gpu.lock().unwrap();
         }
-        self.snapshot.fps = fps;
+        self.snapshot.counts = counts;
         self.snapshot.size = size;
         self.snapshot
     }
@@ -98,7 +133,11 @@ pub fn bar(ui: &mut Ui, s: &Snapshot) {
     ui.horizontal(|ui| {
         ui.monospace(format!("{} × {}", s.size.0, s.size.1));
         ui.separator();
-        ui.monospace(format!("{:.0} fps", s.fps));
+        ui.monospace(format!("{:.0} shown/s", s.shown));
+        ui.separator();
+        ui.monospace(format!("{:.0} rendered/s", s.finished));
+        ui.separator();
+        ui.monospace(format!("{:.0} loops/s", s.loops));
         ui.separator();
         ui.monospace(format!("CPU {:.0}% (app {:.0}%)", s.system_cpu, s.cpu));
         ui.separator();

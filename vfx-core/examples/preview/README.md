@@ -30,16 +30,18 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 when `--frames` or `--seconds` ends the run:
 
 ```text
-stats t=1.0 fps=59.9 ms=16.69 max_ms=18.20 size=1280x720 cpu=12.3 app_cpu=45.0 mem_mb=312 gpu=n/a
-done frames=600 seconds=10.01 fps=59.9 max_ms=40.20
+stats t=1.0 fps=144.0 ms=6.94 max_ms=9.20 size=1280x720 cpu=12.3 app_cpu=45.0 mem_mb=312 gpu=n/a loops=144.0 finished=59.9 shown=59.9
+done frames=1440 seconds=10.01 fps=143.8 max_ms=40.20 loops=143.8 finished=59.8 shown=59.8
 ```
 
-`fps` and `ms` are the frames drawn in that second and their mean interval, `max_ms` the
-longest; `cpu` is the machine's, `app_cpu` this process's as a share of one core, and `gpu`
-is `n/a` where the OS doesn't report it. A frame is one redraw: a visible window is paced by
-vsync, and a video's effect only works when the video moves on, so with a clip `fps` above
-the clip's rate means the effect keeps up. Under `--quiet` frames are unpaced and each waits
-for the GPU, so a test pattern (which changes every frame) shows the effect's throughput.
+`shown` is the number to read: new pictures presented in the window each second. `finished`
+is the renders the effect finished each second, and `loops` the times round the app's loop,
+which a visible window paces by vsync and which repeats the last picture when nothing new
+came in. `ms` and `max_ms` are the mean and longest loop, and `fps` is `loops` under its old
+name, kept for older scripts. `cpu` is the machine's, `app_cpu` this process's as a share of
+one core, and `gpu` is `n/a` where the OS doesn't report it. Under `--quiet` loops are unpaced
+and each waits for the GPU, nothing is presented so `shown` is 0, and a test pattern (which
+changes every loop) shows the effect's throughput in `finished`.
 
 In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
 `--effect` and a file, mistakes show in the panel as before.
