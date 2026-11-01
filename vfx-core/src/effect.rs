@@ -130,9 +130,8 @@ pub trait CpuEffect: Send {
         ctx: &Context,
     );
 
-    /// Whether the last render left its output unfinished, waiting on the GPU, which only a
-    /// browser does. Its output isn't to be shown; the host renders the same frame with the
-    /// same parameters again until this is false.
+    /// Whether the last render is unfinished, waiting on the GPU (browsers only). Hosts don't show
+    /// it and render the same frame with the same parameters again until this is false.
     fn unfinished(&self) -> bool {
         false
     }

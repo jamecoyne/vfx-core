@@ -1,6 +1,8 @@
 //! The contract a CPU effect that keeps state signs: whatever it keeps, every render gives
 //! what a fresh effect renders from the same frames. Hosts rely on it (see [`crate::kept`]);
-//! an effect crate checks itself with [`check`] in its tests, on a clip that moves.
+//! an effect crate checks itself with [`check`] in its tests, on a clip that moves. A render
+//! left [unfinished](CpuEffect::unfinished) counts only once the same frame renders again and
+//! finishes, as a host must show it.
 
 use vfx_core::cpu::{Argb, FrameSource, Image, ImageMut, View, ViewMut};
 use vfx_core::{Context, CpuEffect, ParamValues, Processor};
@@ -53,33 +55,44 @@ impl FrameSource for Source<'_> {
     }
 }
 
+/// How often a frame is rendered again while the effect says it is unfinished.
+const TRIES: usize = 8;
+
 fn render(
     effect: &mut dyn CpuEffect,
     clip: &Clip,
     number: i64,
     missing: &[i64],
     values: &ParamValues,
-) -> Vec<Argb<u8>> {
+) -> Result<Vec<Argb<u8>>, String> {
     let count = (effect.frames_before(values) as i64 + 1).min(number + 1);
-    let mut source = Source {
-        clip,
-        first: number - count + 1,
-        missing,
-    };
-    let mut out = vec![Argb::default(); clip.frames[0].len()];
-    let view = ViewMut::from_pixels(&mut out, clip.width, clip.height);
     let ctx = Context {
         frame: number,
         ..Context::at(number as f64 / 30.0)
     };
-    effect.render(
-        &mut source,
-        count as usize,
-        ImageMut::U8(view),
-        values,
-        &ctx,
-    );
-    out
+    for _ in 0..TRIES {
+        let mut source = Source {
+            clip,
+            first: number - count + 1,
+            missing,
+        };
+        // A new buffer each time, so a finished render can't lean on an unfinished one.
+        let mut out = vec![Argb::default(); clip.frames[0].len()];
+        let view = ViewMut::from_pixels(&mut out, clip.width, clip.height);
+        effect.render(
+            &mut source,
+            count as usize,
+            ImageMut::U8(view),
+            values,
+            &ctx,
+        );
+        if !effect.unfinished() {
+            return Ok(out);
+        }
+    }
+    Err(format!(
+        "frame {number} is still unfinished after {TRIES} renders"
+    ))
 }
 
 fn cpu(make: fn() -> Processor) -> Box<dyn CpuEffect> {
@@ -102,8 +115,8 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
                    values: &ParamValues,
                    what: &str|
      -> Result<(), String> {
-        let got = render(kept, clip, number, missing, values);
-        let want = render(&mut *cpu(make), clip, number, missing, values);
+        let got = render(kept, clip, number, missing, values)?;
+        let want = render(&mut *cpu(make), clip, number, missing, values)?;
         if got == want {
             Ok(())
         } else {
@@ -265,5 +278,66 @@ mod tests {
         };
         let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("stale");
         assert!(err.contains("edited"), "{err}");
+    }
+
+    /// Leaves each frame's first render unfinished with a wrong pixel, as a browser's GPU draw
+    /// does, and draws the frame at the next render of it; `never` stays unfinished.
+    #[derive(Default)]
+    struct Late {
+        waiting: Option<i64>,
+        never: bool,
+    }
+
+    impl CpuEffect for Late {
+        fn params(&self) -> &[ParamSpec] {
+            &[]
+        }
+        fn keeps_state(&self) -> bool {
+            true
+        }
+        fn render(
+            &mut self,
+            frames: &mut dyn FrameSource,
+            count: usize,
+            output: ImageMut<'_>,
+            _: &ParamValues,
+            ctx: &Context,
+        ) {
+            let ImageMut::U8(mut out) = output else {
+                return;
+            };
+            if self.never || self.waiting != Some(ctx.frame) {
+                self.waiting = Some(ctx.frame);
+                out.row_mut(0)[0].red = 1;
+                return;
+            }
+            self.waiting = None;
+            frames.with_frame(count - 1, &mut |image| {
+                if let Some(Image::U8(v)) = image {
+                    out.row_mut(0)[0].red = v.row(0)[0].red;
+                }
+            });
+        }
+        fn unfinished(&self) -> bool {
+            self.waiting.is_some()
+        }
+    }
+
+    #[test]
+    fn an_unfinished_render_counts_once_finished() {
+        let make = || Processor::Cpu(Box::new(Late::default()));
+        assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
+    }
+
+    #[test]
+    fn a_render_that_never_finishes_breaks_it() {
+        let make = || {
+            Processor::Cpu(Box::new(Late {
+                never: true,
+                ..Late::default()
+            }))
+        };
+        let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("unfinished");
+        assert!(err.contains("unfinished"), "{err}");
     }
 }
