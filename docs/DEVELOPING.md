@@ -136,7 +136,7 @@ acts on every effect crate; output goes to `target/vfx-plugin/`.
 |---|---|---|
 | The effects | `cargo vfx list` | each effect crate and its identity |
 | A new effect | `cargo vfx new my-glow` | `vfx-core/effects/my-glow`, added to the workspace and the preview |
-| Checks | `cargo vfx check` | effects missing from the preview, and installed After Effects plugins that share a match name |
+| Checks | `cargo vfx check` | effects missing from the preview, and installed After Effects plugins that share a match name; `--quick` and `--full` run the test tiers ([Testing](#testing)) |
 | Plugins | `cargo vfx build [-p segcam-motion] [--hosts ae,ofx,ffgl] [--native]` | `<file>.plugin`, `.ofx.bundle` and `.bundle` on macOS (one universal binary; `--native` builds this Mac's architecture only); `.aex`, `.ofx.bundle` and `.dll` on Windows |
 | macOS installers | `cargo vfx package` | `<file>-adobe.pkg` (Adobe's MediaCore folder) and `<file>-ofx.pkg` (`/Library/OFX/Plugins`) |
 | Install | `cargo vfx install [--hosts ffgl]` | copies FFGL bundles into Resolume's Extra Effects; for After Effects and OpenFX, prints the `sudo installer` commands |
@@ -196,6 +196,25 @@ Secrets and variables → Actions); without them the packages are unsigned:
 The Windows installer is unsigned, so Windows SmartScreen asks before running it.
 
 ## Testing
+
+Two tiers run the checks locally, each step logged to `target/checks/<step>.log`:
+
+| Tier | Command | Runs |
+|---|---|---|
+| Quick, while iterating | `cargo vfx check --quick [-p PACKAGE]...` | format, the core crates' clippy, and the tests of the packages changed since `origin/main` (committed or not; `-p` picks others). A change to `Cargo.toml`, `Cargo.lock` or `.cargo/` tests the core crates |
+| Full, before a pull request | `cargo vfx check --full` | CI's steps for this OS, the OpenFX and FFGL mini hosts with segcam's full matrices, and the preview's clippy, tests and wasm check |
+
+The full tier needs what the harnesses need: `OFX_INCLUDE` (Resolve's headers are the default on
+macOS) and, on Windows, Git for Windows (its bash runs the scripts) and `CC` (default `clang`).
+`segcam-motion`'s harnesses also take `--quick`, a smaller matrix for iterating on the plugin
+targets; the full tier runs the whole one.
+
+The test profile optimises `segcam-motion` and `vfx-core`, so their pixel tests take seconds;
+overflow checks and debug assertions stay on. Several clones or worktrees on one machine can
+share compiled dependencies through [sccache](https://github.com/mozilla/sccache):
+`cargo install sccache`, then set `RUSTC_WRAPPER=sccache` in your shell (not in the repository's
+config); the tiers use it when it is set. On Windows it can't build `web-sys` for wasm (the command line gets too long), so the full tier
+runs the wasm check without it; unset `RUSTC_WRAPPER` for the web build too.
 
 Unit tests cover the core, each effect, and each target's parameter mapping and pixel
 conversions. Each host also has a harness that runs the effects:

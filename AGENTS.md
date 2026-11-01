@@ -2,6 +2,13 @@
 
 People start at [README.md](README.md); the developer guide is [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
+Recent changes for agents (newest first; prune entries once they are old):
+
+- 2026-10-31: two check tiers. `cargo vfx check --quick` while iterating, `cargo vfx check --full`
+  before a pull request ([docs/DEVELOPING.md](docs/DEVELOPING.md#testing)).
+
+- Run `cargo vfx check --quick` while iterating (format, the core clippy and the tests of the
+  packages you changed) and `cargo vfx check --full` before a pull request (CI's steps and the harnesses).
 - Working on segcam: read [`plugins/segcam/SPEC.md`](plugins/segcam/SPEC.md) first, the 1.0
   requirements with their status. Decisions are in `plugins/segcam/decisions/`, the work order in
   `ROADMAP.md`, and speed numbers follow `BENCHMARK.md`, all in the same folder.

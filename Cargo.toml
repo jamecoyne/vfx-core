@@ -6,3 +6,11 @@ resolver = "3"
 members = ["vfx-core", "vfx-core/effects/vfx-chain", "vfx-core/examples/preview", "vfx-core/wrappers/common", "vfx-core/wrappers/build", "vfx-core/wrappers/plugin", "vfx-core/tools/cargo-vfx", "vfx-core/wrappers/adobe", "vfx-core/wrappers/ofx", "vfx-core/wrappers/ffgl", "vfx-core/wrappers/ffgl-common", "plugins/segcam/segcam-motion", "plugins/segcam/segcam-face"]
 # Plain `cargo test` builds only the core, so windowing never enters CI on Linux.
 default-members = ["vfx-core"]
+
+# The pixel heavy crates' tests run optimised: minutes become seconds, and overflow checks and
+# debug assertions stay on.
+[profile.test.package.segcam-motion]
+opt-level = 2
+
+[profile.test.package.vfx-core]
+opt-level = 2

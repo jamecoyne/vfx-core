@@ -175,7 +175,7 @@ SEGCAM_TEST_DIR=/tmp/segcam OFX_INCLUDE=/path/to/openfx/include ./plugins/segcam
 renders a 32-frame, 320x180 moving-square sequence through the VFX Preview mini host's
 suites and compares it with the CLI in Overlay, Motion matte and Swarm, at all three
 depths, both row orders, and straight and premultiplied alpha, each rendered forwards,
-backwards, shuffled and cold: 144 comparisons. High-depth
+backwards, shuffled and cold: 144 comparisons (`--quick`: the 48 at 8 bits). High-depth
 outputs are compared after rounding to 8-bit levels; this is not a native 16-bit or HDR
 precision check.
 
@@ -203,6 +203,8 @@ CLI's straight ARGB to FFGL's premultiplied ARGB. `segcam` skips the frame-time
 benchmark; `segcam-timing` runs only that benchmark; `--work-dir PATH` after the case
 selects where the temporary raw files go. `FFGL_MINIHOST_SOFTWARE=1` selects Apple's
 software GL renderer, as on macOS CI. On Windows, run from Git Bash with `CC` set.
+`--quick` before the case sends only the default settings through each mode (8 of the 20
+sequences), for iterating.
 
 FFGL expresses Box color as consecutive Box red, Box green and Box blue parameters. Host
 time running backwards, or a size change, starts the history over. More Background or
