@@ -72,6 +72,12 @@ pub struct Incremental {
     window_share: f64,
     /// The last render's draw hasn't come back from the GPU yet (browsers).
     unfinished: bool,
+    /// Live renders act as if the face models were still loading.
+    #[cfg(test)]
+    models_held: bool,
+    /// How many times faces were looked for.
+    #[cfg(test)]
+    finds: u32,
 }
 
 /// A tile in the pile, and where it is kept: frame and index.
@@ -165,6 +171,17 @@ impl Incremental {
         if out.is_empty() {
             return;
         }
+        // A live render can't wait for the face models, so it draws as with faces off until they
+        // are up. Any other render may be exported, so finding faces waits for them.
+        let without_faces = RenderSettings {
+            faces: FaceParts::default(),
+            ..*s
+        };
+        let s = if frames.live() && s.faces.any() && !self.models_up() {
+            &without_faces
+        } else {
+            s
+        };
         if count == 0 {
             let all = PixelRect::new(0, 0, out.width, out.height);
             fill_rect(out, all, Argb::default());
@@ -281,6 +298,10 @@ impl Incremental {
                             if let Some(before) = reused {
                                 motion.blobs.extend(reused_faces(before, source));
                             } else if let Some(view) = view.as_ref().filter(|_| s.faces.any()) {
+                                #[cfg(test)]
+                                {
+                                    self.finds += 1;
+                                }
                                 let found = crate::faces::find(view, s.faces, grid.count());
                                 motion.blobs.extend(found);
                             }
@@ -308,6 +329,15 @@ impl Incremental {
         }
         let reach = background + targets + 2 * Cadence::MAX_STRIDE;
         self.keep(number - reach..=number + reach);
+    }
+
+    /// Whether a live render can find faces.
+    fn models_up(&self) -> bool {
+        #[cfg(test)]
+        if self.models_held {
+            return false;
+        }
+        crate::faces::ready()
     }
 
     /// The frames from `first` a render of `number` has to read: those whose motion or tiles
@@ -759,6 +789,78 @@ mod tests {
         let view = &mut ViewMut::from_pixels(&mut out, W, H);
         state.advance(&s, &mut Frames(clip), clip.len(), n as i64, view);
         out
+    }
+
+    const ALL_PARTS: FaceParts = FaceParts {
+        face: true,
+        eyes: true,
+        mouth: true,
+        body: true,
+    };
+
+    fn with_faces(faces: FaceParts) -> RenderSettings {
+        RenderSettings {
+            mode: OutputMode::Swarm,
+            background_frames: 4,
+            trail_frames: 6,
+            max_tiles: 20,
+            faces,
+            ..RenderSettings::default()
+        }
+    }
+
+    /// Loads the models under the GPU tests' turn, since that opens devices too.
+    fn wait_for_models() {
+        let _turn = turn();
+        crate::faces::wait();
+    }
+
+    /// How often a render of frame `n` looked for faces.
+    fn finds_in(
+        state: &mut Incremental,
+        source: &mut dyn FrameSource,
+        count: usize,
+        n: i64,
+    ) -> u32 {
+        let s = with_faces(ALL_PARTS);
+        let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+        let view = &mut ViewMut::from_pixels(&mut out, W, H);
+        let before = state.finds;
+        state.advance(&s, source, count, n, view);
+        state.finds - before
+    }
+
+    /// While the models load a live render doesn't look for faces, and looks once they are up.
+    #[test]
+    fn a_live_render_finds_no_faces_during_the_load() {
+        wait_for_models();
+        let frames = crossing();
+        let mut state = Incremental {
+            models_held: true,
+            ..Incremental::default()
+        };
+        let mut history = vfx_core::cpu::History::<u8>::default();
+        history.resize(W, H);
+        let before = crate::previous_frames_needed(&with_faces(ALL_PARTS)) as usize;
+        for (n, frame) in frames.iter().enumerate() {
+            state.models_held = n < 7;
+            history.next(before).copy_from_slice(frame);
+            let count = history.len();
+            let finds = finds_in(&mut state, &mut history, count, n as i64);
+            assert_eq!(finds > 0, n == 7 || n > 7 && n % 2 == 0, "frame {n}");
+        }
+    }
+
+    /// A render that may be exported doesn't draw without faces: it waits for the models.
+    #[test]
+    fn an_editing_render_looks_for_faces_during_the_load() {
+        wait_for_models();
+        let frames = crossing();
+        let mut state = Incremental {
+            models_held: true,
+            ..Incremental::default()
+        };
+        assert!(finds_in(&mut state, &mut Frames(&frames[..1]), 1, 0) > 0);
     }
 
     /// The GPU tests take turns: several devices open at once on WARP crash it now and then

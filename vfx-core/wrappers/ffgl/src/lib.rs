@@ -383,6 +383,9 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
                 (Some(me), Some(i)) => {
                     let value = f32::from_bits(unsafe { s.new_parameter_value.uint });
                     me.values[i] = params::clamp(&table[i], value);
+                    if let Some(cpu) = &me.cpu {
+                        cpu.effect.values_known(&me.effect_values());
+                    }
                     FFMixed::success()
                 }
                 _ => FFMixed::fail(),

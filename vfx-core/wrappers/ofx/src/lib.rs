@@ -610,6 +610,9 @@ fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     if !instance.is_kept() {
         return Ok(());
     }
+    if let Ok(values) = values(effect, 0.0) {
+        instance.values_known(&values);
+    }
     let kept: *mut Kept = Box::into_raw(Box::new(Kept {
         effect: instance,
         last: std::sync::Mutex::new(None),

@@ -74,6 +74,9 @@ a host has neither. An effect's `region` tells hosts how far it reads past each 
 whether its output grows; `Context` gives it the time, frame number and render scale.
 `vfx_host::controls::layout` decides the layout for every target, so it is tested once.
 
+A `CpuEffect` with slow setup starts it in `values_known`, which OpenFX and FFGL call ahead of
+the first render.
+
 A `CpuEffect` that keeps work between renders says so with `keeps_state`. OpenFX, FFGL
 and the preview then keep one per instance (`vfx_host::CpuInstance`, which also starts it
 over after a panic, a seek back or a resize); After Effects never does. Either way every

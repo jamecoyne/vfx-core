@@ -121,6 +121,11 @@ pub trait CpuEffect: Send {
         false
     }
 
+    /// The values a host holds for this instance, ahead of a render where it can give them: when
+    /// it makes the instance or a value changes. Slow setup they call for can start here, off
+    /// the render thread.
+    fn values_known(&self, _params: &ParamValues) {}
+
     /// Renders the last of `count` frames into `output`. `frames` hands out the frames it
     /// asks for; frames a host doesn't have come as `None`.
     /// `ctx.frame` is the current frame's number; the one `k` before it is `frame - k`.

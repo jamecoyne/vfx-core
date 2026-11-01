@@ -324,6 +324,13 @@ pub trait FrameSource {
     /// Calls `f` with frame `index`, or with `None` if that frame isn't there.
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>));
 
+    /// Whether frames arrive from a live stream, so an effect should draw what it has rather than
+    /// hold up the output: true for [`History`], false where a render may be exported and has to
+    /// be exact whatever it costs.
+    fn live(&self) -> bool {
+        false
+    }
+
     /// Whether a frame's pixels stay as they were handed over, so an effect that keeps work
     /// between renders needn't read an earlier frame again: true for a host's own copies of
     /// the frames it was given ([`History`]), false where the host renders earlier frames
@@ -409,6 +416,10 @@ impl<C: Depth> FrameSource for History<C> {
             .frames
             .get(index)
             .map(|p| C::image(View::from_pixels(p, self.width, self.height))));
+    }
+
+    fn live(&self) -> bool {
+        true
     }
 
     /// Frames go in through [`History::next`] only, so earlier ones never change.

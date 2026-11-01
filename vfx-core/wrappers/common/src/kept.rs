@@ -61,6 +61,11 @@ impl CpuInstance {
         self.with(|e| e.frames_before(values))
     }
 
+    /// Tells the effect the instance's values ahead of a render (see [`CpuEffect::values_known`]).
+    pub fn values_known(&self, values: &ParamValues) {
+        self.with(|e| e.values_known(values));
+    }
+
     /// Renders, starting over if the render panics.
     pub fn render(
         &self,
