@@ -31,8 +31,9 @@ the two render byte-identical frames (see [Checking it](#checking-it)).
 - **Box matte**: the layer cut out by the segments' boxes.
 - **Swarm**: segcam's desktop collage. Every segment of every recent frame becomes a frozen
   tile of the frame it was cut from, drawn as the macOS window segcam makes for it (title
-  bar, buttons, rounded corners and shadow), newest on top, oldest recycled after
-  **Swarm max tiles**.
+  bar, buttons, rounded corners and shadow), newest on top. As in segcam 1.1, a window
+  stays until **Swarm max tiles** newer ones push it out; **Trail frames** is how far back
+  windows can come from, which segcam 1.1 has no limit for.
 
 **Mirror** flips the picture and the boxes, as segcam does for a selfie camera.
 
@@ -45,9 +46,9 @@ segments are labelled `blob#…`. **Swarm backdrop** puts the windows on a trans
 uses Apple's Vision on macOS and ONNX Runtime models on Windows and Linux. **Detect ▸ Faces
 only** shows just the face and body segments. On Windows the models take about 2 seconds to
 load the first time, then add about 12 ms to a 1080p frame, and the plugin ships its own
-`DirectML.dll`. As in segcam 1.1, faces run on every 2nd frame, the even frame numbers: an odd
-frame shows the faces of the frame before, with their IDs, or finds its own when the host
-doesn't hand that frame over. The face modes don't run in the web build yet.
+`DirectML.dll`. As in segcam 1.1, faces run on every 2nd analysis, the even frame numbers at
+30 fps: the analysis between shows the faces of the one before, with their IDs, or finds its
+own when the host doesn't hand that frame over. The face modes don't run in the web build yet.
 
 ## Parameters
 
@@ -69,7 +70,7 @@ doesn't hand that frame over. The face modes don't run in the web build yet.
 | Boxes (Overlay) | on or off | on |
 | Labels (Overlay) | on or off | on |
 | Box color (Overlay) | red, green, blue | 0.25, 1.0, 0.4 |
-| Trail frames (Swarm) | 1 to 120 | 24 |
+| Trail frames (Swarm) | 1 to 120 | 60 |
 | Swarm max tiles (Swarm) | 1 to 1000 | 100 |
 | Swarm backdrop (Swarm) | Transparent, Source, Black | Transparent |
 | Live windows (Swarm) | on or off | off |
@@ -78,14 +79,22 @@ The group is in brackets. Some sliders show a narrower range than the limit.
 
 ## How it renders
 
-It asks for the **Background** frames before the current one (plus **Trail frames** - 1 in
-Swarm mode) through `CpuEffect::frames_before`. It keeps each frame's grid, motion and tiles
+It asks for the **Background** frames before the current one, plus **Trail frames** - 1 in
+Swarm mode and 3 in the others (see below), through `CpuEffect::frames_before`. It keeps each frame's grid, motion and tiles
 until they age out (`src/incremental.rs`), with a hash of the frame's pixels. Every render
 still reads each frame it depends on, so an edit upstream reaches it however far back it
 is, but only a frame whose pixels changed is worked out again, along with the motion and
 tiles it feeds. A frame the host couldn't hand over counts as empty for that render and is
 read again next time. The output is the same in any render order. After Effects still makes
 a new effect per render, so its cache and Multi-Frame Rendering are unchanged.
+
+Like segcam 1.1 it analyses about 30 frames a second. Where the host says the frame rate
+(OpenFX, After Effects, a video in the preview), it analyses every 2nd frame by number at 50
+to 60 fps and every 4th at 120, and the frames between show the last analysis: its boxes and
+IDs, and no new windows. Resolume says no frame rate, so there every frame is analysed. Outside
+Swarm the 3 extra frames mean the analysis a frame shows is always handed over; when the host
+can't hand it over, the frame analyses itself. With faces on, a render reads 4 frames more, so
+the analysis whose faces it reuses is handed over too.
 
 The C++ effect's README covers how this differs from the live app (no state carried
 forever, per-frame IDs); all of it applies here.
@@ -137,11 +146,12 @@ runs segcam's core checks, and the effect through vfx-core's `CpuEffect` interfa
 - The swarm caps its pile, and the window chrome matches the bake.
 
 `segcam-motion` takes the same options as segcam's own CLI, so the two can be compared on
-any clip:
+any clip. Its Trail frames default is 60 where segcam's is 24, so pass `--trail 24` to
+compare Swarm:
 
 ```bash
 ffmpeg -i in.mov -vf scale=960:540 -f rawvideo -pix_fmt argb - |
-  target/release/segcam-motion 960 540 --mode swarm |
+  target/release/segcam-motion 960 540 --mode swarm --trail 24 |
   ffmpeg -f rawvideo -pix_fmt argb -s 960x540 -r 30 -i - -pix_fmt yuv420p out.mp4
 ```
 
@@ -151,6 +161,12 @@ into single FMA instructions that round once instead of twice. Rust never does t
 against the C++ CLI as normally built, a few soft-edge pixels in Motion matte and Swarm are
 one level apart. The CLI's `--straight-alpha` selects the straight-alpha convention and
 `--float` renders the same 8-bit stream with the float core, for the host comparisons.
+
+Three options aren't in segcam's CLI. `--preset 1.1` renders segcam 1.1's look (the
+benchmark's "1.1 look"), `--fps` gives the clip's frame rate, so it analyses about 30 frames a
+second as the plugins do, and `--keep` keeps work between frames as Resolume does, with the
+same output. On the GPU the CLI always keeps it; with `--cpu` and without `--keep` every frame
+is rendered from scratch, as After Effects does.
 
 ### After Effects
 

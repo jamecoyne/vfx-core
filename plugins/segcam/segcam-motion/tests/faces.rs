@@ -1,10 +1,11 @@
-//! Faces run on even frames, and odd frames reuse the faces of the frame before. Checked on a
-//! real portrait the face models find, read from the file `SEGCAM_FACE_PORTRAIT` names (a binary
-//! PPM, P6, at most 180 pixels tall); the tests pass with a note when it isn't set.
+//! Faces run on every 2nd analysis, and the analysis between reuses the faces of the one
+//! before: at 30 fps, even frames run them and odd frames reuse them. Checked on a real portrait
+//! the face models find, read from the file `SEGCAM_FACE_PORTRAIT` names (a binary PPM, P6, at
+//! most 180 pixels tall); the tests pass with a note when it isn't set.
 #![cfg(not(target_arch = "wasm32"))]
 
 use segcam_motion::{
-    Argb, Detect, FaceParts, OutputMode, RenderSettings, SegcamMotion, View, ViewMut,
+    Argb, Cadence, Detect, FaceParts, OutputMode, RenderSettings, SegcamMotion, View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamValue, ParamValues, Processor};
@@ -96,6 +97,7 @@ fn drifting(p: &Portrait) -> Clip {
         width: W,
         height: H,
         frames,
+        frame_rate: None,
     }
 }
 
@@ -132,7 +134,17 @@ fn faces_keep_the_contract() {
         ]),
     ];
     let Some(p) = portrait() else { return };
-    check(make, &drifting(&p), &sets).unwrap();
+    for frame_rate in [None, Some(60.0)] {
+        check(
+            make,
+            &Clip {
+                frame_rate,
+                ..drifting(&p)
+            },
+            &sets,
+        )
+        .unwrap();
+    }
 }
 
 /// A live host keeps the effect and hands over frames forward from its own history, which
@@ -152,7 +164,7 @@ fn faces_from_a_live_history_match_fresh_renders() {
             ("trail", ParamValue::Int(4)),
         ]),
     ];
-    for params in &sets {
+    for (params, frame_rate) in sets.iter().flat_map(|p| [(p, None), (p, Some(60.0))]) {
         let mut kept = SegcamMotion::default();
         let mut history = History::<u8>::default();
         history.resize(W, H);
@@ -162,6 +174,7 @@ fn faces_from_a_live_history_match_fresh_renders() {
                 .copy_from_slice(pixels);
             let ctx = Context {
                 frame: history.frame_number(),
+                frame_rate,
                 ..Context::at(f as f64 / 30.0)
             };
             let mut render = |effect: &mut SegcamMotion| {
@@ -172,7 +185,10 @@ fn faces_from_a_live_history_match_fresh_renders() {
                 out
             };
             let got = render(&mut kept);
-            assert!(got == render(&mut SegcamMotion::default()), "frame {f}");
+            assert!(
+                got == render(&mut SegcamMotion::default()),
+                "frame {f} at {frame_rate:?}"
+            );
         }
     }
 }
@@ -189,7 +205,12 @@ impl FrameSource for Frames<'_> {
 
 /// Faces only, as a box matte: the frame shows through the face boxes alone.
 fn boxes_at(frames: Vec<Option<&[Argb<u8>]>>, number: i64) -> Vec<Argb<u8>> {
+    boxes_every(Cadence::EVERY_FRAME, frames, number)
+}
+
+fn boxes_every(cadence: Cadence, frames: Vec<Option<&[Argb<u8>]>>, number: i64) -> Vec<Argb<u8>> {
     let s = RenderSettings {
+        cadence,
         mode: OutputMode::BoxMatte,
         detect: Detect::FacesOnly,
         faces: FaceParts {
@@ -226,4 +247,31 @@ fn odd_frames_show_the_faces_of_the_frame_before() {
     assert!(shown(&alone, 230), "the frame before isn't handed over");
     let missing = boxes_at(vec![None, Some(right.as_slice())], 5);
     assert!(shown(&missing, 230), "the frame before is missing");
+}
+
+#[test]
+fn at_60_fps_faces_run_on_every_2nd_analysis() {
+    let Some(p) = portrait() else { return };
+    let (left, right) = (frame(&p, 90, 80, None), frame(&p, 230, 80, None));
+    let shown = |out: &[Argb<u8>], x: i32| out[(80 * W + x) as usize].alpha == 255;
+    let every_2nd = Cadence { stride: 2 };
+    let (l, r) = (Some(left.as_slice()), Some(right.as_slice()));
+
+    let own = boxes_every(every_2nd, vec![l, l, r], 8);
+    assert!(
+        shown(&own, 230) && !shown(&own, 90),
+        "analysis 8 runs its own"
+    );
+    let reused = boxes_every(every_2nd, vec![l, l, r], 6);
+    assert!(
+        shown(&reused, 90) && !shown(&reused, 230),
+        "analysis 6 reuses analysis 4's"
+    );
+    let between = boxes_every(every_2nd, vec![l, l, r, r], 7);
+    assert!(
+        shown(&between, 90) && !shown(&between, 230),
+        "frame 7 shows analysis 6, with 4's faces"
+    );
+    let missing = boxes_every(every_2nd, vec![None, l, r], 6);
+    assert!(shown(&missing, 230), "analysis 4 is missing");
 }

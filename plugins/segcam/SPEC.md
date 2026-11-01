@@ -39,12 +39,13 @@ Status: done (on `main`), PR (written, in review), todo.
 | F4 | While an editing host streams, earlier frames are taken as unchanged; the first render after a pause or jump checks them | Resolve Deliver of frames 0 to 299 identical to stepping frame by frame ([ADR 3](decisions/0003-editing-promise.md)) | done |
 | F5 | The first frame of every Deliver checks earlier frames, whatever the clock says | an edit followed by an immediate Deliver renders the edited frames | todo |
 | F6 | A clip keeps its start: frames before the clip's first are never requested or used | Resolve render of a trimmed clip identical to the same frames rendered alone | done |
-| F7 | Faces run on even host frame numbers (`ctx.frame`); odd frames reuse the faces and window IDs of frame N minus 1, or run faces if it isn't available ([ADR 2](decisions/0002-faces-every-2nd-frame.md)) | F3 still passes on a face fixture at odd frames, with N minus 1 missing, shuffled and backwards; face cost halved in Resolve and Resolume in the benchmark | PR |
+| F7 | Faces run on every 2nd analysis, the even host frame numbers (`ctx.frame`) at 30 fps; the analysis between reuses the faces and window IDs of the one before, or runs faces if it isn't available ([ADR 2](decisions/0002-faces-every-2nd-frame.md)) | F3 still passes on a face fixture at 30 and 60 fps, with the analysis before missing, shuffled and backwards; face cost halved in Resolve and Resolume in the benchmark | PR |
 | F8 | Swarm draws on the GPU by default where a hardware GPU exists; each render picks CPU or GPU by the window pixels it draws ([ADR 4](decisions/0004-gpu-by-default.md)) | GPU output within one level of the CPU path, at most 1 pixel in 10,000 off by over half a level, in the 30 offline cases and a lossless Resolve Deliver | done |
 | F9 | No GPU, a failing GPU, or one lost mid render falls back to the CPU path without a wrong frame | the lost device test: every frame after the loss equals the CPU path byte for byte | done |
 | F10 | Overlay draws on the CPU | Overlay output byte for byte with the CLI | done |
 | F11 | Parameter `name`s are frozen from 1.0 | a test listing the shipped `name`s fails if one changes (to add with the tag) | PR |
 | F12 | Windows plugins load the DirectML that ships next to them, not the system's | faces use DirectML on Windows 10 with an old system32 copy; the tests check the same | done; test fix in PR |
+| F13 | Swarm as in segcam 1.1: a window stays until Swarm max tiles newer ones push it out, within Trail frames; analysis about 30 frames a second from the host's frame rate, the frames between showing the last ([ADR 6](decisions/0006-swarm-as-in-1-1.md)) | F3 passes at 60 fps, with the analysis a frame shows missing, shuffled and backwards; the benchmark's 1.1 look preset | PR |
 
 ## 4. Host behaviour
 
@@ -54,7 +55,8 @@ Status: done (on `main`), PR (written, in review), todo.
 | Depth | float | 8, 16 and 32 bit | 8 bit |
 | Kept state | a cache under F3, F4 | none between renders (each is fresh) | kept for the run; history bounded |
 | Frame number | timeline frame | time divided by frame length | frames received, back to 0 on a seek back or resize |
-| Faces every 2nd frame (F7) | halves face cost | same output, same cost as today: one detection per render, since every render is fresh | halves face cost |
+| Analysis (F13) | about 30 a second, from the project's frame rate | same, from the frame length | every frame: no frame rate |
+| Faces every 2nd analysis (F7) | halves face cost | same output, same cost as today: one detection per render, since every render is fresh | halves face cost |
 
 ## 5. Non functional requirements
 

@@ -303,6 +303,7 @@ fn context(in_data: &ae::InData) -> Context {
         frame: if step > 0 { i64::from(now / step) } else { 0 },
         scale: scale(in_data),
         premultiplied: false,
+        frame_rate: (step > 0).then(|| f64::from(time_scale) / f64::from(step)),
     }
 }
 

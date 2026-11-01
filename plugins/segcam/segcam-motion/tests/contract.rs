@@ -35,6 +35,7 @@ fn crossing() -> Clip {
         width,
         height,
         frames,
+        frame_rate: None,
     }
 }
 
@@ -71,7 +72,13 @@ fn overlay_and_mattes_keep_the_contract() {
             ("background", ParamValue::Int(6)),
         ]),
     ];
-    check(make, &crossing(), &sets).unwrap();
+    for frame_rate in [None, Some(60.0)] {
+        let clip = Clip {
+            frame_rate,
+            ..crossing()
+        };
+        check(make, &clip, &sets).unwrap();
+    }
 }
 
 #[test]
@@ -84,7 +91,13 @@ fn swarm_keeps_the_contract() {
             ("mirror", ParamValue::Bool(mirror)),
         ])
     };
-    check(make, &crossing(), &[swarm(false), swarm(true)]).unwrap();
+    for frame_rate in [None, Some(60.0)] {
+        let clip = Clip {
+            frame_rate,
+            ..crossing()
+        };
+        check(make, &clip, &[swarm(false), swarm(true)]).unwrap();
+    }
 }
 
 /// The swarm on the GPU keeps it too, and so does choosing the path by its windows; skipped

@@ -79,13 +79,14 @@ impl CpuStage {
     }
 
     /// Renders the newest frame again if anything changed since the last render.
-    fn refresh(&mut self, values: &ParamValues, time: f64) {
+    fn refresh(&mut self, values: &ParamValues, time: f64, frame_rate: Option<f64>) {
         if self.rendered_with.as_ref() == Some(values) || self.history.is_empty() {
             return;
         }
         let (w, h) = (self.size.0 as i32, self.size.1 as i32);
         let ctx = Context {
             frame: self.history.frame_number(),
+            frame_rate,
             ..Context::at(time)
         };
         let count = self.history.len();
@@ -115,12 +116,13 @@ impl CpuStage {
         output: &Frame,
         values: &ParamValues,
         time: f64,
+        frame_rate: Option<f64>,
     ) {
         // A frame still waiting on the GPU keeps its place until it's done.
         if !self.effect.unfinished() {
             self.push(gpu, input, time, values);
         }
-        self.refresh(values, time);
+        self.refresh(values, time, frame_rate);
         if self.effect.unfinished() {
             return; // the last output stays up
         }

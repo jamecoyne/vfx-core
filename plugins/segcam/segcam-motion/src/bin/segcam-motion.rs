@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
-    Argb, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View, ViewMut,
+    Argb, Cadence, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, Image};
 
@@ -28,7 +28,10 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --min-size percent                    (0.25)
   --max-segments n                      (16)
   --grid columns                        (192)
-  --trail frames  --max-tiles n         (24, 100)
+  --trail frames  --max-tiles n         (60, 100)
+  --preset 1.1                          (segcam 1.1's look; later options change it)
+  --fps rate                            (the clip's; analyses about 30 a second)
+  --keep                                (keep work between frames on the CPU too)
   --detect motion|threshold|faces       (motion)
   --face  --eyes  --mouth  --body       (off; segcam-face's models)
   --level 0..255  --auto-level  --invert   (170; threshold)
@@ -44,6 +47,8 @@ struct Ring<C> {
     frames: VecDeque<Vec<Argb<C>>>,
     width: i32,
     height: i32,
+    /// Frames only join at the end, so earlier ones never change.
+    fixed: bool,
 }
 
 impl<C: Depth> FrameSource for Ring<C> {
@@ -52,6 +57,10 @@ impl<C: Depth> FrameSource for Ring<C> {
             .frames
             .get(index)
             .map(|p| C::image(View::from_pixels(p, self.width, self.height))));
+    }
+
+    fn fixed(&self) -> bool {
+        self.fixed
     }
 }
 
@@ -102,6 +111,16 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
             "--max-segments" => s.motion.max_segments = value()?.parse().ok()?,
             "--grid" => s.grid_width = value()?.parse().ok()?,
             "--trail" => s.trail_frames = value()?.parse().ok()?,
+            "--preset" => {
+                s = match value()? {
+                    "1.1" => RenderSettings {
+                        cadence: s.cadence,
+                        ..RenderSettings::look_1_1(None)
+                    },
+                    _ => return None,
+                }
+            }
+            "--fps" => s.cadence = Cadence::at(Some(value()?.parse().ok()?)),
             "--max-tiles" => s.max_tiles = value()?.parse().ok()?,
             "--straight-alpha" => s.straight_alpha = true,
             "--mirror" => s.mirror = true,
@@ -117,8 +136,9 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let float = args.iter().any(|a| a == "--float");
+    let kept = args.iter().any(|a| a == "--keep");
     let cpu = args.iter().any(|a| a == "--cpu");
-    args.retain(|a| a != "--float" && a != "--cpu");
+    args.retain(|a| a != "--float" && a != "--keep" && a != "--cpu");
     let Some((width, height, settings)) = parse(&args) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -132,10 +152,11 @@ fn main() -> ExitCode {
             state.use_gpu(true);
             state
         });
+    let state = gpu.or_else(|| kept.then(Incremental::default));
     if float {
-        run::<f32>(width, height, settings, gpu)
+        run::<f32>(width, height, settings, state)
     } else {
-        run::<u8>(width, height, settings, gpu)
+        run::<u8>(width, height, settings, state)
     }
 }
 
@@ -143,7 +164,7 @@ fn run<C: Depth>(
     width: i32,
     height: i32,
     settings: RenderSettings,
-    mut gpu: Option<Incremental>,
+    mut kept: Option<Incremental>,
 ) -> ExitCode {
     let pixels = width as usize * height as usize;
     let keep = segcam_motion::previous_frames_needed(&settings) as usize + 1;
@@ -151,6 +172,7 @@ fn run<C: Depth>(
         frames: VecDeque::new(),
         width,
         height,
+        fixed: kept.is_some(),
     };
     let mut out = vec![Argb::<C>::default(); pixels];
     let (mut stdin, mut stdout) = (io::stdin().lock(), io::stdout().lock());
@@ -174,10 +196,11 @@ fn run<C: Depth>(
             ring.frames.pop_front();
         }
 
-        // Like After Effects: every frame rendered from scratch out of the frames before it.
+        // Like After Effects: every frame rendered from scratch out of the frames before it,
+        // unless the work is kept, which renders the same.
         let count = ring.frames.len();
         let mut view = ViewMut::from_pixels(&mut out, width, height);
-        match &mut gpu {
+        match &mut kept {
             Some(state) => state.advance(&settings, &mut ring, count, frame, &mut view),
             None => segcam_motion::render(&settings, &mut ring, count, frame, &mut view),
         }

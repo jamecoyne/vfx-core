@@ -257,7 +257,7 @@ impl Preview {
             Some(size) => image::open(path).map_err(|e| e.to_string()).map(|img| {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 self.effects
-                    .start_stream(&self.gpu, name.into_owned(), size);
+                    .start_stream(&self.gpu, name.into_owned(), size, None);
                 self.effects
                     .write_source(&self.gpu, &fit_still(&img.to_rgba8(), size));
             }),
@@ -280,7 +280,8 @@ impl Preview {
         };
         self.message = match opened {
             Ok(video) => {
-                self.effects.start_stream(&self.gpu, name, video.info.size);
+                self.effects
+                    .start_stream(&self.gpu, name, video.info.size, Some(video.info.fps));
                 let file = video.info.file();
                 self.media = Some(Media {
                     sound: self

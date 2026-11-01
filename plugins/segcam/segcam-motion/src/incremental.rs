@@ -15,7 +15,7 @@ use crate::gpu::{self, Cut, Drawer, Fault};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
-    Detect, FaceParts, OutputMode, Pile, PiledTile, PixelRect, RenderSettings, downsample,
+    Cadence, Detect, FaceParts, OutputMode, Pile, PiledTile, PixelRect, RenderSettings, downsample,
     draw_output, fill_rect, frame_tiles, history_frames,
 };
 use crate::swarm::{self, SwarmMetrics, Tile};
@@ -44,9 +44,9 @@ struct Basis {
     detection: Detection,
     /// The first frame of its background: later than usual near the start of the frames.
     from: i64,
-    /// For a frame that reuses the faces of the frame before, that frame's `from`, since the
-    /// faces keep the IDs they had there.
-    faces: Option<i64>,
+    /// For a frame that reuses the faces of an earlier analysis: that frame and its `from`,
+    /// since the faces keep the IDs they had there.
+    faces: Option<(i64, i64)>,
 }
 
 #[derive(Default)]
@@ -191,16 +191,17 @@ impl Incremental {
         }
         let swarm = s.mode == OutputMode::Swarm;
         let background = i64::from(history_frames(s));
-        // What a changed frame feeds: the frames it is background to, and with faces the next.
-        let feeds = background.max(i64::from(s.faces.any()));
+        // What a changed frame feeds: the frames it is background to, and with faces the
+        // analysis after.
+        let feeds = background.max(i64::from(s.faces.any()) * s.cadence.stride);
         let targets = targets(s);
         let first = number - count as i64 + 1;
-        let start = start(s, number, first);
+        let used = worked_out(s, number, first);
 
         // Frames the host didn't hand over count as empty, as in a cold render, but nothing
         // worked out from one is kept, so it is read again next time.
         let mut missing = BTreeSet::new();
-        let oldest = (start - background).max(first);
+        let oldest = (used.first().map_or(number, |&f| f.min(number)) - background).max(first);
         // A fixed source's earlier frames are as they were, so only the current frame is
         // checked: a different one means the source started over.
         let fixed = frames.fixed();
@@ -243,9 +244,14 @@ impl Incremental {
                         }
                     }
                 }
-                let previous = basis(s, frame - 1, first);
+                let source = faces_from(s, frame, first);
+                let previous = basis(s, source, first);
                 let basis = basis(s, frame, first);
-                if frame >= start && !self.complete(frame, &basis, s) {
+                // Outside the swarm a missing analysis isn't worked out: the frame showing it
+                // works out its own instead.
+                let wanted = used.contains(&frame) && (swarm || view.is_some())
+                    || !swarm && frame == number && self.shows(s, number, first) == number;
+                if wanted && !self.complete(frame, &basis, s) {
                     let motion = match self.motion(frame, &basis) {
                         Some(motion) => motion.clone(),
                         None => {
@@ -267,13 +273,13 @@ impl Incremental {
                                     ..Motion::default()
                                 },
                             };
-                            // The frame before was worked out first, unless it is missing.
+                            // The frame it reuses was worked out first, unless it is missing.
                             let reused = basis
                                 .faces
-                                .filter(|_| !missing.contains(&(frame - 1)))
-                                .and_then(|_| self.motion(frame - 1, &previous));
+                                .filter(|_| !missing.contains(&source))
+                                .and_then(|_| self.motion(source, &previous));
                             if let Some(before) = reused {
-                                motion.blobs.extend(reused_faces(before, frame - 1));
+                                motion.blobs.extend(reused_faces(before, source));
                             } else if let Some(view) = view.as_ref().filter(|_| s.faces.any()) {
                                 let found = crate::faces::find(view, s.faces, grid.count());
                                 motion.blobs.extend(found);
@@ -283,8 +289,9 @@ impl Incremental {
                         }
                     };
                     if swarm {
-                        // A trail of one draws no frame before, so reused faces need tiles here.
-                        let reused = targets == 1;
+                        // A trail no longer than the stride draws no earlier analysis, so
+                        // reused faces need tiles here.
+                        let reused = targets <= s.cadence.stride;
                         let tiles =
                             frame_tiles(&motion, view.as_ref(), frame, w, h, s.mirror, reused);
                         self.tiles.insert(frame, (basis, s.mirror, tiles));
@@ -299,21 +306,26 @@ impl Incremental {
         for &frame in &missing {
             self.forget(frame, feeds);
         }
-        let reach = background + targets;
+        let reach = background + targets + 2 * Cadence::MAX_STRIDE;
         self.keep(number - reach..=number + reach);
     }
 
     /// The frames from `first` a render of `number` has to read: those whose motion or tiles
-    /// aren't kept, the frames before them whose grids aren't, and `number`, which it draws.
+    /// aren't kept, the frames before them whose grids aren't, and `number`, which it draws
+    /// and, outside the swarm, may have to analyse.
     fn lacking(&self, s: &RenderSettings, first: i64, number: i64) -> BTreeSet<i64> {
         let mut wanted = BTreeSet::from([number]);
-        for target in start(s, number, first)..=number {
-            let basis = basis(s, target, first);
-            if !self.complete(target, &basis, s) {
+        let grids = |target: i64| {
+            (basis(s, target, first).from..target).filter(|k| !self.grids.contains_key(k))
+        };
+        for target in worked_out(s, number, first) {
+            if !self.complete(target, &basis(s, target, first), s) {
                 wanted.insert(target);
-                let before = basis.from..target;
-                wanted.extend(before.filter(|k| !self.grids.contains_key(k)));
+                wanted.extend(grids(target));
             }
+        }
+        if s.mode != OutputMode::Swarm {
+            wanted.extend(grids(number));
         }
         wanted
     }
@@ -385,10 +397,21 @@ impl Incremental {
         let first = number - count as i64 + 1;
         let pile = pile(&self.tiles, s, count, number, out.width, out.height);
         let empty = Motion::default();
+        let shows = self.shows(s, number, first);
         let motion = self
-            .motion(number, &basis(s, number, first))
+            .motion(shows, &basis(s, shows, first))
             .unwrap_or(&empty);
-        draw_output(out, s, frame, motion, number, pile.shown());
+        draw_output(out, s, frame, motion, shows, pile.shown());
+    }
+
+    /// The frame whose analysis frame `number` shows: the last analysed, or its own where that
+    /// one is missing.
+    fn shows(&self, s: &RenderSettings, number: i64, first: i64) -> i64 {
+        let analysis = s.cadence.analysis(number, first);
+        match self.motion(analysis, &basis(s, analysis, first)) {
+            Some(_) => analysis,
+            None => number,
+        }
     }
 
     fn draw_gpu<C: Channel>(
@@ -404,10 +427,11 @@ impl Incremental {
         if let (OutputMode::Overlay, Some(view), true) = (s.mode, frame.as_ref(), self.gpu_overlay)
         {
             let empty = Motion::default();
+            let shows = self.shows(s, number, first);
             let motion = self
-                .motion(number, &basis(s, number, first))
+                .motion(shows, &basis(s, shows, first))
                 .unwrap_or(&empty);
-            return gpu.draw_overlay(out, view, &motion.blobs, number, s);
+            return gpu.draw_overlay(out, view, &motion.blobs, number, shows, s);
         }
         if s.mode != OutputMode::Swarm {
             self.draw_cpu(s, count, number, frame, out);
@@ -536,7 +560,7 @@ fn pile<'a>(
     let first = number - count as i64 + 1;
     let mut pile = Pile::new(width, height, s.max_tiles);
     if s.mode == OutputMode::Swarm {
-        for target in (number - targets(s) + 1).max(first)..=number {
+        for target in analysed(s, number, first) {
             let tiles = tiles_of(kept, target, &basis(s, target, first), s.mirror);
             for (index, tile) in tiles.into_iter().flatten().enumerate() {
                 pile.push(Placed {
@@ -587,8 +611,26 @@ fn basis(s: &RenderSettings, frame: i64, first: i64) -> Basis {
     Basis {
         detection: detection(s),
         from: from(frame),
-        faces: (faces_from(s, frame, first) != frame).then(|| from(frame - 1)),
+        faces: Some(faces_from(s, frame, first))
+            .filter(|&source| source != frame)
+            .map(|source| (source, from(source))),
     }
+}
+
+/// The frames whose motion a render of `number` uses: the analysed frames of the swarm's
+/// trail, or the analysis the frame shows.
+fn analysed(s: &RenderSettings, number: i64, first: i64) -> impl Iterator<Item = i64> {
+    // The trail's oldest frame is never analysed early, or its windows would come and go with it.
+    let (frames, stride) = if s.mode == OutputMode::Swarm {
+        (
+            (number - targets(s) + 1).max(first)..=number,
+            s.cadence.stride,
+        )
+    } else {
+        let shown = s.cadence.analysis(number, first);
+        (shown..=shown, 1)
+    };
+    frames.filter(move |f| f.rem_euclid(stride) == 0)
 }
 
 /// How many frames up to the current one are drawn from: the trail for the swarm.
@@ -601,22 +643,26 @@ fn targets(s: &RenderSettings) -> i64 {
 }
 
 /// The frame whose faces `frame` shows in a render whose frames start at `first`. As in
-/// segcam, faces run on every 2nd frame, the even ones; an odd frame reuses the frame before's.
+/// segcam, faces run on every 2nd analysis; the analysis between reuses the one before's.
 fn faces_from(s: &RenderSettings, frame: i64, first: i64) -> i64 {
-    if s.faces.any() && frame.rem_euclid(2) == 1 && frame > first {
-        frame - 1
+    let stride = s.cadence.stride;
+    let before = frame - stride;
+    if s.faces.any() && frame.rem_euclid(2 * stride) == stride && before >= first {
+        before
     } else {
         frame
     }
 }
 
-/// The first frame whose motion a render of `number` works out: the first it draws, or the
-/// frame before if that one's faces are reused.
-fn start(s: &RenderSettings, number: i64, first: i64) -> i64 {
-    faces_from(s, (number - targets(s) + 1).max(first), first)
+/// The frames whose motion a render of `number` works out: those it uses, and the frames whose
+/// faces they reuse.
+fn worked_out(s: &RenderSettings, number: i64, first: i64) -> BTreeSet<i64> {
+    analysed(s, number, first)
+        .flat_map(|f| [faces_from(s, f, first), f])
+        .collect()
 }
 
-/// The faces in `motion`, frame `frame`'s, as the next frame reuses them: with their IDs.
+/// The faces in `motion`, frame `frame`'s, as the next analysis reuses them: with their IDs.
 fn reused_faces(motion: &Motion, frame: i64) -> impl Iterator<Item = motion::Blob> + '_ {
     use motion::SegmentKind as Kind;
     motion

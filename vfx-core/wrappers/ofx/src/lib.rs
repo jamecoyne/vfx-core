@@ -430,6 +430,12 @@ fn seconds(effect: ImageEffect, time: OfxTime) -> Result<f64, OfxStatus> {
     Ok(if rate > 0.0 { time / rate } else { time })
 }
 
+/// The project's frames a second, if the host says.
+fn frame_rate(effect: ImageEffect) -> Result<Option<f64>, OfxStatus> {
+    let rate = effect_props(effect)?.get_double(PROP_FRAME_RATE, 0).ok();
+    Ok(rate.filter(|r| *r > 0.0))
+}
+
 /// Canonical point values (full-resolution pixels, y up) to normalised canvas coordinates.
 fn map_points(values: &mut ParamValues, specs: &[ParamSpec], scale: [f64; 2], canvas: Rect) {
     let (w, h) = (canvas.width() as f64, canvas.height() as f64);
@@ -486,6 +492,7 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
                 frame: time.round() as i64,
                 scale: scale.map(|s| s as f32),
                 premultiplied: false,
+                frame_rate: frame_rate(effect)?,
             },
             width: canvas.width() as u32,
             height: canvas.height() as u32,
@@ -674,6 +681,7 @@ fn render_cpu_with(
         // CPU effects see whole frames; a host may leave the scale out.
         scale: [0, 1].map(|i| in_args.get_double(PROP_RENDER_SCALE, i).unwrap_or(1.0) as f32),
         premultiplied: source_props.str_is(PROP_PREMULTIPLICATION, PREMULTIPLIED)?,
+        frame_rate: frame_rate(effect)?,
     };
     let window = in_args
         .get_rect_i(PROP_RENDER_WINDOW)?
