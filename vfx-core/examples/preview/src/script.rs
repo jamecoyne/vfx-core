@@ -248,74 +248,78 @@ pub fn list() -> String {
     out
 }
 
-/// Counts frames for `--stats`, `--frames` and `--seconds`.
+/// Counts frames for `--stats`, `--frames` and `--seconds`, from the first frame on.
 pub struct Meter {
     print: bool,
     stop: Option<Stop>,
-    start: Option<Instant>,
+    start: Instant,
+    last: Option<Instant>,
     frames: u64,
-    /// The second being counted: its start, frames and longest frame.
+    max: f64,
+    /// The second being counted: its start, frame intervals and longest one.
     window: Instant,
     window_frames: u32,
     window_max: f64,
-    max: f64,
+    done: bool,
 }
 
 impl Meter {
     pub fn new(print: bool, stop: Option<Stop>) -> Self {
+        let now = Instant::now();
         Self {
             print,
             stop,
-            start: None,
+            start: now,
+            last: None,
             frames: 0,
-            window: Instant::now(),
+            max: 0.0,
+            window: now,
             window_frames: 0,
             window_max: 0.0,
-            max: 0.0,
+            done: false,
         }
     }
 
-    /// Counts a frame that took `dt` seconds since the last. True once the run should end.
-    pub fn frame(&mut self, dt: f64, stats: &Snapshot) -> bool {
-        let now = Instant::now();
-        let start = *self.start.get_or_insert_with(|| {
-            self.window = now;
-            now
-        });
-        if self.frames > 0 {
-            self.window_max = self.window_max.max(dt);
-            self.max = self.max.max(dt);
+    /// Counts a frame. True once the run should end.
+    pub fn frame(&mut self, stats: &Snapshot) -> bool {
+        if self.done {
+            return true;
         }
+        let now = Instant::now();
+        match self.last {
+            None => (self.start, self.window) = (now, now),
+            Some(last) => {
+                let dt = now.duration_since(last).as_secs_f64();
+                self.max = self.max.max(dt);
+                self.window_max = self.window_max.max(dt);
+                self.window_frames += 1;
+            }
+        }
+        self.last = Some(now);
         self.frames += 1;
-        self.window_frames += 1;
+        let elapsed = now.duration_since(self.start).as_secs_f64();
         let span = now.duration_since(self.window).as_secs_f64();
         if span >= 1.0 {
             if self.print {
-                let elapsed = now.duration_since(start).as_secs_f64();
-                println!(
-                    "{}",
-                    line(elapsed, self.window_frames, span, self.window_max, stats)
-                );
+                let frames = self.window_frames;
+                println!("{}", line(elapsed, frames, span, self.window_max, stats));
             }
-            self.window = now;
-            self.window_frames = 0;
-            self.window_max = 0.0;
+            (self.window, self.window_frames, self.window_max) = (now, 0, 0.0);
         }
-        let done = match self.stop {
+        self.done = match self.stop {
             Some(Stop::Frames(n)) => self.frames >= n,
-            Some(Stop::Seconds(s)) => now.duration_since(start).as_secs_f64() >= s,
+            Some(Stop::Seconds(s)) => elapsed >= s,
             None => false,
         };
-        if done && self.print {
-            let seconds = now.duration_since(start).as_secs_f64();
+        if self.done && self.print {
             println!(
-                "done frames={} seconds={seconds:.2} fps={:.1} max_ms={:.1}",
+                "done frames={} seconds={elapsed:.2} fps={:.1} max_ms={:.1}",
                 self.frames,
-                self.frames.saturating_sub(1) as f64 / seconds.max(f64::EPSILON),
+                (self.frames - 1) as f64 / elapsed.max(f64::EPSILON),
                 self.max * 1000.0
             );
         }
-        done
+        self.done
     }
 }
 
@@ -427,6 +431,17 @@ mod tests {
         for m in ["Overlay", "Motion matte", "Box matte", "Swarm"] {
             assert_eq!(mode(&specs, m).map(|(name, _)| name), Ok("output"), "{m}");
         }
+    }
+
+    #[test]
+    fn the_meter_stops_after_its_frames() {
+        let mut meter = Meter::new(false, Some(Stop::Frames(3)));
+        let stats = Snapshot::default();
+        assert!(!meter.frame(&stats));
+        assert!(!meter.frame(&stats));
+        assert!(meter.frame(&stats));
+        assert!(meter.frame(&stats));
+        assert_eq!(meter.frames, 3);
     }
 
     #[test]

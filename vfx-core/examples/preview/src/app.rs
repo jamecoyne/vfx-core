@@ -580,13 +580,16 @@ impl Preview {
 
         self.render_effects(dt);
         #[cfg(not(target_arch = "wasm32"))]
-        let stats = self.stats.sample(self.fps, self.effects.size());
-        #[cfg(not(target_arch = "wasm32"))]
-        self.count_frame(dt, &stats);
-        #[cfg(not(target_arch = "wasm32"))]
         if self.quiet {
             // Nothing paces a hidden window, so wait for the GPU before the next frame.
             let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let stats = self.stats.sample(self.fps, self.effects.size());
+        #[cfg(not(target_arch = "wasm32"))]
+        self.count_frame(&stats);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.quiet {
             return;
         }
 
@@ -1055,8 +1058,10 @@ impl ApplicationHandler<Ready> for App {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run(entries: Vec<catalog::Entry>) -> Result<(), Box<dyn std::error::Error>> {
     catalog::set(entries);
-    let start = script::parse(std::env::args_os().skip(1))
-        .map_err(|e| format!("{e}\n\n{}", script::USAGE))?;
+    let start = match script::parse(std::env::args_os().skip(1)) {
+        Ok(start) => start,
+        Err(e) => fail(&format!("{e}\n\n{}", script::USAGE)),
+    };
     if start.help || start.list {
         print!(
             "{}",
@@ -1072,10 +1077,19 @@ pub fn run(entries: Vec<catalog::Entry>) -> Result<(), Box<dyn std::error::Error
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = App::new(event_loop.create_proxy(), start);
     event_loop.run_app(&mut app)?;
-    match app.failed {
-        Some(e) => Err(e.into()),
-        None => Ok(()),
+    if let Some(e) = app.failed.take() {
+        // Dropped first, so its ffmpeg children stop.
+        drop(app);
+        fail(&e);
     }
+    Ok(())
+}
+
+/// Ends a scripted run that can't go on, with its reason and exit code 2.
+#[cfg(not(target_arch = "wasm32"))]
+fn fail(why: &str) -> ! {
+    eprintln!("vfx-preview: {why}");
+    std::process::exit(2)
 }
 
 /// Opens the preview on `entries` in the page's canvas; called from the web entry point.
@@ -1187,9 +1201,9 @@ impl Preview {
             .map_err(|e| format!("{name}: {e}"))
     }
 
-    fn count_frame(&mut self, dt: f64, stats: &stats::Snapshot) {
+    fn count_frame(&mut self, stats: &stats::Snapshot) {
         if let Some(meter) = &mut self.meter {
-            self.done |= meter.frame(dt, stats);
+            self.done |= meter.frame(stats);
         }
     }
 
