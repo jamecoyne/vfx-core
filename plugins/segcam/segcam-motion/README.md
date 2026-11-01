@@ -59,7 +59,7 @@ own when the host doesn't hand that frame over. The face modes don't run in the 
 | Mirror | on or off | off |
 | Sensitivity (Motion) | 0 to 100 percent | 86.4 |
 | Adaptation (Motion) | 0.1 to 50 percent | 6 |
-| Background (Motion) | 1 to 120 frames | 16 |
+| Background (Motion) | 1 to 120 analyses | 16 |
 | Minimum size (Motion) | 0 to 25 percent | 0.25 |
 | Max segments (Motion) | 1 to 256 | 16 |
 | Grid width (Motion) | 32 to 1024 | 192 |
@@ -79,8 +79,9 @@ The group is in brackets. Some sliders show a narrower range than the limit.
 
 ## How it renders
 
-It asks for the **Background** frames before the current one, plus **Trail frames** - 1 in
-Swarm mode and 3 in the others (see below), through `CpuEffect::frames_before`. It keeps each frame's grid, motion and tiles
+It asks for the frames of the **Background** analyses before the current one, plus **Trail
+frames** - 1 in Swarm mode and 3 in the others (see below), through `CpuEffect::frames_before`.
+It keeps each frame's grid, motion and tiles
 until they age out (`src/incremental.rs`), with a hash of the frame's pixels. Every render
 still reads each frame it depends on, so an edit upstream reaches it however far back it
 is, but only a frame whose pixels changed is worked out again, along with the motion and
@@ -91,10 +92,15 @@ a new effect per render, so its cache and Multi-Frame Rendering are unchanged.
 Like segcam 1.1 it analyses about 30 frames a second. Where the host says the frame rate
 (OpenFX, After Effects, a video in the preview), it analyses every 2nd frame by number at 50
 to 60 fps and every 4th at 120, and the frames between show the last analysis: its boxes and
-IDs, and no new windows. Resolume says no frame rate, so there every frame is analysed. Outside
+IDs, and no new windows. Background counts these analyses, so it covers the same time at any
+frame rate. Resolume says no frame rate, so there every frame is analysed. Outside
 Swarm the 3 extra frames mean the analysis a frame shows is always handed over; when the host
 can't hand it over, the frame analyses itself. With faces on, a render reads 4 frames more, so
 the analysis whose faces it reuses is handed over too.
+
+Resolume and the preview hand frames over one at a time and hold only the current one in full
+(`CpuEffect::frames_held`). Earlier frames live on as their grids, segments and the tiles the
+pile still draws, so a setting changed live reaches new windows only, as in segcam 1.1.
 
 The C++ effect's README covers how this differs from the live app (no state carried
 forever, per-frame IDs); all of it applies here.

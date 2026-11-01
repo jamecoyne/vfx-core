@@ -79,6 +79,8 @@ and the preview then keep one per instance (`vfx_host::CpuInstance`, which also 
 over after a panic, a seek back or a resize); After Effects never does. Either way every
 frame must match a fresh effect's, even after earlier frames change upstream or a host
 misses one: test it with `vfx_host::contract::check`, as `plugins/segcam/segcam-motion` does.
+One that can work from what it kept says how few frames a host keeping its own need hold in
+full with `frames_held`.
 
 ## Layout
 
@@ -248,7 +250,8 @@ conversions. Each host also has a harness that runs the effects:
   per render. Concurrent renders (After Effects MFR, OpenFX hosts) each borrow their own.
 - CPU effects read host frames where they are. After Effects' buffers are read at their own
   depth without copies. OpenFX frames are converted one at a time. Resolume and the preview hand
-  over one frame at a time, so they keep a history of recent frames.
+  over one frame at a time, so they keep a history of recent frames, in full as far as the
+  effect's `frames_held` asks.
 - Plugins never use wgpu's OpenGL backend. Headless devices use Vulkan, Metal or DX12, because
   the OpenGL backend releases whatever context is current when it starts, and on Windows that's
   the FFGL host's. The preview creates its own instance.

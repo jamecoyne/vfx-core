@@ -30,8 +30,8 @@ order, so a render works from the frames before it, which the host fetches or ke
 
 | Option | For | Against |
 |---|---|---|
-| Trail default 60 | the count decides in busy scenes; history at 1080p 8 bit about 600 MiB | a sparse scene still loses windows after 60 frames |
-| Trail default 120 | closest to 1.1 the parameter allows | about 1.1 GiB of history per instance at 1080p, and over three times today's frames to read after a jump |
+| Trail default 60 | the count decides in busy scenes | a sparse scene still loses windows after 60 frames |
+| Trail default 120 | closest to 1.1 the parameter allows | over three times today's frames to read after a jump |
 | Analysis keyed to the frame number | a frame always renders the same, in any order | parity shifts when a host restarts its count, as in 1.1 |
 | Analysis by the host's clock | follows 1.1's pace exactly | renders would depend on timing, not on the frames |
 
@@ -39,8 +39,12 @@ order, so a render works from the frames before it, which the host fetches or ke
 
 - Output changes on purpose: Swarm through the trail default, and every output above 30 fps
   where the host gives the frame rate.
-- The background still counts host frames. 1.1's background adapts once per analysis, so at
-  60 fps the same Background setting covers half of 1.1's time; raising Background matches it.
+- The background counts analyses, as 1.1's adapts once per analysis, so the same setting covers
+  the same time at any frame rate (decided 2026-11-01). Output changes on purpose above 30 fps,
+  and a render there reads as many more frames as the stride asks for.
+- Live hosts hold the current frame only (`CpuEffect::frames_held`). Earlier frames live on as
+  their grids, segments and the tiles the pile still draws, so a setting changed live reaches new
+  windows only, as in 1.1, and the first frames after it don't work out the trail again.
 - 1.1's swarm cap is 100 at start and 60 from the show's cue; the default stays 100.
 - Outside Swarm a render reads 3 frames more, so the analysis a frame shows is always there.
   With faces on it reads 4 more, so the analysis whose faces it reuses is there too.

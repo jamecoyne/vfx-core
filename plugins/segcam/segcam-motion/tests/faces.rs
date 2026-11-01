@@ -168,10 +168,15 @@ fn faces_from_a_live_history_match_fresh_renders() {
         let mut kept = SegcamMotion::default();
         let mut history = History::<u8>::default();
         history.resize(W, H);
+        // The same effect from a history holding what it says it needs.
+        let mut lean = SegcamMotion::default();
+        let mut lean_history = History::<u8>::default();
+        lean_history.resize(W, H);
         for (f, pixels) in clip.frames.iter().enumerate() {
-            history
-                .next(kept.frames_before(params))
-                .copy_from_slice(pixels);
+            let before = kept.frames_before(params, frame_rate);
+            history.next(before, before).copy_from_slice(pixels);
+            let held = lean.frames_held(params, frame_rate);
+            lean_history.next(before, held).copy_from_slice(pixels);
             let ctx = Context {
                 frame: history.frame_number(),
                 frame_rate,
@@ -189,6 +194,11 @@ fn faces_from_a_live_history_match_fresh_renders() {
                 got == render(&mut SegcamMotion::default()),
                 "frame {f} at {frame_rate:?}"
             );
+            let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+            let view = ViewMut::from_pixels(&mut out, W, H);
+            let count = lean_history.len();
+            lean.render(&mut lean_history, count, ImageMut::U8(view), params, &ctx);
+            assert!(got == out, "lean, frame {f} at {frame_rate:?}");
         }
     }
 }

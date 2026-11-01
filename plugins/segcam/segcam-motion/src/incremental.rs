@@ -6,6 +6,10 @@
 //! it hasn't worked out, and the current one. Results come from each frame and the settings
 //! alone, so render order doesn't change the output. Motion whose background is cut short by
 //! the start of the frames, as at the start of a clip, is kept with the frame it starts at.
+//!
+//! A host that holds only its newest frames ([`FrameSource::held`]) can't hand the others over
+//! again. What was cut from them stays as it was cut, so new settings reach new windows only,
+//! as in segcam 1.1, and tiles the pile has stopped drawing drop their pixels.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
@@ -34,6 +38,7 @@ struct Detection {
     detect: Detect,
     motion: MotionSettings,
     background_frames: i32,
+    stride: i64,
     threshold: ThresholdSettings,
     faces: FaceParts,
 }
@@ -214,10 +219,23 @@ impl Incremental {
                 self.reset();
             }
         }
-        let visit = if fixed {
-            self.lacking(s, first, number)
+        // The frames before this one whose pixels the source no longer has.
+        let held = i64::try_from(frames.held()).unwrap_or(i64::MAX);
+        let gone = if fixed {
+            number.saturating_sub(held) + 1
         } else {
-            (oldest..=number).collect()
+            i64::MIN
+        };
+        if swarm {
+            self.settle(s, first, number, gone);
+        }
+        let visit = if fixed {
+            self.lacking(s, first, number, gone)
+        } else {
+            // Frames between analyses feed nothing.
+            let feeding =
+                |f: &i64| f.rem_euclid(s.cadence.stride) == 0 || *f == number || used.contains(f);
+            (oldest..=number).filter(feeding).collect()
         };
         for frame in visit {
             frames.with_frame((frame - first) as usize, &mut |image| {
@@ -260,6 +278,7 @@ impl Incremental {
                             let mut motion = match s.detect {
                                 Detect::Motion => {
                                     let history = (basis.from..frame)
+                                        .filter(|k| k.rem_euclid(s.cadence.stride) == 0)
                                         .map(|k| self.grids.get(&k).unwrap_or(&empty));
                                     motion::detect(history, grid, &s.motion)
                                 }
@@ -308,17 +327,78 @@ impl Incremental {
         }
         let reach = background + targets + 2 * Cadence::MAX_STRIDE;
         self.keep(number - reach..=number + reach);
+        if swarm {
+            self.release(s, count, number, (w, h), gone);
+        }
+    }
+
+    /// The frames before `gone` can't be cut again, so what they gave stays, whatever the
+    /// settings are now; those that gave nothing yet stay empty.
+    fn settle(&mut self, s: &RenderSettings, first: i64, number: i64, gone: i64) {
+        for frame in worked_out(s, number, first)
+            .into_iter()
+            .filter(|&f| f < gone)
+        {
+            let basis = basis(s, frame, first);
+            let motion = self
+                .motion
+                .entry(frame)
+                .or_insert((basis, Motion::default()));
+            motion.0 = basis;
+            let tiles = self
+                .tiles
+                .entry(frame)
+                .or_insert((basis, s.mirror, Vec::new()));
+            (tiles.0, tiles.1) = (basis, s.mirror);
+        }
+    }
+
+    /// Drops what no later render reads from the frames before `gone`: a tile the pile no longer
+    /// draws never comes back, as what buried it or pushed it out stays newer than it, and only
+    /// the frame a render shows has its mask read.
+    fn release(
+        &mut self,
+        s: &RenderSettings,
+        count: usize,
+        number: i64,
+        (width, height): (i32, i32),
+        gone: i64,
+    ) {
+        if self.tiles.range(..gone).next().is_none() {
+            return;
+        }
+        let shown: BTreeSet<(i64, usize)> = pile(&self.tiles, s, count, number, width, height)
+            .shown_entries()
+            .map(|p| (p.frame, p.index))
+            .collect();
+        for (&frame, (_, _, tiles)) in self.tiles.range_mut(..gone) {
+            for (index, tile) in tiles.iter_mut().enumerate() {
+                if !shown.contains(&(frame, index)) {
+                    tile.hidden = true;
+                    tile.pixels = Vec::new();
+                    tile.bar = None;
+                }
+            }
+        }
+        let shows_at_most = number - Cadence::MAX_STRIDE;
+        for (_, (_, motion)) in self.motion.range_mut(..gone.min(shows_at_most)) {
+            motion.mask = Vec::new();
+        }
     }
 
     /// The frames from `first` a render of `number` has to read: those whose motion or tiles
-    /// aren't kept, the frames before them whose grids aren't, and `number`, which it draws
-    /// and, outside the swarm, may have to analyse.
-    fn lacking(&self, s: &RenderSettings, first: i64, number: i64) -> BTreeSet<i64> {
+    /// aren't kept, the analyses before them whose grids aren't, and `number`, which it draws
+    /// and, outside the swarm, may have to analyse. None from before `gone`.
+    fn lacking(&self, s: &RenderSettings, first: i64, number: i64, gone: i64) -> BTreeSet<i64> {
         let mut wanted = BTreeSet::from([number]);
         let grids = |target: i64| {
-            (basis(s, target, first).from..target).filter(|k| !self.grids.contains_key(k))
+            (basis(s, target, first).from.max(gone)..target)
+                .filter(|k| k.rem_euclid(s.cadence.stride) == 0 && !self.grids.contains_key(k))
         };
-        for target in worked_out(s, number, first) {
+        for target in worked_out(s, number, first)
+            .into_iter()
+            .filter(|&f| f >= gone)
+        {
             if !self.complete(target, &basis(s, target, first), s) {
                 wanted.insert(target);
                 wanted.extend(grids(target));
@@ -600,6 +680,7 @@ fn detection(s: &RenderSettings) -> Detection {
         detect: s.detect,
         motion: s.motion,
         background_frames: s.background_frames,
+        stride: s.cadence.stride,
         threshold: s.threshold,
         faces: s.faces,
     }
@@ -607,7 +688,13 @@ fn detection(s: &RenderSettings) -> Detection {
 
 /// What `frame` is worked out from in a render whose frames start at `first`.
 fn basis(s: &RenderSettings, frame: i64, first: i64) -> Basis {
-    let from = |frame: i64| (frame - i64::from(history_frames(s))).max(first);
+    // The background's analyses end at the last one before the frame, on it or not.
+    let stride = s.cadence.stride;
+    let from = |frame: i64| {
+        let last = frame - 1 - (frame - 1).rem_euclid(stride);
+        let oldest = last + stride - i64::from(history_frames(s));
+        oldest.min(frame).max(first)
+    };
     Basis {
         detection: detection(s),
         from: from(frame),
@@ -997,6 +1084,40 @@ mod tests {
         }
         assert_eq!(faults(&on_gpu), u64::from(gpu::TRIES));
         assert!(dev.lost().is_none(), "the device was given up");
+    }
+
+    /// A host holding only the current frame: tiles the pile stopped drawing keep no pixels.
+    #[test]
+    fn tiles_the_pile_stopped_drawing_drop_their_pixels() {
+        let frames = crossing();
+        let s = RenderSettings {
+            mode: OutputMode::Swarm,
+            background_frames: 4,
+            trail_frames: 12,
+            max_tiles: 2,
+            ..RenderSettings::default()
+        };
+        let mut state = Incremental::default();
+        let mut history = vfx_core::cpu::History::<u8>::default();
+        history.resize(W, H);
+        let before = crate::previous_frames_needed(&s) as usize;
+        let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+        for (n, frame) in frames.iter().enumerate() {
+            history.next(before, 0).copy_from_slice(frame);
+            let view = &mut ViewMut::from_pixels(&mut out, W, H);
+            let count = history.len();
+            state.advance(&s, &mut history, count, n as i64, view);
+        }
+        // The current frame's are dropped by the next render.
+        let last = frames.len() as i64 - 1;
+        let tiles: Vec<&Tile> = state
+            .tiles
+            .range(..last)
+            .flat_map(|(_, (_, _, t))| t)
+            .collect();
+        let with_pixels = tiles.iter().filter(|t| !t.pixels.is_empty()).count();
+        assert!(tiles.len() > 2, "the clip spawned too few tiles");
+        assert!(with_pixels <= 2, "{with_pixels} tiles keep their pixels");
     }
 
     /// An atlas too small for the trail draws the renders it can't hold on the CPU, and the

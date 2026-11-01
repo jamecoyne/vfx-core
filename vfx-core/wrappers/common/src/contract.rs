@@ -67,7 +67,7 @@ fn render(
     missing: &[i64],
     values: &ParamValues,
 ) -> Result<Vec<Argb<u8>>, String> {
-    let count = (effect.frames_before(values) as i64 + 1).min(number + 1);
+    let count = (effect.frames_before(values, clip.frame_rate) as i64 + 1).min(number + 1);
     let ctx = Context {
         frame: number,
         frame_rate: clip.frame_rate,
@@ -212,7 +212,7 @@ mod tests {
         fn keeps_state(&self) -> bool {
             true
         }
-        fn frames_before(&self, _: &ParamValues) -> usize {
+        fn frames_before(&self, _: &ParamValues, _: Option<f64>) -> usize {
             1
         }
         fn render(
