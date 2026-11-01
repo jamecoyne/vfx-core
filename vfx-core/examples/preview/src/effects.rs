@@ -14,8 +14,7 @@ pub const FRAME_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 /// Generated patterns render at this size; dropped images keep their own.
 pub const PATTERN_SIZE: (u32, u32) = (1280, 720);
-/// Dropped images are scaled down to fit this, to keep the demo interactive.
-#[cfg(not(target_arch = "wasm32"))]
+/// Dropped images and video frames are scaled down to fit this, to keep the demo interactive.
 pub const MAX_IMAGE_SIDE: u32 = 1920;
 /// egui samples "normal" (not sRGB-aware) textures holding gamma-encoded colour,
 /// which is what the pipeline produces.
@@ -427,8 +426,8 @@ impl Effects {
     }
 
     /// Makes a `size` source called `name` that the caller fills with
-    /// [`Effects::write_source`], as video does. Black until the first write.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// [`Effects::write_source`] (in the browser, through [`Effects::source_frame`]), as
+    /// video does. Black until the first write.
     pub fn start_stream(
         &mut self,
         gpu: &Gpu,
@@ -448,6 +447,13 @@ impl Effects {
         if let Some((_, frame)) = &self.image {
             frame.write(gpu, bytemuck::cast_slice(pixels));
         }
+    }
+
+    /// The source made by [`Effects::start_stream`], for the browser to copy video frames
+    /// into on the GPU.
+    #[cfg(target_arch = "wasm32")]
+    pub fn source_frame(&self) -> Option<&Frame> {
+        self.image.as_ref().map(|(_, frame)| frame)
     }
 
     /// Goes back to the generated patterns.
