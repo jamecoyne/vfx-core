@@ -94,6 +94,9 @@ impl CpuStage {
         let _ = self
             .effect
             .render(&mut self.history, count, out, values, &ctx);
+        if self.effect.unfinished() {
+            return; // the next render of this frame finishes it
+        }
         self.rendered_with = Some(values.clone());
         let width = self.size.0 as usize;
         let rendered = &self.rendered;
@@ -113,8 +116,14 @@ impl CpuStage {
         values: &ParamValues,
         time: f64,
     ) {
-        self.push(gpu, input, time, values);
+        // A frame still waiting on the GPU keeps its place until it's done.
+        if !self.effect.unfinished() {
+            self.push(gpu, input, time, values);
+        }
         self.refresh(values, time);
+        if self.effect.unfinished() {
+            return; // the last output stays up
+        }
         if self.history.is_empty() {
             // Nothing read back yet (the web build reads a frame late): show the input.
             let mut encoder = gpu.device.create_command_encoder(&Default::default());
