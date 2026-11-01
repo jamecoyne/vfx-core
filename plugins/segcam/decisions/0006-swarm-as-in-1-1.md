@@ -23,8 +23,7 @@ order, so a render works from the frames before it, which the host fetches or ke
 - Analysis about 30 a second, from the frame rate the host gives: every 2nd frame by number at
   50 to 60 fps, every 4th at 120 and above. The frames between show the last analysis, its boxes
   and IDs, and spawn no windows. Where the host gives no frame rate (Resolume), every frame.
-- Faces on every 2nd analysis, in ADR 2's own PR (issue 24); at 30 fps that is ADR 2's even
-  frames.
+- Faces on every 2nd analysis, as ADR 2 now says; at 30 fps those are its even frames.
 - A "1.1 look" benchmark preset, so numbers compare with the app like for like.
 
 ## Options considered
@@ -44,3 +43,4 @@ order, so a render works from the frames before it, which the host fetches or ke
   60 fps the same Background setting covers half of 1.1's time; raising Background matches it.
 - 1.1's swarm cap is 100 at start and 60 from the show's cue; the default stays 100.
 - Outside Swarm a render reads 3 frames more, so the analysis a frame shows is always there.
+  With faces on it reads 4 more, so the analysis whose faces it reuses is there too.

@@ -9,8 +9,10 @@ run it on every frame. Faces are the biggest cost left in Swarm with all face pa
 
 ## Decision
 
-Run faces on even host frame numbers (`ctx.frame`) in every host. An odd frame reuses the faces and
-window IDs of frame N minus 1, or runs its own faces when that frame isn't available.
+Run faces on every 2nd analysis in every host, keyed to the host frame number (`ctx.frame`). With
+the analysis at about 30 a second ([ADR 6](0006-swarm-as-in-1-1.md)) that is the even frames at
+30 fps and every 4th frame at 60. The analysis between reuses the faces and window IDs of the one
+before, or runs its own faces when that frame isn't available.
 
 ## Options considered
 
