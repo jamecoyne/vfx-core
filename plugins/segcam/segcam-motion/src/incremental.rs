@@ -699,6 +699,13 @@ mod tests {
         out
     }
 
+    /// The GPU tests take turns: several devices open at once on WARP crash it now and then
+    /// (an access violation in d3d10warp.dll) unless the D3D12 debug layer is on.
+    fn turn() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A device of the test's own, on the adapter `SEGCAM_GPU_ADAPTER` picks or on a software
     /// one where there is none; `None` where there is no adapter at all.
     fn own_device() -> Option<Arc<gpu::Device>> {
@@ -746,6 +753,7 @@ mod tests {
     /// what the CPU draws, and no new instance draws on that device.
     #[test]
     fn a_lost_gpu_falls_back_to_the_cpu() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -774,6 +782,7 @@ mod tests {
     /// new instances still draw on it and a render that didn't cause it isn't charged with it.
     #[test]
     fn an_error_leaves_the_device_usable() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         dev.misuse();
@@ -794,6 +803,7 @@ mod tests {
     /// draws, byte for byte, from what it kept.
     #[test]
     fn leaving_the_gpu_keeps_the_cpu_output() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -821,6 +831,7 @@ mod tests {
     /// the CPU byte for byte, and the next render is back on the GPU.
     #[test]
     fn a_fault_falls_back_for_one_render() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -855,6 +866,7 @@ mod tests {
     /// the GPU, so only what must hold either way is checked.
     #[test]
     fn a_slow_readback_falls_back_for_one_render() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -890,6 +902,7 @@ mod tests {
     /// rest is over the GPU draws again.
     #[test]
     fn faults_close_together_rest_on_the_cpu() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -928,6 +941,7 @@ mod tests {
     /// GPU draws again once the trail moves on; the instance never leaves it.
     #[test]
     fn a_full_atlas_falls_back_for_one_render() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
