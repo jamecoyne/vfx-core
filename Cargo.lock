@@ -2750,6 +2750,7 @@ dependencies = [
  "vfx-core",
  "vfx-host",
  "vfx-plugin",
+ "web-time",
 ]
 
 [[package]]

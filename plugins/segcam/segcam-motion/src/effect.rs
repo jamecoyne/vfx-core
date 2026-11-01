@@ -192,6 +192,10 @@ impl CpuEffect for SegcamMotion {
             ImageMut::F32(mut out) => state.advance(&s, frames, count, n, &mut out),
         }
     }
+
+    fn unfinished(&self) -> bool {
+        self.state.unfinished()
+    }
 }
 
 #[cfg(test)]

@@ -67,6 +67,8 @@ pub struct Incremental {
     /// From what share of the canvas in window pixels the swarm draws on the GPU.
     gpu_from: Option<f64>,
     window_share: f64,
+    /// The last render's draw hasn't come back from the GPU yet (browsers).
+    unfinished: bool,
 }
 
 /// A tile in the pile, and where it is kept: frame and index.
@@ -86,8 +88,15 @@ impl PiledTile for Placed<'_> {
 /// counted, as the CPU draws them) the CPU draws the swarm faster than the GPU's copy back. On an
 /// RTX 4070 at 1080p the CPU took about 2.7 ms a canvas at 8 bits and 2.2 ms in float, the GPU
 /// about 1.2 and 3.6 ms whatever the windows; these sit a little above where they cross.
+#[cfg(not(target_arch = "wasm32"))]
 const GPU_FROM_8_BIT: f64 = 0.5;
+#[cfg(not(target_arch = "wasm32"))]
 const GPU_FROM_DEEPER: f64 = 1.5;
+// Browsers draw on the CPU on one thread: the GPU draws every swarm there.
+#[cfg(target_arch = "wasm32")]
+const GPU_FROM_8_BIT: f64 = 0.0;
+#[cfg(target_arch = "wasm32")]
+const GPU_FROM_DEEPER: f64 = 0.0;
 
 impl Incremental {
     /// Draws Swarm on the GPU where there is one, or always on the CPU. Off by default, so the
@@ -113,6 +122,11 @@ impl Incremental {
     /// The share of the canvas the last swarm render's windows covered, overlaps counted.
     pub fn window_share(&self) -> f64 {
         self.window_share
+    }
+
+    /// Whether the last render is still waiting on the GPU (see [`vfx_core::CpuEffect::unfinished`]).
+    pub fn unfinished(&self) -> bool {
+        self.unfinished
     }
 
     /// Draws with `drawer` from now on.
@@ -144,6 +158,7 @@ impl Incremental {
         number: i64,
         out: &mut ViewMut<C>,
     ) {
+        self.unfinished = false;
         if out.is_empty() {
             return;
         }
@@ -317,6 +332,7 @@ impl Incremental {
         };
         gpu.begin();
         let drawn = self.draw_gpu(&mut gpu, s, count, number, frame, out);
+        self.unfinished = drawn.is_ok() && gpu.unfinished;
         self.gpu = Some(gpu);
         drawn
     }
