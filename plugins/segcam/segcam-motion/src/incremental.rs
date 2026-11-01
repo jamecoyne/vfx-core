@@ -44,6 +44,9 @@ struct Basis {
     detection: Detection,
     /// The first frame of its background: later than usual near the start of the frames.
     from: i64,
+    /// For a frame that reuses the faces of the frame before, that frame's `from`, since the
+    /// faces keep the IDs they had there.
+    faces: Option<i64>,
 }
 
 #[derive(Default)]
@@ -173,13 +176,16 @@ impl Incremental {
         }
         let swarm = s.mode == OutputMode::Swarm;
         let background = i64::from(history_frames(s));
+        // What a changed frame feeds: the frames it is background to, and with faces the next.
+        let feeds = background.max(i64::from(s.faces.any()));
         let targets = targets(s);
         let first = number - count as i64 + 1;
+        let start = start(s, number, first);
 
         // Frames the host didn't hand over count as empty, as in a cold render, but nothing
         // worked out from one is kept, so it is read again next time.
         let mut missing = BTreeSet::new();
-        let oldest = (number - targets + 1 - background).max(first);
+        let oldest = (start - background).max(first);
         // A fixed source's earlier frames are as they were, so only the current frame is
         // checked: a different one means the source started over.
         let fixed = frames.fixed();
@@ -202,7 +208,7 @@ impl Incremental {
                 let view = image.and_then(C::view);
                 match &view {
                     None => {
-                        self.forget(frame, background);
+                        self.forget(frame, feeds);
                         missing.insert(frame);
                     }
                     Some(_) if fixed && self.prints.contains_key(&frame) => {}
@@ -215,15 +221,16 @@ impl Incremental {
                             // changed what later frames worked out from it; elsewhere a
                             // frame that wasn't kept may have.
                             if !fixed {
-                                self.forget(frame, background);
+                                self.forget(frame, feeds);
                             }
                             self.grids.insert(frame, downsample(v, s.grid_width));
                             self.prints.insert(frame, print);
                         }
                     }
                 }
+                let previous = basis(s, frame - 1, first);
                 let basis = basis(s, frame, first);
-                if frame > number - targets && !self.complete(frame, &basis, s) {
+                if frame >= start && !self.complete(frame, &basis, s) {
                     let motion = match self.motion(frame, &basis) {
                         Some(motion) => motion.clone(),
                         None => {
@@ -245,7 +252,14 @@ impl Incremental {
                                     ..Motion::default()
                                 },
                             };
-                            if let Some(view) = view.as_ref().filter(|_| s.faces.any()) {
+                            // The frame before was worked out first, unless it is missing.
+                            let reused = basis
+                                .faces
+                                .filter(|_| !missing.contains(&(frame - 1)))
+                                .and_then(|_| self.motion(frame - 1, &previous));
+                            if let Some(before) = reused {
+                                motion.blobs.extend(reused_faces(before, frame - 1));
+                            } else if let Some(view) = view.as_ref().filter(|_| s.faces.any()) {
                                 let found = crate::faces::find(view, s.faces, grid.count());
                                 motion.blobs.extend(found);
                             }
@@ -254,7 +268,10 @@ impl Incremental {
                         }
                     };
                     if swarm {
-                        let tiles = frame_tiles(&motion, view.as_ref(), frame, w, h, s.mirror);
+                        // A trail of one draws no frame before, so reused faces need tiles here.
+                        let reused = targets == 1;
+                        let tiles =
+                            frame_tiles(&motion, view.as_ref(), frame, w, h, s.mirror, reused);
                         self.tiles.insert(frame, (basis, s.mirror, tiles));
                         self.cuts.remove(&frame);
                     }
@@ -265,7 +282,7 @@ impl Incremental {
             });
         }
         for &frame in &missing {
-            self.forget(frame, background);
+            self.forget(frame, feeds);
         }
         let reach = background + targets;
         self.keep(number - reach..=number + reach);
@@ -275,7 +292,7 @@ impl Incremental {
     /// aren't kept, the frames before them whose grids aren't, and `number`, which it draws.
     fn lacking(&self, s: &RenderSettings, first: i64, number: i64) -> BTreeSet<i64> {
         let mut wanted = BTreeSet::from([number]);
-        for target in (number - targets(s) + 1).max(first)..=number {
+        for target in start(s, number, first)..=number {
             let basis = basis(s, target, first);
             if !self.complete(target, &basis, s) {
                 wanted.insert(target);
@@ -550,9 +567,11 @@ fn detection(s: &RenderSettings) -> Detection {
 
 /// What `frame` is worked out from in a render whose frames start at `first`.
 fn basis(s: &RenderSettings, frame: i64, first: i64) -> Basis {
+    let from = |frame: i64| (frame - i64::from(history_frames(s))).max(first);
     Basis {
         detection: detection(s),
-        from: (frame - i64::from(history_frames(s))).max(first),
+        from: from(frame),
+        faces: (faces_from(s, frame, first) != frame).then(|| from(frame - 1)),
     }
 }
 
@@ -563,6 +582,36 @@ fn targets(s: &RenderSettings) -> i64 {
     } else {
         1
     }
+}
+
+/// The frame whose faces `frame` shows in a render whose frames start at `first`. As in
+/// segcam, faces run on every 2nd frame, the even ones; an odd frame reuses the frame before's.
+fn faces_from(s: &RenderSettings, frame: i64, first: i64) -> i64 {
+    if s.faces.any() && frame.rem_euclid(2) == 1 && frame > first {
+        frame - 1
+    } else {
+        frame
+    }
+}
+
+/// The first frame whose motion a render of `number` works out: the first it draws, or the
+/// frame before if that one's faces are reused.
+fn start(s: &RenderSettings, number: i64, first: i64) -> i64 {
+    faces_from(s, (number - targets(s) + 1).max(first), first)
+}
+
+/// The faces in `motion`, frame `frame`'s, as the next frame reuses them: with their IDs.
+fn reused_faces(motion: &Motion, frame: i64) -> impl Iterator<Item = motion::Blob> + '_ {
+    use motion::SegmentKind as Kind;
+    motion
+        .blobs
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !matches!(b.kind, Kind::Motion | Kind::Blob))
+        .map(move |(i, b)| motion::Blob {
+            reused: Some((frame, i)),
+            ..*b
+        })
 }
 
 /// A hash of every pixel, read as u64 words in four lanes so it's limited by memory bandwidth.
@@ -650,6 +699,13 @@ mod tests {
         out
     }
 
+    /// The GPU tests take turns: several devices open at once on WARP crash it now and then
+    /// (an access violation in d3d10warp.dll) unless the D3D12 debug layer is on.
+    fn turn() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A device of the test's own, on the adapter `SEGCAM_GPU_ADAPTER` picks or on a software
     /// one where there is none; `None` where there is no adapter at all.
     fn own_device() -> Option<Arc<gpu::Device>> {
@@ -697,6 +753,7 @@ mod tests {
     /// what the CPU draws, and no new instance draws on that device.
     #[test]
     fn a_lost_gpu_falls_back_to_the_cpu() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -725,6 +782,7 @@ mod tests {
     /// new instances still draw on it and a render that didn't cause it isn't charged with it.
     #[test]
     fn an_error_leaves_the_device_usable() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         dev.misuse();
@@ -745,6 +803,7 @@ mod tests {
     /// draws, byte for byte, from what it kept.
     #[test]
     fn leaving_the_gpu_keeps_the_cpu_output() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -772,6 +831,7 @@ mod tests {
     /// the CPU byte for byte, and the next render is back on the GPU.
     #[test]
     fn a_fault_falls_back_for_one_render() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -806,6 +866,7 @@ mod tests {
     /// the GPU, so only what must hold either way is checked.
     #[test]
     fn a_slow_readback_falls_back_for_one_render() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -841,6 +902,7 @@ mod tests {
     /// rest is over the GPU draws again.
     #[test]
     fn faults_close_together_rest_on_the_cpu() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -879,6 +941,7 @@ mod tests {
     /// GPU draws again once the trail moves on; the instance never leaves it.
     #[test]
     fn a_full_atlas_falls_back_for_one_render() {
+        let _turn = turn();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();

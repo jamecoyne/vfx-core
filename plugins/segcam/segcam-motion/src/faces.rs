@@ -77,6 +77,7 @@ pub fn find<C: Channel>(frame: &View<C>, parts: FaceParts, cells: usize) -> Vec<
                 Kind::Mouth => SegmentKind::Mouth,
                 Kind::Body => SegmentKind::Body,
             },
+            reused: None,
         })
         .collect()
 }
