@@ -7,6 +7,8 @@ use crate::catalog;
 use crate::controls::{self, Controls, Status};
 use crate::effects::{self, Effects};
 use crate::modulation::{self, Expressions, Sources};
+#[cfg(target_arch = "wasm32")]
+use crate::web_media;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{audio, face, script, stats, video};
 use vfx_core::Gpu;
@@ -57,6 +59,12 @@ struct Preview {
     /// Cameras found at startup.
     #[cfg(not(target_arch = "wasm32"))]
     cameras: Vec<String>,
+    /// A video file or the webcam, in the browser.
+    #[cfg(target_arch = "wasm32")]
+    web_video: Option<web_media::WebVideo>,
+    /// A file pick or camera request the browser hasn't answered yet.
+    #[cfg(target_arch = "wasm32")]
+    web_pending: web_media::Pending,
     /// Samples the bottom bar's CPU, memory and GPU numbers.
     #[cfg(not(target_arch = "wasm32"))]
     stats: stats::Sampler,
@@ -210,6 +218,10 @@ impl Preview {
             tracker: None,
             #[cfg(not(target_arch = "wasm32"))]
             cameras: video::cameras(),
+            #[cfg(target_arch = "wasm32")]
+            web_video: None,
+            #[cfg(target_arch = "wasm32")]
+            web_pending: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             stats: stats::Sampler::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -299,14 +311,81 @@ impl Preview {
         self.refresh_image();
     }
 
+    /// The browser's video file or webcam: takes one the browser has just opened, copies a
+    /// new frame onto the GPU, and sets this frame's expression variables. Returns the time
+    /// that names the frame the effect sees.
+    #[cfg(target_arch = "wasm32")]
+    fn feed_web_video(&mut self) -> f64 {
+        if let Some(opened) = self.web_pending.borrow_mut().take() {
+            match opened {
+                Ok(video) => {
+                    self.web_video = Some(video);
+                    self.message = None;
+                }
+                Err(e) => self.message = Some(format!("Couldn't open it: {e}")),
+            }
+        }
+        let Some(video) = &mut self.web_video else {
+            self.sources = modulation::sources(self.time, None, [0.0; 5], modulation::FACE_NONE);
+            return self.time;
+        };
+        // Until the browser knows its size the previous source stays up.
+        if let Some(size) = video.size() {
+            let current = self.effects.image_name() == Some(video.name.as_str())
+                && self.effects.size() == size;
+            if !current {
+                self.effects
+                    .start_stream(&self.gpu, video.name.clone(), size, None);
+                self.refresh_image();
+            }
+            let video = self.web_video.as_mut().expect("checked above");
+            if let Some(frame) = self.effects.source_frame()
+                && let Err(e) = video.upload(&self.gpu, frame)
+            {
+                self.message = Some(format!("Couldn't read the video: {e}"));
+            }
+        }
+        let video = self.web_video.as_ref().expect("checked above");
+        let position = video.position();
+        self.sources = modulation::sources(
+            self.time,
+            Some((position, video.duration())),
+            [0.0; 5],
+            modulation::FACE_NONE,
+        );
+        position
+    }
+
+    /// The panel's source and transport actions, in the browser.
+    #[cfg(target_arch = "wasm32")]
+    fn handle_web_actions(&mut self, actions: &controls::Actions) {
+        if actions.import {
+            web_media::pick_file(&self.web_pending);
+        }
+        if actions.start_camera.is_some() {
+            web_media::open_camera(&self.web_pending);
+        }
+        let Some(video) = &mut self.web_video else {
+            return;
+        };
+        if actions.toggle_play {
+            video.toggle_play();
+        }
+        if let Some(position) = actions.scrub.or(actions.scrub_done) {
+            video.seek(position);
+        }
+    }
+
     /// Works out this frame's expression variables, then renders the live preview.
     fn render_effects(&mut self, dt: f64) {
         #[cfg(not(target_arch = "wasm32"))]
         self.feed_layer();
         // The effect's time names the frame it sees: the video's position for media (a
         // new frame only when the video moves on), the clock for test patterns.
-        #[allow(unused_mut)]
+        #[cfg(not(target_arch = "wasm32"))]
         let mut frame_time = self.time;
+        #[cfg(target_arch = "wasm32")]
+        let frame_time = self.feed_web_video();
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(media) = &mut self.media {
             // Dragging the slider: show the frame under it, at most every 60 ms.
@@ -348,10 +427,6 @@ impl Preview {
                     .map_or(modulation::FACE_NONE, face::Tracker::values),
             );
         } else {
-            self.sources = modulation::sources(self.time, None, [0.0; 5], modulation::FACE_NONE);
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
             self.sources = modulation::sources(self.time, None, [0.0; 5], modulation::FACE_NONE);
         }
 
@@ -625,8 +700,18 @@ impl Preview {
                     .map_or_else(|| m.video.playing(), |s| s.resume),
             });
         #[cfg(target_arch = "wasm32")]
-        let (video, sound_on, cameras, face_tracking, playback) =
-            (false, false, &[][..], false, None);
+        let (video, sound_on, cameras, face_tracking) =
+            (false, false, &web_media::CAMERAS[..], false);
+        #[cfg(target_arch = "wasm32")]
+        let playback =
+            self.web_video
+                .as_ref()
+                .filter(|v| !v.is_camera())
+                .map(|v| controls::Playback {
+                    position: v.position(),
+                    duration: v.duration(),
+                    playing: v.playing(),
+                });
         #[cfg(not(target_arch = "wasm32"))]
         let record_result = self.record_result.as_deref();
         #[cfg(target_arch = "wasm32")]
@@ -670,12 +755,18 @@ impl Preview {
             {
                 self.media = None;
             }
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.web_video = None;
+            }
             self.effects.clear_image(&self.gpu);
             self.message = None;
             self.refresh_image();
         }
         #[cfg(not(target_arch = "wasm32"))]
         self.handle_media_actions(&actions);
+        #[cfg(target_arch = "wasm32")]
+        self.handle_web_actions(&actions);
         self.egui_state
             .handle_platform_output(&self.window, output.platform_output);
         // Apply texture updates before anything can skip the frame: egui sends each

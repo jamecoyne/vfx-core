@@ -31,5 +31,7 @@ mod script;
 mod stats;
 #[cfg(not(target_arch = "wasm32"))]
 mod video;
+#[cfg(target_arch = "wasm32")]
+mod web_media;
 
 pub use app::run;

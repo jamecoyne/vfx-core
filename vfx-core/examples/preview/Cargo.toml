@@ -47,5 +47,12 @@ windows-sys = { version = "0.61.2", features = ["Win32_Security", "Win32_System_
 wgpu = { version = "=30.0.1", features = ["fragile-send-sync-non-atomic-wasm"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Document", "Element", "HtmlElement", "Location", "Window"] }
+js-sys = "0.3"
+# The DOM, plus a <video> for video files and the webcam (web_media.rs).
+web-sys = { version = "0.3", features = [
+    "Document", "Element", "HtmlElement", "Location", "Window",
+    "HtmlInputElement", "HtmlMediaElement", "HtmlVideoElement", "File", "FileList", "Blob", "Url",
+    "Navigator", "MediaDevices", "MediaStream", "MediaStreamTrack", "MediaStreamConstraints",
+    "OffscreenCanvas", "OffscreenCanvasRenderingContext2d",
+] }
 console_error_panic_hook = "0.1"
