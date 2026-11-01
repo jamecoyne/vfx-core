@@ -577,11 +577,7 @@ impl Effects {
                 };
             }
             Run::Cpu(stage) => {
-                let finished = stage.render(gpu, source, result, values, time, self.frame_rate);
-                self.rendered = Rendered {
-                    finished,
-                    new_picture: finished,
-                };
+                self.rendered = stage.render(gpu, source, result, values, time, self.frame_rate);
             }
         }
 

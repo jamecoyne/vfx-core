@@ -16,7 +16,7 @@ pub struct Counts {
     pub loops: u64,
     /// Renders the effect finished.
     pub finished: u64,
-    /// New pictures presented in the window.
+    /// Pictures presented in the window that differ from the one before.
     pub shown: u64,
 }
 

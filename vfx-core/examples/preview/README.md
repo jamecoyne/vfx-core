@@ -34,10 +34,11 @@ stats t=1.0 fps=144.0 ms=6.94 max_ms=9.20 size=1280x720 cpu=12.3 app_cpu=45.0 me
 done frames=1440 seconds=10.01 fps=143.8 max_ms=40.20 loops=143.8 finished=59.8 shown=59.8
 ```
 
-`shown` is the number to read: new pictures presented in the window each second. `finished`
-is the renders the effect finished each second, and `loops` the times round the app's loop,
-which a visible window paces by vsync and which repeats the last picture when nothing new
-came in. `ms` and `max_ms` are the mean and longest loop, and `fps` is `loops` under its old
+`shown` is the number to read: new pictures presented in the window each second, where a
+CPU effect's render counts only if its output differs from the last one, and a GPU effect's
+only if its time or parameters changed. `finished` is the renders the effect finished each
+second, and `loops` the times round the app's loop, which a visible window paces by vsync
+and which repeats the last picture when nothing new came in. `ms` and `max_ms` are the mean and longest loop, and `fps` is `loops` under its old
 name, kept for older scripts. `cpu` is the machine's, `app_cpu` this process's as a share of
 one core, and `gpu` is `n/a` where the OS doesn't report it. Under `--quiet` loops are unpaced
 and each waits for the GPU, nothing is presented so `shown` is 0, and a test pattern (which

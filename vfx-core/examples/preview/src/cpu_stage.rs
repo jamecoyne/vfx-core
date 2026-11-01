@@ -7,6 +7,7 @@
 //! time earlier than the last starts the history over, as a seek back does. The effect is
 //! kept between renders when it keeps state ([`vfx_host::CpuInstance`]).
 
+use crate::effects::Rendered;
 use vfx_core::cpu::{Argb, Channel, History, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, Gpu, ParamValues};
 use vfx_host::{CpuInstance, by_rows};
@@ -20,7 +21,8 @@ pub struct CpuStage {
     /// The last render, and what it was rendered with.
     rendered: Vec<Argb<u8>>,
     rendered_with: Option<ParamValues>,
-    /// `rendered` as the output frame's float RGBA, uploaded every render.
+    /// The picture in the output frame, and the same as float RGBA for its upload.
+    shown: Vec<Argb<u8>>,
     upload: Vec<f32>,
     reader: Reader,
 }
@@ -37,6 +39,7 @@ impl CpuStage {
             last_time: None,
             rendered: vec![Argb::default(); pixels],
             rendered_with: None,
+            shown: Vec::new(),
             upload: vec![0.0; pixels * 4],
             reader: Reader::new(gpu, size),
         }
@@ -78,11 +81,10 @@ impl CpuStage {
         }
     }
 
-    /// Renders the newest frame again if anything changed since the last render. True when
-    /// a render finished.
-    fn refresh(&mut self, values: &ParamValues, time: f64, frame_rate: Option<f64>) -> bool {
+    /// Renders the newest frame again if anything changed since the last render.
+    fn refresh(&mut self, values: &ParamValues, time: f64, frame_rate: Option<f64>) -> Rendered {
         if self.rendered_with.as_ref() == Some(values) || self.history.is_empty() {
-            return false;
+            return Rendered::default();
         }
         let (w, h) = (self.size.0 as i32, self.size.1 as i32);
         let ctx = Context {
@@ -97,21 +99,31 @@ impl CpuStage {
             .effect
             .render(&mut self.history, count, out, values, &ctx);
         if self.effect.unfinished() {
-            return false; // the next render of this frame finishes it
+            return Rendered::default(); // the next render of this frame finishes it
         }
         self.rendered_with = Some(values.clone());
-        let width = self.size.0 as usize;
-        let rendered = &self.rendered;
-        by_rows(&mut self.upload, width * 4, |y, dst| {
-            let src = &rendered[y * width..][..width];
-            for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
-                *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
-            }
-        });
-        true
+        // The same picture again, as Swarm draws between analyses, needs no copy to the GPU.
+        let new_picture = bytemuck::cast_slice::<_, u8>(&self.rendered)
+            != bytemuck::cast_slice::<_, u8>(&self.shown);
+        if new_picture {
+            // `shown` starts empty; after that the two buffers trade places.
+            std::mem::swap(&mut self.rendered, &mut self.shown);
+            self.rendered.resize(self.shown.len(), Argb::default());
+            let width = self.size.0 as usize;
+            let shown = &self.shown;
+            by_rows(&mut self.upload, width * 4, |y, dst| {
+                let src = &shown[y * width..][..width];
+                for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                    *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
+                }
+            });
+        }
+        Rendered {
+            finished: true,
+            new_picture,
+        }
     }
 
-    /// True when a render finished, so `output` has a new picture.
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -120,14 +132,14 @@ impl CpuStage {
         values: &ParamValues,
         time: f64,
         frame_rate: Option<f64>,
-    ) -> bool {
+    ) -> Rendered {
         // A frame still waiting on the GPU keeps its place until it's done.
         if !self.effect.unfinished() {
             self.push(gpu, input, time, values);
         }
-        let finished = self.refresh(values, time, frame_rate);
+        let rendered = self.refresh(values, time, frame_rate);
         if self.effect.unfinished() {
-            return false; // the last output stays up
+            return rendered; // the last output stays up
         }
         if self.history.is_empty() {
             // Nothing read back yet (the web build reads a frame late): show the input.
@@ -138,10 +150,10 @@ impl CpuStage {
                 input.texture.size(),
             );
             gpu.queue.submit(Some(encoder.finish()));
-        } else {
+        } else if rendered.new_picture {
             output.write(gpu, bytemuck::cast_slice(&self.upload));
         }
-        finished
+        rendered
     }
 }
 
