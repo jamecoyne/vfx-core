@@ -164,7 +164,10 @@ fn faces_from_a_live_history_match_fresh_renders() {
             ("trail", ParamValue::Int(4)),
         ]),
     ];
-    for (params, frame_rate) in sets.iter().flat_map(|p| [(p, None), (p, Some(60.0))]) {
+    for (params, frame_rate) in sets
+        .iter()
+        .flat_map(|p| [(p, None), (p, Some(30.0)), (p, Some(60.0))])
+    {
         let mut kept = SegcamMotion::default();
         let mut history = History::<u8>::default();
         history.resize(W, H);

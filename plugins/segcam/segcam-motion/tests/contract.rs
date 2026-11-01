@@ -72,7 +72,7 @@ fn overlay_and_mattes_keep_the_contract() {
             ("background", ParamValue::Int(6)),
         ]),
     ];
-    for frame_rate in [None, Some(60.0)] {
+    for frame_rate in [None, Some(30.0), Some(60.0)] {
         let clip = Clip {
             frame_rate,
             ..crossing()
@@ -91,7 +91,7 @@ fn swarm_keeps_the_contract() {
             ("mirror", ParamValue::Bool(mirror)),
         ])
     };
-    for frame_rate in [None, Some(60.0)] {
+    for frame_rate in [None, Some(30.0), Some(60.0)] {
         let clip = Clip {
             frame_rate,
             ..crossing()
