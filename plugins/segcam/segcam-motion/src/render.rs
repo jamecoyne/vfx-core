@@ -193,8 +193,8 @@ impl RenderSettings {
 
 /// How many frames before the current one [`render`] wants to see: the background and the
 /// swarm's trail, or for the other outputs the background of the analysis the frame shows,
-/// at any frame rate. With faces on, one more: an odd frame reuses the faces of the frame
-/// before, with that frame's IDs.
+/// at any frame rate. With faces on, a stride more: every 2nd analysis reuses the faces of the
+/// one before, with that frame's IDs.
 pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
     history_frames(s)
         + if s.mode == OutputMode::Swarm {
@@ -202,7 +202,7 @@ pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
         } else {
             Cadence::MAX_STRIDE as i32 - 1
         }
-        + i32::from(s.faces.any())
+        + i32::from(s.faces.any()) * Cadence::MAX_STRIDE as i32
 }
 
 /// How many frames before a frame its detection reads: the background, for motion.

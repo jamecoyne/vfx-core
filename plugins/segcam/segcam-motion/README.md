@@ -46,9 +46,9 @@ segments are labelled `blob#…`. **Swarm backdrop** puts the windows on a trans
 uses Apple's Vision on macOS and ONNX Runtime models on Windows and Linux. **Detect ▸ Faces
 only** shows just the face and body segments. On Windows the models take about 2 seconds to
 load the first time, then add about 12 ms to a 1080p frame, and the plugin ships its own
-`DirectML.dll`. As in segcam 1.1, faces run on every 2nd frame, the even frame numbers: an odd
-frame shows the faces of the frame before, with their IDs, or finds its own when the host
-doesn't hand that frame over. The face modes don't run in the web build yet.
+`DirectML.dll`. As in segcam 1.1, faces run on every 2nd analysis, the even frame numbers at
+30 fps: the analysis between shows the faces of the one before, with their IDs, or finds its
+own when the host doesn't hand that frame over. The face modes don't run in the web build yet.
 
 ## Parameters
 
@@ -93,7 +93,8 @@ Like segcam 1.1 it analyses about 30 frames a second. Where the host says the fr
 to 60 fps and every 4th at 120, and the frames between show the last analysis: its boxes and
 IDs, and no new windows. Resolume says no frame rate, so there every frame is analysed. Outside
 Swarm the 3 extra frames mean the analysis a frame shows is always handed over; when the host
-can't hand it over, the frame analyses itself.
+can't hand it over, the frame analyses itself. With faces on, a render reads 4 frames more, so
+the analysis whose faces it reuses is handed over too.
 
 The C++ effect's README covers how this differs from the live app (no state carried
 forever, per-frame IDs); all of it applies here.
