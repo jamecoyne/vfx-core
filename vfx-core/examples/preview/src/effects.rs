@@ -298,6 +298,9 @@ impl Stage {
 pub struct Rendered {
     pub finished: bool,
     pub new_picture: bool,
+    /// How long a CPU effect's finished render took. A GPU effect's work ends later, on
+    /// the GPU, so it has none.
+    pub render_time: Option<std::time::Duration>,
 }
 
 pub struct Effects {
@@ -364,6 +367,26 @@ impl Effects {
     /// How many extra layers the shown effect reads.
     pub fn layers(&self) -> usize {
         self.stage.layers
+    }
+
+    /// The shown effect's name.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn name(&self) -> &'static str {
+        &catalog::entries()[self.stage.effect].name
+    }
+
+    /// The shown effect as `--effect` names it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn slug(&self) -> &'static str {
+        &catalog::entries()[self.stage.effect].slug
+    }
+
+    /// Whether the shown effect renders on the CPU (a `CpuEffect`) rather than in a chain
+    /// of GPU passes. What it does inside its render, segcam's face models on DirectML say,
+    /// the preview can't see.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn on_cpu(&self) -> bool {
+        matches!(self.stage.run, Run::Cpu(_))
     }
 
     fn set_size(&mut self, gpu: &Gpu, size: (u32, u32)) {
@@ -574,6 +597,7 @@ impl Effects {
                 self.rendered = Rendered {
                     finished: true,
                     new_picture,
+                    render_time: None,
                 };
             }
             Run::Cpu(stage) => {

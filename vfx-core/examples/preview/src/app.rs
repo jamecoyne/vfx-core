@@ -593,14 +593,25 @@ impl Preview {
             let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
         }
         #[cfg(not(target_arch = "wasm32"))]
-        {
+        let stats = {
             let rendered = self.effects.rendered();
-            self.counts.loops += 1;
-            self.counts.finished += u64::from(rendered.finished);
+            self.counts.rendered += u64::from(rendered.finished);
+            self.counts.render_time += rendered.render_time.unwrap_or_default();
             self.unshown |= rendered.new_picture;
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        let stats = self.stats.sample(self.counts, self.effects.size());
+            let source = match &self.media {
+                Some(media) => stats::SourceRate::Fps(media.video.info.fps),
+                None if self.effects.image_name().is_some() => stats::SourceRate::Still,
+                None => stats::SourceRate::Pattern,
+            };
+            let what = stats::What {
+                effect: self.effects.name(),
+                slug: self.effects.slug(),
+                on_cpu: self.effects.on_cpu(),
+                source,
+                size: self.effects.size(),
+            };
+            self.stats.sample(self.counts, rendered.render_time, what)
+        };
         #[cfg(not(target_arch = "wasm32"))]
         self.count_frame(&stats);
         #[cfg(not(target_arch = "wasm32"))]
@@ -754,7 +765,7 @@ impl Preview {
         self.gpu.queue.present(frame);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.counts.shown += u64::from(self.unshown);
+            self.counts.screen += u64::from(self.unshown);
             self.unshown = false;
         }
     }

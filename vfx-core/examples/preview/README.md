@@ -30,21 +30,28 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 when `--frames` or `--seconds` ends the run:
 
 ```text
-stats t=12.1 fps=62.5 ms=16.01 max_ms=47.60 size=1920x1080 cpu=20.2 app_cpu=230.8 mem_mb=2620 gpu=n/a loops=62.5 finished=45.6 shown=22.8
-done frames=1108 seconds=20.01 fps=55.3 max_ms=141.7 loops=55.3 finished=44.8 shown=22.4
+stats t=12.1 effect=segcam-motion on=cpu source=59.9 rendered=45.6 rendered_ms=14.1 worst_ms=38.6 screen=22.8 size=1920x1080 cpu=20.2 app_cpu=230.8 mem_mb=2620 gpu=n/a
+done frames=1108 seconds=20.01 effect=segcam-motion on=cpu source=59.9 rendered=44.8 rendered_ms=14.3 worst_ms=141.7 screen=22.4
 ```
 
-`shown` is the number to read: new pictures presented in the window each second, where a
-CPU effect's render counts only if its output differs from the last one, and a GPU effect's
-only if its time or parameters changed. `finished` is the renders the effect finished each
-second, and `loops` the times round the app's loop, which a visible window paces by vsync
-and which repeats the last picture when nothing new came in. segcam's Swarm on a transparent
-canvas only changes when it analyses, every 2nd frame of a 60 fps clip, so there `shown` tops
-out at 30. `ms` and `max_ms` are the mean and longest loop, and `fps` is `loops` under its old
-name, kept for older scripts. `cpu` is the machine's, `app_cpu` this process's as a share of
-one core, and `gpu` is `n/a` where the OS doesn't report it. Under `--quiet` loops are unpaced
-and each waits for the GPU, nothing is presented so `shown` is 0, and a test pattern (which
-changes every loop) shows the effect's throughput in `finished`.
+The keys follow the frames: `source` is the rate they come in at (the file's or camera's,
+or `pattern` and `still`), `rendered` the renders the effect finished each second, and
+`screen` the new frames presented in the window each second, where a CPU effect's render
+counts only if its output differs from the last one, and a GPU effect's only if its time or
+parameters changed. segcam's Swarm on a transparent canvas only changes when it analyses,
+every 2nd frame of a 60 fps clip, so there `screen` tops out at 30. `on` says whether the
+effect renders on the CPU or in GPU passes; it can't see what a CPU effect does inside its
+render. For a CPU effect `rendered_ms` and `worst_ms` are a render's mean and longest time
+over the second (the run, on the `done` line); a GPU effect's work ends on the GPU, so it has
+neither. `frames` counts passes of the app's loop, which a visible window paces by vsync and
+which repeats the last frame when nothing new came in; `--frames N` stops after that many.
+`cpu` is the machine's, `app_cpu` this process's as a share of one core, and `gpu` is `n/a`
+where the OS doesn't report it. Under `--quiet` loops are unpaced and each waits for the GPU,
+nothing is presented so `screen` is 0, and a test pattern (which changes every loop) shows
+the effect's throughput in `rendered`.
+
+The window's bottom bar shows the same, source to screen: `source 60 fps | segcam Motion on
+CPU: rendered 45 fps, 14 ms, worst 138 ms | screen 22 fps`, then the machine.
 
 In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
 `--effect` and a file, mistakes show in the panel as before.

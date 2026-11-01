@@ -7,6 +7,10 @@
 //! time earlier than the last starts the history over, as a seek back does. The effect is
 //! kept between renders when it keeps state ([`vfx_host::CpuInstance`]).
 
+use std::time::Duration;
+
+use web_time::Instant;
+
 use crate::effects::Rendered;
 use vfx_core::cpu::{Argb, Channel, History, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, Gpu, ParamValues};
@@ -21,6 +25,8 @@ pub struct CpuStage {
     /// The last render, and what it was rendered with.
     rendered: Vec<Argb<u8>>,
     rendered_with: Option<ParamValues>,
+    /// Time spent so far on the render in progress, over its unfinished calls.
+    rendering: Duration,
     /// The picture in the output frame, and the same as float RGBA for its upload.
     shown: Vec<Argb<u8>>,
     upload: Vec<f32>,
@@ -39,6 +45,7 @@ impl CpuStage {
             last_time: None,
             rendered: vec![Argb::default(); pixels],
             rendered_with: None,
+            rendering: Duration::ZERO,
             shown: Vec::new(),
             upload: vec![0.0; pixels * 4],
             reader: Reader::new(gpu, size),
@@ -95,12 +102,15 @@ impl CpuStage {
         let count = self.history.len();
         let out = ImageMut::U8(ViewMut::from_pixels(&mut self.rendered, w, h));
         // A render that panicked starts the effect over; its frame shows what it drew.
+        let started = Instant::now();
         let _ = self
             .effect
             .render(&mut self.history, count, out, values, &ctx);
+        self.rendering += started.elapsed();
         if self.effect.unfinished() {
             return Rendered::default(); // the next render of this frame finishes it
         }
+        let render_time = Some(std::mem::take(&mut self.rendering));
         self.rendered_with = Some(values.clone());
         // The same picture again, as Swarm draws between analyses, needs no copy to the GPU.
         let new_picture = bytemuck::cast_slice::<_, u8>(&self.rendered)
@@ -121,6 +131,7 @@ impl CpuStage {
         Rendered {
             finished: true,
             new_picture,
+            render_time,
         }
     }
 
