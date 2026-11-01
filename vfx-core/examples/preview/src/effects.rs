@@ -301,6 +301,8 @@ pub struct Effects {
     generator: Pass,
     display_pass: Pass,
     stage: Stage,
+    /// The size generated patterns render at.
+    pattern_size: (u32, u32),
 }
 
 impl Effects {
@@ -333,6 +335,7 @@ impl Effects {
             generator,
             display_pass,
             stage: Stage::new(gpu, 0, PATTERN_SIZE),
+            pattern_size: PATTERN_SIZE,
         }
     }
 
@@ -439,7 +442,16 @@ impl Effects {
     /// Goes back to the generated patterns.
     pub fn clear_image(&mut self, gpu: &Gpu) {
         if self.image.take().is_some() {
-            self.set_size(gpu, PATTERN_SIZE);
+            self.set_size(gpu, self.pattern_size);
+        }
+    }
+
+    /// Renders generated patterns at `size` from now on.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_pattern_size(&mut self, gpu: &Gpu, size: (u32, u32)) {
+        self.pattern_size = size;
+        if self.image.is_none() {
+            self.set_size(gpu, size);
         }
     }
 
