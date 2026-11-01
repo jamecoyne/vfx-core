@@ -106,11 +106,17 @@ pub trait Effect: Send {
 pub trait CpuEffect: Send {
     fn params(&self) -> &[ParamSpec];
 
-    /// How many frames before the current one a render reads. Hosts that can fetch earlier
-    /// frames (After Effects, OpenFX) fetch them; hosts that can't (Resolume, the preview)
-    /// keep the ones they've seen.
-    fn frames_before(&self, _params: &ParamValues) -> usize {
+    /// How many frames before the current one a render reads, at `frame_rate` where the host
+    /// knows it. Hosts that can fetch earlier frames (After Effects, OpenFX) fetch them; hosts
+    /// that can't (Resolume, the preview) keep the ones they've seen.
+    fn frames_before(&self, _params: &ParamValues, _frame_rate: Option<f64>) -> usize {
         0
+    }
+
+    /// How many of those a host that hands frames over one at a time and keeps this effect must
+    /// hold in full. An effect that keeps state can work from what it kept, and take fewer.
+    fn frames_held(&self, params: &ParamValues, frame_rate: Option<f64>) -> usize {
+        self.frames_before(params, frame_rate)
     }
 
     /// Whether the effect keeps what it worked out between renders. Hosts that can keep one

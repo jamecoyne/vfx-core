@@ -312,7 +312,7 @@ fn source_rod(effect: ImageEffect, time: OfxTime) -> Result<[f64; 4], OfxStatus>
 fn frames_needed(effect: ImageEffect, in_args: Props, out_args: Props) -> Result<(), OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
     let before = match (vfx_host::plugin().make)() {
-        Processor::Cpu(e) => e.frames_before(&values(effect, time)?),
+        Processor::Cpu(e) => e.frames_before(&values(effect, time)?, frame_rate(effect)?),
         Processor::Gpu(_) => 0,
     };
     out_args.set_doubles(CLIP_FRAME_RANGE_SOURCE, &[time - before as f64, time])
@@ -674,14 +674,16 @@ fn render_cpu_with(
     let start = source_props.get_double(PROP_FRAME_RANGE, 0)?;
     let values = values(effect, time)?;
     // Frames go back to the clip's first: earlier ones aren't missing, there are none.
-    let count = (cpu_effect.frames_before(&values) + 1).min((time - start).max(0.0) as usize + 1);
+    let rate = frame_rate(effect)?;
+    let count =
+        (cpu_effect.frames_before(&values, rate) + 1).min((time - start).max(0.0) as usize + 1);
     let ctx = Context {
         time: seconds(effect, time)?,
         frame: time.round() as i64,
         // CPU effects see whole frames; a host may leave the scale out.
         scale: [0, 1].map(|i| in_args.get_double(PROP_RENDER_SCALE, i).unwrap_or(1.0) as f32),
         premultiplied: source_props.str_is(PROP_PREMULTIPLICATION, PREMULTIPLIED)?,
-        frame_rate: frame_rate(effect)?,
+        frame_rate: rate,
     };
     let window = in_args
         .get_rect_i(PROP_RENDER_WINDOW)?

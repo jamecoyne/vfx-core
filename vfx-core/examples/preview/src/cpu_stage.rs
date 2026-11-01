@@ -43,7 +43,14 @@ impl CpuStage {
     }
 
     /// Reads the input back if it is a new frame and adds it to the history.
-    fn push(&mut self, gpu: &Gpu, input: &Frame, time: f64, values: &ParamValues) {
+    fn push(
+        &mut self,
+        gpu: &Gpu,
+        input: &Frame,
+        time: f64,
+        values: &ParamValues,
+        frame_rate: Option<f64>,
+    ) {
         let Self {
             reader,
             history,
@@ -60,7 +67,8 @@ impl CpuStage {
                 effect.reset();
             }
             *last_time = Some(time);
-            let frame = history.next(effect.frames_before(values));
+            let before = effect.frames_before(values, frame_rate);
+            let frame = history.next(before, effect.frames_held(values, frame_rate));
             by_rows(frame, width, |y, dst| {
                 let src = &rgba[y * pitch..][..width * 4];
                 for (dst, &[r, g, b, a]) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
@@ -120,7 +128,7 @@ impl CpuStage {
     ) {
         // A frame still waiting on the GPU keeps its place until it's done.
         if !self.effect.unfinished() {
-            self.push(gpu, input, time, values);
+            self.push(gpu, input, time, values, frame_rate);
         }
         self.refresh(values, time, frame_rate);
         if self.effect.unfinished() {

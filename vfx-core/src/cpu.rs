@@ -333,12 +333,21 @@ pub trait FrameSource {
     fn fixed(&self) -> bool {
         false
     }
+
+    /// How many of the newest frames a [fixed](Self::fixed) source still has the pixels of.
+    /// Older ones come as `None`, and stay gone.
+    fn held(&self) -> usize {
+        usize::MAX
+    }
 }
 
 /// For hosts that hand over one frame at a time (Resolume, the preview): the last few
-/// frames, oldest first, with their allocations recycled at the front.
+/// frames, oldest first, with their allocations recycled at the front. Only the newest are
+/// held in full, as the effect says; a render still counts the rest, which come as `None`.
 pub struct History<C> {
     frames: VecDeque<Vec<Argb<C>>>,
+    /// How many frames a render counts, `frames` being the newest of them.
+    count: usize,
     width: i32,
     height: i32,
     /// How many frames have been pushed; the newest is number `pushed - 1`.
@@ -349,6 +358,7 @@ impl<C> Default for History<C> {
     fn default() -> Self {
         Self {
             frames: VecDeque::new(),
+            count: 0,
             width: 0,
             height: 0,
             pushed: 0,
@@ -359,6 +369,7 @@ impl<C> Default for History<C> {
 impl<C: Depth> History<C> {
     pub fn clear(&mut self) {
         self.frames.clear();
+        self.count = 0;
         self.pushed = 0;
     }
 
@@ -373,11 +384,11 @@ impl<C: Depth> History<C> {
     }
 
     pub fn len(&self) -> usize {
-        self.frames.len()
+        self.count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.count == 0
     }
 
     /// The newest frame's number: frames pushed since the last clear, less one.
@@ -385,10 +396,11 @@ impl<C: Depth> History<C> {
         (self.pushed - 1).max(0)
     }
 
-    /// Room for a new frame, the newest, to be filled by the caller. Keeps `before` frames
-    /// before it.
-    pub fn next(&mut self, before: usize) -> &mut [Argb<C>] {
-        let keep = before + 1;
+    /// Room for a new frame, the newest, to be filled by the caller. Counts `before` frames
+    /// before it and holds the pixels of `held` of them.
+    pub fn next(&mut self, before: usize, held: usize) -> &mut [Argb<C>] {
+        self.count = (self.count + 1).min(before + 1);
+        let keep = held.min(before) + 1;
         while self.frames.len() > keep {
             self.frames.pop_front();
         }
@@ -405,15 +417,18 @@ impl<C: Depth> History<C> {
 
 impl<C: Depth> FrameSource for History<C> {
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
-        f(self
-            .frames
-            .get(index)
-            .map(|p| C::image(View::from_pixels(p, self.width, self.height))));
+        let older = self.count - self.frames.len();
+        let pixels = index.checked_sub(older).and_then(|i| self.frames.get(i));
+        f(pixels.map(|p| C::image(View::from_pixels(p, self.width, self.height))));
     }
 
     /// Frames go in through [`History::next`] only, so earlier ones never change.
     fn fixed(&self) -> bool {
         true
+    }
+
+    fn held(&self) -> usize {
+        self.frames.len()
     }
 }
 
@@ -440,24 +455,45 @@ mod tests {
         };
         let mut h = History::<u8>::default();
         h.resize(2, 1);
-        h.next(1).fill(grey(255));
+        h.next(1, 1).fill(grey(255));
         let first = h.frames[0].as_ptr();
-        h.next(1).fill(grey(0));
-        h.next(1).fill(grey(128));
+        h.next(1, 1).fill(grey(0));
+        h.next(1, 1).fill(grey(128));
         assert_eq!(h.len(), 2);
         assert_eq!(h.frames[1].as_ptr(), first, "the oldest buffer is reused");
         assert_eq!((h.frames[0][0].red, h.frames[1][0].red), (0, 128));
         assert_eq!(h.frame_number(), 2);
         for _ in 0..5 {
-            h.next(3);
+            h.next(3, 3);
         }
         assert_eq!(h.len(), 4);
-        h.next(0);
+        h.next(0, 0);
         assert_eq!(h.len(), 1);
         h.clear();
         assert!(h.is_empty() && h.frame_number() == 0);
         h.resize(3, 2);
-        assert_eq!(h.next(0).len(), 6);
+        assert_eq!(h.next(0, 0).len(), 6);
+    }
+
+    /// Frames not held still count, so numbering is what a full history's would be.
+    #[test]
+    fn history_counts_frames_it_does_not_hold() {
+        let mut h = History::<u8>::default();
+        h.resize(1, 1);
+        for v in 0..6u8 {
+            h.next(3, 1)[0].red = v;
+        }
+        assert_eq!((h.len(), h.held(), h.frame_number()), (4, 2, 5));
+        let mut read = Vec::new();
+        for index in 0..4 {
+            h.with_frame(index, &mut |image| {
+                read.push(image.map(|i| match i {
+                    Image::U8(v) => v.row(0)[0].red,
+                    _ => unreachable!(),
+                }));
+            });
+        }
+        assert_eq!(read, [None, None, Some(4), Some(5)]);
     }
 
     #[test]

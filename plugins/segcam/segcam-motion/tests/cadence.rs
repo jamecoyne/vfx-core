@@ -149,7 +149,12 @@ fn overlay_shows_the_last_analysis() {
         .collect();
     let n = 15;
     let analysis = n - 1;
-    let found = motion::detect(&grids[analysis - 6..analysis], &grids[analysis], &s.motion);
+    // Background 6 counts analyses: every 2nd frame at this rate.
+    let background: Vec<LumaGrid> = (1..=6)
+        .rev()
+        .map(|k| grids[analysis - 2 * k].clone())
+        .collect();
+    let found = motion::detect(&background, &grids[analysis], &s.motion);
     assert!(!found.blobs.is_empty());
     let mut want = vec![Argb::default(); (W * H) as usize];
     let mut view = ViewMut::from_pixels(&mut want, W, H);
@@ -171,8 +176,7 @@ impl FrameSource for Gappy<'_> {
     }
 }
 
-/// A frame whose analysis the host can't hand over analyses itself, as every frame does
-/// without a frame rate.
+/// A frame whose analysis the host can't hand over analyses itself, over the analyses before.
 #[test]
 fn a_missing_analysis_is_stood_in_for() {
     let frames = crossing(24);
@@ -194,8 +198,52 @@ fn a_missing_analysis_is_stood_in_for() {
     };
     let at_60 = at(Cadence::at(Some(60.0)));
     let stood_in = without_analysis(&at_60);
-    assert!(stood_in == without_analysis(&at(Cadence::EVERY_FRAME)));
+    let grids: Vec<LumaGrid> = frames
+        .iter()
+        .map(|f| downsample(&View::from_pixels(f, W, H), at_60.grid_width))
+        .collect();
+    // The analyses before it, without the missing one.
+    let background: Vec<LumaGrid> = (1..6).rev().map(|k| grids[n - 1 - 2 * k].clone()).collect();
+    let found = motion::detect(&background, &grids[n], &at_60.motion);
+    let mut want = vec![Argb::default(); (W * H) as usize];
+    let mut view = ViewMut::from_pixels(&mut want, W, H);
+    copy_scaled(&View::from_pixels(&frames[n], W, H), &mut view, false);
+    draw_overlay(&mut view, &found.blobs, n as i64, &at_60);
+    assert!(stood_in == want);
     assert!(stood_in != cold(&at_60, &frames, n));
+}
+
+/// Background counts analyses, so the same setting covers the same time: every 2nd frame of a
+/// clip at 60 fps finds what the clip of those frames finds at 30.
+#[test]
+fn background_covers_the_same_time_at_any_frame_rate() {
+    let frames = crossing(40);
+    let at_30: Vec<Frame> = frames.iter().step_by(2).cloned().collect();
+    let boxes = |s: &RenderSettings, frames: &[Frame], number: usize| {
+        let s = RenderSettings {
+            labels: false,
+            ..*s
+        };
+        cold(&s, frames, number)
+    };
+    let s = RenderSettings {
+        background_frames: 6,
+        ..RenderSettings::default()
+    };
+    let doubled = RenderSettings {
+        cadence: Cadence::at(Some(60.0)),
+        ..s
+    };
+    for n in [8, 12, 16] {
+        assert!(
+            boxes(&doubled, &frames, 2 * n) == boxes(&s, &at_30, n),
+            "{n}"
+        );
+    }
+    assert_eq!(
+        previous_frames_needed(&doubled) - previous_frames_needed(&s),
+        6
+    );
 }
 
 /// Renders `frames` through `effect` one at a time, as Resolume and the preview hand them
@@ -211,9 +259,9 @@ fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]
     frames
         .iter()
         .map(|frame| {
-            history
-                .next(effect.frames_before(&values))
-                .copy_from_slice(frame);
+            let before = effect.frames_before(&values, Some(60.0));
+            let held = effect.frames_held(&values, Some(60.0));
+            history.next(before, held).copy_from_slice(frame);
             let ctx = Context {
                 frame: history.frame_number(),
                 frame_rate: Some(60.0),
@@ -249,4 +297,105 @@ fn a_seek_back_starts_the_cadence_again() {
     }
     // An odd number of frames in, the swarm still holds the last analysis.
     assert!(after[11] == after[10]);
+}
+
+/// Renders `frames` through a kept effect from a history holding `held` of the frames before
+/// each, or as many as it asks for.
+fn live(
+    values: &ParamValues,
+    frames: &[Frame],
+    rate: Option<f64>,
+    held: Option<usize>,
+) -> Vec<Frame> {
+    let mut effect = SegcamMotion::with_gpu(false);
+    let mut history = History::default();
+    history.resize(W, H);
+    frames
+        .iter()
+        .map(|frame| {
+            let before = effect.frames_before(values, rate);
+            let held = held.unwrap_or(before);
+            history.next(before, held).copy_from_slice(frame);
+            let ctx = Context {
+                frame: history.frame_number(),
+                frame_rate: rate,
+                ..Context::at(0.0)
+            };
+            let mut out = vec![Argb::default(); (W * H) as usize];
+            let view = ViewMut::from_pixels(&mut out, W, H);
+            let count = history.len();
+            effect.render(&mut history, count, ImageMut::U8(view), values, &ctx);
+            out
+        })
+        .collect()
+}
+
+/// A kept effect works from what it kept: a host holding only the current frame shows what one
+/// holding them all shows, in every mode, at any rate, with tiles pushed out and buried.
+#[test]
+fn holding_only_the_current_frame_changes_nothing() {
+    let frames = crossing(40);
+    for output in 0..4 {
+        for (trail, max_tiles) in [(60, 100), (12, 3)] {
+            let mut values = ParamValues::new(SegcamMotion::with_gpu(false).params());
+            for (name, value) in [
+                ("output", output),
+                ("background", 4),
+                ("trail", trail),
+                ("max_tiles", max_tiles),
+            ] {
+                values.set(name, ParamValue::Int(value)).expect("an int");
+            }
+            for rate in [None, Some(30.0), Some(60.0)] {
+                let full = live(&values, &frames, rate, None);
+                let one = live(&values, &frames, rate, Some(0));
+                for (n, (a, b)) in full.iter().zip(&one).enumerate() {
+                    assert!(
+                        a == b,
+                        "output {output}, trail {trail}, {rate:?}: frame {n}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Frames whose pixels are gone can't be cut again: a setting changed live reaches new windows
+/// only, as in segcam 1.1, and the windows up stay.
+#[test]
+fn a_setting_changed_live_leaves_the_windows_up() {
+    let frames = crossing(24);
+    let mut effect = SegcamMotion::with_gpu(false);
+    let mut values = ParamValues::new(effect.params());
+    values.set("output", ParamValue::Int(3)).expect("a choice");
+    values
+        .set("background", ParamValue::Int(4))
+        .expect("an int");
+    let mut history = History::default();
+    history.resize(W, H);
+    let mut last = Vec::new();
+    for (n, frame) in frames.iter().enumerate() {
+        if n == 20 {
+            // Nothing is this big, so no new window.
+            values
+                .set("min_size", ParamValue::Float(25.0))
+                .expect("a float");
+        }
+        let before = effect.frames_before(&values, None);
+        let held = effect.frames_held(&values, None);
+        history.next(before, held).copy_from_slice(frame);
+        let ctx = Context {
+            frame: history.frame_number(),
+            ..Context::at(0.0)
+        };
+        let mut out = vec![Argb::default(); (W * H) as usize];
+        let view = ViewMut::from_pixels(&mut out, W, H);
+        let count = history.len();
+        effect.render(&mut history, count, ImageMut::U8(view), &values, &ctx);
+        if n >= 20 {
+            assert!(out == last, "frame {n}");
+        }
+        last = out;
+    }
+    assert!(last.iter().any(|p| p.alpha != 0), "no windows up");
 }

@@ -174,8 +174,17 @@ impl CpuEffect for SegcamMotion {
         true
     }
 
-    fn frames_before(&self, params: &ParamValues) -> usize {
-        crate::previous_frames_needed(&settings(params, false)) as usize
+    fn frames_before(&self, params: &ParamValues, frame_rate: Option<f64>) -> usize {
+        let s = RenderSettings {
+            cadence: Cadence::at(frame_rate),
+            ..settings(params, false)
+        };
+        crate::previous_frames_needed(&s) as usize
+    }
+
+    /// None: earlier frames live on as the grids, segments and tiles kept from them.
+    fn frames_held(&self, _params: &ParamValues, _frame_rate: Option<f64>) -> usize {
+        0
     }
 
     fn render(
@@ -298,7 +307,8 @@ mod tests {
         history.resize(w, h);
         let mut out = vec![Argb::<u8>::default(); (w * h) as usize];
         for f in 0..8 {
-            let frame = history.next(effect.frames_before(&params));
+            let before = effect.frames_before(&params, None);
+            let frame = history.next(before, effect.frames_held(&params, None));
             frame.fill(grey(80));
             for y in 20..44 {
                 for x in 10 + f * 12..34 + f * 12 {

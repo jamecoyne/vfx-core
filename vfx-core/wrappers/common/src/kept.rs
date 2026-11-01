@@ -57,8 +57,17 @@ impl CpuInstance {
     }
 
     /// The frames before the current one a render with `values` reads.
-    pub fn frames_before(&self, values: &ParamValues) -> usize {
-        self.with(|e| e.frames_before(values))
+    pub fn frames_before(&self, values: &ParamValues, frame_rate: Option<f64>) -> usize {
+        self.with(|e| e.frames_before(values, frame_rate))
+    }
+
+    /// How many of those a host keeping its own frames holds in full: all of them, unless the
+    /// effect is kept and works from what it kept.
+    pub fn frames_held(&self, values: &ParamValues, frame_rate: Option<f64>) -> usize {
+        self.with(|e| match self.kept {
+            Some(_) => e.frames_held(values, frame_rate),
+            None => e.frames_before(values, frame_rate),
+        })
     }
 
     /// Renders, starting over if the render panics.
