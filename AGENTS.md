@@ -15,6 +15,8 @@ Recent changes for agents (newest first; prune entries once they are old):
 - Pull requests: small, one topic each. Request review from jamecoyne, and from whoever wrote the
   code you change (`git log` on its files). A PR that touches speed adds the benchmark rows for the
   hosts it changes; one that finishes a segcam requirement changes its status in SPEC.md.
+- A PR that adds to the core API (a trait method, a `Context` field, a `Gpu` function) adds a
+  row to the table in [docs/DEVELOPING.md](docs/DEVELOPING.md#what-a-host-implements) (ADR 7).
 - Effect logic belongs in an effect crate (`vfx-core/effects/`, `plugins/`) or the core
   (`vfx-core/src/effects`). A target crate (`vfx-core/wrappers/`) only translates parameters
   and moves pixels, for any effect; what two targets share belongs in
