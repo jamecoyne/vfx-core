@@ -676,6 +676,41 @@ mod tests {
         assert!(alpha.contains(&1.0), "nothing moved");
         assert!(alpha.contains(&0.0), "everything moved");
     }
+
+    /// A render that draws the same picture again is finished but not new, and a new one
+    /// still reaches the output.
+    #[test]
+    fn a_repeated_picture_is_not_new() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut effects = Effects::new(&gpu);
+        let (controls, values) = shown("segcam Motion (Rust)");
+        let size = (64, 64);
+        effects.start_stream(&gpu, "still".into(), size, None);
+        let render = |effects: &mut Effects, time| {
+            let frame = effects.render(&gpu, &controls, &values, time, true);
+            (effects.rendered(), frame.unwrap())
+        };
+
+        effects.write_source(&gpu, &vec![0.25; 64 * 64 * 4]);
+        let (first, picture) = render(&mut effects, 0.0);
+        assert!(first.finished && first.new_picture);
+
+        let (again, same) = render(&mut effects, 0.0);
+        assert!(!again.finished && !again.new_picture);
+        assert_eq!(picture, same);
+
+        // The same input as new frames settles on one picture.
+        render(&mut effects, 1.0);
+        let (settled, before) = render(&mut effects, 2.0);
+        let (repeat, same) = render(&mut effects, 3.0);
+        assert!(settled.finished && repeat.finished && !repeat.new_picture);
+        assert_eq!(before, same);
+
+        effects.write_source(&gpu, &vec![0.75; 64 * 64 * 4]);
+        let (changed, after) = render(&mut effects, 4.0);
+        assert!(changed.finished && changed.new_picture);
+        assert_ne!(before, after);
+    }
 }
 
 #[cfg(test)]

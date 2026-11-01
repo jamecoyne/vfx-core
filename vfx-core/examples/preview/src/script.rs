@@ -464,6 +464,22 @@ mod tests {
         assert_eq!(meter.frames, 3);
     }
 
+    /// Older scripts read the keys up to `gpu`, so new keys only go after them.
+    #[test]
+    fn a_stats_line_keeps_its_old_keys_first() {
+        let done = Counts {
+            loops: 120,
+            finished: 60,
+            shown: 30,
+        };
+        let text = line(1.0, 120, 1.0, 0.01, &Snapshot::default(), done);
+        assert_eq!(
+            text,
+            "stats t=1.0 fps=120.0 ms=8.33 max_ms=10.00 size=0x0 cpu=0.0 app_cpu=0.0 mem_mb=0 \
+             gpu=n/a loops=120.0 finished=60.0 shown=30.0"
+        );
+    }
+
     #[test]
     fn inputs_pick_patterns_and_cameras() {
         assert_eq!(pattern(""), Ok(0));
