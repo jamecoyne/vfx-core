@@ -1,8 +1,8 @@
 //! Opt-in timing of CPU effect frames, for measuring a plugin inside a real host.
 //! `VFX_FFGL_TIMING=1` waits for the host's queued GL work before each frame (so it isn't
 //! counted) and for the upload after it, then every [`BATCH`] frames appends the median and
-//! p95 of each stage to `vfx-ffgl-timing.log` in the temp directory. The waits cost the
-//! host some overlap, so leave it off outside measurements.
+//! p95 of each stage, and the slowest frame, to `vfx-ffgl-timing.log` in the temp directory.
+//! The waits cost the host some overlap, so leave it off outside measurements.
 
 use std::io::Write;
 use std::sync::OnceLock;
@@ -62,9 +62,13 @@ impl Timing {
             v.sort_by(f64::total_cmp);
             format!("{:.2}/{:.2}", v[v.len() / 2], v[v.len() * 95 / 100])
         };
+        // A stall shows in neither the median nor the p95, so the worst frame and the count of
+        // frames over 100 ms go in too.
+        let max = total.iter().copied().fold(0.0, f64::max);
+        let slow = total.iter().filter(|&&t| t > 100.0).count();
         let values: Vec<String> = values.iter().map(|v| format!("{v:.2}")).collect();
         let line = format!(
-            "{}x{} {BATCH} frames, ms median/p95: total {} read {} render {} upload {} values [{}]",
+            "{}x{} {BATCH} frames, ms median/p95: total {} (max {max:.2}, {slow} over 100) read {} render {} upload {} values [{}]",
             size.0,
             size.1,
             stat(&total),
