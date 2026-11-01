@@ -80,6 +80,37 @@ over after a panic, a seek back or a resize); After Effects never does. Either w
 frame must match a fresh effect's, even after earlier frames change upstream or a host
 misses one: test it with `vfx_host::contract::check`, as `plugins/segcam/segcam-motion` does.
 
+## What a host implements
+
+The core API for 1.0, from [ADR 7](../plugins/segcam/decisions/0007-core-api.md). A PR that
+adds a trait method, a `Context` field or a `Gpu` function adds a row here and says so in its
+description. Every new trait method has a default and `Context::at` fills every new field, so
+old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
+
+| Item | Where | Since |
+|---|---|---|
+| `Effect` (GPU): `params`, `prepare`, `render`, `layer_inputs`, `layer_name`, `render_layers`, `region` | vfx-core | from the start |
+| `CpuEffect`: `params`, `frames_before`, `render` | vfx-core | from the start |
+| `CpuEffect::keeps_state` | vfx-core | #11 |
+| `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core | #47 |
+| `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core | from the start |
+| `Context::frame_rate` | vfx-core | #50 |
+| `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core | from the start |
+| `FrameSource`: `with_frame`; `History` | vfx-core | from the start; `fixed` since #31 |
+| `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core | from the start |
+| `Gpu::share`, `Gpu::shared` (browsers only) | vfx-core | #47 |
+| Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core | from the start; `ViewMut::bands` since #11, `Argb` as bytemuck `Pod` since #39 |
+| Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core | from the start |
+| `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host | #16; the frame rate since #50 |
+| `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host | #16 |
+| `plugin::register`, `plugin`, `gpu` | vfx-host | #10 |
+| `controls::layout` | vfx-host | from the start |
+| `by_rows` (a frame in row bands over a work queue) | vfx-host | #38 |
+
+A target implements `FrameSource` for its frames, fills a `Context` per render, keeps a
+`CpuInstance` if it keeps effects, and lays out parameters with `controls::layout`. The browser
+only items (`unfinished`, `share`, `shared`) are the only platform conditional parts.
+
 ## Layout
 
 One Cargo workspace (`Cargo.toml` at the root) in two folders: `vfx-core/`, the toolchain,
