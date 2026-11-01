@@ -12,6 +12,8 @@
 //! cargo vfx preview [-p EFFECT] [-- ARGS]      the preview app, opened on the effect
 //! cargo vfx env -p EFFECT                      the identity as KEY="value" lines
 //! cargo vfx check                              problems a host would hit, before building
+//! cargo vfx check --quick [-p PACKAGE]...      while iterating: fmt, core clippy, changed tests
+//! cargo vfx check --full                       before a pull request: CI's steps and the harnesses
 //! cargo vfx new NAME                           a new effect crate in vfx-core/effects/NAME
 //! ```
 //!
@@ -30,9 +32,10 @@ use vfx_build::Metadata;
 
 mod check;
 mod new;
+mod tiers;
 
 const USAGE: &str = "usage: cargo vfx <list|build|package|install|preview|env|check> [-p EFFECT]... \
-[--hosts ae,ofx,ffgl] [--debug] [--native] [-- ARGS]\n       cargo vfx new NAME";
+[--hosts ae,ofx,ffgl] [--debug] [--native] [-- ARGS]\n       cargo vfx check [--quick|--full] [-p PACKAGE]...\n       cargo vfx new NAME";
 
 const MEDIACORE: &str = "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore";
 const MAC_OFX: &str = "/Library/OFX/Plugins";
@@ -81,6 +84,7 @@ struct Options {
     hosts: Vec<Host>,
     release: bool,
     native: bool,
+    tier: Option<tiers::Tier>,
     rest: Vec<String>,
 }
 
@@ -98,6 +102,7 @@ fn parse_args() -> Result<Options, String> {
         hosts: Host::ALL.to_vec(),
         release: true,
         native: false,
+        tier: None,
         rest: Vec::new(),
     };
     while let Some(arg) = it.next() {
@@ -109,6 +114,8 @@ fn parse_args() -> Result<Options, String> {
             }
             "--debug" => o.release = false,
             "--native" => o.native = true,
+            "--quick" if o.command == "check" => o.tier = Some(tiers::Tier::Quick),
+            "--full" if o.command == "check" => o.tier = Some(tiers::Tier::Full),
             "--" => o.rest.extend(it.by_ref()),
             "-h" | "--help" => return Err(USAGE.into()),
             name if o.command == "new" && !name.starts_with('-') => o.rest.push(name.to_owned()),
@@ -193,6 +200,11 @@ fn dispatch(o: &Options) -> Result<(), String> {
         return new::new(&root, name);
     }
     let (all, root, target) = workspace()?;
+    if let Some(tier) = o.tier {
+        // Here -p names any package: the ones `--quick` tests.
+        report(check::check(&all, &root), all.len())?;
+        return tiers::run(tier, &o.packages, &root, &target);
+    }
     let chosen: Vec<&Effect> = if o.packages.is_empty() {
         all.iter().collect()
     } else {
@@ -253,19 +265,20 @@ fn dispatch(o: &Options) -> Result<(), String> {
             Ok(())
         }
         "preview" => preview(&chosen, &root, o),
-        "check" => {
-            let problems = check::check(&all, &root);
-            for p in &problems {
-                eprintln!("{p}");
-            }
-            if problems.is_empty() {
-                println!("{} effects: no problems", all.len());
-                Ok(())
-            } else {
-                Err(format!("{} problems", problems.len()))
-            }
-        }
+        "check" => report(check::check(&all, &root), all.len()),
         other => Err(format!("unknown command `{other}`\n{USAGE}")),
+    }
+}
+
+fn report(problems: Vec<String>, effects: usize) -> Result<(), String> {
+    for p in &problems {
+        eprintln!("{p}");
+    }
+    if problems.is_empty() {
+        println!("{effects} effects: no problems");
+        Ok(())
+    } else {
+        Err(format!("{} problems", problems.len()))
     }
 }
 
@@ -521,6 +534,7 @@ fn package(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), Str
         command: o.command.clone(),
         packages: Vec::new(),
         hosts: o.hosts.clone(),
+        tier: None,
         rest: Vec::new(),
     };
     let m = &e.meta;
