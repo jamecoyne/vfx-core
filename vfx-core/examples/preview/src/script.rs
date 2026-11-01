@@ -9,7 +9,7 @@ use vfx_core::{ParamKind, ParamSpec, ParamValue};
 
 use crate::catalog;
 use crate::effects::PATTERNS;
-use crate::stats::Snapshot;
+use crate::stats::{Counts, Snapshot};
 
 pub const USAGE: &str = "\
 vfx-preview [FLAGS] [FILE]
@@ -260,6 +260,9 @@ pub struct Meter {
     window: Instant,
     window_frames: u32,
     window_max: f64,
+    /// The totals at the first frame and at the start of the second being counted.
+    first_counts: Counts,
+    window_counts: Counts,
     done: bool,
 }
 
@@ -276,6 +279,8 @@ impl Meter {
             window: now,
             window_frames: 0,
             window_max: 0.0,
+            first_counts: Counts::default(),
+            window_counts: Counts::default(),
             done: false,
         }
     }
@@ -287,7 +292,10 @@ impl Meter {
         }
         let now = Instant::now();
         match self.last {
-            None => (self.start, self.window) = (now, now),
+            None => {
+                (self.start, self.window) = (now, now);
+                (self.first_counts, self.window_counts) = (stats.counts, stats.counts);
+            }
             Some(last) => {
                 let dt = now.duration_since(last).as_secs_f64();
                 self.max = self.max.max(dt);
@@ -302,9 +310,14 @@ impl Meter {
         if span >= 1.0 {
             if self.print {
                 let frames = self.window_frames;
-                println!("{}", line(elapsed, frames, span, self.window_max, stats));
+                let done = stats.counts.since(self.window_counts);
+                println!(
+                    "{}",
+                    line(elapsed, frames, span, self.window_max, stats, done)
+                );
             }
             (self.window, self.window_frames, self.window_max) = (now, 0, 0.0);
+            self.window_counts = stats.counts;
         }
         self.done = match self.stop {
             Some(Stop::Frames(n)) => self.frames >= n,
@@ -312,23 +325,28 @@ impl Meter {
             None => false,
         };
         if self.done && self.print {
+            let seconds = elapsed.max(f64::EPSILON);
+            let rate = (self.frames - 1) as f64 / seconds;
+            let done = stats.counts.since(self.first_counts);
             println!(
-                "done frames={} seconds={elapsed:.2} fps={:.1} max_ms={:.1}",
+                "done frames={} seconds={elapsed:.2} fps={rate:.1} max_ms={:.1} loops={rate:.1} finished={:.1} shown={:.1}",
                 self.frames,
-                (self.frames - 1) as f64 / elapsed.max(f64::EPSILON),
-                self.max * 1000.0
+                self.max * 1000.0,
+                done.finished as f64 / seconds,
+                done.shown as f64 / seconds,
             );
         }
         self.done
     }
 }
 
-/// One `--stats` line: always these keys, in this order.
-fn line(elapsed: f64, frames: u32, span: f64, max: f64, s: &Snapshot) -> String {
+/// One `--stats` line: always these keys, in this order. `fps` stays for older scripts and
+/// is the same number as `loops`.
+fn line(elapsed: f64, frames: u32, span: f64, max: f64, s: &Snapshot, done: Counts) -> String {
     let gpu = s.gpu.map_or("n/a".to_owned(), |g| format!("{g:.1}"));
+    let loops = frames as f64 / span;
     format!(
-        "stats t={elapsed:.1} fps={:.1} ms={:.2} max_ms={:.2} size={}x{} cpu={:.1} app_cpu={:.1} mem_mb={} gpu={gpu}",
-        frames as f64 / span,
+        "stats t={elapsed:.1} fps={loops:.1} ms={:.2} max_ms={:.2} size={}x{} cpu={:.1} app_cpu={:.1} mem_mb={} gpu={gpu} loops={loops:.1} finished={:.1} shown={:.1}",
         span * 1000.0 / f64::from(frames.max(1)),
         max * 1000.0,
         s.size.0,
@@ -336,6 +354,8 @@ fn line(elapsed: f64, frames: u32, span: f64, max: f64, s: &Snapshot) -> String 
         s.system_cpu,
         s.cpu,
         s.memory_mb,
+        done.finished as f64 / span,
+        done.shown as f64 / span,
     )
 }
 
@@ -442,6 +462,22 @@ mod tests {
         assert!(meter.frame(&stats));
         assert!(meter.frame(&stats));
         assert_eq!(meter.frames, 3);
+    }
+
+    /// Older scripts read the keys up to `gpu`, so new keys only go after them.
+    #[test]
+    fn a_stats_line_keeps_its_old_keys_first() {
+        let done = Counts {
+            loops: 120,
+            finished: 60,
+            shown: 30,
+        };
+        let text = line(1.0, 120, 1.0, 0.01, &Snapshot::default(), done);
+        assert_eq!(
+            text,
+            "stats t=1.0 fps=120.0 ms=8.33 max_ms=10.00 size=0x0 cpu=0.0 app_cpu=0.0 mem_mb=0 \
+             gpu=n/a loops=120.0 finished=60.0 shown=30.0"
+        );
     }
 
     #[test]

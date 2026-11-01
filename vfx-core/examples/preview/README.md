@@ -30,16 +30,21 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 when `--frames` or `--seconds` ends the run:
 
 ```text
-stats t=1.0 fps=59.9 ms=16.69 max_ms=18.20 size=1280x720 cpu=12.3 app_cpu=45.0 mem_mb=312 gpu=n/a
-done frames=600 seconds=10.01 fps=59.9 max_ms=40.20
+stats t=12.1 fps=62.5 ms=16.01 max_ms=47.60 size=1920x1080 cpu=20.2 app_cpu=230.8 mem_mb=2620 gpu=n/a loops=62.5 finished=45.6 shown=22.8
+done frames=1108 seconds=20.01 fps=55.3 max_ms=141.7 loops=55.3 finished=44.8 shown=22.4
 ```
 
-`fps` and `ms` are the frames drawn in that second and their mean interval, `max_ms` the
-longest; `cpu` is the machine's, `app_cpu` this process's as a share of one core, and `gpu`
-is `n/a` where the OS doesn't report it. A frame is one redraw: a visible window is paced by
-vsync, and a video's effect only works when the video moves on, so with a clip `fps` above
-the clip's rate means the effect keeps up. Under `--quiet` frames are unpaced and each waits
-for the GPU, so a test pattern (which changes every frame) shows the effect's throughput.
+`shown` is the number to read: new pictures presented in the window each second, where a
+CPU effect's render counts only if its output differs from the last one, and a GPU effect's
+only if its time or parameters changed. `finished` is the renders the effect finished each
+second, and `loops` the times round the app's loop, which a visible window paces by vsync
+and which repeats the last picture when nothing new came in. segcam's Swarm on a transparent
+canvas only changes when it analyses, every 2nd frame of a 60 fps clip, so there `shown` tops
+out at 30. `ms` and `max_ms` are the mean and longest loop, and `fps` is `loops` under its old
+name, kept for older scripts. `cpu` is the machine's, `app_cpu` this process's as a share of
+one core, and `gpu` is `n/a` where the OS doesn't report it. Under `--quiet` loops are unpaced
+and each waits for the GPU, nothing is presented so `shown` is 0, and a test pattern (which
+changes every loop) shows the effect's throughput in `finished`.
 
 In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
 `--effect` and a file, mistakes show in the panel as before.

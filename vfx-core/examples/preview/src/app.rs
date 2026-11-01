@@ -60,6 +60,11 @@ struct Preview {
     /// Samples the bottom bar's CPU, memory and GPU numbers.
     #[cfg(not(target_arch = "wasm32"))]
     stats: stats::Sampler,
+    #[cfg(not(target_arch = "wasm32"))]
+    counts: stats::Counts,
+    /// A new picture is waiting for the next present.
+    #[cfg(not(target_arch = "wasm32"))]
+    unshown: bool,
     /// Counts frames for `--stats`, `--frames` and `--seconds`.
     #[cfg(not(target_arch = "wasm32"))]
     meter: Option<script::Meter>,
@@ -71,7 +76,6 @@ struct Preview {
     quiet: bool,
     time: f64,
     last_frame: Instant,
-    fps: f32,
     message: Option<String>,
 }
 
@@ -213,6 +217,10 @@ impl Preview {
             #[cfg(not(target_arch = "wasm32"))]
             stats: stats::Sampler::new(),
             #[cfg(not(target_arch = "wasm32"))]
+            counts: stats::Counts::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            unshown: false,
+            #[cfg(not(target_arch = "wasm32"))]
             meter: None,
             #[cfg(not(target_arch = "wasm32"))]
             done: false,
@@ -220,7 +228,6 @@ impl Preview {
             quiet: false,
             time: 0.0,
             last_frame: Instant::now(),
-            fps: 0.0,
             message: None,
         })
     }
@@ -575,9 +582,6 @@ impl Preview {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64();
         self.last_frame = now;
-        if dt > 0.0 {
-            self.fps = self.fps * 0.9 + (1.0 / dt as f32) * 0.1;
-        }
         if self.controls.animate {
             self.time += dt;
         }
@@ -589,7 +593,14 @@ impl Preview {
             let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let stats = self.stats.sample(self.fps, self.effects.size());
+        {
+            let rendered = self.effects.rendered();
+            self.counts.loops += 1;
+            self.counts.finished += u64::from(rendered.finished);
+            self.unshown |= rendered.new_picture;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let stats = self.stats.sample(self.counts, self.effects.size());
         #[cfg(not(target_arch = "wasm32"))]
         self.count_frame(&stats);
         #[cfg(not(target_arch = "wasm32"))]
@@ -741,6 +752,11 @@ impl Preview {
         self.gpu.queue.submit(commands);
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.counts.shown += u64::from(self.unshown);
+            self.unshown = false;
+        }
     }
 }
 

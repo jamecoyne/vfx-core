@@ -249,6 +249,8 @@ enum Run {
         chain: Box<EffectChain>,
         /// The effect's own position in `chain`.
         index: usize,
+        /// What it last drew with: the same again is the same picture.
+        drawn: Option<(f64, ParamValues)>,
     },
     Cpu(Box<CpuStage>),
 }
@@ -274,6 +276,7 @@ impl Stage {
                     run: Run::Gpu {
                         chain: Box::new(chain),
                         index,
+                        drawn: None,
                     },
                 }
             }
@@ -289,7 +292,16 @@ impl Stage {
     }
 }
 
+/// What the last [`Effects::render`] did, for the stats.
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub struct Rendered {
+    pub finished: bool,
+    pub new_picture: bool,
+}
+
 pub struct Effects {
+    rendered: Rendered,
     frames: Frames,
     /// A dropped image, uploaded once, used instead of the generated pattern.
     image: Option<(String, Frame)>,
@@ -337,6 +349,7 @@ impl Effects {
             readback: None,
             generator,
             display_pass,
+            rendered: Rendered::default(),
             stage: Stage::new(gpu, 0, PATTERN_SIZE),
             pattern_size: PATTERN_SIZE,
         }
@@ -450,6 +463,12 @@ impl Effects {
         }
     }
 
+    /// What the last render did.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn rendered(&self) -> Rendered {
+        self.rendered
+    }
+
     /// Goes back to the generated patterns.
     pub fn clear_image(&mut self, gpu: &Gpu) {
         self.frame_rate = None;
@@ -539,11 +558,27 @@ impl Effects {
         };
         let result = &self.frames.output;
         match &mut self.stage.run {
-            Run::Gpu { chain, index } => {
+            Run::Gpu {
+                chain,
+                index,
+                drawn,
+            } => {
                 *chain.params_mut(*index) = values.clone();
                 chain.render_with_layers(gpu, source, layers, result, time);
+                let new_picture = drawn
+                    .as_ref()
+                    .is_none_or(|(at, with)| *at != time || with != values);
+                if new_picture {
+                    *drawn = Some((time, values.clone()));
+                }
+                self.rendered = Rendered {
+                    finished: true,
+                    new_picture,
+                };
             }
-            Run::Cpu(stage) => stage.render(gpu, source, result, values, time, self.frame_rate),
+            Run::Cpu(stage) => {
+                self.rendered = stage.render(gpu, source, result, values, time, self.frame_rate);
+            }
         }
 
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -640,6 +675,41 @@ mod tests {
         let alpha: Vec<f32> = out.iter().skip(3).step_by(4).copied().collect();
         assert!(alpha.contains(&1.0), "nothing moved");
         assert!(alpha.contains(&0.0), "everything moved");
+    }
+
+    /// A render that draws the same picture again is finished but not new, and a new one
+    /// still reaches the output.
+    #[test]
+    fn a_repeated_picture_is_not_new() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut effects = Effects::new(&gpu);
+        let (controls, values) = shown("segcam Motion (Rust)");
+        let size = (64, 64);
+        effects.start_stream(&gpu, "still".into(), size, None);
+        let render = |effects: &mut Effects, time| {
+            let frame = effects.render(&gpu, &controls, &values, time, true);
+            (effects.rendered(), frame.unwrap())
+        };
+
+        effects.write_source(&gpu, &vec![0.25; 64 * 64 * 4]);
+        let (first, picture) = render(&mut effects, 0.0);
+        assert!(first.finished && first.new_picture);
+
+        let (again, same) = render(&mut effects, 0.0);
+        assert!(!again.finished && !again.new_picture);
+        assert_eq!(picture, same);
+
+        // The same input as new frames settles on one picture.
+        render(&mut effects, 1.0);
+        let (settled, before) = render(&mut effects, 2.0);
+        let (repeat, same) = render(&mut effects, 3.0);
+        assert!(settled.finished && repeat.finished && !repeat.new_picture);
+        assert_eq!(before, same);
+
+        effects.write_source(&gpu, &vec![0.75; 64 * 64 * 4]);
+        let (changed, after) = render(&mut effects, 4.0);
+        assert!(changed.finished && changed.new_picture);
+        assert_ne!(before, after);
     }
 }
 
