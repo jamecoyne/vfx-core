@@ -144,7 +144,9 @@ fn full(root: &Path, logs: &Path) -> Vec<(String, Command)> {
     steps.push(("clippy-preview".into(), clippy(&["vfx-preview"], &[])));
     steps.push(("tests-preview".into(), test(&["vfx-preview"], &[])));
     if wasm_installed() {
-        let cmd = cargo(&["check", "-p", "vfx-preview", "--target", WASM]);
+        let mut cmd = cargo(&["check", "-p", "vfx-preview", "--target", WASM]);
+        // sccache on Windows passes web-sys's arguments on one command line, which is too long.
+        cmd.env_remove("RUSTC_WRAPPER");
         steps.push(("wasm-preview".into(), cmd));
     } else {
         println!("wasm-preview: skipped, `rustup target add {WASM}` adds it");

@@ -213,7 +213,8 @@ The test profile optimises `segcam-motion` and `vfx-core`, so their pixel tests 
 overflow checks and debug assertions stay on. Several clones or worktrees on one machine can
 share compiled dependencies through [sccache](https://github.com/mozilla/sccache):
 `cargo install sccache`, then set `RUSTC_WRAPPER=sccache` in your shell (not in the repository's
-config); the tiers use it when it is set. It saves the most when several builds share the CPU.
+config); the tiers use it when it is set. On Windows it can't build `web-sys` for wasm (the command line gets too long), so the full tier
+runs the wasm check without it; unset `RUSTC_WRAPPER` for the web build too.
 
 Unit tests cover the core, each effect, and each target's parameter mapping and pixel
 conversions. Each host also has a harness that runs the effects:
