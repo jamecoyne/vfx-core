@@ -231,8 +231,9 @@ sequences), for iterating.
 FFGL expresses Box color as consecutive Box red, Box green and Box blue parameters. Host
 time running backwards, or a size change, starts the history over. More Background or
 Trail frames take time to fill; scrubbing cannot ask the host for missing history.
-Default history takes about 134 MiB at 1080p for Overlay and the mattes, or 316 MiB for
-Swarm, plus the output, GL textures and the core's temporary work.
+Kept history takes about 9 MiB at 1080p for Overlay and the mattes, and for Swarm about 40 MiB,
+up to 130 MiB in a busy scene, at any Trail frames, plus the output, GL textures and the core's
+temporary work.
 
 Mini-host measurements on Windows with an AMD RX 5700 XT, driver 26.10.1.261008, at the
 default settings, with a shape alternating between two positions (taken with the earlier
