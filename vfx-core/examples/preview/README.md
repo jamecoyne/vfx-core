@@ -41,4 +41,5 @@ vsync, and a video's effect only works when the video moves on, so with a clip `
 the clip's rate means the effect keeps up. Under `--quiet` frames are unpaced and each waits
 for the GPU, so a test pattern (which changes every frame) shows the effect's throughput.
 
-A mistake in any of these flags ends the run with a message and a nonzero exit.
+In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
+`--effect` and a file, mistakes show in the panel as before.
