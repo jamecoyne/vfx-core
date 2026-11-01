@@ -429,9 +429,15 @@ impl Effects {
     /// Makes a `size` source called `name` that the caller fills with
     /// [`Effects::write_source`], as video does. Black until the first write.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn start_stream(&mut self, gpu: &Gpu, name: String, size: (u32, u32), frame_rate: f64) {
+    pub fn start_stream(
+        &mut self,
+        gpu: &Gpu,
+        name: String,
+        size: (u32, u32),
+        frame_rate: Option<f64>,
+    ) {
         self.set_size(gpu, size);
-        self.frame_rate = Some(frame_rate);
+        self.frame_rate = frame_rate;
         let frame = Frame::new(gpu, size.0, size.1, FRAME_FORMAT);
         self.image = Some((name, frame));
     }
