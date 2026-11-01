@@ -260,6 +260,11 @@ conversions. Each host also has a harness that runs the effects:
   GL textures are drawn into IOSurfaces that wgpu's Metal device shares, or into Vulkan images
   shared with OpenGL on Windows. Everything else, and any setup failure, goes through RAM. If the
   GPU fails, the frame passes through unchanged instead of failing the host's render.
+- A CPU effect that draws on the GPU can leave its output there. On Windows the FFGL target shares
+  the device of its Vulkan images (`Gpu::share`) before the effect's first render and offers each
+  render a frame on it (`CpuEffect::render_to`). An effect that draws there says so and the frame
+  is shown with no trip through RAM; otherwise its output in RAM goes up as before. The input
+  still comes through RAM, for the effect's work on the CPU.
 - The OpenFX and FFGL bindings are written by hand. Both are small C ABIs, transcribed from their
   BSD licensed headers; FFGL's notice is kept in `vfx-core/wrappers/ffgl-common/src/ffi.rs`. The
   `ffgl-core` crate is GPL 3.0, so it isn't used.

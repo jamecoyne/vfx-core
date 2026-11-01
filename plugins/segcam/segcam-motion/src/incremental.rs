@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
 use vfx_core::cpu::FrameSource;
+#[cfg(not(target_arch = "wasm32"))]
+use vfx_core::wgpu;
 
 use crate::gpu::{self, Cut, Drawer, Fault};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
@@ -77,6 +79,18 @@ pub struct Incremental {
     window_share: f64,
     /// The last render's draw hasn't come back from the GPU yet (browsers).
     unfinished: bool,
+    /// A host's GPU frame the render may draw into instead of its output.
+    #[cfg(not(target_arch = "wasm32"))]
+    target: Option<Offer>,
+}
+
+/// A host's frame on `device`, offered to one render ([`vfx_core::CpuEffect::render_to`]), and
+/// whether the render drew into it.
+#[cfg(not(target_arch = "wasm32"))]
+struct Offer {
+    device: wgpu::Device,
+    frame: vfx_core::Frame,
+    taken: bool,
 }
 
 /// A tile in the pile, and where it is kept: frame and index.
@@ -153,6 +167,47 @@ impl Incremental {
     /// upload and readback cost more than the CPU's whole Overlay.
     pub fn gpu_overlay(&mut self, on: bool) {
         self.gpu_overlay = on;
+    }
+
+    /// Offers the next render `target` to draw into instead of its output, which a swarm drawn
+    /// on the GPU of the same device takes; [`Incremental::took_target`] says whether it did.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn offer_target(&mut self, target: vfx_core::Target<'_>) {
+        let f = target.frame;
+        self.target = Some(Offer {
+            device: target.gpu.device.clone(),
+            frame: vfx_core::Frame {
+                texture: f.texture.clone(),
+                view: f.view.clone(),
+                width: f.width,
+                height: f.height,
+                format: f.format,
+            },
+            taken: false,
+        });
+    }
+
+    /// Whether the last render drew into the target offered for it. The offer ends.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn took_target(&mut self) -> bool {
+        self.target.take().is_some_and(|offer| offer.taken)
+    }
+
+    /// Whether this render can draw a swarm of `(w, h)` at `C` into the offered target: one
+    /// on `gpu`'s device, of the canvas's size, for an 8-bit canvas.
+    fn offered<C: Channel>(&self, gpu: &Drawer, (w, h): (i32, i32)) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        let fits = self.target.as_ref().is_some_and(|offer| {
+            (offer.frame.width, offer.frame.height) == (w as u32, h as u32)
+                && gpu.draws_on(&offer.device)
+        });
+        // No browser host offers a frame.
+        #[cfg(target_arch = "wasm32")]
+        let fits = {
+            let _ = (gpu, w, h);
+            false
+        };
+        size_of::<C>() == 1 && fits
     }
 
     /// Renders the last of `count` frames, frame `number`, into `out`. Reads the frames the
@@ -518,7 +573,9 @@ impl Incremental {
             return Ok(());
         }
         // The swarm draws where its windows draw faster: the choice depends on this render's
-        // windows alone, so a kept render draws what a cold one does.
+        // windows alone, so a kept render draws what a cold one does. The shares below were
+        // set by the cost of the copy back, which a host's frame to draw into takes away, so
+        // then the GPU draws every swarm.
         let (w, h) = (out.width, out.height);
         let canvas = i64::from(w) * i64::from(h);
         let default = if size_of::<C>() == 1 {
@@ -526,7 +583,11 @@ impl Incremental {
         } else {
             GPU_FROM_DEEPER
         };
-        let from = (self.gpu_from.unwrap_or(default) * 1000.0).round() as i64;
+        let into = self.offered::<C>(gpu, (w, h));
+        let from = match into {
+            true => 0,
+            false => (self.gpu_from.unwrap_or(default) * 1000.0).round() as i64,
+        };
         let m = SwarmMetrics::new(h);
         let shadow = swarm::shadow_kernel(m.scale);
         let pile = pile(&self.tiles, s, count, number, w, h);
@@ -561,6 +622,12 @@ impl Incremental {
         let windows = shown
             .iter()
             .map(|p| (p.tile, self.cuts[&p.frame].slots[p.index]));
+        #[cfg(not(target_arch = "wasm32"))]
+        if into && let Some(offer) = self.target.as_mut() {
+            gpu.draw_swarm_into(&offer.frame, windows, frame.as_ref(), number, s, &shadow)?;
+            offer.taken = true;
+            return Ok(());
+        }
         gpu.draw_swarm(out, windows, frame.as_ref(), number, s, &shadow)
     }
 

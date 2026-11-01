@@ -45,9 +45,100 @@ pub struct Device {
     errors: Arc<Mutex<(u64, String)>>,
     /// An atlas made ahead for the first instance, so its first render needn't.
     spare: Mutex<Option<Atlas>>,
+    /// What writes the swarm into a host's frame, per frame format, made on first use.
+    #[cfg(not(target_arch = "wasm32"))]
+    unpacks: Mutex<Vec<Arc<Unpack>>>,
+}
+
+/// Writes a draw's 8-bit output words into a host's frame of `format` (`unpack.wgsl`).
+#[cfg(not(target_arch = "wasm32"))]
+struct Unpack {
+    format: wgpu::TextureFormat,
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
 }
 
 impl Device {
+    /// Whether `device` is this one.
+    pub(crate) fn is(&self, device: &wgpu::Device) -> bool {
+        self.device == *device
+    }
+
+    /// The unpack for frames of `format`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn unpack(&self, format: wgpu::TextureFormat) -> Arc<Unpack> {
+        let mut unpacks = self.unpacks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(unpack) = unpacks.iter().find(|u| u.format == format) {
+            return unpack.clone();
+        }
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("segcam unpack"),
+                entries: &[
+                    entry(0, wgpu::BufferBindingType::Storage { read_only: true }),
+                    entry(1, wgpu::BufferBindingType::Uniform),
+                ],
+            });
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("segcam unpack"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("unpack.wgsl").into()),
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("segcam unpack"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("segcam unpack"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let unpack = Arc::new(Unpack {
+            format,
+            layout,
+            pipeline,
+        });
+        unpacks.push(unpack.clone());
+        unpack
+    }
+
     pub(crate) fn lost(&self) -> Option<String> {
         self.lost.lock().ok().and_then(|f| f.clone())
     }
@@ -198,6 +289,19 @@ fn settle(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<Device, NoGpu
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
+    // A host that shows frames from the GPU shares the device they're on (FFGL), so the swarm
+    // can draw its output there. It doesn't watch the device, so this does, as on its own.
+    // An adapter asked for by name still gets a device of its own.
+    if choice.is_empty()
+        && let Some(gpu) = vfx_core::Gpu::shared()
+    {
+        let (lost, errors) = watch(&gpu.device);
+        let dev = on_shared(gpu, lost, errors);
+        return match (dev.lost(), dev.errors()) {
+            (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
+            _ => Ok(dev),
+        };
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         // The D3D12 validation layer changes what DirectML finds in the same process, so it
@@ -233,6 +337,25 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| NoGpu::Failed(e.to_string()))?;
+    let (lost, errors) = watch(&device);
+    let max_binding = supported
+        .max_storage_buffer_binding_size
+        .min(supported.max_buffer_size);
+    let dev = Device::build(device, queue, info, max_binding, lost, errors);
+    match (dev.lost(), dev.errors()) {
+        (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
+        _ => Ok(dev),
+    }
+}
+
+/// Why a device was lost, once it is.
+type Lost = Arc<Mutex<Option<String>>>;
+/// How many errors a device has reported, and the last one.
+type Errors = Arc<Mutex<(u64, String)>>;
+
+/// Counts `device`'s errors, keeping the last, and notes why it was lost.
+#[cfg(not(target_arch = "wasm32"))]
+fn watch(device: &wgpu::Device) -> (Lost, Errors) {
     let errors = Arc::new(Mutex::new((0, String::new())));
     let noted = errors.clone();
     device.on_uncaptured_error(Arc::new(move |e| {
@@ -247,14 +370,17 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
             l.get_or_insert(format!("{reason:?}: {e}"));
         }
     });
-    let max_binding = supported
+    (lost, errors)
+}
+
+/// Draws on a device a host shared ([`vfx_core::Gpu::share`]), binding as much as it allows.
+fn on_shared(gpu: vfx_core::Gpu, lost: Lost, errors: Errors) -> Device {
+    let limits = gpu.device.limits();
+    let max_binding = limits
         .max_storage_buffer_binding_size
-        .min(supported.max_buffer_size);
-    let dev = Device::build(device, queue, info, max_binding, lost, errors);
-    match (dev.lost(), dev.errors()) {
-        (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
-        _ => Ok(dev),
-    }
+        .min(limits.max_buffer_size);
+    let info = gpu.device.adapter_info();
+    Device::build(gpu.device, gpu.queue, info, max_binding, lost, errors)
 }
 
 // Browsers can't wait for a device inside a render, so this draws on the one the host shared.
@@ -263,20 +389,8 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
 pub(crate) fn open(_choice: &str) -> Result<Device, NoGpu> {
     let gpu =
         vfx_core::Gpu::shared().ok_or_else(|| NoGpu::NoAdapter("the host shared no GPU".into()))?;
-    let limits = gpu.device.limits();
-    let max_binding = limits
-        .max_storage_buffer_binding_size
-        .min(limits.max_buffer_size);
-    let info = gpu.device.adapter_info();
     let (lost, errors) = Default::default();
-    Ok(Device::build(
-        gpu.device,
-        gpu.queue,
-        info,
-        max_binding,
-        lost,
-        errors,
-    ))
+    Ok(on_shared(gpu, lost, errors))
 }
 
 impl Device {
@@ -348,6 +462,8 @@ impl Device {
             lost,
             errors,
             spare: Mutex::new(None),
+            #[cfg(not(target_arch = "wasm32"))]
+            unpacks: Mutex::new(Vec::new()),
         }
     }
 }
@@ -553,6 +669,9 @@ impl Grown {
 pub struct Drawer {
     dev: Arc<Device>,
     globals: wgpu::Buffer,
+    /// The canvas width for an unpack into a host's frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    canvas: wgpu::Buffer,
     frame: Grown,
     out: Grown,
     staging: Grown,
@@ -616,6 +735,13 @@ impl Drawer {
                 usage: U::UNIFORM | U::COPY_DST,
                 mapped_at_creation: false,
             }),
+            #[cfg(not(target_arch = "wasm32"))]
+            canvas: dev.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("segcam unpack canvas"),
+                size: 16,
+                usage: U::UNIFORM | U::COPY_DST,
+                mapped_at_creation: false,
+            }),
             frame: Grown::new("segcam frame", U::STORAGE | U::COPY_DST),
             out: Grown::new("segcam output", U::STORAGE | U::COPY_SRC),
             staging: Grown::new("segcam readback", U::MAP_READ | U::COPY_DST),
@@ -647,6 +773,11 @@ impl Drawer {
 
     pub fn adapter(&self) -> &wgpu::AdapterInfo {
         &self.dev.info
+    }
+
+    /// Whether this draws on `device`.
+    pub fn draws_on(&self, device: &wgpu::Device) -> bool {
+        self.dev.is(device)
     }
 
     /// Whether the device is lost, which it says when polled.
@@ -819,7 +950,50 @@ impl Drawer {
         shadow: &ShadowKernel,
     ) -> Result<(), Fault> {
         let t = Instant::now();
-        let (w, h) = (out.width, out.height);
+        let size = (out.width, out.height);
+        let (globals, data) = self.swarm_job(size, windows, frame, number, s, shadow)?;
+        let pipeline = self.dev.swarm.clone();
+        self.timings.prepare += ms(t);
+        self.run(&pipeline, &globals, &data, out)
+    }
+
+    /// Draws the swarm as [`Drawer::draw_swarm`] does, into `target`, a host's frame on this
+    /// device the size of the canvas, with no readback: the host shows it from there. An
+    /// 8-bit canvas only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn draw_swarm_into<'t, C: Channel>(
+        &mut self,
+        target: &vfx_core::Frame,
+        windows: impl IntoIterator<Item = (&'t Tile, Slot)>,
+        frame: Option<&View<C>>,
+        number: i64,
+        s: &RenderSettings,
+        shadow: &ShadowKernel,
+    ) -> Result<(), Fault> {
+        if depth::<C>() != 0 {
+            return Err(Fault(
+                "only an 8-bit canvas draws into a host's frame".into(),
+            ));
+        }
+        let t = Instant::now();
+        let size = (target.width as i32, target.height as i32);
+        let (globals, data) = self.swarm_job(size, windows, frame, number, s, shadow)?;
+        let pipeline = self.dev.swarm.clone();
+        self.timings.prepare += ms(t);
+        self.run_into(&pipeline, &globals, &data, target)
+    }
+
+    /// The globals and tables of a swarm draw over a canvas of `(w, h)`, and the frame uploaded
+    /// where the backdrop or live windows show it.
+    fn swarm_job<'t, C: Channel>(
+        &mut self,
+        (w, h): (i32, i32),
+        windows: impl IntoIterator<Item = (&'t Tile, Slot)>,
+        frame: Option<&View<C>>,
+        number: i64,
+        s: &RenderSettings,
+        shadow: &ShadowKernel,
+    ) -> Result<(Globals, Vec<u32>), Fault> {
         let m = SwarmMetrics::new(h);
         let mut data: Vec<u32> = Vec::new();
         let mut widest = 0;
@@ -895,9 +1069,7 @@ impl Drawer {
             edge_shade: chrome::BAR_EDGE_SHADE,
             ..Globals::default()
         };
-        let pipeline = self.dev.swarm.clone();
-        self.timings.prepare += ms(t);
-        self.run(&pipeline, &globals, &data, out)
+        Ok((globals, data))
     }
 
     /// Draws the overlay of `blobs`, found in frame `analysis`, over `frame`, frame `number`,
@@ -1038,6 +1210,30 @@ impl Drawer {
             }))
     }
 
+    /// Records a draw over the whole of a `width` by `height` output of `bytes` into `encoder`,
+    /// and returns the output buffer it writes.
+    fn encode(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        globals: &Globals,
+        data: &[u32],
+        (width, height, bytes): (i32, i32, u64),
+    ) -> Result<wgpu::Buffer, Fault> {
+        let atlas = self.atlas.clone();
+        let atlas = atlas.lock().unwrap_or_else(|e| e.into_inner());
+        let bind = self.bind(globals, data, &atlas.buffer, bytes);
+        drop(atlas);
+        let bind = bind?;
+        let output = self.out.get(&self.dev, self.limit, bytes)?.clone();
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((width as u32).div_ceil(16), (height as u32).div_ceil(16), 1);
+        drop(pass);
+        Ok(output)
+    }
+
     /// Submits a draw over the whole of a `width` by `height` output of `bytes`, copied into the
     /// staging buffer it returns.
     fn submit(
@@ -1047,23 +1243,91 @@ impl Drawer {
         data: &[u32],
         (width, height, bytes): (i32, i32, u64),
     ) -> Result<(wgpu::Buffer, wgpu::SubmissionIndex), Fault> {
-        let atlas = self.atlas.clone();
-        let atlas = atlas.lock().unwrap_or_else(|e| e.into_inner());
-        let bind = self.bind(globals, data, &atlas.buffer, bytes);
-        drop(atlas);
-        let bind = bind?;
-        let output = self.out.get(&self.dev, self.limit, bytes)?.clone();
-        let staging = self.staging.get(&self.dev, self.limit, bytes)?.clone();
         let mut encoder = self.dev.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups((width as u32).div_ceil(16), (height as u32).div_ceil(16), 1);
-        }
+        let output = self.encode(
+            &mut encoder,
+            pipeline,
+            globals,
+            data,
+            (width, height, bytes),
+        )?;
+        let staging = self.staging.get(&self.dev, self.limit, bytes)?.clone();
         encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, bytes);
         let submitted = self.dev.queue.submit(Some(encoder.finish()));
         Ok((staging, submitted))
+    }
+
+    /// Runs a draw over the whole of `target` and writes it there, with no readback. The host's
+    /// work that shows `target` comes after it on the same queue, so nothing here waits.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_into(
+        &mut self,
+        pipeline: &wgpu::ComputePipeline,
+        globals: &Globals,
+        data: &[u32],
+        target: &vfx_core::Frame,
+    ) -> Result<(), Fault> {
+        self.check()?;
+        let t = Instant::now();
+        let size = (target.width as i32, target.height as i32);
+        let bytes = u64::from(target.width) * u64::from(target.height) * 4;
+        let mut encoder = self.dev.device.create_command_encoder(&Default::default());
+        let output = self.encode(
+            &mut encoder,
+            pipeline,
+            globals,
+            data,
+            (size.0, size.1, bytes),
+        )?;
+        let unpack = self.dev.unpack(target.format);
+        let canvas = [target.width, 0, 0, 0];
+        self.dev
+            .queue
+            .write_buffer(&self.canvas, 0, bytemuck::cast_slice(&canvas));
+        let bind = self
+            .dev
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("segcam unpack"),
+                layout: &unpack.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: output.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.canvas.as_entire_binding(),
+                    },
+                ],
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("segcam unpack"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&unpack.pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.dev.queue.submit(Some(encoder.finish()));
+        self.timings.prepare += ms(t);
+        self.check()?;
+        self.drawn += 1;
+        self.note(false);
+        Ok(())
     }
 
     /// Runs a draw over the whole of `out` and reads it back into `out`. Waits only for this

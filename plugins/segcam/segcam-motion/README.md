@@ -102,6 +102,13 @@ Resolume and the preview hand frames over one at a time and hold only the curren
 (`CpuEffect::frames_held`). Earlier frames live on as their grids, segments and the tiles the
 pile still draws, so a setting changed live reaches new windows only, as in segcam 1.1.
 
+In Resolume on Windows a swarm drawn on the GPU stays there: the plugin shares the device its
+frames are on, so the swarm draws into a frame Resolume shows from (`CpuEffect::render_to`),
+with no copy back. There the swarm always draws on the GPU, since the share of windows below
+which it draws on the CPU was set by the cost of the copy back. The output is byte for byte
+the swarm read back, and a frame drawn on the CPU (while the device opens, or after a fault)
+goes through RAM as before.
+
 The C++ effect's README covers how this differs from the live app (no state carried
 forever, per-frame IDs); all of it applies here.
 

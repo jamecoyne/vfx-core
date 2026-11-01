@@ -2,6 +2,8 @@
 //! the host works in. Hosts fetch (or keep) the frames before the current one that
 //! [`CpuEffect::frames_before`] asks for.
 
+#[cfg(not(target_arch = "wasm32"))]
+use vfx_core::Target;
 use vfx_core::cpu::{FrameSource, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Unit};
 
@@ -205,6 +207,23 @@ impl CpuEffect for SegcamMotion {
             ImageMut::U16(mut out) => state.advance(&s, frames, count, n, &mut out),
             ImageMut::F32(mut out) => state.advance(&s, frames, count, n, &mut out),
         }
+    }
+
+    /// A swarm drawn on the GPU goes into `target` when it is on the device the swarm draws
+    /// on, which it is where the host shared it before the first render (FFGL).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn render_to(
+        &mut self,
+        frames: &mut dyn FrameSource,
+        count: usize,
+        output: ImageMut<'_>,
+        target: Target<'_>,
+        params: &ParamValues,
+        ctx: &Context,
+    ) -> bool {
+        self.state.offer_target(target);
+        self.render(frames, count, output, params, ctx);
+        self.state.took_target()
     }
 
     fn unfinished(&self) -> bool {

@@ -15,7 +15,7 @@ mod param;
 mod shader;
 
 pub use chain::EffectChain;
-pub use effect::{Context, CpuEffect, Effect, Processor, Region};
+pub use effect::{Context, CpuEffect, Effect, Processor, Region, Target};
 pub use frame::{Frame, Readback};
 pub use gpu::{Gpu, GpuError};
 pub use param::{ParamError, ParamKind, ParamSpec, ParamValue, ParamValues, Requires, Unit};
