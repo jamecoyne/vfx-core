@@ -919,29 +919,25 @@ pub fn draw_swarm<'t, C: Channel>(
     let count = (threads * BANDS_PER_THREAD).min((out.height / 32).max(1) as usize);
     let bands = std::sync::Mutex::new(out.bands(count));
     let next = || bands.lock().ok().and_then(|mut bands| bands.pop());
+    let draw = || {
+        while let Some(mut band) = next() {
+            if clear {
+                let all = PixelRect::new(0, 0, band.width, band.height);
+                fill_rect(&mut band, all, Argb::default());
+            }
+            for (tile, bar, plan) in &windows {
+                draw_window_with(&mut band, tile, bar, plan, &m, shadow, straight_alpha, live);
+            }
+        }
+    };
+    // One thread draws on the caller's: browsers can't start threads.
+    if threads < 2 {
+        draw();
+        return;
+    }
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            let (next, windows, m, live) = (&next, &windows, &m, live);
-            scope.spawn(move || {
-                while let Some(mut band) = next() {
-                    if clear {
-                        let all = PixelRect::new(0, 0, band.width, band.height);
-                        fill_rect(&mut band, all, Argb::default());
-                    }
-                    for (tile, bar, plan) in windows {
-                        draw_window_with(
-                            &mut band,
-                            tile,
-                            bar,
-                            plan,
-                            m,
-                            shadow,
-                            straight_alpha,
-                            live,
-                        );
-                    }
-                }
-            });
+            scope.spawn(draw);
         }
     });
 }

@@ -129,6 +129,12 @@ pub trait CpuEffect: Send {
         params: &ParamValues,
         ctx: &Context,
     );
+
+    /// Whether the last render is unfinished, waiting on the GPU (browsers only). Hosts don't show
+    /// it and render the same frame with the same parameters again until this is false.
+    fn unfinished(&self) -> bool {
+        false
+    }
 }
 
 /// What an effect crate hands its host: a GPU or a CPU effect.

@@ -6,11 +6,17 @@
 //! ([`crate::Incremental::gpu_overlay`]). The device opens in the background, and renders draw
 //! on the CPU until it is ready. A render the GPU fails is drawn on the CPU and the next one
 //! tries the GPU again, or after a few close together, one a while later; a lost device is
-//! given up by every instance.
+//! given up by every instance. In browsers it draws on the device the host shares, and a draw
+//! comes back at the next render of the same frame.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, Once, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use vfx_core::wgpu;
 
@@ -241,81 +247,109 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
             l.get_or_insert(format!("{reason:?}: {e}"));
         }
     });
-
-    let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    };
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("segcam draw"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            storage(1, true),
-            storage(2, false),
-            storage(3, true),
-            storage(4, false),
-        ],
-    });
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("segcam draw"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("gpu.wgsl").into()),
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("segcam draw"),
-        bind_group_layouts: &[Some(&layout)],
-        immediate_size: 0,
-    });
-    let pipeline = |entry| {
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(entry),
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            cache: None,
-        })
-    };
-    let dev = Device {
-        max_binding: supported
-            .max_storage_buffer_binding_size
-            .min(supported.max_buffer_size),
-        overlay: pipeline("overlay"),
-        swarm: pipeline("swarm"),
-        layout,
-        device,
-        queue,
-        info,
-        lost,
-        errors,
-        spare: Mutex::new(None),
-    };
+    let max_binding = supported
+        .max_storage_buffer_binding_size
+        .min(supported.max_buffer_size);
+    let dev = Device::build(device, queue, info, max_binding, lost, errors);
     match (dev.lost(), dev.errors()) {
         (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
         _ => Ok(dev),
     }
 }
 
-// Browsers can't wait on the GPU inside a render.
+// Browsers can't wait for a device inside a render, so this draws on the one the host shared.
+// Its error and loss callbacks stay the host's.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn open(_choice: &str) -> Result<Device, NoGpu> {
-    Err(NoGpu::NoAdapter(
-        "no blocking GPU access in browsers".into(),
+    let gpu =
+        vfx_core::Gpu::shared().ok_or_else(|| NoGpu::NoAdapter("the host shared no GPU".into()))?;
+    let limits = gpu.device.limits();
+    let max_binding = limits
+        .max_storage_buffer_binding_size
+        .min(limits.max_buffer_size);
+    let info = gpu.device.adapter_info();
+    let (lost, errors) = Default::default();
+    Ok(Device::build(
+        gpu.device,
+        gpu.queue,
+        info,
+        max_binding,
+        lost,
+        errors,
     ))
+}
+
+impl Device {
+    /// The draw's layout and pipelines on `device`.
+    fn build(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        info: wgpu::AdapterInfo,
+        max_binding: u64,
+        lost: Arc<Mutex<Option<String>>>,
+        errors: Arc<Mutex<(u64, String)>>,
+    ) -> Self {
+        let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("segcam draw"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                storage(1, true),
+                storage(2, false),
+                storage(3, true),
+                storage(4, false),
+            ],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("segcam draw"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("gpu.wgsl").into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("segcam draw"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |entry| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        Device {
+            max_binding,
+            overlay: pipeline("overlay"),
+            swarm: pipeline("swarm"),
+            layout,
+            device,
+            queue,
+            info,
+            lost,
+            errors,
+            spare: Mutex::new(None),
+        }
+    }
 }
 
 /// Must match `Globals` in gpu.wgsl.
@@ -526,6 +560,8 @@ pub struct Drawer {
     atlas: Arc<Mutex<Atlas>>,
     /// The most a buffer may take: what the device binds.
     limit: u64,
+    /// How long a render waits for its draw; browsers don't.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     wait: Duration,
     /// The device's error count as this render began.
     seen: u64,
@@ -541,7 +577,31 @@ pub struct Drawer {
     /// When the last of [`TRIES`] faults in the window sent renders to the CPU.
     resting: Option<Instant>,
     rest: Duration,
+    /// This render's draw is still on its way back; the next render of it takes it (browsers).
+    pub unfinished: bool,
+    #[cfg(target_arch = "wasm32")]
+    flight: Option<Flight>,
+    /// Draws replaced in a row before they came back, as when a parameter moves every frame.
+    #[cfg(target_arch = "wasm32")]
+    restarts: u32,
 }
+
+/// A draw submitted without waiting: what it drew, its readback and how the map went.
+#[cfg(target_arch = "wasm32")]
+struct Flight {
+    key: u64,
+    staging: wgpu::Buffer,
+    state: Arc<std::sync::atomic::AtomicU8>,
+}
+
+#[cfg(target_arch = "wasm32")]
+const PENDING: u8 = 0;
+#[cfg(target_arch = "wasm32")]
+const MAPPED: u8 = 1;
+
+/// After this many draws replaced in a row, one render draws on the CPU.
+#[cfg(target_arch = "wasm32")]
+const RESTARTS: u32 = 3;
 
 impl Drawer {
     /// On `dev`, unless it is lost.
@@ -575,6 +635,11 @@ impl Drawer {
             recent: 0,
             resting: None,
             rest: REST,
+            unfinished: false,
+            #[cfg(target_arch = "wasm32")]
+            flight: None,
+            #[cfg(target_arch = "wasm32")]
+            restarts: 0,
             dev,
         };
         Some(drawer)
@@ -614,6 +679,7 @@ impl Drawer {
     /// errors reported before it aren't its own.
     pub fn begin(&mut self) {
         self.loaded = None;
+        self.unfinished = false;
         self.timings = Timings::default();
         self.seen = self.dev.errors().0;
     }
@@ -970,19 +1036,15 @@ impl Drawer {
             }))
     }
 
-    /// Runs a draw over the whole of `out` and reads it back into `out`. Waits only for this
-    /// render's work, and not for long: a render that isn't back in time is a fault.
-    fn run<C: Channel>(
+    /// Submits a draw over the whole of a `width` by `height` output of `bytes`, copied into the
+    /// staging buffer it returns.
+    fn submit(
         &mut self,
         pipeline: &wgpu::ComputePipeline,
         globals: &Globals,
         data: &[u32],
-        out: &mut ViewMut<C>,
-    ) -> Result<(), Fault> {
-        self.check()?;
-        let t = Instant::now();
-        let row = out.width as usize * size_of::<Argb<C>>();
-        let bytes = (row * out.height as usize) as u64;
+        (width, height, bytes): (i32, i32, u64),
+    ) -> Result<(wgpu::Buffer, wgpu::SubmissionIndex), Fault> {
         let atlas = self.atlas.clone();
         let atlas = atlas.lock().unwrap_or_else(|e| e.into_inner());
         let bind = self.bind(globals, data, &atlas.buffer, bytes);
@@ -995,14 +1057,29 @@ impl Drawer {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(
-                (out.width as u32).div_ceil(16),
-                (out.height as u32).div_ceil(16),
-                1,
-            );
+            pass.dispatch_workgroups((width as u32).div_ceil(16), (height as u32).div_ceil(16), 1);
         }
         encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, bytes);
         let submitted = self.dev.queue.submit(Some(encoder.finish()));
+        Ok((staging, submitted))
+    }
+
+    /// Runs a draw over the whole of `out` and reads it back into `out`. Waits only for this
+    /// render's work, and not for long: a render that isn't back in time is a fault.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run<C: Channel>(
+        &mut self,
+        pipeline: &wgpu::ComputePipeline,
+        globals: &Globals,
+        data: &[u32],
+        out: &mut ViewMut<C>,
+    ) -> Result<(), Fault> {
+        self.check()?;
+        let t = Instant::now();
+        let row = out.width as usize * size_of::<Argb<C>>();
+        let bytes = (row * out.height as usize) as u64;
+        let (staging, submitted) =
+            self.submit(pipeline, globals, data, (out.width, out.height, bytes))?;
         self.timings.prepare += ms(t);
 
         let t = Instant::now();
@@ -1059,10 +1136,94 @@ impl Drawer {
         self.note(false);
         Ok(())
     }
+
+    /// Browsers can't wait on the GPU: a draw is submitted and mapped, and this render is left
+    /// [`unfinished`](Self::unfinished). The next render that asks for the same draw reads it
+    /// back into `out`; one that asks for another drops it.
+    #[cfg(target_arch = "wasm32")]
+    fn run<C: Channel>(
+        &mut self,
+        pipeline: &wgpu::ComputePipeline,
+        globals: &Globals,
+        data: &[u32],
+        out: &mut ViewMut<C>,
+    ) -> Result<(), Fault> {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        self.check()?;
+        let t = Instant::now();
+        let mut key = std::hash::DefaultHasher::new();
+        (pipeline, bytemuck::bytes_of(globals), data, self.loaded).hash(&mut key);
+        let key = key.finish();
+        if let Some(flight) = self.flight.take() {
+            let state = flight.state.load(Ordering::Acquire);
+            match (flight.key == key, state) {
+                (true, MAPPED) => return self.take(flight, out),
+                (true, PENDING) => {
+                    self.flight = Some(flight);
+                    self.unfinished = true;
+                    return Ok(());
+                }
+                (true, _) => return Err(Fault("the readback failed to map".into())),
+                (false, PENDING) => self.restarts += 1,
+                (false, _) => {}
+            }
+        }
+        if self.restarts >= RESTARTS {
+            self.restarts = 0;
+            return Err(Fault("the draw changed before the GPU was done".into()));
+        }
+        let row = out.width as usize * size_of::<Argb<C>>();
+        let bytes = (row * out.height as usize) as u64;
+        let (staging, _) = self.submit(pipeline, globals, data, (out.width, out.height, bytes))?;
+        // The next draw takes another buffer while this one is mapped.
+        self.staging.buffer = None;
+        let state = Arc::new(AtomicU8::new(PENDING));
+        let done = state.clone();
+        staging
+            .slice(..bytes)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                done.store(if r.is_ok() { MAPPED } else { u8::MAX }, Ordering::Release);
+            });
+        self.flight = Some(Flight {
+            key,
+            staging,
+            state,
+        });
+        self.unfinished = true;
+        self.timings.prepare += ms(t);
+        Ok(())
+    }
+
+    /// Reads a draw that came back into `out`.
+    #[cfg(target_arch = "wasm32")]
+    fn take<C: Channel>(&mut self, flight: Flight, out: &mut ViewMut<C>) -> Result<(), Fault> {
+        let t = Instant::now();
+        let row = out.width as usize * size_of::<Argb<C>>();
+        let bytes = (row * out.height as usize) as u64;
+        {
+            let slice = flight.staging.slice(..bytes);
+            let mapped = slice.get_mapped_range().map_err(|e| Fault(e.to_string()))?;
+            for y in 0..out.height {
+                let at = y as usize * row;
+                pixel_bytes_mut(out.row_mut(y)).copy_from_slice(&mapped[at..at + row]);
+            }
+        }
+        flight.staging.unmap();
+        self.staging.buffer.get_or_insert(flight.staging);
+        self.restarts = 0;
+        self.timings.read += ms(t);
+        self.check()?;
+        self.drawn += 1;
+        self.note(false);
+        Ok(())
+    }
 }
 
 /// Rows split for copying on a few threads, as `ViewMut::bands` splits them. More threads only
 /// compete with the host's own render threads.
+#[cfg(not(target_arch = "wasm32"))]
 fn bands(height: i32) -> Vec<std::ops::Range<i32>> {
     const THREADS: usize = 6;
     let threads = std::thread::available_parallelism().map_or(1, usize::from);

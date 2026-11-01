@@ -120,6 +120,9 @@ impl Preview {
             .await
             .map_err(|e| format!("couldn't open the GPU: {e}"))?;
         let gpu = Gpu::from_parts(device, queue);
+        // CPU effects can't open a device of their own in browsers.
+        #[cfg(target_arch = "wasm32")]
+        gpu.share();
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);

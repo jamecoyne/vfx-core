@@ -41,6 +41,8 @@ vfx-build = { path = "../../../vfx-core/wrappers/build" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 libm = "0.2"
+# std::time::Instant panics in browsers.
+web-time = "1.1.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "1.0.1"
