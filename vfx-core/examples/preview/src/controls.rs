@@ -48,6 +48,12 @@ impl Controls {
         &self.params[self.effect]
     }
 
+    /// The shown effect's parameter list.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn specs(&self) -> &[ParamSpec] {
+        &self.specs[self.effect]
+    }
+
     /// The pattern the shown effect's second layer shows, if it has one.
     pub fn layer(&self) -> Option<usize> {
         self.layers[self.effect]

@@ -8,12 +8,14 @@ use crate::controls::{self, Controls, Status};
 use crate::effects::{self, Effects};
 use crate::modulation::{self, Expressions, Sources};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{audio, face, stats, video};
+use crate::{audio, face, script, stats, video};
 use vfx_core::Gpu;
 use winit::application::ApplicationHandler;
 #[cfg(not(target_arch = "wasm32"))]
 use winit::event::ElementState;
 use winit::event::WindowEvent;
+#[cfg(not(target_arch = "wasm32"))]
+use winit::event_loop::ControlFlow;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 #[cfg(not(target_arch = "wasm32"))]
 use winit::keyboard::{Key, NamedKey};
@@ -58,6 +60,15 @@ struct Preview {
     /// Samples the bottom bar's CPU, memory and GPU numbers.
     #[cfg(not(target_arch = "wasm32"))]
     stats: stats::Sampler,
+    /// Counts frames for `--stats`, `--frames` and `--seconds`.
+    #[cfg(not(target_arch = "wasm32"))]
+    meter: Option<script::Meter>,
+    /// Set once `--frames` or `--seconds` is reached.
+    #[cfg(not(target_arch = "wasm32"))]
+    done: bool,
+    /// `--quiet`: the window stays hidden and only the effect renders.
+    #[cfg(not(target_arch = "wasm32"))]
+    quiet: bool,
     time: f64,
     last_frame: Instant,
     fps: f32,
@@ -201,6 +212,12 @@ impl Preview {
             cameras: video::cameras(),
             #[cfg(not(target_arch = "wasm32"))]
             stats: stats::Sampler::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            meter: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            done: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            quiet: false,
             time: 0.0,
             last_frame: Instant::now(),
             fps: 0.0,
@@ -227,29 +244,41 @@ impl Preview {
         }
     }
 
-    /// Opens an image or video file (dropped or imported).
+    /// Opens an image or video file (dropped or imported), fitted into `size` if given.
     #[cfg(not(target_arch = "wasm32"))]
-    fn open(&mut self, path: &std::path::Path) {
+    fn open(&mut self, path: &std::path::Path, size: Option<(u32, u32)>) {
         if video::is_video(path) {
-            self.open_input(video::Input::File(path.to_path_buf()));
+            self.open_input(video::Input::File(path.to_path_buf()), size);
             return;
         }
         self.media = None;
-        self.message = self
-            .effects
-            .load_image(&self.gpu, path)
+        let loaded = match size {
+            None => self.effects.load_image(&self.gpu, path),
+            Some(size) => image::open(path).map_err(|e| e.to_string()).map(|img| {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                self.effects
+                    .start_stream(&self.gpu, name.into_owned(), size);
+                self.effects
+                    .write_source(&self.gpu, &fit_still(&img.to_rgba8(), size));
+            }),
+        };
+        self.message = loaded
             .err()
             .map(|e| format!("Couldn't open {}: {e}", path.display()));
         self.refresh_image();
     }
 
-    /// Starts a video file or webcam as the source.
+    /// Starts a video file or webcam as the source, fitted into `size` if given.
     #[cfg(not(target_arch = "wasm32"))]
-    fn open_input(&mut self, input: video::Input) {
+    fn open_input(&mut self, input: video::Input, size: Option<(u32, u32)>) {
         // Stops the old video and its sound first.
         self.media = None;
         let name = input.name();
-        self.message = match video::Video::open(input, effects::MAX_IMAGE_SIDE) {
+        let opened = match size {
+            None => video::Video::open(input, effects::MAX_IMAGE_SIDE),
+            Some(size) => video::Video::open_fitted(input, size),
+        };
+        self.message = match opened {
             Ok(video) => {
                 self.effects.start_stream(&self.gpu, name, video.info.size);
                 let file = video.info.file();
@@ -336,6 +365,13 @@ impl Preview {
             .render(&self.gpu, c, &values, frame_time, recording);
         #[cfg(not(target_arch = "wasm32"))]
         self.record_frame(frame);
+    }
+
+    fn is_quiet(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.quiet;
+        #[cfg(target_arch = "wasm32")]
+        return false;
     }
 
     fn is_recording(&self) -> bool {
@@ -444,12 +480,12 @@ impl Preview {
                 )
                 .pick_file()
         {
-            self.open(&path);
+            self.open(&path, None);
         }
         if let Some(camera) = actions.start_camera
             && let Some(name) = self.cameras.get(camera)
         {
-            self.open_input(video::Input::Camera(name.clone(), None));
+            self.open_input(video::Input::Camera(name.clone(), None), None);
         }
         if actions.refresh_cameras {
             self.cameras = video::cameras();
@@ -546,6 +582,19 @@ impl Preview {
         }
 
         self.render_effects(dt);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.quiet {
+            // Nothing paces a hidden window, so wait for the GPU before the next frame.
+            let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let stats = self.stats.sample(self.fps, self.effects.size());
+        #[cfg(not(target_arch = "wasm32"))]
+        self.count_frame(&stats);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.quiet {
+            return;
+        }
 
         let input = self.egui_state.take_egui_input(&self.window);
         let (image, image_size) = (self.image, self.image_size);
@@ -599,8 +648,6 @@ impl Preview {
         let exprs = &mut self.exprs;
         let sources = &self.sources;
         let mut actions = controls::Actions::default();
-        #[cfg(not(target_arch = "wasm32"))]
-        let stats = self.stats.sample(self.fps, image_size);
         let mut output = self.egui.run_ui(input, |ui| {
             // Added first, so it runs the window's full width under the controls.
             #[cfg(not(target_arch = "wasm32"))]
@@ -794,22 +841,32 @@ struct App {
     proxy: EventLoopProxy<Ready>,
     preview: Option<Preview>,
     starting: bool,
+    start: StartOptions,
+    /// Why a scripted run couldn't start.
+    #[cfg(not(target_arch = "wasm32"))]
+    failed: Option<String>,
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<Ready>) -> Self {
+    fn new(proxy: EventLoopProxy<Ready>, start: StartOptions) -> Self {
         Self {
             proxy,
             preview: None,
             starting: false,
+            start,
+            #[cfg(not(target_arch = "wasm32"))]
+            failed: None,
         }
     }
 }
 
-fn window_attributes() -> winit::window::WindowAttributes {
+#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+fn window_attributes(start: &StartOptions) -> winit::window::WindowAttributes {
     let attributes = Window::default_attributes().with_title("VFX Preview");
     #[cfg(not(target_arch = "wasm32"))]
-    let attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(1440.0, 820.0));
+    let attributes = attributes
+        .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 820.0))
+        .with_visible(!start.quiet);
     // On the web, winit makes a canvas; the page's CSS sizes it to the window.
     #[cfg(target_arch = "wasm32")]
     let attributes = {
@@ -833,27 +890,16 @@ fn instance(event_loop: &ActiveEventLoop) -> wgpu::Instance {
     wgpu::Instance::new(descriptor)
 }
 
-/// What to start with: `vfx-preview [--effect segcam-motion] [clip.mp4]` on the desktop,
-/// `?effect=segcam-motion` in the page's address on the web.
+/// What to start with: `vfx-preview [--effect segcam-motion] [clip.mp4]` and the other
+/// flags of [`script::USAGE`] on the desktop, `?effect=segcam-motion` in the page's address
+/// on the web.
+#[cfg(not(target_arch = "wasm32"))]
+type StartOptions = script::Options;
+
+#[cfg(target_arch = "wasm32")]
 #[derive(Default)]
 struct StartOptions {
     effect: Option<String>,
-    #[cfg(not(target_arch = "wasm32"))]
-    file: Option<std::path::PathBuf>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn start_options() -> StartOptions {
-    let mut start = StartOptions::default();
-    let mut args = std::env::args_os().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--effect" {
-            start.effect = args.next().map(|a| a.to_string_lossy().into_owned());
-        } else {
-            start.file = Some(arg.into());
-        }
-    }
-    start
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -888,7 +934,7 @@ impl ApplicationHandler<Ready> for App {
             return;
         }
         self.starting = true;
-        let window = match event_loop.create_window(window_attributes()) {
+        let window = match event_loop.create_window(window_attributes(&self.start)) {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 report(&format!("Couldn't create a window: {e}"));
@@ -914,17 +960,24 @@ impl ApplicationHandler<Ready> for App {
         match event {
             Ready::Preview(mut preview) => {
                 report("");
-                let start = start_options();
+                let start = std::mem::take(&mut self.start);
                 if let Some(name) = &start.effect {
                     match catalog::find_slug(name) {
                         Some(effect) => preview.controls.effect = effect,
                         None => preview.message = Some(format!("No effect called {name}")),
                     }
                 }
-                // `vfx-preview clip.mp4` (or "Open with") starts with that file.
+                // The other flags; `vfx-preview clip.mp4` (or "Open with") starts with that file.
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(path) = &start.file {
-                    preview.open(path);
+                if let Err(e) = preview.script(&start) {
+                    self.failed = Some(e);
+                    event_loop.exit();
+                    return;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if preview.quiet {
+                    // A hidden window gets no redraws; `about_to_wait` draws instead.
+                    event_loop.set_control_flow(ControlFlow::Poll);
                 }
                 preview.window.request_redraw();
                 self.preview = Some(*preview);
@@ -955,7 +1008,7 @@ impl ApplicationHandler<Ready> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => preview.resize(size.width, size.height),
             #[cfg(not(target_arch = "wasm32"))]
-            WindowEvent::DroppedFile(path) => preview.open(&path),
+            WindowEvent::DroppedFile(path) => preview.open(&path, None),
             // Escape quits the native app; a web page shouldn't close itself.
             #[cfg(not(target_arch = "wasm32"))]
             WindowEvent::KeyboardInput { event, .. }
@@ -976,15 +1029,31 @@ impl ApplicationHandler<Ready> for App {
             {
                 preview.toggle_play();
             }
-            WindowEvent::RedrawRequested => preview.draw(),
+            WindowEvent::RedrawRequested if !preview.is_quiet() => {
+                preview.draw();
+                #[cfg(not(target_arch = "wasm32"))]
+                if preview.done {
+                    event_loop.exit();
+                }
+            }
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(preview) = &self.preview {
-            preview.window.request_redraw();
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if preview.quiet {
+            preview.draw();
+            if preview.done {
+                event_loop.exit();
+            }
+            return;
         }
+        preview.window.request_redraw();
     }
 }
 
@@ -992,11 +1061,38 @@ impl ApplicationHandler<Ready> for App {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run(entries: Vec<catalog::Entry>) -> Result<(), Box<dyn std::error::Error>> {
     catalog::set(entries);
+    let start = match script::parse(std::env::args_os().skip(1)) {
+        Ok(start) => start,
+        Err(e) => fail(&format!("{e}\n\n{}", script::USAGE)),
+    };
+    if start.help || start.list {
+        print!(
+            "{}",
+            if start.help {
+                script::USAGE.to_owned()
+            } else {
+                script::list()
+            }
+        );
+        return Ok(());
+    }
     video::kill_children_on_exit();
     let event_loop = EventLoop::with_user_event().build()?;
-    let mut app = App::new(event_loop.create_proxy());
+    let mut app = App::new(event_loop.create_proxy(), start);
     event_loop.run_app(&mut app)?;
+    if let Some(e) = app.failed.take() {
+        // Dropped first, so its ffmpeg children stop.
+        drop(app);
+        fail(&e);
+    }
     Ok(())
+}
+
+/// Ends a scripted run that can't go on, with its reason and exit code 2.
+#[cfg(not(target_arch = "wasm32"))]
+fn fail(why: &str) -> ! {
+    eprintln!("vfx-preview: {why}");
+    std::process::exit(2)
 }
 
 /// Opens the preview on `entries` in the page's canvas; called from the web entry point.
@@ -1006,7 +1102,7 @@ pub fn run(entries: Vec<catalog::Entry>) {
     catalog::set(entries);
     console_error_panic_hook::set_once();
     let event_loop = EventLoop::with_user_event().build().expect("event loop");
-    let app = App::new(event_loop.create_proxy());
+    let app = App::new(event_loop.create_proxy(), start_options());
     event_loop.spawn_app(app);
 }
 /// A recording in progress: the output so far, in a temporary file until it's saved.
@@ -1050,6 +1146,70 @@ fn fit_still(image: &image::RgbaImage, size: (u32, u32)) -> Vec<f32> {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Preview {
+    /// Applies the command line's flags beyond `--effect`. Mistakes in a scripted run are
+    /// errors; otherwise they show in the panel, as before.
+    fn script(&mut self, start: &script::Options) -> Result<(), String> {
+        let scripted = start.scripted();
+        if scripted && let Some(message) = self.message.take() {
+            return Err(message);
+        }
+        if let Some(size) = start.size {
+            let limit = self.gpu.device.limits().max_texture_dimension_2d;
+            if size.0 > limit || size.1 > limit {
+                return Err(format!(
+                    "--size {}x{}: this GPU's limit is {limit}",
+                    size.0, size.1
+                ));
+            }
+            self.effects.set_pattern_size(&self.gpu, size);
+            self.refresh_image();
+        }
+        match &start.input {
+            None => {}
+            Some(script::Source::Pattern(name)) => self.controls.pattern = script::pattern(name)?,
+            Some(script::Source::Camera(name)) => {
+                let camera = script::camera(&self.cameras, name)?;
+                self.open_input(video::Input::Camera(camera, None), start.size);
+            }
+            Some(script::Source::File(path)) => self.open(path, start.size),
+        }
+        if scripted && let Some(message) = self.message.take() {
+            return Err(message);
+        }
+        if let Some(mode) = &start.mode {
+            let (name, value) = script::mode(self.controls.specs(), mode)?;
+            self.set_param(name, value)?;
+        }
+        for (name, text) in &start.params {
+            let spec = self
+                .controls
+                .specs()
+                .iter()
+                .find(|s| s.name == name)
+                .copied()
+                .ok_or_else(|| format!("--param {name}: no such parameter; --list shows them"))?;
+            self.set_param(name, script::value(&spec, text)?)?;
+        }
+        if start.stats || start.stop.is_some() {
+            self.meter = Some(script::Meter::new(start.stats, start.stop));
+        }
+        self.quiet = start.quiet;
+        Ok(())
+    }
+
+    fn set_param(&mut self, name: &str, value: vfx_core::ParamValue) -> Result<(), String> {
+        let effect = self.controls.effect;
+        self.controls.params[effect]
+            .set(name, value)
+            .map_err(|e| format!("{name}: {e}"))
+    }
+
+    fn count_frame(&mut self, stats: &stats::Snapshot) {
+        if let Some(meter) = &mut self.meter {
+            self.done |= meter.frame(stats);
+        }
+    }
+
     /// Feeds the layer from a file: an image is held and fitted, a video plays fitted.
     fn open_layer(&mut self, path: &std::path::Path) {
         let name = path
