@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # segcam's OpenFX plugin against its CLI, using the VFX Preview mini host's suites.
-# Usage: SEGCAM_TEST_DIR=/tmp/segcam OFX_INCLUDE=... ./ofx-tests/run.sh
+# Usage: SEGCAM_TEST_DIR=/tmp/segcam OFX_INCLUDE=... ./ofx-tests/run.sh [--quick]
+# --quick compares 8 bit only (48 of the 144), for iterating; run the full set before a PR.
 set -euo pipefail
 # The CPU path, plugin and CLI alike: these checks are byte for byte.
 export SEGCAM_GPU=0
@@ -14,4 +15,4 @@ case "$(uname -s)" in
 esac
 cargo build --release -p segcam-motion --features ofx
 "${CC:-cc}" -std=c11 -Wno-incompatible-pointer-types -I"${OFX_INCLUDE:?set OFX_INCLUDE}" "$here/host.c" -o "$host"
-"$(command -v python3 || command -v python)" "$here/compare.py" "$host" "$plugin" "$cli" "$SEGCAM_TEST_DIR"
+"$(command -v python3 || command -v python)" "$here/compare.py" "$host" "$plugin" "$cli" "$SEGCAM_TEST_DIR" "$@"

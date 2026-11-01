@@ -41,6 +41,7 @@ def main():
     parser.add_argument("plugin", type=Path)
     parser.add_argument("cli", type=Path)
     parser.add_argument("--work-dir", type=Path, default=Path(os.environ.get("RUNNER_TEMP", "target/ffgl-minihost")))
+    parser.add_argument("--quick", action="store_true", help="the default settings only, in every mode")
     args = parser.parse_args()
     args.work_dir.mkdir(parents=True, exist_ok=True)
     width, height, count = 320, 180, 48
@@ -53,7 +54,7 @@ def main():
         source.write_bytes(raw)
         for mode, name in enumerate(("overlay", "matte", "boxmatte", "swarm")):
             base = [str(args.cli.resolve()), str(width), str(height), "--mode", name, "--straight-alpha"]
-            for variant in ("default", "custom", "rewind", "resize"):
+            for variant in ("default",) if args.quick else ("default", "custom", "rewind", "resize"):
                 command = base.copy()
                 if variant == "custom":
                     command += ["--sensitivity", "90", "--adaptation", "12.5", "--background", "4",
