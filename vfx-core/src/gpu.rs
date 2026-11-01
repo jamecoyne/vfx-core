@@ -35,6 +35,28 @@ impl Gpu {
             .map_err(|e| GpuError(e.to_string()))?;
         Ok(Self { device, queue })
     }
+
+    /// Lets CPU effects draw on this device. For browsers, where they can't open their own.
+    #[cfg(target_arch = "wasm32")]
+    pub fn share(&self) {
+        SHARED.with(|s| *s.borrow_mut() = Some((self.device.clone(), self.queue.clone())));
+    }
+
+    /// The device a host shared with [`Gpu::share`].
+    #[cfg(target_arch = "wasm32")]
+    pub fn shared() -> Option<Self> {
+        SHARED.with(|s| {
+            s.borrow()
+                .clone()
+                .map(|(device, queue)| Self { device, queue })
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static SHARED: std::cell::RefCell<Option<(wgpu::Device, wgpu::Queue)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug)]

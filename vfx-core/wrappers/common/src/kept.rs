@@ -79,6 +79,11 @@ impl CpuInstance {
         })
     }
 
+    /// Whether the last render is still waiting on the GPU (see [`CpuEffect::unfinished`]).
+    pub fn unfinished(&self) -> bool {
+        self.kept.is_some() && self.with(|e| e.unfinished())
+    }
+
     /// Drops what the kept effect worked out.
     pub fn reset(&self) {
         if let Some(kept) = &self.kept {
