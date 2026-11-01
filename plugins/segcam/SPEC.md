@@ -43,7 +43,7 @@ Status: done (on `main`), PR (written, in review), todo.
 | F8 | Swarm draws on the GPU by default where a hardware GPU exists; each render picks CPU or GPU by the window pixels it draws ([ADR 4](decisions/0004-gpu-by-default.md)) | GPU output within one level of the CPU path, at most 1 pixel in 10,000 off by over half a level, in the 30 offline cases and a lossless Resolve Deliver | done |
 | F9 | No GPU, a failing GPU, or one lost mid render falls back to the CPU path without a wrong frame | the lost device test: every frame after the loss equals the CPU path byte for byte | done |
 | F10 | Overlay draws on the CPU | Overlay output byte for byte with the CLI | done |
-| F11 | Parameter `name`s are frozen from 1.0 | a test listing the shipped `name`s fails if one changes (to add with the tag) | todo |
+| F11 | Parameter `name`s are frozen from 1.0 | a test listing the shipped `name`s fails if one changes (to add with the tag) | PR |
 | F12 | Windows plugins load the DirectML that ships next to them, not the system's | faces use DirectML on Windows 10 with an old system32 copy; the tests check the same | done; test fix in PR |
 
 ## 4. Host behaviour
