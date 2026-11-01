@@ -26,6 +26,8 @@ mod effects;
 mod face;
 mod modulation;
 #[cfg(not(target_arch = "wasm32"))]
+mod script;
+#[cfg(not(target_arch = "wasm32"))]
 mod stats;
 #[cfg(not(target_arch = "wasm32"))]
 mod video;
