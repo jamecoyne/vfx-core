@@ -41,6 +41,13 @@ the other into the host's framebuffer. Shared Win32 semaphores and Vulkan extern
 queue-family barriers transfer image ownership and layout between the APIs. GL and
 wgpu also finish their work before the other API starts. No pixels pass through RAM.
 
+CPU effects read the frame back through RAM for their work on the CPU. On Windows the
+plugin shares that same Vulkan device with them when the instance is made, so one that
+draws on the GPU (segcam's swarm) can draw its output into a frame there instead
+(`CpuEffect::render_to`). That frame is copied into the output image and drawn into the
+host's framebuffer like a GPU effect's, with no readback and no upload. A render the
+effect draws on the CPU goes up through RAM as before.
+
 If sharing can't be set up (missing extensions, a device mismatch, unsupported export
 formats or a setup error), the plugin reads the texture back through RAM instead.
 A Windows shared render error also disables sharing for that instance and uses RAM;
@@ -51,11 +58,13 @@ readback and after upload; the RAM buffers already match the pipeline's canvas.
 The pipeline reuses its readback buffer and copies straight into float storage.
 
 `~/Library/Logs/VfxPreview-FFGL.log` records which path ran on macOS. On Windows the
-log is `%TEMP%\VfxPreview-FFGL.log`. `VFX_FFGL_PATH=ram` forces the RAM path.
+log is `%TEMP%\VfxPreview-FFGL.log`. `VFX_FFGL_PATH=ram` forces the RAM path, for CPU
+effects' output too.
 `VFX_FFGL_TIMING=1` times a CPU effect inside the host: every 300 frames it appends the
 median and p95 milliseconds of the readback, the render and the upload, with the parameter
-values, to `vfx-ffgl-timing.log` in the temp directory. It waits for the host's GL work around
-each frame, so leave it off outside measurements.
+values, to `vfx-ffgl-timing.log` in the temp directory. For output kept on the GPU the upload
+is the copy into the output image and the handoff to GL, waiting for the effect's GPU work.
+It waits for the host's GL work around each frame, so leave it off outside measurements.
 
 Measured on an Apple M5 with blur radius 8 and the vignette on:
 

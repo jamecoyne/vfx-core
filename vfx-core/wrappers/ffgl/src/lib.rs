@@ -159,6 +159,14 @@ struct Instance {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     /// Set once the zero-copy path has failed to set up, so it isn't retried per frame.
     interop_failed: bool,
+    /// The frame a CPU effect may draw its output into, on the interop's device.
+    #[cfg(target_os = "windows")]
+    target: Option<vfx_core::Frame>,
+}
+
+/// `VFX_FFGL_PATH=ram`: every frame through RAM, the zero-copy paths off.
+fn ram_only() -> bool {
+    std::env::var("VFX_FFGL_PATH").as_deref() == Ok("ram")
 }
 
 impl Instance {
@@ -182,7 +190,9 @@ impl Instance {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             interop: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            interop_failed: std::env::var("VFX_FFGL_PATH").as_deref() == Ok("ram"),
+            interop_failed: ram_only(),
+            #[cfg(target_os = "windows")]
+            target: None,
         }
     }
 
@@ -315,6 +325,15 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
             if let Err(e) = gl::load() {
                 LOG.note(&format!("warning: {e}"));
                 return FFMixed::fail();
+            }
+            // A CPU effect that draws on the GPU picks its device on its first render; share
+            // the one that shares frames with this context first, so its output can stay there.
+            #[cfg(target_os = "windows")]
+            if vfx_host::plugin().kind == Kind::Cpu && !ram_only() {
+                // SAFETY: the context is current and the GL functions are loaded.
+                if let Err(e) = unsafe { shared::share_device() } {
+                    LOG.note(&format!("warning: no shared device for GPU output: {e}"));
+                }
             }
             let mut instance = Instance::new();
             match unsafe { gl::Blit::new(gl::PASS) } {
@@ -454,6 +473,11 @@ unsafe fn process_cpu(
     let values = me.effect_values();
     let time = me.time.unwrap_or(0.0);
     let (w, h) = (tex.width, tex.height);
+    // SAFETY: the host's context is current.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        gpu_output(me, (w, h))
+    };
     let Some(cpu) = me.cpu.as_mut() else {
         return false;
     };
@@ -500,19 +524,46 @@ unsafe fn process_cpu(
     };
     let count = cpu.history.len();
     let out = ImageMut::U8(ViewMut::from_pixels(&mut cpu.rendered, w as i32, h as i32));
-    let rendered = cpu
-        .effect
-        .render(&mut cpu.history, count, out, &values, &ctx);
-    if rendered.is_err() {
+    #[cfg(target_os = "windows")]
+    let target =
+        (me.interop.as_ref().zip(me.target.as_ref())).map(|(interop, frame)| vfx_core::Target {
+            gpu: interop.gpu(),
+            frame,
+        });
+    #[cfg(not(target_os = "windows"))]
+    let target = None;
+    let effect = &cpu.effect;
+    let rendered = match target {
+        Some(target) => effect.render_to(&mut cpu.history, count, out, target, &values, &ctx),
+        None => effect
+            .render(&mut cpu.history, count, out, &values, &ctx)
+            .map(|()| false),
+    };
+    let Ok(on_gpu) = rendered else {
         LOG.note("warning: CPU render failed");
         return false;
-    }
+    };
     let render = started.elapsed() - read;
-    // SAFETY: the output storage holds the full straight, top-down image.
-    unsafe {
-        me.output
-            .upload_bytes((w, h), transfer::bytes(&cpu.rendered));
-        canvas.draw(me.output.handle);
+    #[cfg(target_os = "windows")]
+    if let (true, Some(interop), Some(frame)) = (on_gpu, &me.interop, &me.target) {
+        // SAFETY: the context is current with the host's framebuffer bound, and the effect drew
+        // `frame` on the interop's device.
+        if let Err(e) = unsafe { interop.present(frame) } {
+            // This frame is on the GPU only; the next ones go through RAM.
+            LOG.note(&format!(
+                "warning: showing the GPU output failed, using RAM: {e}"
+            ));
+            me.interop_failed = true;
+            return false;
+        }
+    }
+    if !on_gpu {
+        // SAFETY: the output storage holds the full straight, top-down image.
+        unsafe {
+            me.output
+                .upload_bytes((w, h), transfer::bytes(&cpu.rendered));
+            canvas.draw(me.output.handle);
+        }
     }
     if let Some(timing) = cpu.timing.as_mut() {
         // SAFETY: the host's context is current.
@@ -520,8 +571,50 @@ unsafe fn process_cpu(
         let upload = started.elapsed() - read - render;
         timing.record([read, render, upload], (w, h), &me.values);
     }
-    LOG.note("render path: CPU effect through RAM (texture readback)");
+    LOG.note(match on_gpu {
+        true => "render path: CPU effect, output kept on the GPU (Vulkan shared with OpenGL)",
+        false => "render path: CPU effect through RAM (texture readback)",
+    });
     true
+}
+
+/// Readies a CPU effect's GPU output at `size`: the shared images and the frame the effect
+/// draws into, on the device shared at instantiation. Leaves both unset where that device
+/// isn't there or the path has failed, so frames go through RAM.
+///
+/// # Safety
+/// The host's context must be current.
+#[cfg(target_os = "windows")]
+unsafe fn gpu_output(me: &mut Instance, size: (u32, u32)) {
+    let ready = me.interop.as_ref().is_some_and(|i| i.size() == size) && me.target.is_some();
+    if ready && !me.interop_failed {
+        return;
+    }
+    me.target = None;
+    if let Some(old) = me.interop.take() {
+        // SAFETY: the context is current; the old interop belongs to it.
+        unsafe { old.delete() };
+    }
+    if me.interop_failed || vfx_core::Gpu::shared().is_none() {
+        return;
+    }
+    // SAFETY: the context is current.
+    match unsafe { shared::Interop::new(size) } {
+        Ok(interop) => {
+            let (w, h) = size;
+            me.target = Some(vfx_core::Frame::new(
+                interop.gpu(),
+                w,
+                h,
+                pipeline::FRAME_FORMAT,
+            ));
+            me.interop = Some(interop);
+        }
+        Err(e) => {
+            LOG.note(&format!("warning: GPU output unavailable, using RAM: {e}"));
+            me.interop_failed = true;
+        }
+    }
 }
 
 /// A GPU effect: GPU-native where the platform allows, else through RAM.

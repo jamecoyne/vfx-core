@@ -139,11 +139,36 @@ pub trait CpuEffect: Send {
         ctx: &Context,
     );
 
+    /// Like [`CpuEffect::render`], for a host that shows its frames from the GPU (FFGL): the
+    /// effect may draw the frame into `target` instead of `output`, and says whether it did.
+    /// When it didn't, `output` holds the frame. The default renders into `output`.
+    fn render_to(
+        &mut self,
+        frames: &mut dyn FrameSource,
+        count: usize,
+        output: ImageMut<'_>,
+        _target: Target<'_>,
+        params: &ParamValues,
+        ctx: &Context,
+    ) -> bool {
+        self.render(frames, count, output, params, ctx);
+        false
+    }
+
     /// Whether the last render is unfinished, waiting on the GPU (browsers only). Hosts don't show
     /// it and render the same frame with the same parameters again until this is false.
     fn unfinished(&self) -> bool {
         false
     }
+}
+
+/// A GPU frame a host offers a CPU effect's output ([`CpuEffect::render_to`]): `frame`, the
+/// size of the render, on `gpu`, the device the host [shared](Gpu::share). The effect draws
+/// straight colour into it, top row first, as it would into an 8-bit output.
+#[derive(Clone, Copy)]
+pub struct Target<'a> {
+    pub gpu: &'a Gpu,
+    pub frame: &'a Frame,
 }
 
 /// What an effect crate hands its host: a GPU or a CPU effect.

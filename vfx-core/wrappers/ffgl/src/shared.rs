@@ -1,15 +1,18 @@
 //! Windows GPU frames: export two Vulkan RGBA32F images to the host's OpenGL context.
 //! Semaphores and EXTERNAL queue-family barriers hand ownership between APIs. Coarse
 //! waits keep reuse and teardown simple; no frame pixels are mapped or read on the CPU.
+//! GPU effects render between the two images; a CPU effect that draws on the GPU draws on
+//! the same device, shared with it ([`share_device`]), and its output is copied into the
+//! output image ([`Interop::present`]).
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::{Arc, Mutex};
 
 use ash::vk::Handle;
 use ash::{khr, vk};
-use vfx_core::Gpu;
 use vfx_core::wgpu::{self, hal};
 use vfx_core::{Context, ParamValues};
+use vfx_core::{Frame, Gpu};
 use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
 use crate::{gl, ram};
@@ -66,9 +69,17 @@ impl Device {
         if !adapter.features().contains(features) {
             return Err("Vulkan adapter lacks VULKAN_EXTERNAL_MEMORY_WIN32".into());
         }
+        // CPU effects that draw here bind as much as the adapter allows, as on a device of
+        // their own (segcam's swarm atlas grows with the trail).
+        let supported = adapter.limits();
         let desc = wgpu::DeviceDescriptor {
             label: Some("ffgl shared Vulkan device"),
             required_features: features,
+            required_limits: wgpu::Limits {
+                max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
+                max_buffer_size: supported.max_buffer_size,
+                ..wgpu::Limits::default()
+            },
             ..Default::default()
         };
         // SAFETY: this HAL adapter is the selected wgpu adapter. The callback only adds
@@ -120,6 +131,19 @@ impl Device {
         devices.push(Arc::clone(&device));
         Ok(device)
     }
+}
+
+/// Opens the device that shares frames with the current context and shares it with CPU
+/// effects ([`Gpu::share`]), so one that draws on the GPU draws where [`Interop::present`] can
+/// show its output. Before the effect's first render, which picks its device.
+///
+/// # Safety
+/// The host's GL context must be current, with the GL functions loaded.
+pub unsafe fn share_device() -> Result<(), String> {
+    // SAFETY: the caller has the context current.
+    let luid = unsafe { gl::shared_memory_luid()? };
+    Device::open(luid)?.gpu.share();
+    Ok(())
 }
 
 struct Shared {
@@ -519,6 +543,76 @@ impl Interop {
 
     pub fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// The device both images are on.
+    pub fn gpu(&self) -> &Gpu {
+        &self.device.gpu
+    }
+
+    /// Shows `frame`, a CPU effect's output drawn on this device, in the host's framebuffer:
+    /// copied into the output image, which GL draws premultiplied and flipped, with no trip
+    /// through RAM. The effect's draw is ahead of the copy on the same queue.
+    ///
+    /// # Safety
+    /// The host's context must be current, with its framebuffer bound; `frame` is
+    /// [`FRAME_FORMAT`] at this interop's size, on its device.
+    pub unsafe fn present(&self, frame: &Frame) -> Result<(), String> {
+        let _guard = self.device.render.lock().unwrap_or_else(|e| e.into_inner());
+        let gpu = &self.device.gpu;
+        let (w, h) = self.size;
+        // SAFETY: GL owns both shared images until it signals to_vk.
+        unsafe {
+            let textures = [self.input.gl_texture, self.output.gl_texture];
+            gl::glSignalSemaphoreEXT(
+                self.to_vk.gl,
+                0,
+                std::ptr::null(),
+                2,
+                textures.as_ptr(),
+                LAYOUTS.as_ptr(),
+            );
+            gl::finish_shared();
+            gl::check_error("GL to Vulkan handoff")?;
+        }
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        // SAFETY: GL released both images and signalled to_vk. Hold the queue lock until submit.
+        unsafe {
+            gpu.queue
+                .as_hal::<hal::api::Vulkan>()
+                .unwrap()
+                .add_wait_semaphore(self.to_vk.raw, None, vk::PipelineStageFlags::TOP_OF_PIPE);
+            self.barrier(&mut encoder, true, false);
+        }
+        gpu.queue.submit([encoder.finish()]);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_texture(
+            frame.texture.as_image_copy(),
+            self.output.texture.as_image_copy(),
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        // SAFETY: the copy finishes before releasing ownership and signalling GL.
+        unsafe {
+            self.barrier(&mut encoder, false, false);
+            self.signal();
+        }
+        gpu.queue.submit([encoder.finish()]);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| e.to_string())?;
+        // SAFETY: Vulkan finished writing and released the images before GL reads them.
+        unsafe {
+            self.wait_gl();
+            self.from_canvas
+                .draw(self.output.gl_texture, gl::TEXTURE_2D, [1.0, 1.0]);
+            gl::check_error("Vulkan to GL handoff")
+        }
     }
 
     /// # Safety

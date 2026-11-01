@@ -12,7 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 
 use vfx_core::cpu::{FrameSource, ImageMut};
-use vfx_core::{Context, CpuEffect, ParamValues, Processor};
+use vfx_core::{Context, CpuEffect, ParamValues, Processor, Target};
 
 /// A CPU effect as a host instance holds it.
 pub struct CpuInstance {
@@ -81,6 +81,27 @@ impl CpuInstance {
     ) -> Result<(), Panicked> {
         let rendered = catch_unwind(AssertUnwindSafe(|| {
             self.with(|e| e.render(frames, count, output, values, ctx))
+        }));
+        rendered.map_err(|_| {
+            self.reset();
+            Panicked
+        })
+    }
+
+    /// Renders, into `target` where the effect can (see [`CpuEffect::render_to`]), starting over
+    /// if the render panics. `Ok(true)` when the frame is in `target`, `Ok(false)` when it is in
+    /// `output`.
+    pub fn render_to(
+        &self,
+        frames: &mut dyn FrameSource,
+        count: usize,
+        output: ImageMut<'_>,
+        target: Target<'_>,
+        values: &ParamValues,
+        ctx: &Context,
+    ) -> Result<bool, Panicked> {
+        let rendered = catch_unwind(AssertUnwindSafe(|| {
+            self.with(|e| e.render_to(frames, count, output, target, values, ctx))
         }));
         rendered.map_err(|_| {
             self.reset();
