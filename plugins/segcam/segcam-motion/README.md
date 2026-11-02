@@ -44,9 +44,10 @@ segments are labelled `blob#…`. **Swarm backdrop** puts the windows on a trans
 
 **Face**, **Eyes**, **Mouth** and **Body** add those segments from `plugins/segcam/segcam-face`, which
 uses Apple's Vision on macOS and ONNX Runtime models on Windows and Linux. **Detect ▸ Faces
-only** shows just the face and body segments. On Windows the models take about 2 seconds to
-load the first time, then add about 12 ms to a 1080p frame, and the plugin ships its own
-`DirectML.dll`. As in segcam 1.1, faces run on every 2nd analysis, the even frame numbers at
+only** shows just the face and body segments. On Windows the models take about 3 seconds to
+load the first time, on a thread of their own, then add about 12 ms to a 1080p frame, and the
+plugin ships its own `DirectML.dll`. Resolume and the preview draw without faces until they are
+up; other hosts may be exporting, so their renders wait for the models. As in segcam 1.1, faces run on every 2nd analysis, the even frame numbers at
 30 fps: the analysis between shows the faces of the one before, with their IDs, or finds its
 own when the host doesn't hand that frame over. The face modes don't run in the web build yet.
 

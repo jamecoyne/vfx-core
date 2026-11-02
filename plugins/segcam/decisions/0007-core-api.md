@@ -18,11 +18,13 @@ What a host sees today, on `main` at 6bd4d2f:
 | `CpuEffect::keeps_state` | vfx-core | #11 |
 | `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core | #47 |
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |
+| `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core | #59 |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core | from the start |
 | `Context::frame_rate` | vfx-core | #50 |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core | from the start |
 | `FrameSource`: `with_frame`; `History` | vfx-core | from the start; `fixed` since #31 |
 | `FrameSource::held`; `History::next(before, held)` | vfx-core | #57 |
+| `FrameSource::live` (true for `History`) | vfx-core | #59 |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core | from the start |
 | `Gpu::share`, `Gpu::shared` (browsers only) | vfx-core | #47 |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core | from the start; `ViewMut::bands` since #11, `Argb` as bytemuck `Pod` since #39 |
@@ -30,6 +32,7 @@ What a host sees today, on `main` at 6bd4d2f:
 | `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host | #16; the frame rate since #50 |
 | `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host | #16 |
 | `CpuInstance::frames_held` | vfx-host | #57 |
+| `CpuInstance::values_known` | vfx-host | #59 |
 | `plugin::register`, `plugin`, `gpu` | vfx-host | #10 |
 | `controls::layout` | vfx-host | from the start |
 | `by_rows` (a frame in row bands over a work queue) | vfx-host | #38 |

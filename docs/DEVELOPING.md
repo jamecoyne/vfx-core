@@ -74,6 +74,9 @@ a host has neither. An effect's `region` tells hosts how far it reads past each 
 whether its output grows; `Context` gives it the time, frame number and render scale.
 `vfx_host::controls::layout` decides the layout for every target, so it is tested once.
 
+A `CpuEffect` with slow setup starts it in `values_known`, which OpenFX and FFGL call ahead of
+the first render.
+
 A `CpuEffect` that keeps work between renders says so with `keeps_state`. OpenFX, FFGL
 and the preview then keep one per instance (`vfx_host::CpuInstance`, which also starts it
 over after a panic, a seek back or a resize); After Effects never does. Either way every
@@ -96,11 +99,13 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `CpuEffect::keeps_state` | vfx-core | #11 |
 | `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core | #47 |
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |
+| `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core | #59 |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core | from the start |
 | `Context::frame_rate` | vfx-core | #50 |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core | from the start |
 | `FrameSource`: `with_frame`; `History` | vfx-core | from the start; `fixed` since #31 |
 | `FrameSource::held`; `History::next(before, held)` | vfx-core | #57 |
+| `FrameSource::live` (true for `History`) | vfx-core | #59 |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core | from the start |
 | `Gpu::share`, `Gpu::shared` (browsers only) | vfx-core | #47 |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core | from the start; `ViewMut::bands` since #11, `Argb` as bytemuck `Pod` since #39 |
@@ -108,6 +113,7 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host | #16; the frame rate since #50 |
 | `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host | #16 |
 | `CpuInstance::frames_held` | vfx-host | #57 |
+| `CpuInstance::values_known` | vfx-host | #59 |
 | `plugin::register`, `plugin`, `gpu` | vfx-host | #10 |
 | `controls::layout` | vfx-host | from the start |
 | `by_rows` (a frame in row bands over a work queue) | vfx-host | #38 |

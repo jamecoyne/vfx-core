@@ -187,6 +187,12 @@ impl CpuEffect for SegcamMotion {
         0
     }
 
+    fn values_known(&self, params: &ParamValues) {
+        if settings(params, false).faces.any() {
+            crate::faces::start();
+        }
+    }
+
     fn render(
         &mut self,
         frames: &mut dyn FrameSource,
