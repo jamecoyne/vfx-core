@@ -19,6 +19,7 @@ What a host sees today, on `main` at 6bd4d2f:
 | `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core | #47 |
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |
 | `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core | #59 |
+| `CpuEffect::render_to` and `Target` (a host's GPU frame the effect may draw its output into instead) | vfx-core | #70 |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core | from the start |
 | `Context::frame_rate` | vfx-core | #50 |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core | from the start |
@@ -26,13 +27,14 @@ What a host sees today, on `main` at 6bd4d2f:
 | `FrameSource::held`; `History::next(before, held)` | vfx-core | #57 |
 | `FrameSource::live` (true for `History`) | vfx-core | #59 |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core | from the start |
-| `Gpu::share`, `Gpu::shared` (browsers only) | vfx-core | #47 |
+| `Gpu::share`, `Gpu::shared` | vfx-core | #47 in browsers; native since #70 |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core | from the start; `ViewMut::bands` since #11, `Argb` as bytemuck `Pod` since #39 |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core | from the start |
 | `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host | #16; the frame rate since #50 |
 | `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host | #16 |
 | `CpuInstance::frames_held` | vfx-host | #57 |
 | `CpuInstance::values_known` | vfx-host | #59 |
+| `CpuInstance::render_to` | vfx-host | #70 |
 | `plugin::register`, `plugin`, `gpu` | vfx-host | #10 |
 | `controls::layout` | vfx-host | from the start |
 | `by_rows` (a frame in row bands over a work queue) | vfx-host | #38 |
@@ -53,8 +55,8 @@ For 1.0 the list above is the core API. It is written down once, in `docs/DEVELO
   its description, and that row is what jamecoyne reviews.
 - Defaults keep old targets compiling: every new trait method has a default, every new `Context`
   field has `Context::at` fill it. From 1.0 on, nothing in the table is removed or renamed.
-- Browser only items (`unfinished`, `share`, `shared`) stay marked as such and are the only
-  platform conditional parts of the API.
+- Browser only items (`unfinished`) stay marked as such and are the only platform conditional
+  part of the API.
 - The analysis on the GPU will add one more shape, an effect that reads and writes host GPU
   frames without a readback. That comes as its own ADR with the first host that keeps frames on
   the GPU.
