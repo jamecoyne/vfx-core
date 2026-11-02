@@ -207,10 +207,11 @@ pub fn frame_fits(pixels: &[f32], size: (u32, u32)) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 fn to_float(pixels: &[Argb<u8>], width: usize, float: &mut Vec<f32>) {
     float.resize(pixels.len() * 4, 0.0);
+    let table: [f32; 256] = std::array::from_fn(|b| (b as u8).to_unit());
     vfx_host::by_rows(float, width * 4, |y, dst| {
         let src = &pixels[y * width..][..width];
         for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
-            *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
+            *dst = [p.red, p.green, p.blue, p.alpha].map(|b| table[usize::from(b)]);
         }
     });
 }
