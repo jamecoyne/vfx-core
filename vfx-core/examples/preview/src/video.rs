@@ -1,11 +1,11 @@
 //! Video files as a source, decoded by `ffmpeg` / `ffprobe` processes on PATH (native
 //! only).
 //!
-//! Live playback: ffmpeg loops the file at its own frame rate and writes raw 8 bit ARGB
-//! frames to a pipe, the layout a CPU effect's history takes as is. A reader thread queues
-//! them with their times; the loop takes them in order, and a loop that falls behind loses
-//! the oldest, so the picture never trails the clock. Recording writes the output through
-//! [`Encoder`].
+//! Live playback: ffmpeg decodes to raw 8 bit ARGB frames on a pipe, the layout a CPU effect's
+//! history takes as is. A reader thread takes a file's frames from the pipe at its frame rate
+//! and queues them with their times; the loop takes them in order, and a loop that falls
+//! behind loses the oldest, so the picture never trails the clock. Recording writes the output
+//! through [`Encoder`].
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -13,6 +13,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use vfx_core::cpu::{Argb, Channel};
 
@@ -264,18 +265,13 @@ impl Info {
     }
 
     /// ffmpeg arguments that decode this input to raw 8 bit ARGB at `size` on stdout, from
-    /// `start` seconds (files only). `Pace::Live` plays files in real time (cameras
-    /// are real time already); `Pace::OneFrame` stops after the first frame.
+    /// `start` seconds (files only). `Pace::OneFrame` stops after the first frame. Not `-re`:
+    /// it hands over the first half second at once, which the queue would lose at every loop.
     fn decode_command(&self, start: f64, pace: Pace) -> Command {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error"]);
-        if self.file().is_some() {
-            if start > 0.0 {
-                cmd.args(["-ss", &format!("{start:.3}")]);
-            }
-            if pace == Pace::Live {
-                cmd.arg("-re");
-            }
+        if self.file().is_some() && start > 0.0 {
+            cmd.args(["-ss", &format!("{start:.3}")]);
         }
         let (w, h) = self.size;
         // Through RGBA first: swscale rounds YUV to ARGB differently, up to 3 levels off.
@@ -423,12 +419,22 @@ impl Video {
         let size = self.info.frame_pixels();
         let (fps, duration) = (self.info.fps, self.info.duration);
         let mut pixels = s.spare.pop().unwrap_or_else(|| bytemuck::zeroed_vec(size));
+        let mut first = None;
+        let mut read = 0u32;
         std::thread::spawn(move || {
             // Ends at the end of the file, or when a seek or drop kills this ffmpeg.
             while stdout
                 .read_exact(bytemuck::cast_slice_mut(&mut pixels))
                 .is_ok()
             {
+                if !camera {
+                    // Due by the clock from the first frame; a late one goes straight on.
+                    let now = Instant::now();
+                    let since_first = Duration::from_secs_f64(f64::from(read) / fps);
+                    let due = *first.get_or_insert(now) + since_first;
+                    std::thread::sleep(due.saturating_duration_since(now));
+                    read += 1;
+                }
                 let mut s = shared.lock().unwrap();
                 if s.generation != generation {
                     return;
@@ -656,7 +662,6 @@ impl Drop for Sound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
         let until = Instant::now() + Duration::from_secs(10);
@@ -721,8 +726,10 @@ mod tests {
     #[ignore]
     fn a_slow_loop_loses_the_oldest_frames() {
         let video = Video::open(Input::File(clip("queue-test")), 1920).unwrap();
-        wait_for("frames to drop", || video.take_arrived() > 0);
+        wait_for("the first frame", || video.take_arrived() > 0);
         std::thread::sleep(Duration::from_millis(400));
+        let arrived = video.take_arrived();
+        assert!(arrived <= 13, "{arrived} frames in 0.4 s at 25 fps");
 
         let mut pixels = Vec::new();
         let first = video.take_frame(&mut pixels).expect("a waiting frame");
