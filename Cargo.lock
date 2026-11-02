@@ -3452,6 +3452,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "image",
+ "js-sys",
  "ort",
  "pollster 1.0.1",
  "rfd",

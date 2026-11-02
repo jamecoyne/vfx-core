@@ -331,6 +331,8 @@ fn input_box(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actio
         egui::ComboBox::from_id_salt("input")
             // Leaves room for the refresh button beside it.
             .width(ui.available_width() - 32.0)
+            // A long file name would otherwise widen the panel past the window.
+            .truncate()
             .selected_text(shown)
             .show_ui(ui, |ui| {
                 if let Some(i) = pattern_items(ui, |i| status.image.is_none() && c.pattern == i) {
@@ -339,7 +341,6 @@ fn input_box(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actio
                         actions.clear_image = true;
                     }
                 }
-                #[cfg(not(target_arch = "wasm32"))]
                 source_items(ui, status, &mut actions.import, &mut actions.start_camera);
             });
         #[cfg(not(target_arch = "wasm32"))]
@@ -381,10 +382,15 @@ fn pattern_items(ui: &mut Ui, current: impl Fn(usize) -> bool) -> Option<usize> 
 
 /// The video-or-image and webcam rows of the source menus. A click sets `import` or
 /// `camera` for the caller to act on.
-#[cfg(not(target_arch = "wasm32"))]
 fn source_items(ui: &mut Ui, status: &Status, import: &mut bool, camera: &mut Option<usize>) {
+    // The browser build opens videos only (web_media.rs).
+    let open = if cfg!(target_arch = "wasm32") {
+        "Video…"
+    } else {
+        "Video or image…"
+    };
     ui.separator();
-    if ui.selectable_label(false, "Video or image…").clicked() {
+    if ui.selectable_label(false, open).clicked() {
         *import = true;
     }
     ui.separator();
