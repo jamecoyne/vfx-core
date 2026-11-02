@@ -140,6 +140,9 @@ fn dispatch(
             render_gpu(effect, in_args)?;
         }
         STAT_OK
+    } else if action == ACTION_BEGIN_SEQUENCE_RENDER && cpu {
+        begin_sequence(effect)?;
+        STAT_OK
     } else {
         STAT_REPLY_DEFAULT
     })
@@ -644,12 +647,27 @@ fn destroy_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     Ok(())
 }
 
-fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+/// The instance's kept effect, if it has one.
+fn kept<'a>(effect: ImageEffect) -> Result<Option<&'a Kept>, OfxStatus> {
     let kept = effect_props(effect)?
         .get_pointer(PROP_INSTANCE_DATA)
         .unwrap_or(ptr::null_mut());
     // SAFETY: set from a Box in create-instance and freed only in destroy-instance.
-    if let Some(kept) = unsafe { kept.cast::<Kept>().as_ref() } {
+    Ok(unsafe { kept.cast::<Kept>().as_ref() })
+}
+
+/// A sequence render, such as a Deliver, can follow an edit however recent the last render, so
+/// its first frame doesn't continue a stream and checks every earlier frame.
+fn begin_sequence(effect: ImageEffect) -> Result<(), OfxStatus> {
+    LOG.note("begin sequence render");
+    if let Some(kept) = kept(effect)? {
+        *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+    Ok(())
+}
+
+fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+    if let Some(kept) = kept(effect)? {
         let frame = in_args.get_double(PROP_TIME, 0)?.round() as i64;
         let last = *kept.last.lock().unwrap_or_else(|p| p.into_inner());
         let fixed = host::is_resolve() && streaming(last, frame);

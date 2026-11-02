@@ -6,6 +6,9 @@
 static Img history[32], output;
 static OfxPropertySetHandle history_props[32], output_props;
 static int reads;
+static OfxHost host;
+/* Resolve turns temporal clip access off, and is the host earlier frames are trusted in. */
+static int as_resolve;
 /* The plugin keeps what it worked out between renders, so it may read frames in any order and
    hold the current frame while it reads another. */
 static OfxPropertySetHandle temporal(OfxImageClipHandle c, OfxTime t) {
@@ -22,21 +25,92 @@ static OfxImageEffectHandle instance(int mode, int premult) {
     setDouble(src->props, kOfxImageEffectPropFrameRange, 0, 0);
     setDouble(src->props, kOfxImageEffectPropFrameRange, 1, 31);
     setString(src->props, kOfxImageEffectPropPreMultiplication, 0, premult ? kOfxImagePreMultiplied : kOfxImageUnPreMultiplied);
-    CHECK(find(e->props, kOfxImageEffectPropTemporalClipAccess, 0)->i[0] == 1, "effect temporal disabled");
-    CHECK(find(src->props, kOfxImageEffectPropTemporalClipAccess, 0)->i[0] == 1, "clip temporal disabled");
+    if (!as_resolve) {
+        CHECK(find(e->props, kOfxImageEffectPropTemporalClipAccess, 0)->i[0] == 1, "effect temporal disabled");
+        CHECK(find(src->props, kOfxImageEffectPropTemporalClipAccess, 0)->i[0] == 1, "clip temporal disabled");
+    }
     return e;
 }
+static void render_frame(OfxImageEffectHandle e, int t) {
+    OfxPropertySetHandle args=props_new();
+    setDouble(args,kOfxPropTime,0,t);
+    int window[4]={0,0,320,180}; setIntN(args,kOfxImageEffectPropRenderWindow,4,window);
+    reads=0;
+    CHECK(action(kOfxImageEffectActionRender,e,args,NULL)==kOfxStatOK,"render failed at %d",t);
+    CHECK(images_out==0,"image leak");
+}
+/* Changes frames 0 to `before`-1 or changes them back, as a grade upstream would. */
+static void edit_before(int before) {
+    for(int t=0;t<before;t++) {
+        unsigned char *data=history[t].data;
+        for(size_t i=0;i<(size_t)320*180*4;i++) if(i%4!=3) data[i]^=0xff;
+    }
+}
+/* Whether `kept` holds what a fresh instance renders of frame t. */
+static int same_as_fresh(int mode, int t) {
+    static unsigned char kept[320*180*4];
+    memcpy(kept,output.data,sizeof kept);
+    OfxImageEffectHandle fresh=instance(mode,0);
+    render_frame(fresh,t);
+    return !memcmp(kept,output.data,sizeof kept);
+}
+/* As Resolve: a stream of renders takes earlier frames as unchanged, and a sequence render
+   straight after an edit checks them on its first frame, then streams again. */
+static int edit_then_deliver(void) {
+    as_resolve=1;
+    setString(host.host,kOfxPropName,0,"DaVinci Resolve");
+    for(int t=0;t<32;t++) {
+        history[t]=img_new(0,0,320,180,kOfxBitDepthByte);
+        for(int y=0;y<180;y++) for(int x=0;x<320;x++) {
+            float v=20+t*6<=x && x<60+t*6 && 60<=y && y<105 ? .86f : .09f;
+            float *p=at(&history[t],x,y); p[0]=p[1]=p[2]=v; p[3]=1;
+        }
+        store(&history[t]);
+        history_props[t]=image_props(&history[t]);
+    }
+    output=img_new(0,0,320,180,kOfxBitDepthByte); output_props=image_props(&output);
+    temporal_image=temporal;
+    for(int m=0;m<2;m++) {
+        int mode=m?3:0;
+        OfxImageEffectHandle e=instance(mode,0);
+        render_frame(e,20); render_frame(e,21);
+        edit_before(22);
+        render_frame(e,22);
+        CHECK(reads==1,"mode %d: a stream read %d frames",mode,reads);
+        CHECK(!same_as_fresh(mode,22),"mode %d: a stream checked earlier frames",mode);
+        edit_before(22);
+
+        e=instance(mode,0);
+        render_frame(e,20); render_frame(e,21);
+        edit_before(22);
+        OfxPropertySetHandle sequence=props_new();
+        setDouble(sequence,kOfxImageEffectPropFrameRange,0,22);
+        setDouble(sequence,kOfxImageEffectPropFrameRange,1,31);
+        CHECK(action(kOfxImageEffectActionBeginSequenceRender,e,sequence,NULL)==kOfxStatOK,"begin sequence failed");
+        render_frame(e,22);
+        CHECK(reads>1,"mode %d: the first frame of a sequence read %d frames",mode,reads);
+        CHECK(same_as_fresh(mode,22),"mode %d: the first frame of a sequence missed the edit",mode);
+        render_frame(e,23);
+        CHECK(reads==1,"mode %d: the sequence's next frame read %d frames",mode,reads);
+        CHECK(same_as_fresh(mode,23),"mode %d: the sequence's next frame differs",mode);
+        edit_before(22);
+    }
+    printf("edit then deliver: %d failures\n",failures);
+    return failures?1:0;
+}
 /* argv: plugin input output mode depth top premult order, where order is 0 forwards, 1 backwards,
-   2 shuffled, 3 every frame cold on a fresh instance. Frames are written in frame order. */
+   2 shuffled, 3 every frame cold on a fresh instance. Frames are written in frame order.
+   Or argv: plugin deliver, for edit_then_deliver. */
 int main(int argc, char **argv) {
-    if (argc != 9) return 2;
+    if (argc != 9 && argc != 3) return 2;
     void *lib = open_plugin(argv[1]);
     if (!lib) { open_failed(); return 2; }
     OfxPlugin *(*getp)(int) = plugin_symbol(lib,"OfxGetPlugin");
     plugin = getp(0);
     CHECK(!strcmp(plugin->pluginIdentifier,"com.lofiscifi.SegcamMotionRust"),"wrong identity");
-    static OfxHost host; host.host=props_new(); host.fetchSuite=fetchSuite; plugin->setHost(&host);
+    host.host=props_new(); host.fetchSuite=fetchSuite; plugin->setHost(&host);
     CHECK(action(kOfxActionLoad,NULL,NULL,NULL)==kOfxStatOK,"load failed");
+    if (argc == 3) return edit_then_deliver();
     int mode=atoi(argv[4]), top=atoi(argv[6]), premult=atoi(argv[7]), order=atoi(argv[8]);
     const char *depth=atoi(argv[5])==8?kOfxBitDepthByte:atoi(argv[5])==16?kOfxBitDepthShort:kOfxBitDepthFloat;
     FILE *in=fopen(argv[2],"rb"), *out=fopen(argv[3],"wb");
