@@ -54,10 +54,12 @@ depths; `--preset 1.1` is the 1.1 look. A frame's time runs from the frame befor
 so it includes the conversion in and out and the pipe, about 2 ms a frame at 1080p. fps is 1000 over
 the past 40 median, p95 is of the past 40. The CLI's conversion in and out takes about 9 ms a
 frame at 8 bit and 11 ms at float at 1080p on an i7-12700K, so offline 8 bit and float rows compare,
-and rows from before this command don't. The frame hashes go to `target/bench/COMMIT`; that folder is the
-`--reference` of a later run on the same clip (`target/bench/COMMIT-cpu` for a `--cpu` run, which
-matches overlay; the GPU's swarm stays within a level of the CPU's, so it differs there). It prints
-the machine column from the system, every GPU with its driver: paste it, don't retype it.
+and rows from before this command don't. The frame hashes go to `target/bench/COMMIT` (`-dirty` for
+a changed tree); that folder is the `--reference` of a later run on the same clip
+(`target/bench/COMMIT-cpu` for a `--cpu` run, which matches overlay; the GPU's swarm stays within a
+level of the CPU's, so it differs there). It prints the machine column from the system: paste it,
+don't retype it. Windows gives every GPU with its driver and the one driving the display, macOS the
+GPU and the display, Linux the GPUs `lspci` lists.
 
 - Two runs of each, one timed run on a machine at a time. Builds count as load.
 - Report the median and p95 ms per render, for the first 40 frames and for the rest separately.
