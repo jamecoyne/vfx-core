@@ -472,7 +472,7 @@ impl Preview {
             Err("the frame size changed".to_string())
         } else {
             match self.effects.output(&self.gpu) {
-                Output::Cpu(pixels) if pixels.is_empty() => Ok(()), // no picture yet
+                Output::Cpu([]) => Ok(()), // no picture yet
                 Output::Cpu(pixels) => recording.encoder.write(pixels),
                 Output::Gpu(pixels) => recording.encoder.write_float(&pixels),
             }
