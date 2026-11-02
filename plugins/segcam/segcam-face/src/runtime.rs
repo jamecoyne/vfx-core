@@ -51,11 +51,18 @@ fn adapter_name(adapter: u32) -> Option<String> {
 /// The bundled models on ONNX Runtime.
 pub type OrtSegmenter = FaceSegmenter<OrtYuNet, OrtFaceMesh, OrtPicoDet>;
 
+static CHOSEN: OnceLock<Device> = OnceLock::new();
+
+/// The device [`fastest`] chose, once it has. Another user of the models follows this instead of
+/// running the trial again.
+pub fn chosen() -> Option<Device> {
+    CHOSEN.get().copied()
+}
+
 /// The bundled models on the fastest device, or on DirectML when it comes within
 /// `DIRECTML_MARGIN` of the CPU, with the mesh if `mesh` and bodies if `bodies`, or `None` if
 /// no device loads the detector. The first call times each device; later calls reuse its choice.
 pub fn fastest(mesh: bool, bodies: bool) -> Option<(OrtSegmenter, Device)> {
-    static CHOSEN: OnceLock<Device> = OnceLock::new();
     let (detector, face_mesh, device) = match CHOSEN.get() {
         Some(&device) => {
             let detector = OrtYuNet::new(YUNET_MODEL, device).ok()?;
@@ -207,15 +214,15 @@ pub fn set_cpu_threads(threads: usize) {
 }
 
 fn session(model: &[u8], device: Device) -> ort::Result<Session> {
-    // ONNX Runtime allows one environment per process.
-    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
-    let environment = match ENVIRONMENT.get() {
-        Some(environment) => environment,
-        None => {
-            let environment = ort::init().with_name("segcam").build()?;
-            ENVIRONMENT.get_or_init(|| environment)
-        }
-    };
+    // ONNX Runtime allows one environment per process, and threads load models side by side.
+    static ENVIRONMENT: OnceLock<Result<Environment, String>> = OnceLock::new();
+    let environment = ENVIRONMENT
+        .get_or_init(|| {
+            let built = ort::init().with_name("segcam").build();
+            built.map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| ort::Error::new(e.clone()))?;
     let builder = Session::builder(environment)?;
     let mut builder = match device {
         Device::Cpu => match CPU_THREADS.load(Ordering::Relaxed) {

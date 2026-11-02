@@ -143,6 +143,9 @@ impl VisionSegmenter {
         self.next_number += 1;
         if parts.face {
             self.push(Kind::Face, padded(face.rect, FACE_PADDING), face.score);
+            if let Some(pushed) = self.segments.last_mut() {
+                pushed.detected = Some(face.rect);
+            }
         }
         let regions = [
             (parts.eyes, Kind::EyeLeft, &face.left_eye, EYE_PADDING),
@@ -162,6 +165,8 @@ impl VisionSegmenter {
             number: self.next_number,
             rect,
             score,
+            detected: None,
+            landmarks: None,
         });
     }
 }

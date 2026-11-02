@@ -120,6 +120,60 @@ fn faces_from_a_live_history_match_fresh_renders() {
     }
 }
 
+/// A face variable means the same from the report and from a tracker: the model's box and points,
+/// not the box segcam draws. Within a little, as the report's models can be on DirectML.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn readings_are_what_the_model_finds() {
+    use segcam_face::runtime::{Device, OrtYuNet};
+    use segcam_face::{Detector, Pixels, YUNET_MODEL};
+
+    let Some(p) = portrait() else { return };
+    segcam_motion::faces::wait();
+    let pixels = frame(&p, W / 2, H / 2, None);
+    let found = OrtYuNet::new(YUNET_MODEL, Device::Cpu)
+        .unwrap()
+        .detect(&segcam_face::Image {
+            pixels: Pixels::Argb8(bytemuck::cast_slice(&pixels)),
+            width: W as usize,
+            height: H as usize,
+            stride: W as usize,
+        });
+    let (r, points) = (found[0].rect, found[0].landmarks);
+
+    let params = faces_with(&[]);
+    let mut effect = SegcamMotion::with_gpu(false);
+    let mut history = History::<u8>::default();
+    history.resize(W, H);
+    let before = effect.frames_before(&params, None);
+    history.next(before, before).copy_from_slice(&pixels);
+    let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+    let view = ViewMut::from_pixels(&mut out, W, H);
+    let count = history.len();
+    let ctx = Context::at(0.0);
+    effect.render(&mut history, count, ImageMut::U8(view), &params, &ctx);
+
+    let report = effect.report();
+    assert_eq!(report.draw.as_deref(), Some("CPU"));
+    assert!(report.faces.is_some());
+    let read = |name: &str| {
+        let reading = report.readings.iter().find(|r| r.name == name);
+        f64::from(reading.expect(name).value)
+    };
+    assert_eq!(read("face"), 1.0);
+    for (name, wanted) in [
+        ("facex", r.x + r.w / 2.0),
+        ("facey", r.y + r.h / 2.0),
+        ("facesize", r.w),
+        ("nosex", points[2].0),
+        ("nosey", points[2].1),
+        ("mouthx", (points[3].0 + points[4].0) / 2.0),
+        ("mouthy", (points[3].1 + points[4].1) / 2.0),
+    ] {
+        assert!((read(name) - wanted).abs() < 0.02, "{name}: {}", read(name));
+    }
+}
+
 /// Hands over `frames`, oldest first; `None` is a frame the host couldn't give.
 struct Frames<'a>(Vec<Option<&'a [Argb<u8>]>>);
 
