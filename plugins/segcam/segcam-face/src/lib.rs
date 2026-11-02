@@ -140,8 +140,9 @@ pub struct Parts {
 pub enum Segmenter {
     #[cfg(target_os = "macos")]
     Vision(vision::VisionSegmenter),
+    /// The models and the device they run on.
     #[cfg(feature = "onnx")]
-    Ort(Box<runtime::OrtSegmenter>),
+    Ort(Box<runtime::OrtSegmenter>, runtime::Device),
 }
 
 impl Segmenter {
@@ -153,9 +154,22 @@ impl Segmenter {
             return Some(Self::Vision(vision::VisionSegmenter::default()));
         }
         #[cfg(feature = "onnx")]
-        return runtime::fastest(true, true).map(|(segmenter, _)| Self::Ort(Box::new(segmenter)));
+        return runtime::fastest(true, true)
+            .map(|(segmenter, device)| Self::Ort(Box::new(segmenter), device));
         #[cfg(not(feature = "onnx"))]
         None
+    }
+
+    /// Where the models run, for a log line: Vision, or the ONNX Runtime device.
+    pub fn runs_on(&self) -> String {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Vision(_) => "Vision".to_owned(),
+            #[cfg(feature = "onnx")]
+            Self::Ort(_, device) => device.to_string(),
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => unreachable!("without a backend, best() makes no segmenter"),
+        }
     }
 
     /// The `parts` in `image`: each face and then its parts, then the bodies, each with a new number.
@@ -164,7 +178,7 @@ impl Segmenter {
             #[cfg(target_os = "macos")]
             Self::Vision(segmenter) => segmenter.find(image, parts),
             #[cfg(feature = "onnx")]
-            Self::Ort(segmenter) => segmenter.find(image, parts),
+            Self::Ort(segmenter, _) => segmenter.find(image, parts),
             #[cfg(not(any(target_os = "macos", feature = "onnx")))]
             _ => unreachable!("without a backend, best() makes no segmenter: {image:?} {parts:?}"),
         }
@@ -176,7 +190,7 @@ impl Segmenter {
             #[cfg(target_os = "macos")]
             Self::Vision(segmenter) => segmenter.continue_after(last),
             #[cfg(feature = "onnx")]
-            Self::Ort(segmenter) => segmenter.continue_after(last),
+            Self::Ort(segmenter, _) => segmenter.continue_after(last),
             #[cfg(not(any(target_os = "macos", feature = "onnx")))]
             _ => unreachable!("without a backend, best() makes no segmenter: {last}"),
         }

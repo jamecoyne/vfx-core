@@ -16,7 +16,8 @@ let segments = segmenter.find(&image, parts);
 ```
 
 macOS uses Vision, like segcam 1.1. Windows runs the models on its fastest GPU through
-DirectML, or on the CPU if that's faster. Linux runs them on the CPU.
+DirectML, or on the CPU if that's more than half again as fast in a short trial, since in a
+render the CPU kernels share the cores. Linux runs them on the CPU.
 For DirectML in a plugin, add `cargo:rustc-link-arg-cdylib=/DELAYLOAD:DirectML.dll` to its build
 script and ship `DirectML.dll` next to the plugin binary. Needed for Windows 10: the older
 DirectML isn't compatible with newer ONNX Runtime, so it has to be bundled to avoid falling back

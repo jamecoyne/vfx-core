@@ -51,9 +51,9 @@ fn adapter_name(adapter: u32) -> Option<String> {
 /// The bundled models on ONNX Runtime.
 pub type OrtSegmenter = FaceSegmenter<OrtYuNet, OrtFaceMesh, OrtPicoDet>;
 
-/// The bundled models on the fastest device, with the mesh if `mesh` and bodies if `bodies`, or
-/// `None` if no device loads the detector. The first call times each device; later calls reuse
-/// its choice.
+/// The bundled models on the fastest device, or on DirectML when it comes within
+/// `DIRECTML_MARGIN` of the CPU, with the mesh if `mesh` and bodies if `bodies`, or `None` if
+/// no device loads the detector. The first call times each device; later calls reuse its choice.
 pub fn fastest(mesh: bool, bodies: bool) -> Option<(OrtSegmenter, Device)> {
     static CHOSEN: OnceLock<Device> = OnceLock::new();
     let (detector, face_mesh, device) = match CHOSEN.get() {
@@ -70,7 +70,12 @@ pub fn fastest(mesh: bool, bodies: bool) -> Option<(OrtSegmenter, Device)> {
                 height: 360,
                 stride: 640,
             };
-            let best = trials(&image, mesh).into_iter().next()?;
+            let trials = trials(&image, mesh);
+            let times: Vec<_> = trials
+                .iter()
+                .map(|trial| (trial.device, trial.time))
+                .collect();
+            let best = trials.into_iter().nth(preferred(&times)?)?;
             (
                 best.detector,
                 best.mesh,
@@ -96,6 +101,29 @@ pub struct Trial {
 const TIMED_RUNS: usize = 9;
 #[cfg(windows)]
 const MAX_ADAPTERS: u32 = 8;
+
+/// How much longer than the CPU DirectML may take in the trial and still be picked. The trial
+/// runs the models alone with every core free; in a render the CPU kernels share the cores with
+/// the analysis and the host. On an APU where the two timed close, the runs that picked the CPU
+/// used three times the CPU and rendered 10 to 20 ms slower (#66).
+#[cfg(windows)]
+pub const DIRECTML_MARGIN: f64 = 1.5;
+
+/// Which of `times` (each trial's device and time, fastest first) to keep: the fastest, unless
+/// that is the CPU and a DirectML adapter came within `DIRECTML_MARGIN` of it.
+fn preferred(times: &[(Device, Duration)]) -> Option<usize> {
+    #[cfg(windows)]
+    if let Some(&(Device::Cpu, cpu)) = times.first() {
+        let close = |time: &Duration| time.as_secs_f64() <= cpu.as_secs_f64() * DIRECTML_MARGIN;
+        if let Some(index) = times
+            .iter()
+            .position(|(device, time)| *device != Device::Cpu && close(time))
+        {
+            return Some(index);
+        }
+    }
+    (!times.is_empty()).then_some(0)
+}
 
 /// Loads the face models, with the mesh if `mesh`, on the CPU and each DirectML adapter, times a
 /// few runs on `image`, and returns the devices that worked, fastest first.
@@ -365,5 +393,51 @@ impl Landmarker for OrtFaceMesh {
         mesh::fill_input(image, &crop, &mut self.input)?;
         let (points, presence) = self.run().ok()?;
         mesh::landmarks_from(&points, presence, &crop, image)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn no_trials_pick_nothing() {
+        assert_eq!(preferred(&[]), None);
+    }
+
+    #[test]
+    fn the_fastest_is_kept_when_it_is_alone_or_on_directml() {
+        assert_eq!(preferred(&[(Device::Cpu, ms(10))]), Some(0));
+        #[cfg(windows)]
+        assert_eq!(
+            preferred(&[(Device::DirectMl(0), ms(8)), (Device::Cpu, ms(10))]),
+            Some(0)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directml_close_behind_the_cpu_is_picked() {
+        let times = [
+            (Device::Cpu, ms(10)),
+            (Device::DirectMl(1), ms(14)),
+            (Device::DirectMl(0), ms(15)),
+        ];
+        assert_eq!(preferred(&times), Some(1));
+        assert_eq!(
+            preferred(&[(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(15))]),
+            Some(1)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_cpu_more_than_the_margin_faster_is_kept() {
+        let times = [(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(16))];
+        assert_eq!(preferred(&times), Some(0));
     }
 }
