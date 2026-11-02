@@ -30,8 +30,8 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 when `--frames` or `--seconds` ends the run:
 
 ```text
-stats t=12.1 effect=segcam-motion on=cpu source=59.9 rendered=45.6 rendered_ms=14.1 worst_ms=38.6 screen=22.8 size=1920x1080 cpu=20.2 app_cpu=230.8 mem_mb=2620 gpu=n/a
-done frames=1108 seconds=20.01 effect=segcam-motion on=cpu source=59.9 rendered=44.8 rendered_ms=14.3 worst_ms=141.7 screen=22.4
+stats t=18.4 effect=segcam-motion on=cpu source=59.9 rendered=39.4 rendered_ms=8.9 worst_ms=23.5 screen=19.7 size=1920x1080 cpu=29.2 app_cpu=239.9 mem_mb=1932 gpu=n/a
+done frames=905 seconds=20.00 effect=segcam-motion on=cpu source=59.9 rendered=37.2 rendered_ms=10.0 worst_ms=2661.5 screen=18.6
 ```
 
 The keys follow the frames: `source` is the rate they come in at (the file's or camera's,
@@ -51,7 +51,8 @@ nothing is presented so `screen` is 0, and a test pattern (which changes every l
 the effect's throughput in `rendered`.
 
 The window's bottom bar shows the same, source to screen: `source 60 fps | segcam Motion on
-CPU: rendered 45 fps, 14 ms, worst 138 ms | screen 22 fps`, then the machine.
+CPU: rendered 39 fps, 9 ms, worst 24 ms | screen 20 fps`, then the machine. The `done` line's
+worst above is the face models loading in the first render.
 
 In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
 `--effect` and a file, mistakes show in the panel as before.
