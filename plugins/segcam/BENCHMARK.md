@@ -52,9 +52,12 @@ It builds the release CLI, decodes the clip's first 300 frames with ffmpeg to ra
 that file to the CLI. Without `--preset` and `--depth` it runs the first four presets at both
 depths; `--preset 1.1` is the 1.1 look. A frame's time runs from the frame before it out of the CLI,
 so it includes the conversion in and out and the pipe, about 2 ms a frame at 1080p. fps is 1000 over
-the past 40 median, p95 is of the past 40. The frame hashes go to `target/bench/COMMIT`; that folder is
-the `--reference` of a later run (for a GPU run, of a `--cpu` run, `target/bench/COMMIT-cpu`). It
-prints the machine column from the system, every GPU with its driver: paste it, don't retype it.
+the past 40 median, p95 is of the past 40. The CLI's conversion in costs 23 ms a frame at 8 bit and
+6 ms at float at 1080p on an i7-12700K, and hosts at 8 bit don't pay it, so offline 8 bit and float
+rows don't compare with each other. The frame hashes go to `target/bench/COMMIT`; that folder is the
+`--reference` of a later run on the same clip (`target/bench/COMMIT-cpu` for a `--cpu` run, which
+matches overlay; the GPU's swarm stays within a level of the CPU's, so it differs there). It prints
+the machine column from the system, every GPU with its driver: paste it, don't retype it.
 
 - Two runs of each, one timed run on a machine at a time. Builds count as load.
 - Report the median and p95 ms per render, for the first 40 frames and for the rest separately.
