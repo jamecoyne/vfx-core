@@ -171,9 +171,17 @@ pub trait CpuEffect: Send {
 /// size of the render, on `gpu`, the device the host [shared](Gpu::share). The effect draws
 /// straight colour into it, top row first, as it would into an 8-bit output.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct Target<'a> {
     pub gpu: &'a Gpu,
     pub frame: &'a Frame,
+}
+
+impl<'a> Target<'a> {
+    /// `frame` on `gpu`, the device the host shared, for the effect's output.
+    pub fn new(gpu: &'a Gpu, frame: &'a Frame) -> Self {
+        Self { gpu, frame }
+    }
 }
 
 /// What an effect crate hands its host: a GPU or a CPU effect.

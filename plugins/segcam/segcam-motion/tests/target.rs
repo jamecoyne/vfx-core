@@ -144,10 +144,7 @@ fn a_swarm_drawn_into_a_host_frame_is_the_one_read_back() {
             read_back.render(source, count, ImageMut::U8(view), params, &ctx);
             let view = ViewMut::from_pixels(&mut out, W, H);
             let source = &mut Frames(&frames[first..=n]);
-            let to = Target {
-                gpu,
-                frame: &target,
-            };
+            let to = Target::new(gpu, &target);
             let took = drawn_into.render_to(source, count, ImageMut::U8(view), to, params, &ctx);
             assert!(took, "{name}: frame {n} wasn't drawn into the target");
             assert!(argb(&target.read(gpu)) == want, "{name}: frame {n}");

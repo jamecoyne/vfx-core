@@ -528,11 +528,8 @@ unsafe fn process_cpu(
     let count = cpu.history.len();
     let out = ImageMut::U8(ViewMut::from_pixels(&mut cpu.rendered, w as i32, h as i32));
     #[cfg(target_os = "windows")]
-    let target =
-        (me.interop.as_ref().zip(me.target.as_ref())).map(|(interop, frame)| vfx_core::Target {
-            gpu: interop.gpu(),
-            frame,
-        });
+    let target = (me.interop.as_ref().zip(me.target.as_ref()))
+        .map(|(interop, frame)| vfx_core::Target::new(interop.gpu(), frame));
     #[cfg(not(target_os = "windows"))]
     let target = None;
     let effect = &cpu.effect;

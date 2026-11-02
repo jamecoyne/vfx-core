@@ -63,10 +63,7 @@ fn an_effect_that_takes_no_target_renders_into_its_output() {
     let frame = Frame::new(&gpu, 2, 2, wgpu::TextureFormat::Rgba32Float);
     let mut out = vec![Argb::<u8>::default(); 4];
     let output = ImageMut::U8(ViewMut::from_pixels(&mut out, 2, 2));
-    let target = Target {
-        gpu: &gpu,
-        frame: &frame,
-    };
+    let target = Target::new(&gpu, &frame);
     let params = ParamValues::new(&[]);
     let took = Fill.render_to(&mut NoFrames, 1, output, target, &params, &Context::at(0.0));
     assert!(!took, "the frame went into the target");
