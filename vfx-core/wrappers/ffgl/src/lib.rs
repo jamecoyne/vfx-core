@@ -476,7 +476,8 @@ unsafe fn process_cpu(
         cpu.rendered
             .resize(w as usize * h as usize, Argb::default());
     }
-    let before = cpu.effect.frames_before(&values);
+    let before = cpu.effect.frames_before(&values, None);
+    let held = cpu.effect.frames_held(&values, None);
     let canvas = cpu.ram.as_ref().expect("made above");
     if cpu.timing.is_some() {
         // SAFETY: the host's context is current.
@@ -489,7 +490,7 @@ unsafe fn process_cpu(
             tex.handle,
             (tex.hardware_width, tex.hardware_height),
             args.host_fbo,
-            cpu.history.next(before),
+            cpu.history.next(before, held),
         )
     };
     let read = started.elapsed();

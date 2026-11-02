@@ -30,7 +30,7 @@ pub struct Tile {
     /// `stored.w` x `stored.h`.
     pub pixels: Vec<TilePixel>,
     pub title: String,
-    /// Buried under a later tile: still in the pile, never drawn.
+    /// Buried under a later tile or past the pile's end: still counted, never drawn.
     pub hidden: bool,
     /// Its title bar, made when it was cut, so renders that draw it again needn't.
     pub bar: Option<TitleBar>,

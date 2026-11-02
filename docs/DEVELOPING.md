@@ -79,6 +79,8 @@ and the preview then keep one per instance (`vfx_host::CpuInstance`, which also 
 over after a panic, a seek back or a resize); After Effects never does. Either way every
 frame must match a fresh effect's, even after earlier frames change upstream or a host
 misses one: test it with `vfx_host::contract::check`, as `plugins/segcam/segcam-motion` does.
+One that can work from what it kept says how few frames a host keeping its own need hold in
+full with `frames_held`.
 
 ## What a host implements
 
@@ -90,19 +92,22 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | Item | Where | Since |
 |---|---|---|
 | `Effect` (GPU): `params`, `prepare`, `render`, `layer_inputs`, `layer_name`, `render_layers`, `region` | vfx-core | from the start |
-| `CpuEffect`: `params`, `frames_before`, `render` | vfx-core | from the start |
+| `CpuEffect`: `params`, `frames_before` (the frame rate since #57), `render` | vfx-core | from the start |
 | `CpuEffect::keeps_state` | vfx-core | #11 |
 | `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core | #47 |
+| `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core | from the start |
 | `Context::frame_rate` | vfx-core | #50 |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core | from the start |
 | `FrameSource`: `with_frame`; `History` | vfx-core | from the start; `fixed` since #31 |
+| `FrameSource::held`; `History::next(before, held)` | vfx-core | #57 |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core | from the start |
 | `Gpu::share`, `Gpu::shared` (browsers only) | vfx-core | #47 |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core | from the start; `ViewMut::bands` since #11, `Argb` as bytemuck `Pod` since #39 |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core | from the start |
 | `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host | #16; the frame rate since #50 |
 | `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host | #16 |
+| `CpuInstance::frames_held` | vfx-host | #57 |
 | `plugin::register`, `plugin`, `gpu` | vfx-host | #10 |
 | `controls::layout` | vfx-host | from the start |
 | `by_rows` (a frame in row bands over a work queue) | vfx-host | #38 |
@@ -279,7 +284,8 @@ conversions. Each host also has a harness that runs the effects:
   per render. Concurrent renders (After Effects MFR, OpenFX hosts) each borrow their own.
 - CPU effects read host frames where they are. After Effects' buffers are read at their own
   depth without copies. OpenFX frames are converted one at a time. Resolume and the preview hand
-  over one frame at a time, so they keep a history of recent frames.
+  over one frame at a time, so they keep a history of recent frames, in full as far as the
+  effect's `frames_held` asks.
 - Plugins never use wgpu's OpenGL backend. Headless devices use Vulkan, Metal or DX12, because
   the OpenGL backend releases whatever context is current when it starts, and on Windows that's
   the FFGL host's. The preview creates its own instance.
