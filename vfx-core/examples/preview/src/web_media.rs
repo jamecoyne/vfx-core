@@ -6,7 +6,7 @@
 //! Browsers answer a file pick or a camera request later, so both land in a [`Pending`]
 //! the app checks each frame.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::LazyLock;
 
@@ -38,6 +38,81 @@ pub struct WebVideo {
     canvas: Option<(OffscreenCanvas, OffscreenCanvasRenderingContext2d)>,
     /// The video time of the last frame copied, so a paused video isn't copied again.
     last: Option<f64>,
+    /// The last frame the browser presented, its media time and count, from
+    /// `requestVideoFrameCallback`; `None` until the first.
+    presented: Rc<Cell<Option<(f64, u32)>>>,
+    /// Whether the browser reports presented frames. Without that, copies follow the clock.
+    reports_frames: bool,
+    /// The count of the last presented frame copied.
+    copied: Option<u32>,
+    /// The frame callback and its pending request, cancelled and freed on drop.
+    watch: Option<Watch>,
+}
+
+/// A `requestVideoFrameCallback` callback: the time now and the frame's metadata.
+type FrameCallback = Closure<dyn FnMut(JsValue, JsValue)>;
+
+/// A standing `requestVideoFrameCallback`: the callback asks for the next one itself and
+/// keeps the request's id, so [`Watch::cancel`] can end it.
+struct Watch {
+    callback: Rc<RefCell<Option<FrameCallback>>>,
+    pending: Rc<Cell<f64>>,
+    video: JsValue,
+}
+
+impl Watch {
+    /// Asks the browser for a callback per presented frame, keeping `presented` current. None
+    /// where the browser has no `requestVideoFrameCallback` (web-sys has no binding for it yet).
+    fn new(video: &HtmlVideoElement, presented: &Rc<Cell<Option<(f64, u32)>>>) -> Option<Self> {
+        let target: &JsValue = video.as_ref();
+        let request = Reflect::get(target, &"requestVideoFrameCallback".into())
+            .ok()?
+            .dyn_into::<js_sys::Function>()
+            .ok()?;
+        let callback: Rc<RefCell<Option<FrameCallback>>> = Rc::new(RefCell::new(None));
+        let pending = Rc::new(Cell::new(0.0));
+        let (presented, own, next, video, again) = (
+            presented.clone(),
+            callback.clone(),
+            pending.clone(),
+            target.clone(),
+            request.clone(),
+        );
+        *callback.borrow_mut() = Some(Closure::new(move |_now: JsValue, metadata: JsValue| {
+            let number = |name: &str| Reflect::get(&metadata, &name.into()).ok()?.as_f64();
+            if let (Some(time), Some(count)) = (number("mediaTime"), number("presentedFrames")) {
+                presented.set(Some((time, count as u32)));
+            }
+            if let Some(callback) = own.borrow().as_ref()
+                && let Ok(id) = again.call1(&video, callback.as_ref().unchecked_ref())
+            {
+                next.set(id.as_f64().unwrap_or(0.0));
+            }
+        }));
+        let id = {
+            let callback = callback.borrow();
+            let callback = callback.as_ref().expect("set above");
+            request
+                .call1(target, callback.as_ref().unchecked_ref())
+                .ok()?
+        };
+        pending.set(id.as_f64().unwrap_or(0.0));
+        Some(Self {
+            callback,
+            pending,
+            video: target.clone(),
+        })
+    }
+
+    /// Cancels the pending request and frees the callback.
+    fn cancel(&self) {
+        if let Ok(cancel) = Reflect::get(&self.video, &"cancelVideoFrameCallback".into())
+            && let Ok(cancel) = cancel.dyn_into::<js_sys::Function>()
+        {
+            let _ = cancel.call1(&self.video, &self.pending.get().into());
+        }
+        self.callback.borrow_mut().take();
+    }
 }
 
 fn error(e: JsValue) -> String {
@@ -73,6 +148,9 @@ impl WebVideo {
         url: Option<String>,
     ) -> Self {
         let _ = video.play();
+        let presented = Rc::new(Cell::new(None));
+        let watch = Watch::new(&video, &presented);
+        let reports_frames = watch.is_some();
         Self {
             video,
             name,
@@ -80,6 +158,10 @@ impl WebVideo {
             url,
             canvas: None,
             last: None,
+            presented,
+            reports_frames,
+            copied: None,
+            watch,
         }
     }
 
@@ -103,6 +185,14 @@ impl WebVideo {
     /// Seconds into the video (for a camera, since it started).
     pub fn position(&self) -> f64 {
         self.video.current_time()
+    }
+
+    /// The time that names the frame the effect sees: the last presented frame's media time,
+    /// so a frame shown twice renders once; the playback clock where frames aren't reported.
+    pub fn frame_time(&self) -> f64 {
+        self.presented
+            .get()
+            .map_or_else(|| self.video.current_time(), |(time, _)| time)
     }
 
     /// Infinite for a camera.
@@ -134,10 +224,17 @@ impl WebVideo {
     }
 
     /// Copies the current frame into `frame` (sized as [`WebVideo::size`] says) when it's
-    /// new. Returns whether it copied.
+    /// new: once per frame the browser presented, so a paused video or a camera between
+    /// frames isn't copied again. Returns whether it copied.
     pub fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> Result<bool, String> {
         let time = self.video.current_time();
-        if self.last == Some(time) && !self.is_camera() {
+        let presented = self.presented.get().map(|(_, count)| count);
+        let fresh = match (self.reports_frames, presented) {
+            (true, Some(count)) => self.copied != Some(count),
+            (true, None) => false,
+            (false, _) => self.last != Some(time) || self.is_camera(),
+        };
+        if !fresh {
             return Ok(false);
         }
         let (w, h) = (frame.width, frame.height);
@@ -187,12 +284,16 @@ impl WebVideo {
             },
         );
         self.last = Some(time);
+        self.copied = presented;
         Ok(true)
     }
 }
 
 impl Drop for WebVideo {
     fn drop(&mut self) {
+        if let Some(watch) = &self.watch {
+            watch.cancel();
+        }
         let _ = self.video.pause();
         self.video.set_src_object(None);
         if let Some(stream) = &self.camera {

@@ -353,14 +353,13 @@ impl Preview {
             }
         }
         let video = self.web_video.as_ref().expect("checked above");
-        let position = video.position();
         self.sources = modulation::sources(
             self.time,
-            Some((position, video.duration())),
+            Some((video.position(), video.duration())),
             [0.0; 5],
             modulation::FACE_NONE,
         );
-        position
+        video.frame_time()
     }
 
     /// The panel's source and transport actions, in the browser.
