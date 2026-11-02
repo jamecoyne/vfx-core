@@ -1,16 +1,24 @@
 //! Video files as a source, decoded by `ffmpeg` / `ffprobe` processes on PATH (native
 //! only).
 //!
-//! Live playback: ffmpeg loops the file at its own frame rate and writes raw RGBA8
-//! frames to a pipe. A reader thread converts each one to the pipeline's float format
-//! and keeps only the newest, so a slow frame on the GPU side drops video frames
-//! instead of falling behind. Recording writes the output through [`Encoder`].
+//! Live playback: ffmpeg loops the file at its own frame rate and writes raw 8 bit ARGB
+//! frames to a pipe, the layout a CPU effect's history takes as is. A reader thread queues
+//! them with their times; the loop takes them in order, and a loop that falls behind loses
+//! the oldest, so the picture never trails the clock. Recording writes the output through
+//! [`Encoder`].
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
+
+use vfx_core::cpu::{Argb, Channel};
+
+/// Decoded frames waiting for the loop, at most: enough for a render that runs long, few
+/// enough that a loop that stays behind shows the picture no more than this many frames late.
+const QUEUE: usize = 2;
 
 /// File extensions treated as video when dropped on the window.
 const EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv"];
@@ -251,11 +259,11 @@ impl Info {
         Err("no frame rate the camera supports worked".into())
     }
 
-    fn frame_bytes(&self) -> usize {
-        (self.size.0 * self.size.1 * 4) as usize
+    fn frame_pixels(&self) -> usize {
+        (self.size.0 * self.size.1) as usize
     }
 
-    /// ffmpeg arguments that decode this input to raw RGBA8 at `size` on stdout, from
+    /// ffmpeg arguments that decode this input to raw 8 bit ARGB at `size` on stdout, from
     /// `start` seconds (files only). `Pace::Live` plays files in real time (cameras
     /// are real time already); `Pace::OneFrame` stops after the first frame.
     fn decode_command(&self, start: f64, pace: Pace) -> Command {
@@ -270,6 +278,7 @@ impl Info {
             }
         }
         let (w, h) = self.size;
+        // Through RGBA first: swscale rounds YUV to ARGB differently, up to 3 levels off.
         let filter = if self.fit {
             format!(
                 "format=rgba,scale={w}:{h}:force_original_aspect_ratio=decrease,\
@@ -277,13 +286,13 @@ impl Info {
                 self.rate
             )
         } else {
-            format!("scale={w}:{h},fps={}", self.rate)
+            format!("scale={w}:{h},format=rgba,fps={}", self.rate)
         };
         cmd.args(self.input.args()).args(["-an", "-vf"]).arg(filter);
         if pace == Pace::OneFrame {
             cmd.args(["-frames:v", "1"]);
         }
-        cmd.args(["-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+        cmd.args(["-pix_fmt", "argb", "-f", "rawvideo", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -297,11 +306,6 @@ fn parse_rate(rate: &str) -> Option<f64> {
     (fps.is_finite() && fps > 0.0).then_some(fps)
 }
 
-/// 8-bit RGBA to the pipeline's input: straight alpha, gamma-encoded floats.
-fn to_float(raw: &[u8]) -> Vec<f32> {
-    raw.iter().map(|&b| b as f32 / 255.0).collect()
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum Pace {
     /// Real time, to the end.
@@ -311,22 +315,34 @@ enum Pace {
 }
 
 /// Live playback that can pause and seek. Each seek replaces the ffmpeg process with
-/// one started at the new position; a reader thread per process keeps the newest
-/// frame, and frames from a replaced process are ignored.
+/// one started at the new position; a reader thread per process queues its frames, and
+/// frames from a replaced process are ignored.
 pub struct Video {
     pub info: Info,
     shared: Arc<Mutex<Playback>>,
+}
+
+struct Decoded {
+    pixels: Vec<Argb<u8>>,
+    time: f64,
 }
 
 struct Playback {
     /// Bumped on every seek, so old reader threads know to stop.
     generation: u64,
     child: Option<Child>,
-    latest: Option<Vec<f32>>,
+    /// Oldest first, at most [`QUEUE`].
+    queue: VecDeque<Decoded>,
+    /// Buffers to decode into again, so a frame allocates nothing.
+    spare: Vec<Vec<Argb<u8>>>,
+    /// The time of the frame last taken, or where the last seek landed.
+    position: f64,
     /// Where the current decode started, in seconds.
     start: f64,
     /// Frames the current decode has delivered.
     frames: u64,
+    /// Frames that arrived since the last [`Video::take_arrived`], dropped ones too.
+    arrived: u64,
     playing: bool,
     /// A playing file reached its end (the caller loops it with `seek`).
     ended: bool,
@@ -351,9 +367,12 @@ impl Video {
             shared: Arc::new(Mutex::new(Playback {
                 generation: 0,
                 child: None,
-                latest: None,
+                queue: VecDeque::new(),
+                spare: Vec::new(),
+                position: 0.0,
                 start: 0.0,
                 frames: 0,
+                arrived: 0,
                 playing: true,
                 ended: false,
             })),
@@ -390,24 +409,41 @@ impl Video {
         let mut stdout = child.stdout.take().expect("stdout is piped");
         s.generation += 1;
         s.child = Some(child);
+        s.position = position;
         s.start = position;
         s.frames = 0;
         s.playing = play || camera;
         s.ended = false;
+        while let Some(old) = s.queue.pop_front() {
+            s.spare.push(old.pixels);
+        }
 
         let generation = s.generation;
         let shared = Arc::clone(&self.shared);
-        let mut raw = vec![0u8; self.info.frame_bytes()];
+        let size = self.info.frame_pixels();
+        let (fps, duration) = (self.info.fps, self.info.duration);
+        let mut pixels = s.spare.pop().unwrap_or_else(|| bytemuck::zeroed_vec(size));
         std::thread::spawn(move || {
             // Ends at the end of the file, or when a seek or drop kills this ffmpeg.
-            while stdout.read_exact(&mut raw).is_ok() {
-                let pixels = to_float(&raw);
+            while stdout
+                .read_exact(bytemuck::cast_slice_mut(&mut pixels))
+                .is_ok()
+            {
                 let mut s = shared.lock().unwrap();
                 if s.generation != generation {
                     return;
                 }
-                s.latest = Some(pixels);
+                let time = (s.start + s.frames as f64 / fps).min(duration);
                 s.frames += 1;
+                s.arrived += 1;
+                let next = if s.queue.len() == QUEUE {
+                    s.queue.pop_front().map(|oldest| oldest.pixels)
+                } else {
+                    s.spare.pop()
+                };
+                let next = next.unwrap_or_else(|| bytemuck::zeroed_vec(size));
+                let pixels = std::mem::replace(&mut pixels, next);
+                s.queue.push_back(Decoded { pixels, time });
             }
             let mut s = shared.lock().unwrap();
             if s.generation == generation && s.playing {
@@ -417,25 +453,51 @@ impl Video {
         Ok(())
     }
 
-    /// The newest decoded frame, if one arrived since the last call.
-    pub fn take_frame(&self) -> Option<Vec<f32>> {
-        self.shared.lock().unwrap().latest.take()
+    /// Swaps the oldest waiting frame into `pixels`, whose old buffer is decoded into again,
+    /// and returns its time. None when nothing arrived since the last call.
+    pub fn take_frame(&self, pixels: &mut Vec<Argb<u8>>) -> Option<f64> {
+        let mut s = self.shared.lock().unwrap();
+        let frame = s.queue.pop_front()?;
+        let old = std::mem::replace(pixels, frame.pixels);
+        if !old.is_empty() {
+            s.spare.push(old);
+        }
+        s.position = frame.time;
+        Some(frame.time)
     }
 
-    /// Where playback is in the file (or how long a camera has run), in seconds.
+    /// As [`Video::take_frame`], skipping to the newest waiting frame, for a layer that
+    /// has no history to keep whole.
+    pub fn take_newest(&self, pixels: &mut Vec<Argb<u8>>) -> Option<f64> {
+        {
+            let mut s = self.shared.lock().unwrap();
+            while s.queue.len() > 1 {
+                let old = s.queue.pop_front().expect("more than one");
+                s.spare.push(old.pixels);
+            }
+        }
+        self.take_frame(pixels)
+    }
+
+    /// The frames that arrived from ffmpeg since the last call.
+    pub fn take_arrived(&self) -> u64 {
+        std::mem::take(&mut self.shared.lock().unwrap().arrived)
+    }
+
+    /// Where playback is in the file (or how long a camera has run), in seconds: the frame
+    /// last taken.
     pub fn position(&self) -> f64 {
-        let s = self.shared.lock().unwrap();
-        let played = s.frames.saturating_sub(1) as f64 / self.info.fps;
-        (s.start + played).min(self.info.duration)
+        self.shared.lock().unwrap().position
     }
 
     pub fn playing(&self) -> bool {
         self.shared.lock().unwrap().playing
     }
 
-    /// Whether a playing file has reached its end.
+    /// Whether a playing file has reached its end and its last frame was taken.
     pub fn ended(&self) -> bool {
-        self.shared.lock().unwrap().ended
+        let s = self.shared.lock().unwrap();
+        s.ended && s.queue.is_empty()
     }
 }
 
@@ -491,14 +553,15 @@ const RECORD_FPS: u32 = 30;
 pub struct Encoder {
     child: Child,
     stdin: Option<ChildStdin>,
-    raw: Vec<u8>,
+    /// A float frame as 8 bit, kept for the next.
+    raw: Vec<Argb<u8>>,
 }
 
 impl Encoder {
     pub fn record(size: (u32, u32), out: &Path) -> Result<Self, String> {
         let mut child = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s",
+                "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "argb", "-s",
             ])
             .arg(format!("{}x{}", size.0, size.1))
             .args(["-use_wallclock_as_timestamps", "1", "-i", "-"])
@@ -518,19 +581,28 @@ impl Encoder {
         })
     }
 
-    /// Writes one pipeline output frame (float RGBA).
-    pub fn write(&mut self, pixels: &[f32]) -> Result<(), String> {
-        self.raw.clear();
-        self.raw.extend(
-            pixels
-                .iter()
-                .map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8),
-        );
+    /// Writes one output frame as it is.
+    pub fn write(&mut self, pixels: &[Argb<u8>]) -> Result<(), String> {
         self.stdin
             .as_mut()
             .expect("open until finish")
-            .write_all(&self.raw)
+            .write_all(bytemuck::cast_slice(pixels))
             .map_err(|_| "ffmpeg stopped accepting frames".to_string())
+    }
+
+    /// Writes one output frame of a GPU effect (float RGBA).
+    pub fn write_float(&mut self, pixels: &[f32]) -> Result<(), String> {
+        let mut raw = std::mem::take(&mut self.raw);
+        raw.clear();
+        raw.extend(pixels.as_chunks::<4>().0.iter().map(|&[r, g, b, a]| Argb {
+            alpha: u8::from_unit(a),
+            red: u8::from_unit(r),
+            green: u8::from_unit(g),
+            blue: u8::from_unit(b),
+        }));
+        let written = self.write(&raw);
+        self.raw = raw;
+        written
     }
 
     /// Closes the input and waits for ffmpeg to finish the file.
@@ -594,12 +666,9 @@ mod tests {
         }
     }
 
-    /// Seeks paused and playing, and reports the end. Needs ffmpeg:
-    /// `cargo test -p vfx-preview -- --ignored`.
-    #[test]
-    #[ignore]
-    fn seeks_pauses_and_ends() {
-        let dir = std::env::temp_dir().join("vfx-preview-seek-test");
+    /// A 3 s, 25 fps clip for one test to play.
+    fn clip(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vfx-preview-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("clip.mp4");
         let made = Command::new("ffmpeg")
@@ -610,14 +679,24 @@ mod tests {
             .status()
             .unwrap();
         assert!(made.success());
+        clip
+    }
 
-        let video = Video::open(Input::File(clip), 1920).unwrap();
+    /// Seeks paused and playing, and reports the end. Needs ffmpeg:
+    /// `cargo test -p vfx-preview -- --ignored`.
+    #[test]
+    #[ignore]
+    fn seeks_pauses_and_ends() {
+        let video = Video::open(Input::File(clip("seek-test")), 1920).unwrap();
         assert!(video.playing());
+        let mut pixels = Vec::new();
 
         // Paused seek: one frame, and the position stays put.
         video.seek(2.0, false).unwrap();
         assert!(!video.playing());
-        wait_for("the paused frame", || video.take_frame().is_some());
+        wait_for("the paused frame", || {
+            video.take_frame(&mut pixels).is_some()
+        });
         std::thread::sleep(Duration::from_millis(300));
         assert!(
             (video.position() - 2.0).abs() < 0.05,
@@ -626,10 +705,63 @@ mod tests {
         );
         assert!(!video.ended());
 
-        // Playing on from 2 s reaches the end of the 3 s clip in about a second.
+        // Playing on from 2 s reaches the end of the 3 s clip in about a second, with its
+        // last frames taken.
         video.seek(2.0, true).unwrap();
-        wait_for("the end", || video.ended());
+        wait_for("the end", || {
+            video.take_frame(&mut pixels);
+            video.ended()
+        });
         assert!(video.position() > 2.8, "{}", video.position());
+    }
+
+    /// A loop that falls behind gets the newest frames in order, each with its own time, and
+    /// the clock stays with the frame it took.
+    #[test]
+    #[ignore]
+    fn a_slow_loop_loses_the_oldest_frames() {
+        let video = Video::open(Input::File(clip("queue-test")), 1920).unwrap();
+        wait_for("frames to drop", || video.take_arrived() > 0);
+        std::thread::sleep(Duration::from_millis(400));
+
+        let mut pixels = Vec::new();
+        let first = video.take_frame(&mut pixels).expect("a waiting frame");
+        assert!(first > 0.2, "{first} is an old frame");
+        assert_eq!(video.position(), first);
+        let second = video.take_frame(&mut pixels).expect("a second one");
+        assert_eq!(video.position(), second);
+        assert!(
+            (second - first - 1.0 / 25.0).abs() < 1e-3,
+            "{first} {second}"
+        );
+    }
+
+    /// The bytes of a frame are ffmpeg's plain RGBA decode, in ARGB order: the frame that
+    /// reaches a history is the one the preview always decoded.
+    #[test]
+    fn decoding_keeps_the_rgba_bytes() {
+        let clip = clip("bytes-test");
+        for side in [160, 80] {
+            let info = Info::probe(Input::File(clip.clone()), side).unwrap();
+            let (w, h) = info.size;
+            let filter = format!("scale={w}:{h},fps={}", info.rate);
+            let plain = Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&clip)
+                .args(["-an", "-vf", &filter, "-frames:v", "1"])
+                .args(["-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+                .output()
+                .unwrap()
+                .stdout;
+
+            let video = Video::start(info).unwrap();
+            let mut pixels = Vec::new();
+            wait_for("a frame", || video.take_frame(&mut pixels).is_some());
+            assert_eq!(pixels.len() * 4, plain.len());
+            for (p, rgba) in pixels.iter().zip(plain.as_chunks::<4>().0) {
+                assert_eq!([p.red, p.green, p.blue, p.alpha], *rgba);
+            }
+        }
     }
 }
 
@@ -641,9 +773,11 @@ mod record_tests {
     fn records_frames_to_an_mp4() {
         let out = std::env::temp_dir().join("vfx-preview-record-test.mp4");
         let mut encoder = Encoder::record((64, 48), &out).expect("ffmpeg starts");
-        let frame = vec![0.5f32; 64 * 48 * 4];
-        for _ in 0..10 {
+        let frame = vec![vfx_core::cpu::Argb::<u8>::default(); 64 * 48];
+        let float = vec![0.5f32; 64 * 48 * 4];
+        for _ in 0..5 {
             encoder.write(&frame).expect("frame written");
+            encoder.write_float(&float).expect("frame written");
             std::thread::sleep(std::time::Duration::from_millis(40));
         }
         encoder.finish().expect("ffmpeg finishes");

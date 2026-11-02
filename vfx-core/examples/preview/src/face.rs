@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use ort::environment::Environment;
 use ort::session::Session;
 use ort::value::Tensor;
+use vfx_core::cpu::Argb;
 
 const MODEL: &[u8] = include_bytes!("../models/face_detection_yunet_2023mar.onnx");
 /// The model's fixed input size.
@@ -47,8 +48,8 @@ impl Detector {
         })
     }
 
-    /// The best face in `pixels` (float RGBA at `size`), or None.
-    pub fn detect(&mut self, pixels: &[f32], size: (u32, u32)) -> Option<Values> {
+    /// The best face in `pixels` (at `size`), or None.
+    pub fn detect(&mut self, pixels: &[Argb<u8>], size: (u32, u32)) -> Option<Values> {
         let (w, h) = (size.0 as usize, size.1 as usize);
         // Letterbox into the top-left of the square input, nearest-neighbour; the model
         // wants BGR planes from 0 to 255.
@@ -60,13 +61,13 @@ impl Detector {
                 let sx = (x as f32 / scale) as usize;
                 let i = y * SIDE + x;
                 let bgr = if sx < w && sy < h {
-                    let p = (sy * w + sx) * 4;
-                    [pixels[p + 2], pixels[p + 1], pixels[p]]
+                    let p = pixels[sy * w + sx];
+                    [p.blue, p.green, p.red]
                 } else {
-                    [0.0; 3]
+                    [0; 3]
                 };
                 for (c, v) in bgr.into_iter().enumerate() {
-                    self.input[c * plane + i] = v * 255.0;
+                    self.input[c * plane + i] = f32::from(v);
                 }
             }
         }
@@ -136,7 +137,9 @@ pub struct Tracker {
 }
 
 struct Shared {
-    frame: Option<(Vec<f32>, (u32, u32))>,
+    frame: Option<(Vec<Argb<u8>>, (u32, u32))>,
+    /// The buffer of the last frame looked at, to copy the next into.
+    spare: Vec<Argb<u8>>,
     values: Values,
     stop: bool,
 }
@@ -147,6 +150,7 @@ impl Tracker {
         let shared = Arc::new((
             Mutex::new(Shared {
                 frame: None,
+                spare: Vec::new(),
                 values: NONE,
                 stop: false,
             }),
@@ -168,6 +172,7 @@ impl Tracker {
                 };
                 let found = detector.detect(&pixels, size);
                 let mut s = lock.lock().unwrap();
+                s.spare = pixels;
                 match found {
                     Some(values) => s.values = values,
                     None => s.values[0] = 0.0,
@@ -177,11 +182,17 @@ impl Tracker {
         Ok(Self { shared })
     }
 
-    /// Hands over the newest frame (float RGBA at `size`), replacing any not yet
-    /// looked at.
-    pub fn submit(&self, pixels: Vec<f32>, size: (u32, u32)) {
+    /// Hands over a copy of the newest frame (at `size`), replacing any not yet looked at.
+    pub fn submit(&self, pixels: &[Argb<u8>], size: (u32, u32)) {
         let (lock, wake) = &*self.shared;
-        lock.lock().unwrap().frame = Some((pixels, size));
+        let mut s = lock.lock().unwrap();
+        let mut frame = match s.frame.take() {
+            Some((frame, _)) => frame,
+            None => std::mem::take(&mut s.spare),
+        };
+        frame.clear();
+        frame.extend_from_slice(pixels);
+        s.frame = Some((frame, size));
         wake.notify_one();
     }
 
@@ -204,7 +215,13 @@ mod tests {
 
     #[test]
     fn no_face_in_a_flat_frame() {
-        let pixels = vec![0.5; 320 * 240 * 4];
+        let grey = Argb {
+            alpha: 255,
+            red: 128,
+            green: 128,
+            blue: 128,
+        };
+        let pixels = vec![grey; 320 * 240];
         assert!(
             Detector::new()
                 .unwrap()
@@ -218,11 +235,20 @@ mod tests {
     #[ignore]
     fn finds_a_face_in_a_photo() {
         let path = std::env::var("FACE_TEST_IMAGE").expect("set FACE_TEST_IMAGE");
-        let img = image::open(path).unwrap().to_rgba32f();
+        let img = image::open(path).unwrap().to_rgba8();
         let size = img.dimensions();
+        let pixels: Vec<Argb<u8>> = img
+            .pixels()
+            .map(|p| Argb {
+                alpha: p[3],
+                red: p[0],
+                green: p[1],
+                blue: p[2],
+            })
+            .collect();
         let v = Detector::new()
             .unwrap()
-            .detect(img.as_raw(), size)
+            .detect(&pixels, size)
             .expect("a face");
         println!("{v:?}");
         assert_eq!(v[0], 1.0);
