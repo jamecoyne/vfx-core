@@ -178,6 +178,8 @@ fn run<C: Depth>(
     let (mut stdin, mut stdout) = (io::stdin().lock(), io::stdout().lock());
     let mut bytes = vec![0u8; pixels * 4];
     let mut frame = 0i64;
+    // Every input byte's channel value, worked out once: this runs on 8.3 M channels a frame.
+    let levels: [C; 256] = std::array::from_fn(|b| C::from_unit(b as f32 / 255.0));
 
     while stdin.read_exact(&mut bytes).is_ok() {
         let argb = bytes
@@ -185,10 +187,10 @@ fn run<C: Depth>(
             .0
             .iter()
             .map(|&[alpha, red, green, blue]| Argb {
-                alpha: C::from_unit(f32::from(alpha) / 255.0),
-                red: C::from_unit(f32::from(red) / 255.0),
-                green: C::from_unit(f32::from(green) / 255.0),
-                blue: C::from_unit(f32::from(blue) / 255.0),
+                alpha: levels[usize::from(alpha)],
+                red: levels[usize::from(red)],
+                green: levels[usize::from(green)],
+                blue: levels[usize::from(blue)],
             })
             .collect();
         ring.frames.push_back(argb);
