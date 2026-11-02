@@ -67,11 +67,19 @@ How a host hands over frames changes the cost, so each run names its source.
 | same | CLI kept, F7 on PR 39 | overlay faces | float | CPU | 59.9 ms | 63.2 ms | 82.1 ms | 15.8 fps | PR 39 998dc33 on even frames, 150 of 150 |
 | same | CLI kept, F7 on PR 39 | show faces | 8 bit | GPU or CPU per render | 70.5 ms | 99.5 ms | 122.8 ms | 10.0 fps | changed on purpose (F7) |
 | same | CLI kept, F7 on PR 39 | show faces | float | GPU or CPU per render | 73.8 ms | 115.3 ms | 227.3 ms | 8.7 fps | changed on purpose (F7) |
+| Ryzen 5 3600, RX 5700 XT 50th Anniversary (display), AMD 26.10.1, Windows 10 22H2 | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output through RAM | not split out | 32.7 ms | 45.6 ms | 26.7 fps | |
+| same | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output kept on the GPU | not split out | 28.9 ms | 41.4 ms | 30.0 fps | the swarm read back, byte for byte (`tests/target.rs`) |
 
 F7 rows: jamecoyne's clip (DNxHR HQ transcode, 1080p, 59.94 fps), frames 0 to 299, two runs pooled,
 raw ARGB in from a file. Faces run on DirectML on the RTX 4070. The CLI renders each frame fresh;
 "CLI kept" is the CLI of PR 39 (998dc33), which keeps one instance, with F7 merged on top. Times
 run from frame to frame out of the CLI, so they include its conversion of each frame in and out.
+
+Resolume rows: the #26 clip, an 8 s 720p pan over the Apollo 11 crew photo looping in a 1080p
+composition, one run of 3 minutes each, the same build, the first row with `VFX_FFGL_PATH=ram`.
+From the FFGL timing log (`VFX_FFGL_TIMING=1`): the medians of its 300-frame batches after the
+first, which holds the face models' load, so the first 40 frames aren't split out. Times run
+from the readback to the frame shown; fps is frames over the run.
 
 ## When
 

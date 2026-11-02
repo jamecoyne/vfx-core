@@ -37,5 +37,6 @@ stays the reference and the fallback. Overlay stays on the CPU.
 - Output is within one level of the CPU, not byte for byte; the docs say so.
 - The switch points come from an RTX 4070 and need tuning per kind of GPU.
 - `SEGCAM_GPU=0` forces the CPU for tests; users never need it.
-- Keeping frames on the host's GPU would remove the upload and read back, and move Overlay to the
-  GPU too. That comes after 1.0.
+- With a host frame to draw into (`CpuEffect::render_to`, FFGL on Windows since #70) the read back
+  is gone, so every swarm draws on the GPU there; the switch points apply where the output goes
+  through RAM. Overlay on the GPU still comes after 1.0.

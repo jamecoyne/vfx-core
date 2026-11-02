@@ -100,6 +100,7 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core | #47 |
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |
 | `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core | #59 |
+| `CpuEffect::render_to` and `Target` (a host's GPU frame the effect may draw its output into instead) | vfx-core | #70 |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core | from the start |
 | `Context::frame_rate` | vfx-core | #50 |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core | from the start |
@@ -107,13 +108,14 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `FrameSource::held`; `History::next(before, held)` | vfx-core | #57 |
 | `FrameSource::live` (true for `History`) | vfx-core | #59 |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core | from the start |
-| `Gpu::share`, `Gpu::shared` (browsers only) | vfx-core | #47 |
+| `Gpu::share`, `Gpu::shared` | vfx-core | #47 in browsers; native since #70 |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core | from the start; `ViewMut::bands` since #11, `Argb` as bytemuck `Pod` since #39 |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core | from the start |
 | `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host | #16; the frame rate since #50 |
 | `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host | #16 |
 | `CpuInstance::frames_held` | vfx-host | #57 |
 | `CpuInstance::values_known` | vfx-host | #59 |
+| `CpuInstance::render_to` | vfx-host | #70 |
 | `plugin::register`, `plugin`, `gpu` | vfx-host | #10 |
 | `controls::layout` | vfx-host | from the start |
 | `by_rows` (a frame in row bands over a work queue) | vfx-host | #38 |
@@ -300,6 +302,11 @@ conversions. Each host also has a harness that runs the effects:
   GL textures are drawn into IOSurfaces that wgpu's Metal device shares, or into Vulkan images
   shared with OpenGL on Windows. Everything else, and any setup failure, goes through RAM. If the
   GPU fails, the frame passes through unchanged instead of failing the host's render.
+- A CPU effect that draws on the GPU can leave its output there. On Windows the FFGL target shares
+  the device of its Vulkan images (`Gpu::share`) before the effect's first render and offers each
+  render a frame on it (`CpuEffect::render_to`). An effect that draws there says so and the frame
+  is shown with no trip through RAM; otherwise its output in RAM goes up as before. The input
+  still comes through RAM, for the effect's work on the CPU.
 - The OpenFX and FFGL bindings are written by hand. Both are small C ABIs, transcribed from their
   BSD licensed headers; FFGL's notice is kept in `vfx-core/wrappers/ffgl-common/src/ffi.rs`. The
   `ffgl-core` crate is GPL 3.0, so it isn't used.
