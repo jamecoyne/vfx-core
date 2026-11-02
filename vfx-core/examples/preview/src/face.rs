@@ -321,6 +321,14 @@ impl Tracker {
     pub fn values(&self) -> Values {
         self.shared.0.lock().unwrap().values
     }
+
+    /// While an effect's report reads the faces: holds its positions, with `face` at 0, so when
+    /// the report stops, the variables carry on from there until this finds a face itself.
+    pub fn hold(&self, values: Values) {
+        let mut s = self.shared.0.lock().unwrap();
+        s.values = values;
+        s.values[0] = 0.0;
+    }
 }
 
 impl Drop for Tracker {
@@ -350,6 +358,15 @@ mod tests {
                 .detect(&pixels, (320, 240))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_held_tracker_claims_no_face() {
+        let tracker = Tracker::start().unwrap();
+        tracker.hold([1.0; 12]);
+        let values = tracker.values();
+        assert_eq!(values[0], 0.0);
+        assert_eq!(values[1..], [1.0; 11]);
     }
 
     /// In a process of its own: DirectML can deadlock in the driver with another test's wgpu

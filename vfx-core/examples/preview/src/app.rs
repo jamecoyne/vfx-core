@@ -414,6 +414,9 @@ impl Preview {
             self.report = self.effects.report();
             let needed = modulation::read_face(&mut face, &self.face, &self.report.readings);
             self.face = face;
+            if let Some(tracker) = self.tracker.as_ref().filter(|_| !needed) {
+                tracker.hold(face);
+            }
             needed
         };
         #[cfg(not(target_arch = "wasm32"))]
