@@ -21,8 +21,9 @@ vfx-preview [FLAGS] [FILE]
                        option's name or index, r,g,b,a for colours, x,y for points
   --input SOURCE       pattern[:NAME|N], camera[:NAME|N], or a video or image path
   --size WxH           the frame size (patterns, and videos, webcams and stills fitted into it)
+  --detect-faces       tick the Expressions panel's Detect faces
   --stats              print the stats bar to stdout once a second
-  --frames N           exit after N frames
+  --frames N          exit after N frames
   --seconds N          exit after N seconds
   --quiet              no window on screen (frames unpaced, not shown)
   --list               print the effects and their parameters, then exit
@@ -38,6 +39,7 @@ pub struct Options {
     pub params: Vec<(String, String)>,
     pub input: Option<Source>,
     pub size: Option<(u32, u32)>,
+    pub detect_faces: bool,
     pub stats: bool,
     pub stop: Option<Stop>,
     pub quiet: bool,
@@ -67,6 +69,7 @@ impl Options {
         self.mode.is_some()
             || !self.params.is_empty()
             || self.size.is_some()
+            || self.detect_faces
             || self.stats
             || self.stop.is_some()
             || self.quiet
@@ -98,6 +101,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String
             }
             "--input" => options.input = Some(source(&value()?)),
             "--size" => options.size = Some(size(&value()?)?),
+            "--detect-faces" => options.detect_faces = true,
             "--stats" => options.stats = true,
             "--frames" => {
                 let v = value()?;
@@ -356,7 +360,7 @@ fn counts_text(seconds: f64, worst: Duration, what: &What, done: Counts) -> Stri
 /// One `--stats` line: the counts over the last `span` seconds, then the machine.
 fn line(elapsed: f64, span: f64, worst: Duration, s: &Snapshot, done: Counts) -> String {
     let gpu = s.gpu.map_or("n/a".to_owned(), |g| format!("{g:.1}"));
-    format!(
+    let mut text = format!(
         "stats t={elapsed:.1} {} size={}x{} cpu={:.1} app_cpu={:.1} mem_mb={} gpu={gpu}",
         counts_text(span, worst, &s.what, done),
         s.what.size.0,
@@ -364,7 +368,14 @@ fn line(elapsed: f64, span: f64, worst: Duration, s: &Snapshot, done: Counts) ->
         s.system_cpu,
         s.cpu,
         s.memory_mb,
-    )
+    );
+    if let Some(draw) = &s.report.draw {
+        text += &format!(" draw={draw:?}");
+    }
+    if let Some(faces) = &s.report.faces {
+        text += &format!(" faces={faces:?}");
+    }
+    text
 }
 
 #[cfg(test)]
@@ -395,12 +406,14 @@ mod tests {
             "pattern:checker",
             "--size",
             "640x360",
+            "--detect-faces",
             "--stats",
             "--seconds",
             "5",
             "--quiet",
         ])
         .unwrap();
+        assert!(o.detect_faces);
         assert_eq!(o.mode.as_deref(), Some("Swarm"));
         assert_eq!(o.params, [("grid".to_owned(), "96".to_owned())]);
         assert_eq!(o.input, Some(Source::Pattern("checker".into())));

@@ -5,6 +5,12 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
 
+# `tracker`: the "Detect faces" box on Windows and Linux, through segcam-face's YuNet. Without it,
+# the face variables come only from effects that report them.
+[features]
+default = ["tracker"]
+tracker = ["dep:segcam-face"]
+
 [dependencies]
 vfx-core = { path = "../.." }
 vfx-host = { path = "../../wrappers/common" }
@@ -32,9 +38,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 pollster = "1.0.1"
 # Native file picker for "Import…".
 rfd = "0.17.2"
-# Runs the face model (models/face_detection_yunet_2023mar.onnx).
-ort = "=2.0.0-rc.15"
 sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Runs the face model (models/face_detection_yunet_2023mar.onnx); segcam-face has no ONNX Runtime
+# on macOS.
+ort = "=2.0.0-rc.15"
+
+[target.'cfg(not(any(target_os = "macos", target_arch = "wasm32")))'.dependencies]
+segcam-face = { path = "../../../plugins/segcam/segcam-face", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # A job object, so ffmpeg and ffplay close with the app.

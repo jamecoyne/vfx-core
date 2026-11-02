@@ -58,6 +58,12 @@ struct Preview {
     /// Runs while face tracking is switched on.
     #[cfg(not(target_arch = "wasm32"))]
     tracker: Option<face::Tracker>,
+    /// This frame's face variables, held while no face is found.
+    #[cfg(not(target_arch = "wasm32"))]
+    face: modulation::Face,
+    /// What the effect said of its last render, asked once a frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    report: vfx_core::Report,
     /// Cameras found at startup.
     #[cfg(not(target_arch = "wasm32"))]
     cameras: Vec<String>,
@@ -222,6 +228,10 @@ impl Preview {
             sound_on: true,
             #[cfg(not(target_arch = "wasm32"))]
             tracker: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            face: modulation::FACE_NONE,
+            #[cfg(not(target_arch = "wasm32"))]
+            report: vfx_core::Report::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cameras: video::cameras(),
             #[cfg(target_arch = "wasm32")]
@@ -394,6 +404,18 @@ impl Preview {
         let mut frame_time = self.time;
         #[cfg(target_arch = "wasm32")]
         let frame_time = self.feed_web_video();
+        // The face variables: from the effect's report where it gives them, else the tracker's.
+        #[cfg(not(target_arch = "wasm32"))]
+        let tracker_needed = {
+            let mut face = match (&self.tracker, &self.media) {
+                (Some(tracker), Some(_)) => tracker.values(),
+                _ => modulation::FACE_NONE,
+            };
+            self.report = self.effects.report();
+            let needed = modulation::read_face(&mut face, &self.face, &self.report.readings);
+            self.face = face;
+            needed
+        };
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(media) = &mut self.media {
             // Dragging the slider: show the frame under it, at most every 60 ms.
@@ -417,7 +439,7 @@ impl Preview {
 
             self.counts.arrived += media.video.take_arrived_count();
             if let Some(pixels) = self.effects.take_video_frame(&media.video)
-                && let Some(tracker) = &self.tracker
+                && let Some(tracker) = self.tracker.as_ref().filter(|_| tracker_needed)
             {
                 tracker.submit(pixels, media.video.info.size);
             }
@@ -430,12 +452,14 @@ impl Preview {
                     .audio
                     .as_ref()
                     .map_or([0.0; 5], |a| a.levels(position)),
-                self.tracker
-                    .as_ref()
-                    .map_or(modulation::FACE_NONE, face::Tracker::values),
+                self.face,
             );
         } else {
-            self.sources = modulation::sources(self.time, None, [0.0; 5], modulation::FACE_NONE);
+            #[cfg(not(target_arch = "wasm32"))]
+            let face = self.face;
+            #[cfg(target_arch = "wasm32")]
+            let face = modulation::FACE_NONE;
+            self.sources = modulation::sources(self.time, None, [0.0; 5], face);
         }
 
         let c = &self.controls;
@@ -685,7 +709,8 @@ impl Preview {
                 source,
                 size: self.effects.size(),
             };
-            self.stats.sample(self.counts, rendered.render_time, what)
+            self.stats
+                .sample(self.counts, rendered.render_time, what, &self.report)
         };
         #[cfg(not(target_arch = "wasm32"))]
         self.count_frame(&stats);
@@ -1314,6 +1339,9 @@ impl Preview {
                 .copied()
                 .ok_or_else(|| format!("--param {name}: no such parameter; --list shows them"))?;
             self.set_param(name, script::value(&spec, text)?)?;
+        }
+        if start.detect_faces {
+            self.tracker = Some(face::Tracker::start()?);
         }
         if start.stats || start.stop.is_some() {
             self.meter = Some(script::Meter::new(start.stats, start.stop));

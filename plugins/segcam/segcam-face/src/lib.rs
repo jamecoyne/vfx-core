@@ -45,6 +45,7 @@ pub const PICODET_MODEL: &[u8] = include_bytes!("../models/picodet.onnx");
 pub enum Pixels<'a> {
     Rgba8(&'a [u8]),
     Bgra8(&'a [u8]),
+    Argb8(&'a [u8]),
     /// RGBA from 0 to 1.
     RgbaF32(&'a [f32]),
 }
@@ -62,7 +63,7 @@ impl Image<'_> {
     /// Whether the size is non-zero and the pixels cover it.
     pub fn is_usable(&self) -> bool {
         let channels = match self.pixels {
-            Pixels::Rgba8(data) | Pixels::Bgra8(data) => data.len(),
+            Pixels::Rgba8(data) | Pixels::Bgra8(data) | Pixels::Argb8(data) => data.len(),
             Pixels::RgbaF32(data) => data.len(),
         };
         self.width > 0
@@ -78,6 +79,7 @@ impl Image<'_> {
         match self.pixels {
             Pixels::Rgba8(d) => [d[i], d[i + 1], d[i + 2]].map(f32::from),
             Pixels::Bgra8(d) => [d[i + 2], d[i + 1], d[i]].map(f32::from),
+            Pixels::Argb8(d) => [d[i + 1], d[i + 2], d[i + 3]].map(f32::from),
             Pixels::RgbaF32(d) => [d[i], d[i + 1], d[i + 2]].map(|v| v.clamp(0.0, 1.0) * 255.0),
         }
     }
