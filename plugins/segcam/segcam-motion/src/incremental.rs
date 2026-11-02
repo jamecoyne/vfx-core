@@ -540,7 +540,8 @@ impl Incremental {
         self.readings = if s.faces.face {
             let shows = self.shows(s, number, first);
             let motion = self.motion(shows, &basis(s, shows, first));
-            crate::faces::readings(motion.map_or(&[], |m| &m.blobs))
+            let models = crate::faces::runs_on().is_some();
+            crate::faces::readings(models, motion.map_or(&[], |m| &m.blobs))
         } else {
             Vec::new()
         };

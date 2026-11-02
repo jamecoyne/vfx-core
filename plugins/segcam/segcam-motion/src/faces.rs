@@ -204,8 +204,11 @@ pub fn runs_on() -> Option<&'static str> {
 
 /// The best face in `blobs` as readings for a host, positions from 0 to 1 of the source frame:
 /// what the model found, not the box segcam draws. Without a face, just `face` at 0, so a host
-/// can hold the last positions.
-pub fn readings(blobs: &[Blob]) -> Vec<Reading> {
+/// can hold the last positions. Without `models`, nothing: nobody looked, so a host may.
+pub fn readings(models: bool, blobs: &[Blob]) -> Vec<Reading> {
+    if !models {
+        return Vec::new();
+    }
     let Some(at) = blobs.iter().position(|b| b.kind == SegmentKind::Face) else {
         return vec![Reading::new("face", 0.0)];
     };
@@ -277,7 +280,12 @@ mod tests {
     #[test]
     fn no_face_reads_face_alone() {
         let motion = Blob::default();
-        assert_eq!(readings(&[motion]), [Reading::new("face", 0.0)]);
+        assert_eq!(readings(true, &[motion]), [Reading::new("face", 0.0)]);
+    }
+
+    #[test]
+    fn without_models_nothing_is_read() {
+        assert_eq!(readings(false, &[Blob::default()]), []);
     }
 
     #[test]
@@ -291,7 +299,7 @@ mod tests {
             }),
             ..face()
         };
-        let r = readings(&[found]);
+        let r = readings(true, &[found]);
         assert_eq!(value(&r, "facex"), Some(0.125));
         assert_eq!(value(&r, "facey"), Some(0.5));
         assert_eq!(value(&r, "facesize"), Some(0.25));
@@ -309,7 +317,7 @@ mod tests {
             ]),
             ..face()
         };
-        let r = readings(&[Blob::default(), found]);
+        let r = readings(true, &[Blob::default(), found]);
         assert_eq!(r.len(), 12);
         assert_eq!(value(&r, "face"), Some(1.0));
         assert_eq!(value(&r, "facex"), Some(0.5));
@@ -334,12 +342,15 @@ mod tests {
             kind,
             ..Blob::default()
         };
-        let r = readings(&[
-            face(),
-            part(SegmentKind::Mouth, 0.25),
-            face(),
-            part(SegmentKind::Mouth, 0.5),
-        ]);
+        let r = readings(
+            true,
+            &[
+                face(),
+                part(SegmentKind::Mouth, 0.25),
+                face(),
+                part(SegmentKind::Mouth, 0.5),
+            ],
+        );
         assert_eq!(value(&r, "mouthx"), Some(0.5));
         assert_eq!(value(&r, "nosex"), None);
     }
