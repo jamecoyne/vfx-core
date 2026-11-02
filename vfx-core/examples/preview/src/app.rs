@@ -1062,7 +1062,13 @@ impl ApplicationHandler<Ready> for App {
                 #[cfg(not(target_arch = "wasm32"))]
                 if preview.done {
                     event_loop.exit();
+                    return;
                 }
+                // Asked for here too, not only in `about_to_wait`: while the window is moved or
+                // resized, or its title bar held, Windows runs a loop of its own and
+                // `about_to_wait` waits for it to end, but a redraw asked for while drawing
+                // still comes.
+                preview.window.request_redraw();
             }
             _ => {}
         }
