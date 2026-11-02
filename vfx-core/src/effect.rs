@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::cpu::{FrameSource, ImageMut};
 use crate::{Frame, Gpu, ParamSpec, ParamValues};
 
@@ -164,6 +166,43 @@ pub trait CpuEffect: Send {
     /// it and render the same frame with the same parameters again until this is false.
     fn unfinished(&self) -> bool {
         false
+    }
+
+    /// Where the last render's work ran and what it found, which a host can't see from outside.
+    /// Cheap enough to ask every frame. The default says nothing.
+    fn report(&self) -> Report {
+        Report::default()
+    }
+}
+
+/// What an effect tells its host about its last render ([`CpuEffect::report`]). `draw` and `faces`
+/// are words for a status line, not stable strings to branch on.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct Report {
+    /// Where it drew, in words for a status line: "CPU", "GPU (NVIDIA GeForce RTX 4070)".
+    pub draw: Option<String>,
+    /// Where its face models run, in words for a status line: "DirectML 0", "CPU", "Vision".
+    pub faces: Option<String>,
+    /// What it found. A host uses the names it knows and ignores the rest.
+    pub readings: Vec<Reading>,
+}
+
+/// A named number an effect found ([`Report::readings`]).
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct Reading {
+    /// A fixed name, or one made at run time ("face 2 x").
+    pub name: Cow<'static, str>,
+    pub value: f32,
+}
+
+impl Reading {
+    pub fn new(name: impl Into<Cow<'static, str>>, value: f32) -> Self {
+        Self {
+            name: name.into(),
+            value,
+        }
     }
 }
 

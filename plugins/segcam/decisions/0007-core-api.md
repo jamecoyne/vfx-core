@@ -20,6 +20,7 @@ What a host sees today, on `main` at 6bd4d2f:
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |
 | `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core | #59 |
 | `CpuEffect::render_to` and `Target` (a host's GPU frame the effect may draw its output into instead) | vfx-core | #70 |
+| `CpuEffect::report`, `Report`, `Reading` (where the last render's work ran and what it found; default empty) | vfx-core | #68 |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core | from the start |
 | `Context::frame_rate` | vfx-core | #50 |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core | from the start |
@@ -35,6 +36,7 @@ What a host sees today, on `main` at 6bd4d2f:
 | `CpuInstance::frames_held` | vfx-host | #57 |
 | `CpuInstance::values_known` | vfx-host | #59 |
 | `CpuInstance::render_to` | vfx-host | #70 |
+| `CpuInstance::report` | vfx-host | #68 |
 | `plugin::register`, `plugin`, `gpu` | vfx-host | #10 |
 | `controls::layout` | vfx-host | from the start |
 | `by_rows` (a frame in row bands over a work queue) | vfx-host | #38 |
