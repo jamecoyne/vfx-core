@@ -425,7 +425,8 @@ fn machine() -> String {
     } else {
         linux_machine()
     };
-    parts.join(", ").replace("(R)", "").replace("(TM)", "")
+    let text = parts.join(", ").replace("(R)", "").replace("(TM)", "");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn windows_machine() -> Vec<String> {

@@ -52,7 +52,8 @@ that file to the CLI. Without `--preset` and `--depth` it runs the first four pr
 depths; `--preset 1.1` is the 1.1 look. A frame's time runs from the frame before it out of the CLI,
 so it includes the conversion in and out and the pipe, about 2 ms a frame at 1080p. fps is 1000 over
 the past 40 median, p95 is of the past 40. The frame hashes go to `target/bench/COMMIT`; that folder is
-the `--reference` of a later run (for a GPU run, of a `--cpu` run, `target/bench/COMMIT-cpu`).
+the `--reference` of a later run (for a GPU run, of a `--cpu` run, `target/bench/COMMIT-cpu`). It
+prints the machine column from the system, every GPU with its driver: paste it, don't retype it.
 
 - Two runs of each, one timed run on a machine at a time. Builds count as load.
 - Report the median and p95 ms per render, for the first 40 frames and for the rest separately.
