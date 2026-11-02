@@ -24,7 +24,7 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --mode overlay|matte|boxmatte|swarm   (overlay)
   --sensitivity 0..100                  (86.4)
   --adaptation percent                  (6)
-  --background frames                   (16)
+  --background analyses                 (16)
   --min-size percent                    (0.25)
   --max-segments n                      (16)
   --grid columns                        (192)

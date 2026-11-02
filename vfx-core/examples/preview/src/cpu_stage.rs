@@ -7,6 +7,11 @@
 //! time earlier than the last starts the history over, as a seek back does. The effect is
 //! kept between renders when it keeps state ([`vfx_host::CpuInstance`]).
 
+use std::time::Duration;
+
+use web_time::Instant;
+
+use crate::effects::Rendered;
 use vfx_core::cpu::{Argb, Channel, History, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, Gpu, ParamValues};
 use vfx_host::{CpuInstance, by_rows};
@@ -20,7 +25,10 @@ pub struct CpuStage {
     /// The last render, and what it was rendered with.
     rendered: Vec<Argb<u8>>,
     rendered_with: Option<ParamValues>,
-    /// `rendered` as the output frame's float RGBA, uploaded every render.
+    /// Time spent so far on the render in progress, over its unfinished calls.
+    rendering: Duration,
+    /// The picture in the output frame, and the same as float RGBA for its upload.
+    shown: Vec<Argb<u8>>,
     upload: Vec<f32>,
     reader: Reader,
 }
@@ -37,13 +45,22 @@ impl CpuStage {
             last_time: None,
             rendered: vec![Argb::default(); pixels],
             rendered_with: None,
+            rendering: Duration::ZERO,
+            shown: Vec::new(),
             upload: vec![0.0; pixels * 4],
             reader: Reader::new(gpu, size),
         }
     }
 
     /// Reads the input back if it is a new frame and adds it to the history.
-    fn push(&mut self, gpu: &Gpu, input: &Frame, time: f64, values: &ParamValues) {
+    fn push(
+        &mut self,
+        gpu: &Gpu,
+        input: &Frame,
+        time: f64,
+        values: &ParamValues,
+        frame_rate: Option<f64>,
+    ) {
         let Self {
             reader,
             history,
@@ -60,7 +77,8 @@ impl CpuStage {
                 effect.reset();
             }
             *last_time = Some(time);
-            let frame = history.next(effect.frames_before(values));
+            let before = effect.frames_before(values, frame_rate);
+            let frame = history.next(before, effect.frames_held(values, frame_rate));
             by_rows(frame, width, |y, dst| {
                 let src = &rgba[y * pitch..][..width * 4];
                 for (dst, &[r, g, b, a]) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
@@ -79,9 +97,9 @@ impl CpuStage {
     }
 
     /// Renders the newest frame again if anything changed since the last render.
-    fn refresh(&mut self, values: &ParamValues, time: f64, frame_rate: Option<f64>) {
+    fn refresh(&mut self, values: &ParamValues, time: f64, frame_rate: Option<f64>) -> Rendered {
         if self.rendered_with.as_ref() == Some(values) || self.history.is_empty() {
-            return;
+            return Rendered::default();
         }
         let (w, h) = (self.size.0 as i32, self.size.1 as i32);
         let ctx = Context {
@@ -92,21 +110,37 @@ impl CpuStage {
         let count = self.history.len();
         let out = ImageMut::U8(ViewMut::from_pixels(&mut self.rendered, w, h));
         // A render that panicked starts the effect over; its frame shows what it drew.
+        let started = Instant::now();
         let _ = self
             .effect
             .render(&mut self.history, count, out, values, &ctx);
+        self.rendering += started.elapsed();
         if self.effect.unfinished() {
-            return; // the next render of this frame finishes it
+            return Rendered::default(); // the next render of this frame finishes it
         }
+        let render_time = Some(std::mem::take(&mut self.rendering));
         self.rendered_with = Some(values.clone());
-        let width = self.size.0 as usize;
-        let rendered = &self.rendered;
-        by_rows(&mut self.upload, width * 4, |y, dst| {
-            let src = &rendered[y * width..][..width];
-            for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
-                *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
-            }
-        });
+        // The same picture again, as Swarm draws between analyses, needs no copy to the GPU.
+        let new_picture = bytemuck::cast_slice::<_, u8>(&self.rendered)
+            != bytemuck::cast_slice::<_, u8>(&self.shown);
+        if new_picture {
+            // `shown` starts empty; after that the two buffers trade places.
+            std::mem::swap(&mut self.rendered, &mut self.shown);
+            self.rendered.resize(self.shown.len(), Argb::default());
+            let width = self.size.0 as usize;
+            let shown = &self.shown;
+            by_rows(&mut self.upload, width * 4, |y, dst| {
+                let src = &shown[y * width..][..width];
+                for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                    *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
+                }
+            });
+        }
+        Rendered {
+            finished: true,
+            new_picture,
+            render_time,
+        }
     }
 
     pub fn render(
@@ -117,14 +151,14 @@ impl CpuStage {
         values: &ParamValues,
         time: f64,
         frame_rate: Option<f64>,
-    ) {
+    ) -> Rendered {
         // A frame still waiting on the GPU keeps its place until it's done.
         if !self.effect.unfinished() {
-            self.push(gpu, input, time, values);
+            self.push(gpu, input, time, values, frame_rate);
         }
-        self.refresh(values, time, frame_rate);
+        let rendered = self.refresh(values, time, frame_rate);
         if self.effect.unfinished() {
-            return; // the last output stays up
+            return rendered; // the last output stays up
         }
         if self.history.is_empty() {
             // Nothing read back yet (the web build reads a frame late): show the input.
@@ -135,9 +169,10 @@ impl CpuStage {
                 input.texture.size(),
             );
             gpu.queue.submit(Some(encoder.finish()));
-        } else {
+        } else if rendered.new_picture {
             output.write(gpu, bytemuck::cast_slice(&self.upload));
         }
+        rendered
     }
 }
 

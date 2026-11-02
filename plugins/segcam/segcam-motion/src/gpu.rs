@@ -10,7 +10,7 @@
 //! comes back at the next render of the same frame.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -147,6 +147,13 @@ type Opened = Result<Arc<Device>, NoGpu>;
 
 static DEVICE: OnceLock<Opened> = OnceLock::new();
 
+/// Held while opening this device or loading the face models. A D3D12 device made on one thread
+/// while another releases one can deadlock (seen on NVIDIA, inside the driver and D3D12).
+pub(crate) fn device_turn() -> MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Opens the device every instance shares, on first use, in the background: opening it and
 /// compiling its pipelines would stall a render. Software adapters (WARP, lavapipe) are left
 /// out unless `SEGCAM_GPU_ADAPTER=fallback` asks for one; `SEGCAM_GPU_ADAPTER=low` picks the
@@ -155,6 +162,7 @@ fn start() {
     static START: Once = Once::new();
     START.call_once(|| {
         let load = || {
+            let _turn = device_turn();
             let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
             settle(&DEVICE, || open(&choice));
         };
