@@ -465,7 +465,8 @@ impl Video {
         let mut s = self.shared.lock().unwrap();
         let frame = s.queue.pop_front()?;
         let old = std::mem::replace(pixels, frame.pixels);
-        if !old.is_empty() {
+        // A buffer from another video, of another size, would put the pipe out of step.
+        if old.len() == self.info.frame_pixels() {
             s.spare.push(old);
         }
         s.position = frame.time;
@@ -741,6 +742,23 @@ mod tests {
             (second - first - 1.0 / 25.0).abs() < 1e-3,
             "{first} {second}"
         );
+    }
+
+    /// One buffer taken in turn from videos of two sizes, as a layer's is when its video
+    /// changes: a video only ever decodes into buffers of its own size.
+    #[test]
+    fn a_buffer_of_another_size_is_not_decoded_into() {
+        let clip = clip("sizes-test");
+        let large = Video::open(Input::File(clip.clone()), 160).unwrap();
+        let small = Video::open(Input::File(clip), 80).unwrap();
+        let mut pixels = Vec::new();
+        for video in [&large, &small, &large, &small] {
+            let size = video.info.frame_pixels();
+            wait_for("a frame", || video.take_newest(&mut pixels).is_some());
+            assert_eq!(pixels.len(), size);
+            let spare = &video.shared.lock().unwrap().spare;
+            assert!(spare.iter().all(|buffer| buffer.len() == size));
+        }
     }
 
     /// The bytes of a frame are ffmpeg's plain RGBA decode, in ARGB order: the frame that

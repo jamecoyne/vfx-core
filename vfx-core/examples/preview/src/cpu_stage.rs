@@ -65,6 +65,14 @@ impl CpuStage {
         }
     }
 
+    /// Starts over for a new source, whose first frame may have the time of the last one here.
+    pub fn restart(&mut self) {
+        self.history.clear();
+        self.effect.reset();
+        self.last_time = None;
+        self.rendered_with = None;
+    }
+
     /// The frame the last picture is in.
     pub fn output(&self) -> &Frame {
         &self.output

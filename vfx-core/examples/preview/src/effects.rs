@@ -554,6 +554,9 @@ impl Effects {
         {
             self.video = None;
         }
+        if let Run::Cpu(stage) = &mut self.stage.run {
+            stage.restart();
+        }
     }
 
     /// Makes a `size` source called `name` that [`Effects::take_video_frame`] fills.
@@ -910,6 +913,14 @@ mod tests {
             panic!("segcam is a CPU effect");
         };
         assert_eq!(out, pixels);
+        // The texture the display pass reads holds the same picture in RGBA order.
+        let Run::Cpu(stage) = &effects.stage.run else {
+            panic!("segcam is a CPU effect");
+        };
+        let on_gpu = stage.output().read_rgba8(&gpu);
+        for (p, rgba) in pixels.iter().zip(on_gpu.as_chunks::<4>().0) {
+            assert_eq!([p.red, p.green, p.blue, p.alpha], *rgba);
+        }
 
         let (controls, values) = shown("Flip");
         let out = render(&mut effects, &gpu, &controls, &values, 0.0);
@@ -918,6 +929,30 @@ mod tests {
             .flat_map(|p| [p.red, p.green, p.blue, p.alpha].map(|b| f32::from(b) / 255.0))
             .collect();
         assert_eq!(out, want);
+    }
+
+    /// A new video of the same size starts over, even with a first frame at the time of the
+    /// last one shown, as a one frame clip after another has.
+    #[test]
+    fn a_new_video_replaces_the_picture() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut effects = Effects::new(&gpu);
+        let (controls, values) = shown("segcam Motion (Rust)");
+        for shade in [64, 192] {
+            let grey = Argb {
+                alpha: 255,
+                red: shade,
+                green: shade,
+                blue: shade,
+            };
+            effects.start_video(&gpu, "clip".into(), (64, 64), 60.0);
+            effects.video.as_mut().unwrap().pixels = vec![grey; 64 * 64];
+            effects.render(&gpu, &controls, &values, 0.0);
+            let Output::Cpu(out) = effects.output(&gpu) else {
+                panic!("segcam is a CPU effect");
+            };
+            assert!(out.iter().all(|p| *p == grey), "shade {shade}");
+        }
     }
 }
 
