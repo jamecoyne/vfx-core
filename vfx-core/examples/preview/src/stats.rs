@@ -196,9 +196,12 @@ impl Sampler {
         if let Some(render) = render {
             self.worst = self.worst.max(render);
         }
-        if self.last.is_none_or(|t| t.elapsed() >= INTERVAL) {
+        let due = self.last.is_none_or(|t| t.elapsed() >= INTERVAL);
+        if due || what.slug != self.snapshot.what.slug {
             self.snapshot.report.clone_from(report);
             self.snapshot.report.readings.clear(); // the bar has no use for them
+        }
+        if due {
             if let Some(last) = self.last {
                 let seconds = last.elapsed().as_secs_f32();
                 let done = counts.since(self.last_counts);
