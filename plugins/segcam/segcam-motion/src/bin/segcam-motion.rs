@@ -214,6 +214,13 @@ fn run<C: Depth>(
         }
         frame += 1;
     }
-    eprintln!("segcam-motion: {frame} frames");
+    // `cargo vfx bench` reads the path from here.
+    let path = match &kept {
+        None => "CPU, fresh".to_owned(),
+        Some(state) => state.gpu().map_or("CPU, kept".to_owned(), |gpu| {
+            format!("GPU or CPU per render, {}", gpu.adapter().name)
+        }),
+    };
+    eprintln!("segcam-motion: {frame} frames, {path}");
     ExitCode::SUCCESS
 }
