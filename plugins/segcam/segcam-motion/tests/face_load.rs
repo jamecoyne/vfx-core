@@ -55,9 +55,9 @@ fn renders_during_the_load_and_after_match_fresh_renders() {
     history.resize(W, H);
     let mut pushed = 0;
     let mut next = |history: &mut History<u8>, values: &ParamValues| {
-        let before = SegcamMotion::default().frames_before(values);
+        let before = SegcamMotion::default().frames_before(values, None);
         let frame = &clip.frames[pushed % clip.frames.len()];
-        history.next(before).copy_from_slice(frame);
+        history.next(before, before).copy_from_slice(frame);
         pushed += 1;
     };
     let mut kept = SegcamMotion::default();

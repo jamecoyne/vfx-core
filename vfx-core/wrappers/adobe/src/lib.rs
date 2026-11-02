@@ -691,7 +691,8 @@ fn cpu_pre_render(
     params: &ae::Parameters<Key>,
 ) -> Result<(), ae::Error> {
     let values = params::read(params, specs())?;
-    let wanted = cpu_instance()?.frames_before(&values);
+    let ctx = context(in_data);
+    let wanted = cpu_instance()?.frames_before(&values, ctx.frame_rate);
 
     // CPU effects see the whole frame, so ask for the whole layer whatever region After
     // Effects wants back.
@@ -729,7 +730,7 @@ fn cpu_pre_render(
     extra.set_pre_render_data(Plan {
         values,
         frame_count,
-        ctx: context(in_data),
+        ctx,
     });
     Ok(())
 }

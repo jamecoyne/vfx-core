@@ -122,7 +122,8 @@ pub struct RenderSettings {
     pub motion: MotionSettings,
     pub threshold: ThresholdSettings,
     pub faces: FaceParts,
-    /// How many frames before each frame build its background.
+    /// How many analyses before each one build its background, so the same time at any frame
+    /// rate.
     pub background_frames: i32,
     pub grid_width: i32,
     pub mirror: bool,
@@ -205,10 +206,11 @@ pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
         + i32::from(s.faces.any()) * Cadence::MAX_STRIDE as i32
 }
 
-/// How many frames before a frame its detection reads: the background, for motion.
+/// How many frames before a frame its detection reaches back: the background's analyses, for
+/// motion.
 pub fn history_frames(s: &RenderSettings) -> i32 {
     match s.detect {
-        Detect::Motion => s.background_frames.max(1),
+        Detect::Motion => s.background_frames.max(1) * s.cadence.stride as i32,
         Detect::Threshold | Detect::FacesOnly => 0,
     }
 }
@@ -615,7 +617,8 @@ impl<T: PiledTile> Pile<T> {
                 older.bury();
             }
         }
-        self.tiles.push_back((tile, false, kept));
+        let hidden = tile.tile().hidden;
+        self.tiles.push_back((tile, hidden, kept));
         while self.tiles.len() > self.max_tiles
             || (self.stored_pixels * size_of::<Argb<u8>>() > Self::BYTE_BUDGET
                 && self.tiles.len() > 1)
