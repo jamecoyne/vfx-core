@@ -180,6 +180,7 @@ acts on every effect crate; output goes to `target/vfx-plugin/`.
 |---|---|---|
 | The effects | `cargo vfx list` | each effect crate and its identity |
 | A new effect | `cargo vfx new my-glow` | `vfx-core/effects/my-glow`, added to the workspace and the preview |
+| segcam's benchmark | `cargo vfx bench clip.mov [--preset overlay] [--depth 8] [--runs 2] [--cpu] [--reference DIR]` | the offline rows of `plugins/segcam/BENCHMARK.md`, timed on the release CLI; needs ffmpeg |
 | Checks | `cargo vfx check` | effects missing from the preview, and installed After Effects plugins that share a match name; `--quick` and `--full` run the test tiers ([Testing](#testing)) |
 | Plugins | `cargo vfx build [-p segcam-motion] [--hosts ae,ofx,ffgl] [--native]` | `<file>.plugin`, `.ofx.bundle` and `.bundle` on macOS (one universal binary; `--native` builds this Mac's architecture only); `.aex`, `.ofx.bundle` and `.dll` on Windows |
 | macOS installers | `cargo vfx package` | `<file>-adobe.pkg` (Adobe's MediaCore folder) and `<file>-ofx.pkg` (`/Library/OFX/Plugins`) |

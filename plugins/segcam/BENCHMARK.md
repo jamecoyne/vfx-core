@@ -41,6 +41,19 @@ How a host hands over frames changes the cost, so each run names its source.
 
 ## Method
 
+Offline, one command runs it all and prints the rows, ready to paste:
+
+```text
+cargo vfx bench clip.mov [--preset overlay] [--depth 8] [--runs 2] [--cpu] [--reference DIR]
+```
+
+It builds the release CLI, decodes the clip's first 300 frames with ffmpeg to raw ARGB, and feeds
+that file to the CLI. Without `--preset` and `--depth` it runs the first four presets at both
+depths; `--preset 1.1` is the 1.1 look. A frame's time runs from the frame before it out of the CLI,
+so it includes the conversion in and out and the pipe, about 2 ms a frame at 1080p. fps is 1000 over
+the past 40 median, p95 is of the past 40. The frame hashes go to `target/bench/COMMIT`; that folder is
+the `--reference` of a later run (for a GPU run, of a `--cpu` run, `target/bench/COMMIT-cpu`).
+
 - Two runs of each, one timed run on a machine at a time. Builds count as load.
 - Report the median and p95 ms per render, for the first 40 frames and for the rest separately.
   The first 40 are the clip start; the rest is steady state.
@@ -87,6 +100,3 @@ Every release candidate gets the whole table on each contributor's machine, name
 including one at the floor (Intel UHD 770 class graphics) and at least one Apple silicon Mac.
 Between releases, a PR that touches speed shows the offline rows and the rows of the hosts it
 changes.
-
-To do: an offline bench in the repo that runs the four presets on any clip, so every machine runs
-the same code.
