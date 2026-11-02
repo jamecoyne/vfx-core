@@ -34,8 +34,8 @@ stats t=18.4 effect=segcam-motion on=cpu source=59.9 rendered=39.4 rendered_ms=8
 done frames=905 seconds=20.00 effect=segcam-motion on=cpu source=59.9 rendered=37.2 rendered_ms=10.0 worst_ms=2661.5 screen=18.6
 ```
 
-The keys follow the frames: `source` is the rate they come in at (the file's or camera's,
-or `pattern` and `still`), `rendered` the renders the effect finished each second, and
+The keys follow the frames: `source` is the rate they arrive from the decoder, whether they
+are taken or dropped (or `pattern` and `still`), `rendered` the renders the effect finished each second, and
 `screen` the new frames presented in the window each second, where a CPU effect's render
 counts only if its output differs from the last one, and a GPU effect's only if its time or
 parameters changed. segcam's Swarm on a transparent canvas only changes when it analyses,
