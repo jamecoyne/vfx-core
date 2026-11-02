@@ -60,28 +60,28 @@ static void begin_sequence(OfxImageEffectHandle e, int first, int last) {
     setDouble(sequence,kOfxImageEffectPropFrameRange,1,last);
     CHECK(action(kOfxImageEffectActionBeginSequenceRender,e,sequence,NULL)==kOfxStatOK,"begin sequence failed");
 }
-/* Plays frames 6 to 23, stops at 13, edits frames `from` to `to`, and renders `order` straight
-   after, a begin for one frame before each render, as Resolve does. A step back or a repeat checks
-   earlier frames; a step forward streams, reading the frame and the few a check dropped.
-   Every frame's last render equals a fresh one, except frame `stale`, which comes before the
-   step back that would catch the edit. */
-static void replay(int mode, const char *name, const int *order, int n, int from, int to, int stale) {
+/* Plays frames 6 to 23, plays again up to 13, edits frames `from` to `to`, and renders `order`
+   straight after, a begin for one frame before each render, as Resolve does. A step back or a
+   repeat checks earlier frames, and so does the render after it; any other step forward streams,
+   reading the frame and the few a check dropped. Every frame's last render equals a fresh one. */
+static void replay(int mode, const char *name, const int *order, int n, int from, int to) {
     OfxImageEffectHandle e=instance(mode,0);
     for(int t=6;t<=23;t++) render_frame(e,t);
-    render_frame(e,13);
+    for(int t=10;t<=13;t++) render_frame(e,t);
     edit_frames(from,to);
-    int before=13;
+    int before=13, jumped=0;
     for(int i=0;i<n;i++) {
         int t=order[i], again=0;
         for(int j=i+1;j<n;j++) again|=order[j]==t;
         begin_sequence(e,t,t);
         render_frame(e,t);
         int read=reads;
-        if(t>before) CHECK(read<=3,"%s, mode %d, edit %d to %d: a stream read %d frames at %d",name,mode,from,to,read,t);
+        if(t>before && !jumped) CHECK(read<=3,"%s, mode %d, edit %d to %d: a stream read %d frames at %d",name,mode,from,to,read,t);
         else CHECK(read>2,"%s, mode %d, edit %d to %d: a check read %d frames at %d",name,mode,from,to,read,t);
+        jumped=t<=before;
         before=t;
         int same=same_as_fresh(mode,t);
-        if(!again) CHECK(same==(t!=stale),"%s, mode %d, edit %d to %d: frame %d %s a fresh render",name,mode,from,to,t,same?"equals":"differs from");
+        if(!again) CHECK(same,"%s, mode %d, edit %d to %d: frame %d differs from a fresh render",name,mode,from,to,t);
     }
     edit_frames(from,to);
 }
@@ -140,15 +140,17 @@ static int edit_then_deliver(void) {
         CHECK(reads>1,"mode %d: the first frame of a sequence read %d frames",mode,reads);
         CHECK(same_as_fresh(mode,22),"mode %d: the first frame of a sequence missed the edit",mode);
         render_frame(e,23);
-        CHECK(reads==1,"mode %d: the sequence's next frame read %d frames",mode,reads);
+        CHECK(reads>1,"mode %d: the sequence's next frame read %d frames",mode,reads);
         CHECK(same_as_fresh(mode,23),"mode %d: the sequence's next frame differs",mode);
+        render_frame(e,24);
+        CHECK(reads==1,"mode %d: the frame after read %d frames",mode,reads);
+        CHECK(same_as_fresh(mode,24),"mode %d: the frame after differs",mode);
         edit_frames(0,21);
 
-        replay(mode,"macOS order",mac,mac_n,0,13,-1);
-        replay(mode,"macOS order",mac,mac_n,15,15,-1);
-        replay(mode,"Windows order",win,win_n,0,13,-1);
-        /* In Overlay one changed frame of 16 leaves this clip's motion as it was. */
-        replay(mode,"Windows order",win,win_n,15,15,m?16:-1);
+        replay(mode,"macOS order",mac,mac_n,0,13);
+        replay(mode,"macOS order",mac,mac_n,15,15);
+        replay(mode,"Windows order",win,win_n,0,13);
+        replay(mode,"Windows order",win,win_n,15,15);
     }
     printf("edit then deliver: %d failures\n",failures);
     return failures?1:0;

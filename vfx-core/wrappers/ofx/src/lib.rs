@@ -591,19 +591,26 @@ struct Kept {
     last: std::sync::Mutex<Option<Rendered>>,
 }
 
-/// A frame rendered and when it finished.
+/// A frame rendered, when it finished, and whether it didn't follow on from the one before.
 #[derive(Clone, Copy)]
 struct Rendered {
     frame: i64,
     ended: std::time::Instant,
+    jumped: bool,
 }
 
-/// Whether a render of `frame` continues a stream of renders, as playback and Deliver make:
-/// a step forward soon after the last. Nothing upstream is edited mid-stream, so its earlier
-/// frames are taken as unchanged; the first render after a pause checks them all again.
-fn streaming(last: Option<Rendered>, frame: i64) -> bool {
+/// Whether a render of `frame` is a step forward soon after the last.
+fn follows(last: Option<Rendered>, frame: i64) -> bool {
     const GAP: std::time::Duration = std::time::Duration::from_secs(1);
     last.is_some_and(|last| last.ended.elapsed() < GAP && (1..=120).contains(&(frame - last.frame)))
+}
+
+/// Whether a render of `frame` continues a stream of renders, as playback and Deliver make.
+/// Nothing upstream is edited mid-stream, so its earlier frames are taken as unchanged; the first
+/// render after a pause or a jump checks them all again, and so does the next, since Resolve may
+/// start a Deliver past a frame and step back to it, rendering the later frame just once.
+fn streaming(last: Option<Rendered>, frame: i64) -> bool {
+    follows(last, frame) && last.is_some_and(|last| !last.jumped)
 }
 
 fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
@@ -680,6 +687,7 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Rendered {
             frame,
             ended: std::time::Instant::now(),
+            jumped: !follows(last, frame),
         });
         return rendered;
     }
@@ -840,6 +848,7 @@ mod tests {
                 last = Some(Rendered {
                     frame,
                     ended: std::time::Instant::now(),
+                    jumped: !follows(last, frame),
                 });
                 streaming
             })
@@ -849,9 +858,9 @@ mod tests {
     #[test]
     fn forward_steps_stream_and_anything_else_checks_again() {
         // How Resolve 21 starts a Deliver, then playback skipping, a seek back and a jump.
-        let frames = [0, 0, 0, 2, 1, 3, 4, 7, 5, 200];
+        let frames = [0, 0, 0, 2, 1, 3, 4, 7, 5, 200, 201, 202];
         let expected = [
-            false, false, false, true, false, true, true, true, false, false,
+            false, false, false, false, false, false, true, true, false, false, false, true,
         ];
         assert_eq!(streamed(&frames), expected);
     }
