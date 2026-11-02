@@ -39,9 +39,9 @@ static void render_frame(OfxImageEffectHandle e, int t) {
     CHECK(action(kOfxImageEffectActionRender,e,args,NULL)==kOfxStatOK,"render failed at %d",t);
     CHECK(images_out==0,"image leak");
 }
-/* Changes frames 0 to `before`-1 or changes them back, as a grade upstream would. */
-static void edit_before(int before) {
-    for(int t=0;t<before;t++) {
+/* Changes frames `from` to `to` or changes them back, as a grade upstream would. */
+static void edit_frames(int from, int to) {
+    for(int t=from;t<=to;t++) {
         unsigned char *data=history[t].data;
         for(size_t i=0;i<(size_t)320*180*4;i++) if(i%4!=3) data[i]^=0xff;
     }
@@ -54,8 +54,40 @@ static int same_as_fresh(int mode, int t) {
     render_frame(fresh,t);
     return !memcmp(kept,output.data,sizeof kept);
 }
+static void begin_sequence(OfxImageEffectHandle e, int first, int last) {
+    OfxPropertySetHandle sequence=props_new();
+    setDouble(sequence,kOfxImageEffectPropFrameRange,0,first);
+    setDouble(sequence,kOfxImageEffectPropFrameRange,1,last);
+    CHECK(action(kOfxImageEffectActionBeginSequenceRender,e,sequence,NULL)==kOfxStatOK,"begin sequence failed");
+}
+/* Plays frames 6 to 23, stops at 13, edits frames `from` to `to`, and renders `order` straight
+   after, a begin for one frame before each render, as Resolve does. A step back or a repeat checks
+   earlier frames; a step forward streams, reading the frame and the few a check dropped.
+   Every frame's last render equals a fresh one, except frame `stale`, which comes before the
+   step back that would catch the edit. */
+static void replay(int mode, const char *name, const int *order, int n, int from, int to, int stale) {
+    OfxImageEffectHandle e=instance(mode,0);
+    for(int t=6;t<=23;t++) render_frame(e,t);
+    render_frame(e,13);
+    edit_frames(from,to);
+    int before=13;
+    for(int i=0;i<n;i++) {
+        int t=order[i], again=0;
+        for(int j=i+1;j<n;j++) again|=order[j]==t;
+        begin_sequence(e,t,t);
+        render_frame(e,t);
+        int read=reads;
+        if(t>before) CHECK(read<=3,"%s, mode %d, edit %d to %d: a stream read %d frames at %d",name,mode,from,to,read,t);
+        else CHECK(read>2,"%s, mode %d, edit %d to %d: a check read %d frames at %d",name,mode,from,to,read,t);
+        before=t;
+        int same=same_as_fresh(mode,t);
+        if(!again) CHECK(same==(t!=stale),"%s, mode %d, edit %d to %d: frame %d %s a fresh render",name,mode,from,to,t,same?"equals":"differs from");
+    }
+    edit_frames(from,to);
+}
 /* As Resolve: a stream of renders takes earlier frames as unchanged, and a sequence render
-   straight after an edit checks them on its first frame, then streams again. */
+   straight after an edit checks them on its first frame, then streams again. A host's begin for
+   one frame at a time leaves the stream as it was. */
 static int edit_then_deliver(void) {
     as_resolve=1;
     setString(host.host,kOfxPropName,0,"DaVinci Resolve");
@@ -70,30 +102,53 @@ static int edit_then_deliver(void) {
     }
     output=img_new(0,0,320,180,kOfxBitDepthByte); output_props=image_props(&output);
     temporal_image=temporal;
+    static unsigned char streamed[2][320*180*4];
+    /* The orders Resolve 21 starts a Deliver in, from frame 14: on macOS the last frame first, and
+       on Windows the first frame three times. */
+    static const int mac[]={23,15,14,16,17,18,19,20,21,22,23,14,14,14};
+    static const int win[]={14,14,14,16,15,17,18,19,20,21,22,23};
+    int mac_n=sizeof mac/sizeof *mac, win_n=sizeof win/sizeof *win;
     for(int m=0;m<2;m++) {
         int mode=m?3:0;
         OfxImageEffectHandle e=instance(mode,0);
         render_frame(e,20); render_frame(e,21);
-        edit_before(22);
+        edit_frames(0,21);
         render_frame(e,22);
         CHECK(reads==1,"mode %d: a stream read %d frames",mode,reads);
+        memcpy(streamed[0],output.data,sizeof streamed[0]);
         CHECK(!same_as_fresh(mode,22),"mode %d: a stream checked earlier frames",mode);
-        edit_before(22);
+        render_frame(e,23);
+        memcpy(streamed[1],output.data,sizeof streamed[1]);
+        edit_frames(0,21);
 
         e=instance(mode,0);
         render_frame(e,20); render_frame(e,21);
-        edit_before(22);
-        OfxPropertySetHandle sequence=props_new();
-        setDouble(sequence,kOfxImageEffectPropFrameRange,0,22);
-        setDouble(sequence,kOfxImageEffectPropFrameRange,1,31);
-        CHECK(action(kOfxImageEffectActionBeginSequenceRender,e,sequence,NULL)==kOfxStatOK,"begin sequence failed");
+        edit_frames(0,21);
+        for(int t=22;t<24;t++) {
+            begin_sequence(e,t,t);
+            render_frame(e,t);
+            CHECK(reads==1,"mode %d: a begin for frame %d alone read %d frames",mode,t,reads);
+            CHECK(!memcmp(output.data,streamed[t-22],sizeof streamed[0]),"mode %d: a begin for frame %d alone changed the stream",mode,t);
+        }
+        edit_frames(0,21);
+
+        e=instance(mode,0);
+        render_frame(e,20); render_frame(e,21);
+        edit_frames(0,21);
+        begin_sequence(e,22,31);
         render_frame(e,22);
         CHECK(reads>1,"mode %d: the first frame of a sequence read %d frames",mode,reads);
         CHECK(same_as_fresh(mode,22),"mode %d: the first frame of a sequence missed the edit",mode);
         render_frame(e,23);
         CHECK(reads==1,"mode %d: the sequence's next frame read %d frames",mode,reads);
         CHECK(same_as_fresh(mode,23),"mode %d: the sequence's next frame differs",mode);
-        edit_before(22);
+        edit_frames(0,21);
+
+        replay(mode,"macOS order",mac,mac_n,0,13,-1);
+        replay(mode,"macOS order",mac,mac_n,15,15,-1);
+        replay(mode,"Windows order",win,win_n,0,13,-1);
+        /* In Overlay one changed frame of 16 leaves this clip's motion as it was. */
+        replay(mode,"Windows order",win,win_n,15,15,m?16:-1);
     }
     printf("edit then deliver: %d failures\n",failures);
     return failures?1:0;

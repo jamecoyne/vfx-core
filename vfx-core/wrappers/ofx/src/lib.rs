@@ -141,7 +141,7 @@ fn dispatch(
         }
         STAT_OK
     } else if action == ACTION_BEGIN_SEQUENCE_RENDER && cpu {
-        begin_sequence(effect)?;
+        begin_sequence(effect, in_args)?;
         STAT_OK
     } else {
         STAT_REPLY_DEFAULT
@@ -657,10 +657,15 @@ fn kept<'a>(effect: ImageEffect) -> Result<Option<&'a Kept>, OfxStatus> {
 }
 
 /// A sequence render, such as a Deliver, can follow an edit however recent the last render, so
-/// its first frame doesn't continue a stream and checks every earlier frame.
-fn begin_sequence(effect: ImageEffect) -> Result<(), OfxStatus> {
+/// its first frame doesn't continue a stream and checks every earlier frame. Hosts send this
+/// for single frames too, so a range of one frame leaves the stream alone.
+fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
     LOG.note("begin sequence render");
-    if let Some(kept) = kept(effect)? {
+    let range = [0, 1].map(|i| in_args.get_double(PROP_FRAME_RANGE, i));
+    if let [Ok(first), Ok(last)] = range
+        && last > first
+        && let Some(kept) = kept(effect)?
+    {
         *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
     Ok(())
