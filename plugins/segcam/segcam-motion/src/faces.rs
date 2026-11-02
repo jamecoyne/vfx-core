@@ -48,8 +48,9 @@ mod models {
         let started = Instant::now();
         let segmenter = catch_unwind(AssertUnwindSafe(warmed)).unwrap_or(None);
         match &segmenter {
-            Some(_) => eprintln!(
-                "segcam Motion: face models ready in {} ms",
+            Some(segmenter) => eprintln!(
+                "segcam Motion: face models on {}, ready in {} ms",
+                segmenter.runs_on(),
                 started.elapsed().as_millis()
             ),
             None => eprintln!("segcam Motion: no face models"),
