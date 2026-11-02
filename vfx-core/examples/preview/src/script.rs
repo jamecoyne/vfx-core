@@ -3,13 +3,13 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use vfx_core::{ParamKind, ParamSpec, ParamValue};
 
 use crate::catalog;
 use crate::effects::PATTERNS;
-use crate::stats::Snapshot;
+use crate::stats::{Counts, Snapshot, SourceRate, What};
 
 pub const USAGE: &str = "\
 vfx-preview [FLAGS] [FILE]
@@ -248,18 +248,22 @@ pub fn list() -> String {
     out
 }
 
-/// Counts frames for `--stats`, `--frames` and `--seconds`, from the first frame on.
+/// Counts frames for `--stats`, `--frames` and `--seconds`, from the first frame on. A
+/// frame here is a pass of the app's loop, which is what `--frames` counts.
 pub struct Meter {
     print: bool,
     stop: Option<Stop>,
     start: Instant,
-    last: Option<Instant>,
+    started: bool,
     frames: u64,
-    max: f64,
-    /// The second being counted: its start, frame intervals and longest one.
+    /// The longest render of the run.
+    worst: Duration,
+    /// The second being counted: its start and longest render.
     window: Instant,
-    window_frames: u32,
-    window_max: f64,
+    window_worst: Duration,
+    /// The totals at the first frame and at the start of the second being counted.
+    first_counts: Counts,
+    window_counts: Counts,
     done: bool,
 }
 
@@ -270,12 +274,13 @@ impl Meter {
             print,
             stop,
             start: now,
-            last: None,
+            started: false,
             frames: 0,
-            max: 0.0,
+            worst: Duration::ZERO,
             window: now,
-            window_frames: 0,
-            window_max: 0.0,
+            window_worst: Duration::ZERO,
+            first_counts: Counts::default(),
+            window_counts: Counts::default(),
             done: false,
         }
     }
@@ -286,25 +291,25 @@ impl Meter {
             return true;
         }
         let now = Instant::now();
-        match self.last {
-            None => (self.start, self.window) = (now, now),
-            Some(last) => {
-                let dt = now.duration_since(last).as_secs_f64();
-                self.max = self.max.max(dt);
-                self.window_max = self.window_max.max(dt);
-                self.window_frames += 1;
-            }
+        if !self.started {
+            self.started = true;
+            (self.start, self.window) = (now, now);
+            (self.first_counts, self.window_counts) = (stats.counts, stats.counts);
         }
-        self.last = Some(now);
         self.frames += 1;
+        if let Some(render) = stats.last_render {
+            self.worst = self.worst.max(render);
+            self.window_worst = self.window_worst.max(render);
+        }
         let elapsed = now.duration_since(self.start).as_secs_f64();
         let span = now.duration_since(self.window).as_secs_f64();
         if span >= 1.0 {
             if self.print {
-                let frames = self.window_frames;
-                println!("{}", line(elapsed, frames, span, self.window_max, stats));
+                let done = stats.counts.since(self.window_counts);
+                println!("{}", line(elapsed, span, self.window_worst, stats, done));
             }
-            (self.window, self.window_frames, self.window_max) = (now, 0, 0.0);
+            (self.window, self.window_worst) = (now, Duration::ZERO);
+            self.window_counts = stats.counts;
         }
         self.done = match self.stop {
             Some(Stop::Frames(n)) => self.frames >= n,
@@ -312,27 +317,50 @@ impl Meter {
             None => false,
         };
         if self.done && self.print {
+            let seconds = elapsed.max(f64::EPSILON);
+            let done = stats.counts.since(self.first_counts);
             println!(
-                "done frames={} seconds={elapsed:.2} fps={:.1} max_ms={:.1}",
+                "done frames={} seconds={elapsed:.2} {}",
                 self.frames,
-                (self.frames - 1) as f64 / elapsed.max(f64::EPSILON),
-                self.max * 1000.0
+                counts_text(seconds, self.worst, &stats.what, done)
             );
         }
         self.done
     }
 }
 
-/// One `--stats` line: always these keys, in this order.
-fn line(elapsed: f64, frames: u32, span: f64, max: f64, s: &Snapshot) -> String {
+/// The counts as keys: the effect and where it runs, the source's rate, renders a second
+/// with their mean and longest time in ms when the effect has one, and new frames a second.
+fn counts_text(seconds: f64, worst: Duration, what: &What, done: Counts) -> String {
+    let source = match what.source {
+        SourceRate::Pattern => "pattern".to_owned(),
+        SourceRate::Still => "still".to_owned(),
+        SourceRate::Fps(fps) => format!("{fps:.1}"),
+    };
+    let mut text = format!(
+        "effect={} on={} source={source} rendered={:.1}",
+        what.slug,
+        if what.on_cpu { "cpu" } else { "gpu" },
+        done.rendered as f64 / seconds,
+    );
+    if let Some(ms) = done.render_ms() {
+        text += &format!(
+            " rendered_ms={ms:.1} worst_ms={:.1}",
+            worst.as_secs_f64() * 1000.0
+        );
+    }
+    text += &format!(" screen={:.1}", done.screen as f64 / seconds);
+    text
+}
+
+/// One `--stats` line: the counts over the last `span` seconds, then the machine.
+fn line(elapsed: f64, span: f64, worst: Duration, s: &Snapshot, done: Counts) -> String {
     let gpu = s.gpu.map_or("n/a".to_owned(), |g| format!("{g:.1}"));
     format!(
-        "stats t={elapsed:.1} fps={:.1} ms={:.2} max_ms={:.2} size={}x{} cpu={:.1} app_cpu={:.1} mem_mb={} gpu={gpu}",
-        frames as f64 / span,
-        span * 1000.0 / f64::from(frames.max(1)),
-        max * 1000.0,
-        s.size.0,
-        s.size.1,
+        "stats t={elapsed:.1} {} size={}x{} cpu={:.1} app_cpu={:.1} mem_mb={} gpu={gpu}",
+        counts_text(span, worst, &s.what, done),
+        s.what.size.0,
+        s.what.size.1,
         s.system_cpu,
         s.cpu,
         s.memory_mb,
@@ -442,6 +470,51 @@ mod tests {
         assert!(meter.frame(&stats));
         assert!(meter.frame(&stats));
         assert_eq!(meter.frames, 3);
+    }
+
+    /// The keys name what they count; the render times are there for a CPU effect only.
+    #[test]
+    fn a_stats_line_names_what_it_counts() {
+        let s = Snapshot {
+            what: What {
+                effect: "segcam Motion",
+                slug: "segcam-motion",
+                on_cpu: true,
+                source: SourceRate::Fps(59.94),
+                size: (1920, 1080),
+            },
+            ..Default::default()
+        };
+        let done = Counts {
+            rendered: 60,
+            render_time: Duration::from_millis(600),
+            screen: 30,
+        };
+        assert_eq!(
+            line(1.0, 1.0, Duration::from_millis(20), &s, done),
+            "stats t=1.0 effect=segcam-motion on=cpu source=59.9 rendered=60.0 rendered_ms=10.0 \
+             worst_ms=20.0 screen=30.0 size=1920x1080 cpu=0.0 app_cpu=0.0 mem_mb=0 gpu=n/a"
+        );
+        let s = Snapshot {
+            what: What {
+                effect: "Gaussian blur",
+                slug: "gaussian-blur",
+                on_cpu: false,
+                source: SourceRate::Pattern,
+                size: (0, 0),
+            },
+            ..Default::default()
+        };
+        let done = Counts {
+            rendered: 120,
+            render_time: Duration::ZERO,
+            screen: 120,
+        };
+        assert_eq!(
+            line(2.0, 1.0, Duration::ZERO, &s, done),
+            "stats t=2.0 effect=gaussian-blur on=gpu source=pattern rendered=120.0 screen=120.0 \
+             size=0x0 cpu=0.0 app_cpu=0.0 mem_mb=0 gpu=n/a"
+        );
     }
 
     #[test]

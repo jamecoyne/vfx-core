@@ -17,7 +17,7 @@ an announcement. Requirements and their status are in [SPEC.md](SPEC.md).
 ## After 1.0
 
 - Reusing vfx-core for new effects.
-- The web, with NicoWasHere's SYNUS as a test case.
+- The web, with NicoWasHere's SYNUS as a test case; #62 lists what a WebGL2 host needs.
 - A live only build option for effects that keep feedback, so they skip the After Effects and
   OpenFX builds (NicoWasHere's idea).
 - Keeping work between renders in After Effects.
