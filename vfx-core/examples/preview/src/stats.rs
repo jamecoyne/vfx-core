@@ -108,8 +108,6 @@ impl Default for Snapshot {
 }
 
 pub struct Sampler {
-    sys: Option<System>,
-    pid: Pid,
     last: Option<Instant>,
     last_counts: Counts,
     /// The longest render since the last sample.
@@ -117,6 +115,16 @@ pub struct Sampler {
     snapshot: Snapshot,
     /// Written by the GPU thread (macOS only).
     gpu: Arc<Mutex<Option<f32>>>,
+    /// Written by the usage thread. None until its first reading, and for good if the OS
+    /// won't say what's running; the bar then keeps its last numbers.
+    usage: Arc<Mutex<Option<Usage>>>,
+}
+
+/// This process's CPU and memory in MB, when the OS lists it, and the whole machine's CPU.
+#[derive(Clone, Copy)]
+struct Usage {
+    process: Option<(f32, u64)>,
+    system_cpu: f32,
 }
 
 impl Sampler {
@@ -133,15 +141,36 @@ impl Sampler {
                 }
             });
         }
+        let usage = Arc::new(Mutex::new(None));
+        let shared = Arc::clone(&usage);
+        // Its own thread too: where Windows can't open its CPU counters, each CPU reading
+        // loads them again first, which takes a third of a second or more.
+        std::thread::spawn(move || {
+            let Ok(mut sys) = System::new() else {
+                return;
+            };
+            let pid = Pid::from_u32(std::process::id());
+            loop {
+                sys.refresh_cpu_usage();
+                sys.refresh_memory();
+                sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+                let process = sys
+                    .process(pid)
+                    .map(|process| (process.cpu_usage(), process.memory() / (1024 * 1024)));
+                *shared.lock().unwrap() = Some(Usage {
+                    process,
+                    system_cpu: sys.global_cpu_usage(),
+                });
+                std::thread::sleep(INTERVAL);
+            }
+        });
         Self {
-            // None if the OS won't say what's running; the bar then keeps its last numbers.
-            sys: System::new().ok(),
-            pid: Pid::from_u32(std::process::id()),
             last: None,
             last_counts: Counts::default(),
             worst: Duration::ZERO,
             snapshot: Snapshot::default(),
             gpu,
+            usage,
         }
     }
 
@@ -165,15 +194,12 @@ impl Sampler {
             }
             self.last = Some(Instant::now());
             self.last_counts = counts;
-            if let Some(sys) = self.sys.as_mut() {
-                sys.refresh_cpu_usage();
-                sys.refresh_memory();
-                sys.refresh_processes(ProcessesToUpdate::Some(&[self.pid]), true);
-                if let Some(process) = sys.process(self.pid) {
-                    self.snapshot.cpu = process.cpu_usage();
-                    self.snapshot.memory_mb = process.memory() / (1024 * 1024);
+            if let Some(usage) = *self.usage.lock().unwrap() {
+                if let Some((cpu, memory_mb)) = usage.process {
+                    self.snapshot.cpu = cpu;
+                    self.snapshot.memory_mb = memory_mb;
                 }
-                self.snapshot.system_cpu = sys.global_cpu_usage();
+                self.snapshot.system_cpu = usage.system_cpu;
             }
             self.snapshot.gpu = *self.gpu.lock().unwrap();
         }
