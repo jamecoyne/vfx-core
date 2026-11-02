@@ -46,13 +46,12 @@ static void edit_frames(int from, int to) {
         for(size_t i=0;i<(size_t)320*180*4;i++) if(i%4!=3) data[i]^=0xff;
     }
 }
-/* Whether `kept` holds what a fresh instance renders of frame t. */
-static int same_as_fresh(int mode, int t) {
-    static unsigned char kept[320*180*4];
-    memcpy(kept,output.data,sizeof kept);
+/* Whether `pixels` is what a fresh instance renders of frame t. A kept instance's renders come
+   first, and these after, so a cold render doesn't stretch the gap a stream depends on. */
+static int same_as_fresh(int mode, int t, const unsigned char *pixels) {
     OfxImageEffectHandle fresh=instance(mode,0);
     render_frame(fresh,t);
-    return !memcmp(kept,output.data,sizeof kept);
+    return !memcmp(pixels,output.data,(size_t)320*180*4);
 }
 static void begin_sequence(OfxImageEffectHandle e, int first, int last) {
     OfxPropertySetHandle sequence=props_new();
@@ -69,10 +68,10 @@ static void replay(int mode, const char *name, const int *order, int n, int from
     for(int t=6;t<=23;t++) render_frame(e,t);
     for(int t=10;t<=13;t++) render_frame(e,t);
     edit_frames(from,to);
+    static unsigned char rendered[16][320*180*4];
     int before=13, jumped=0;
     for(int i=0;i<n;i++) {
-        int t=order[i], again=0;
-        for(int j=i+1;j<n;j++) again|=order[j]==t;
+        int t=order[i];
         begin_sequence(e,t,t);
         render_frame(e,t);
         int read=reads;
@@ -80,8 +79,12 @@ static void replay(int mode, const char *name, const int *order, int n, int from
         else CHECK(read>2,"%s, mode %d, edit %d to %d: a check read %d frames at %d",name,mode,from,to,read,t);
         jumped=t<=before;
         before=t;
-        int same=same_as_fresh(mode,t);
-        if(!again) CHECK(same,"%s, mode %d, edit %d to %d: frame %d differs from a fresh render",name,mode,from,to,t);
+        memcpy(rendered[i],output.data,sizeof rendered[i]);
+    }
+    for(int i=0;i<n;i++) {
+        int t=order[i], again=0;
+        for(int j=i+1;j<n;j++) again|=order[j]==t;
+        if(!again) CHECK(same_as_fresh(mode,t,rendered[i]),"%s, mode %d, edit %d to %d: frame %d differs from a fresh render",name,mode,from,to,t);
     }
     edit_frames(from,to);
 }
@@ -102,7 +105,7 @@ static int edit_then_deliver(void) {
     }
     output=img_new(0,0,320,180,kOfxBitDepthByte); output_props=image_props(&output);
     temporal_image=temporal;
-    static unsigned char streamed[2][320*180*4];
+    static unsigned char streamed[2][320*180*4], sequence[3][320*180*4];
     /* The orders Resolve 21 starts a Deliver in, from frame 14: on macOS the last frame first, and
        on Windows the first frame three times. */
     static const int mac[]={23,15,14,16,17,18,19,20,21,22,23,14,14,14};
@@ -116,9 +119,9 @@ static int edit_then_deliver(void) {
         render_frame(e,22);
         CHECK(reads==1,"mode %d: a stream read %d frames",mode,reads);
         memcpy(streamed[0],output.data,sizeof streamed[0]);
-        CHECK(!same_as_fresh(mode,22),"mode %d: a stream checked earlier frames",mode);
         render_frame(e,23);
         memcpy(streamed[1],output.data,sizeof streamed[1]);
+        CHECK(!same_as_fresh(mode,22,streamed[0]),"mode %d: a stream checked earlier frames",mode);
         edit_frames(0,21);
 
         e=instance(mode,0);
@@ -138,13 +141,16 @@ static int edit_then_deliver(void) {
         begin_sequence(e,22,31);
         render_frame(e,22);
         CHECK(reads>1,"mode %d: the first frame of a sequence read %d frames",mode,reads);
-        CHECK(same_as_fresh(mode,22),"mode %d: the first frame of a sequence missed the edit",mode);
+        memcpy(sequence[0],output.data,sizeof sequence[0]);
         render_frame(e,23);
         CHECK(reads>1,"mode %d: the sequence's next frame read %d frames",mode,reads);
-        CHECK(same_as_fresh(mode,23),"mode %d: the sequence's next frame differs",mode);
+        memcpy(sequence[1],output.data,sizeof sequence[1]);
         render_frame(e,24);
         CHECK(reads==1,"mode %d: the frame after read %d frames",mode,reads);
-        CHECK(same_as_fresh(mode,24),"mode %d: the frame after differs",mode);
+        memcpy(sequence[2],output.data,sizeof sequence[2]);
+        CHECK(same_as_fresh(mode,22,sequence[0]),"mode %d: the first frame of a sequence missed the edit",mode);
+        CHECK(same_as_fresh(mode,23,sequence[1]),"mode %d: the sequence's next frame differs",mode);
+        CHECK(same_as_fresh(mode,24,sequence[2]),"mode %d: the frame after differs",mode);
         edit_frames(0,21);
 
         replay(mode,"macOS order",mac,mac_n,0,13);

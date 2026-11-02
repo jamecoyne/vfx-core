@@ -1,11 +1,13 @@
 //! segcam Motion worked out incrementally: each frame's grid, motion and tiles are kept, with
 //! a hash of the pixels they came from. Where earlier frames can change upstream (OpenFX), a
-//! render still reads every frame it depends on and works out again only what a changed frame
-//! feeds, so an edit reaches it however far back it is. Where they can't (a host's own history
-//! of frames, as in Resolume and the preview: [`FrameSource::fixed`]), it reads only the frames
-//! it hasn't worked out, and the current one. Results come from each frame and the settings
-//! alone, so render order doesn't change the output. Motion whose background is cut short by
-//! the start of the frames, as at the start of a clip, is kept with the frame it starts at.
+//! render reads every frame it depends on and works out again only what a changed frame feeds,
+//! so an edit reaches it however far back it is. Where they are taken as unchanged
+//! ([`FrameSource::fixed`]: a host's own history of frames, as in Resolume and the preview, and
+//! Resolve while it streams), it reads only the frames it hasn't worked out, and the current
+//! one, so an edit in Resolve is caught when that frame is rendered or at the next check.
+//! Results come from each frame and the settings alone, so render order doesn't change the
+//! output. Motion whose background is cut short by the start of the frames, as at the start of
+//! a clip, is kept with the frame it starts at.
 //!
 //! A host that holds only its newest frames ([`FrameSource::held`]) can't hand the others over
 //! again. What was cut from them stays as it was cut, so new settings reach new windows only,
