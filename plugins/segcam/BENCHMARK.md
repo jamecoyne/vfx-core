@@ -8,7 +8,8 @@ correctness only: its machines are shared, have no real GPU and time too unevenl
 To choose: a 1080p, 59.94 fps clip the project can share, with motion and several faces, 300
 frames. Until then each run names the clip it used, and only runs on the same clip compare.
 
-Offline runs use the decoded RGBA frames and Resolume plays the clip in a composition. Resolve
+Offline runs use the decoded frames of the clip as H.264 from now on (the F7 rows below used a
+DNxHR HQ transcode, so their pixels differ slightly) and Resolume plays the clip in a composition. Resolve
 uses a DNxHR HQ transcode: segcam asks for earlier frames, and an intra frame codec gets any frame
 without decoding the ones before it.
 

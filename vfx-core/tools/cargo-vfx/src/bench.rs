@@ -385,7 +385,7 @@ fn probe(clip: &str) -> Result<(u32, u32, String), String> {
 
 /// The clip's first frames as the raw ARGB the CLI reads.
 fn decode(clip: &str, raw: &Path) -> Result<(), String> {
-    eprintln!("decoding the first {FRAMES} frames of {clip}");
+    eprintln!("decoding the first {FRAMES} frames");
     run_cmd(
         Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-i", clip, "-map", "0:v:0"])
