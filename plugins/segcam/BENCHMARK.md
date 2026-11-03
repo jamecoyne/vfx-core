@@ -75,16 +75,16 @@ Linux the GPUs `lspci` lists.
 
 | Machine | Host | Preset | Depth | Path | First 40 median | Past 40 median | p95 | fps or renders/s | Matches |
 |---|---|---|---|---|---|---|---|---|---|
-| 12th Gen Intel Core i7-12700K, NVIDIA GeForce RTX 4070 (display, 621.01), Intel UHD Graphics 770 (32.0.101.7092), NVIDIA GeForce RTX 3070 (621.01), Windows 11 Pro 26300 | CLI | overlay | 8 bit | CPU, fresh | 34.4 ms | 35.4 ms | 50.6 ms | 28.3 fps | b90932c, 300 of 300 |
-| same | CLI | overlay | float | CPU, fresh | 51.3 ms | 54.6 ms | 74.8 ms | 18.3 fps | b90932c, 300 of 300 |
-| same | CLI | overlay | 8 bit | CPU, kept | 14.1 ms | 14.1 ms | 21.3 ms | 70.9 fps | b90932c, 300 of 300 |
-| same | CLI | overlay | float | CPU, kept | 20.3 ms | 21.2 ms | 27.9 ms | 47.2 fps | b90932c, 300 of 300 |
-| same | CLI | overlay faces | 8 bit | CPU, kept, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 22.5 ms | 22.0 ms | 28.2 ms | 45.4 fps | b90932c, 300 of 300 |
-| same | CLI | overlay faces | float | CPU, kept, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 27.8 ms | 28.2 ms | 37.4 ms | 35.5 fps | b90932c, 300 of 300 |
-| same | CLI | show | 8 bit | GPU or CPU per render, NVIDIA GeForce RTX 4070 | 16.2 ms | 17.2 ms | 23.3 ms | 58.0 fps | b90932c, 300 of 300 |
-| same | CLI | show | float | GPU or CPU per render, NVIDIA GeForce RTX 4070 | 23.1 ms | 26.9 ms | 40.1 ms | 37.2 fps | b90932c, 300 of 300 |
-| same | CLI | show faces | 8 bit | GPU or CPU per render, NVIDIA GeForce RTX 4070, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 23.8 ms | 26.3 ms | 42.9 ms | 38.0 fps | b90932c, 300 of 300 |
-| same | CLI | show faces | float | GPU or CPU per render, NVIDIA GeForce RTX 4070, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 31.6 ms | 36.9 ms | 69.2 ms | 27.1 fps | b90932c, 300 of 300 |
+| 12th Gen Intel Core i7-12700K, NVIDIA GeForce RTX 4070 (display, 621.01), Intel UHD Graphics 770 (32.0.101.7092), NVIDIA GeForce RTX 3070 (621.01), Windows 11 Pro 26300 | CLI | overlay | 8 bit | CPU, fresh, 600 of 600 frames | 35.8 ms | 36.6 ms | 38.0 ms | 27.4 fps | no reference |
+| same | CLI | overlay | float | CPU, fresh, 600 of 600 frames | 53.4 ms | 55.1 ms | 60.7 ms | 18.1 fps | no reference |
+| same | CLI | overlay | 8 bit | CPU, kept, 600 of 600 frames | 14.6 ms | 14.9 ms | 15.9 ms | 66.9 fps | the `--cpu` rows, 300 of 300 |
+| same | CLI | overlay | float | CPU, kept, 600 of 600 frames | 20.1 ms | 20.9 ms | 22.5 ms | 47.8 fps | the `--cpu` rows, 300 of 300 |
+| same | CLI | overlay faces | 8 bit | CPU, kept, 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 18.3 ms | 20.3 ms | 27.9 ms | 49.3 fps | no reference |
+| same | CLI | overlay faces | float | CPU, kept, 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 25.5 ms | 27.0 ms | 33.9 ms | 37.0 fps | no reference |
+| same | CLI | show | 8 bit | GPU (NVIDIA GeForce RTX 4070), 582 of 600 frames, CPU 18 frames | 17.0 ms | 17.9 ms | 20.5 ms | 55.9 fps | no reference |
+| same | CLI | show | float | GPU (NVIDIA GeForce RTX 4070), 548 of 600 frames, CPU 52 frames | 23.6 ms | 26.2 ms | 35.3 ms | 38.2 fps | no reference |
+| same | CLI | show faces | 8 bit | GPU (NVIDIA GeForce RTX 4070), 594 of 600 frames, CPU 6 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 24.0 ms | 25.4 ms | 35.5 ms | 39.4 fps | no reference |
+| same | CLI | show faces | float | GPU (NVIDIA GeForce RTX 4070), 570 of 600 frames, CPU 30 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 30.4 ms | 34.0 ms | 63.6 ms | 29.4 fps | no reference |
 | Ryzen 5 3600, RX 5700 XT 50th Anniversary (display), AMD 26.10.1, Windows 10 22H2 | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output through RAM | not split out | 32.7 ms | 45.6 ms | 26.7 fps | |
 | same | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output kept on the GPU | not split out | 28.9 ms | 41.4 ms | 30.0 fps | the swarm read back, byte for byte (`tests/target.rs`) |
 
