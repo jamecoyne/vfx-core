@@ -178,6 +178,7 @@ fn run<C: Depth>(
     let (mut stdin, mut stdout) = (io::stdin().lock(), io::stdout().lock());
     let mut bytes = vec![0u8; pixels * 4];
     let mut frame = 0i64;
+    let (mut on_gpu, mut adapter) = (0u64, String::new());
     // Every input byte's channel value, worked out once: this runs on 8.3 M channels a frame.
     let levels: [C; 256] = std::array::from_fn(|b| C::from_unit(b as f32 / 255.0));
 
@@ -207,6 +208,15 @@ fn run<C: Depth>(
             None => segcam_motion::render(&settings, &mut ring, count, frame, &mut view),
         }
 
+        if let Some(state) = &kept
+            && state.drew_on_gpu()
+        {
+            on_gpu += 1;
+            if let Some(gpu) = state.gpu() {
+                adapter.clone_from(&gpu.adapter().name);
+            }
+        }
+
         for (dst, p) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&out) {
             *dst = [p.alpha, p.red, p.green, p.blue]
                 .map(|c| (c.to_unit().clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
@@ -217,12 +227,12 @@ fn run<C: Depth>(
         frame += 1;
     }
     // `cargo vfx bench` reads the path from here.
-    let path = match &kept {
-        None => "CPU, fresh".to_owned(),
-        Some(state) => state.gpu().map_or("CPU, kept".to_owned(), |gpu| {
-            format!("GPU or CPU per render, {}", gpu.adapter().name)
-        }),
+    let how = if kept.is_some() { "kept" } else { "fresh" };
+    let adapter = if on_gpu > 0 {
+        format!(" ({adapter})")
+    } else {
+        String::new()
     };
-    eprintln!("segcam-motion: {frame} frames, {path}");
+    eprintln!("segcam-motion: {frame} frames, {how}, {on_gpu} on the GPU{adapter}");
     ExitCode::SUCCESS
 }

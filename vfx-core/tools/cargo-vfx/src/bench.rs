@@ -19,7 +19,7 @@ const USAGE: &str = "usage: cargo vfx bench CLIP [--preset NAME]... [--depth 8|f
 
 const FRAMES: u32 = 300;
 /// The first frames are the clip start, the rest steady state.
-const SPLIT: usize = 40;
+const FIRST_FRAMES: usize = 40;
 
 const PRESETS: [(&str, &[&str]); 5] = [
     ("overlay", &["--mode", "overlay", "--background", "16"]),
@@ -153,14 +153,14 @@ pub fn run(args: &[String], root: &Path, target: &Path) -> Result<(), String> {
         .join("release")
         .join(format!("segcam-motion{}", std::env::consts::EXE_SUFFIX));
     let bench = target.join("bench");
-    let hashes = bench.join(folder(&commit(root), dirty(root), o.cpu));
+    let hashes = bench.join(hash_folder(&head_commit(root), tree_is_dirty(root), o.cpu));
     fs::create_dir_all(&hashes).map_err(|e| format!("{}: {e}", hashes.display()))?;
 
     let raw = bench.join("frames.argb");
     let frame_bytes = width as usize * height as usize * 4;
     let result = decode(&o.clip, &raw).and_then(|()| {
         // References are checked before anything is timed.
-        let clip = frames_hash(&raw, frame_bytes)?;
+        let clip = decoded_frames_hash(&raw, frame_bytes)?;
         let mut rows = Vec::new();
         for &preset in &o.presets {
             for &depth in &o.depths {
@@ -197,7 +197,7 @@ impl Row {
             preset_name.replace(' ', "-"),
             depth_name.replace(' ', "")
         );
-        let header = header(clip, preset_name, depth_name);
+        let header = hash_file_header(clip, preset_name, depth_name);
         let reference = match &o.reference {
             Some(dir) => Some(load_reference(Path::new(dir), &file, &header)?),
             None => None,
@@ -236,7 +236,7 @@ impl Row {
 
         let (mut first, mut rest) = (Vec::new(), Vec::new());
         let (mut matched, mut of) = (usize::MAX, 0);
-        let mut path = String::new();
+        let (mut drawn, mut faces) = (DrawnOn::default(), None);
         for n in 0..o.runs {
             eprintln!("{preset}, {depth}, run {} of {}", n + 1, o.runs);
             let timed = timed_run(&mut cmd, raw, width as usize * height as usize * 4)?;
@@ -249,12 +249,16 @@ impl Row {
                     timed.log
                 ));
             }
-            let split = timed.ms.len().min(SPLIT);
+            let split = timed.ms.len().min(FIRST_FRAMES);
             first.extend_from_slice(&timed.ms[..split]);
             rest.extend_from_slice(&timed.ms[split..]);
-            path = path_from(&timed.log);
+            drawn.pool(
+                drawn_on(&timed.log)
+                    .ok_or_else(|| format!("{preset}: the CLI named no path:\n{}", timed.log))?,
+            );
+            faces = faces_device(&timed.log).map(str::to_owned);
             if let Some((_, want)) = &self.reference {
-                let (same, total) = matching(&timed.hashes, want);
+                let (same, total) = count_matches(&timed.hashes, want);
                 matched = matched.min(same);
                 of = of.max(total);
             }
@@ -271,6 +275,7 @@ impl Row {
             Some((name, _)) => format!("{name}, {matched} of {of}"),
             None => "no reference".to_owned(),
         };
+        let path = path_cell(&drawn, faces.as_deref());
         let median_rest = median(&mut rest);
         println!(
             "| {machine} | CLI | {preset} | {depth} | {path} | {} | {} | {} | {} | {matches} |",
@@ -283,14 +288,14 @@ impl Row {
     }
 }
 
-struct Timed {
+struct TimedRun {
     /// Each frame's time out of the CLI, frame 0's from the start of the process.
     ms: Vec<f64>,
     hashes: Vec<String>,
     log: String,
 }
 
-fn timed_run(cmd: &mut Command, raw: &Path, frame_bytes: usize) -> Result<Timed, String> {
+fn timed_run(cmd: &mut Command, raw: &Path, frame_bytes: usize) -> Result<TimedRun, String> {
     let input = File::open(raw).map_err(|e| format!("{}: {e}", raw.display()))?;
     let start = Instant::now();
     let mut child = cmd
@@ -319,30 +324,30 @@ fn timed_run(cmd: &mut Command, raw: &Path, frame_bytes: usize) -> Result<Timed,
         let now = Instant::now();
         ms.push((now - last).as_secs_f64() * 1000.0);
         last = now;
-        hashes.push(format!("{:016x}", hash(&frame)));
+        hashes.push(format!("{:016x}", frame_hash(&frame)));
     }
     let status = child.wait().map_err(|e| format!("{cmd:?}: {e}"))?;
     let log = log.join().unwrap_or_default();
     if !status.success() || ms.is_empty() {
         return Err(format!("{cmd:?} failed ({status}):\n{log}"));
     }
-    Ok(Timed { ms, hashes, log })
+    Ok(TimedRun { ms, hashes, log })
 }
 
 /// A hash file's first line: what its hashes are of.
-fn header(clip: u64, preset: &str, depth: &str) -> String {
+fn hash_file_header(clip: u64, preset: &str, depth: &str) -> String {
     format!("clip {clip:016x} preset {preset} depth {depth}")
 }
 
 fn load_reference(dir: &Path, file: &str, header: &str) -> Result<(String, Vec<String>), String> {
     let path = dir.join(file);
     let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let hashes = reference_hashes(&text, header).map_err(|e| format!("{}: {e}", path.display()))?;
+    let hashes = parse_reference(&text, header).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = dir.file_name().unwrap_or(dir.as_os_str());
     Ok((name.to_string_lossy().into_owned(), hashes))
 }
 
-fn reference_hashes(text: &str, header: &str) -> Result<Vec<String>, String> {
+fn parse_reference(text: &str, header: &str) -> Result<Vec<String>, String> {
     let mut lines = text.lines();
     let first = lines.next().unwrap_or_default();
     if first != header {
@@ -354,20 +359,20 @@ fn reference_hashes(text: &str, header: &str) -> Result<Vec<String>, String> {
 }
 
 /// The frames that match, and out of how many: a run or a reference that stops short doesn't match.
-fn matching(run: &[String], reference: &[String]) -> (usize, usize) {
+fn count_matches(run: &[String], reference: &[String]) -> (usize, usize) {
     let same = run.iter().zip(reference).filter(|(a, b)| a == b).count();
     (same, run.len().max(reference.len()))
 }
 
 /// The hash of the decoded frames, which names the clip without its file name.
-fn frames_hash(raw: &Path, frame_bytes: usize) -> Result<u64, String> {
+fn decoded_frames_hash(raw: &Path, frame_bytes: usize) -> Result<u64, String> {
     let mut file = File::open(raw).map_err(|e| format!("{}: {e}", raw.display()))?;
     let mut frame = vec![0u8; frame_bytes];
     let mut h = 0u64;
     loop {
         match file.read_exact(&mut frame) {
             Ok(()) => {
-                h = (h ^ hash(&frame))
+                h = (h ^ frame_hash(&frame))
                     .wrapping_mul(0x0100_0000_01b3)
                     .rotate_left(23)
             }
@@ -377,16 +382,70 @@ fn frames_hash(raw: &Path, frame_bytes: usize) -> Result<u64, String> {
     }
 }
 
-/// The path from the CLI's last line, and where the face models ran.
-fn path_from(log: &str) -> String {
-    let path = log
+/// Which path drew a run's frames, from the CLI's last line.
+#[derive(Debug, Default, PartialEq)]
+struct DrawnOn {
+    frames: u64,
+    gpu_frames: u64,
+    adapter: String,
+    kept: bool,
+}
+
+impl DrawnOn {
+    fn pool(&mut self, run: DrawnOn) {
+        self.frames += run.frames;
+        self.gpu_frames += run.gpu_frames;
+        self.kept = run.kept;
+        if !run.adapter.is_empty() {
+            self.adapter = run.adapter;
+        }
+    }
+}
+
+fn drawn_on(log: &str) -> Option<DrawnOn> {
+    let line = log
         .lines()
         .rev()
-        .find_map(|l| l.strip_prefix("segcam-motion: ")?.split_once(", "))
-        .map_or("unknown", |(_, path)| path);
-    match faces_device(log) {
+        .find_map(|l| l.strip_prefix("segcam-motion: "))?;
+    let mut parts = line.splitn(3, ", ");
+    let frames = parts.next()?.strip_suffix(" frames")?.parse().ok()?;
+    let kept = match parts.next()? {
+        "kept" => true,
+        "fresh" => false,
+        _ => return None,
+    };
+    let (gpu_frames, adapter) = parts.next()?.split_once(" on the GPU")?;
+    Some(DrawnOn {
+        frames,
+        gpu_frames: gpu_frames.parse().ok()?,
+        adapter: adapter
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .to_owned(),
+        kept,
+    })
+}
+
+fn path_cell(drawn: &DrawnOn, faces: Option<&str>) -> String {
+    let DrawnOn {
+        frames,
+        gpu_frames,
+        adapter,
+        kept,
+    } = drawn;
+    let cpu_frames = frames - gpu_frames;
+    let path = if *gpu_frames == 0 {
+        let how = if *kept { "kept" } else { "fresh" };
+        format!("CPU, {how}, {cpu_frames} of {frames} frames")
+    } else if cpu_frames == 0 {
+        format!("GPU ({adapter}), {gpu_frames} of {frames} frames")
+    } else {
+        format!("GPU ({adapter}), {gpu_frames} of {frames} frames, CPU {cpu_frames} frames")
+    };
+    match faces {
         Some(device) => format!("{path}, faces on {device}"),
-        None => path.to_owned(),
+        None => path,
     }
 }
 
@@ -398,7 +457,7 @@ fn faces_device(log: &str) -> Option<&str> {
     })
 }
 
-fn hash(bytes: &[u8]) -> u64 {
+fn frame_hash(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let (words, tail) = bytes.as_chunks::<8>();
     let tail = tail.iter().map(|&b| u64::from(b));
@@ -463,8 +522,8 @@ fn probe(clip: &str) -> Result<(u32, u32, String), String> {
 fn decode(clip: &str, raw: &Path) -> Result<(), String> {
     eprintln!("decoding the first {FRAMES} frames");
     // ffmpeg before 5.1 has only -vsync. The size is the coded one, so frames stay unrotated.
-    let help = output("ffmpeg", &["-hide_banner", "-h", "full"]);
-    let every_frame = if help.contains("-fps_mode") {
+    let help = command_stdout("ffmpeg", &["-hide_banner", "-h", "full"]);
+    let passthrough_flag = if help.contains("-fps_mode") {
         "-fps_mode"
     } else {
         "-vsync"
@@ -472,14 +531,14 @@ fn decode(clip: &str, raw: &Path) -> Result<(), String> {
     run_cmd(
         Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-noautorotate", "-i", clip])
-            .args(["-map", "0:v:0", every_frame, "passthrough"])
+            .args(["-map", "0:v:0", passthrough_flag, "passthrough"])
             .args(["-frames:v", &FRAMES.to_string()])
             .args(["-f", "rawvideo", "-pix_fmt", "argb"])
             .arg(raw),
     )
 }
 
-fn commit(root: &Path) -> String {
+fn head_commit(root: &Path) -> String {
     let sha = git(root, &["rev-parse", "--short=7", "HEAD"]);
     if sha.is_empty() {
         "unknown".to_owned()
@@ -488,23 +547,23 @@ fn commit(root: &Path) -> String {
     }
 }
 
-fn dirty(root: &Path) -> bool {
+fn tree_is_dirty(root: &Path) -> bool {
     !git(root, &["status", "--porcelain"]).is_empty()
 }
 
 fn git(root: &Path, args: &[&str]) -> String {
     let root = root.to_string_lossy();
-    output("git", &[&["-C", &root], args].concat())
+    command_stdout("git", &[&["-C", &root], args].concat())
 }
 
 /// The hash folder's name: a dirty tree must not overwrite its commit's hashes.
-fn folder(commit: &str, dirty: bool, cpu: bool) -> String {
+fn hash_folder(commit: &str, dirty: bool, cpu: bool) -> String {
     let dirty = if dirty { "-dirty" } else { "" };
     let cpu = if cpu { "-cpu" } else { "" };
     format!("{commit}{dirty}{cpu}")
 }
 
-fn output(program: &str, args: &[&str]) -> String {
+fn command_stdout(program: &str, args: &[&str]) -> String {
     Command::new(program)
         .args(args)
         .output()
@@ -532,7 +591,7 @@ fn windows_machine() -> Vec<String> {
         os=(Get-CimInstance Win32_OperatingSystem | ForEach-Object {$_.Caption + ' ' + $_.BuildNumber});\
         gpus=@(Get-CimInstance Win32_VideoController | ForEach-Object {@{name=$_.Name;driver=$_.DriverVersion;\
         display=[bool]$_.CurrentHorizontalResolution}})} | ConvertTo-Json -Depth 3 -Compress";
-    let text = output("powershell", &["-NoProfile", "-Command", script]);
+    let text = command_stdout("powershell", &["-NoProfile", "-Command", script]);
     let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
     let text_of = |v: &serde_json::Value| v.as_str().unwrap_or("unknown").to_owned();
     let mut parts = vec![text_of(&json["cpu"])];
@@ -561,23 +620,23 @@ fn driver_number(gpu: &str, driver: &str) -> String {
 }
 
 fn macos_machine() -> Vec<String> {
-    let sysctl = |key: &str| output("sysctl", &["-n", key]);
-    mac_parts(
+    let sysctl = |key: &str| command_stdout("sysctl", &["-n", key]);
+    macos_parts(
         &sysctl("machdep.cpu.brand_string"),
         &sysctl("hw.physicalcpu"),
         &sysctl("hw.memsize"),
-        &output("system_profiler", &["SPDisplaysDataType", "-json"]),
+        &command_stdout("system_profiler", &["SPDisplaysDataType", "-json"]),
         &format!(
             "macOS {} {}",
-            output("sw_vers", &["-productVersion"]),
-            output("sw_vers", &["-buildVersion"])
+            command_stdout("sw_vers", &["-productVersion"]),
+            command_stdout("sw_vers", &["-buildVersion"])
         ),
     )
 }
 
 /// Apple silicon's CPU and GPU are one chip, so it is named once, with what tells two models
 /// apart. Without those numbers, and on Intel, the CPU and each GPU are listed.
-fn mac_parts(
+fn macos_parts(
     cpu: &str,
     cpu_cores: &str,
     memory_bytes: &str,
@@ -630,7 +689,7 @@ fn linux_machine() -> Vec<String> {
             })
     };
     let mut parts = vec![line_of("/proc/cpuinfo", "model name")];
-    let pci = output("lspci", &[]);
+    let pci = command_stdout("lspci", &[]);
     parts.extend(
         pci.lines()
             .filter(|l| l.contains("VGA") || l.contains("3D controller"))
@@ -647,94 +706,137 @@ fn linux_machine() -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn lines(items: &[&str]) -> Vec<String> {
+    fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
     }
 
     #[test]
-    fn a_short_run_or_reference_does_not_match() {
-        let full = lines(&["a", "b", "c"]);
-        assert_eq!(matching(&full, &full), (3, 3));
-        assert_eq!(matching(&full[..2], &full), (2, 3));
-        assert_eq!(matching(&full, &full[..2]), (2, 3));
-        assert_eq!(matching(&full, &lines(&["a", "x", "c"])), (2, 3));
-        assert_eq!(matching(&[], &full), (0, 3));
+    fn short_hashes_do_not_match() {
+        let full = strings(&["a", "b", "c"]);
+        assert_eq!(count_matches(&full, &full), (3, 3));
+        assert_eq!(count_matches(&full[..2], &full), (2, 3));
+        assert_eq!(count_matches(&full, &full[..2]), (2, 3));
+        assert_eq!(count_matches(&full, &strings(&["a", "x", "c"])), (2, 3));
+        assert_eq!(count_matches(&[], &full), (0, 3));
     }
 
     #[test]
-    fn a_dirty_tree_has_its_own_folder() {
-        assert_eq!(folder("abc1234", false, false), "abc1234");
-        assert_eq!(folder("abc1234", true, false), "abc1234-dirty");
-        assert_eq!(folder("abc1234", false, true), "abc1234-cpu");
-        assert_eq!(folder("abc1234", true, true), "abc1234-dirty-cpu");
+    fn dirty_tree_gets_own_folder() {
+        assert_eq!(hash_folder("abc1234", false, false), "abc1234");
+        assert_eq!(hash_folder("abc1234", true, false), "abc1234-dirty");
+        assert_eq!(hash_folder("abc1234", false, true), "abc1234-cpu");
+        assert_eq!(hash_folder("abc1234", true, true), "abc1234-dirty-cpu");
     }
 
     #[test]
-    fn a_reference_of_another_row_is_refused() {
-        let this = header(1, "overlay", "8 bit");
+    fn other_row_reference_refused() {
+        let this = hash_file_header(1, "overlay", "8 bit");
         let text = format!("{this}\na\nb\n");
-        assert_eq!(reference_hashes(&text, &this).unwrap(), lines(&["a", "b"]));
+        assert_eq!(parse_reference(&text, &this).unwrap(), strings(&["a", "b"]));
         for other in [
-            header(2, "overlay", "8 bit"),
-            header(1, "show", "8 bit"),
-            header(1, "overlay", "float"),
+            hash_file_header(2, "overlay", "8 bit"),
+            hash_file_header(1, "show", "8 bit"),
+            hash_file_header(1, "overlay", "float"),
         ] {
-            assert!(reference_hashes(&text, &other).is_err());
+            assert!(parse_reference(&text, &other).is_err());
         }
-        assert!(reference_hashes("a\nb\n", &this).is_err());
-        assert!(reference_hashes("", &this).is_err());
+        assert!(parse_reference("a\nb\n", &this).is_err());
+        assert!(parse_reference("", &this).is_err());
     }
 
-    const M4: &str = r#"{"SPDisplaysDataType": [{
+    const M4_DISPLAYS: &str = r#"{"SPDisplaysDataType": [{
         "sppci_model": "Apple M4", "sppci_cores": "10",
         "spdisplays_ndrvs": [{"spdisplays_main": "spdisplays_yes"}]
     }]}"#;
-    const OS: &str = "macOS 27.2 26B123";
+    const MACOS: &str = "macOS 27.2 26B123";
 
     #[test]
     fn apple_silicon_is_one_chip() {
         assert_eq!(
-            mac_parts("Apple M4", "10", "25769803776", M4, OS),
-            ["Apple M4, 10 CPU cores, 10 GPU cores, 24 GB", OS]
+            macos_parts("Apple M4", "10", "25769803776", M4_DISPLAYS, MACOS),
+            ["Apple M4, 10 CPU cores, 10 GPU cores, 24 GB", MACOS]
         );
     }
 
     #[test]
-    fn apple_silicon_without_its_numbers_lists_what_it_has() {
-        let today = ["Apple M4", "Apple M4 (display)", OS];
-        assert_eq!(mac_parts("Apple M4", "", "25769803776", M4, OS), today);
-        assert_eq!(mac_parts("Apple M4", "10", "", M4, OS), today);
-        let no_gpu_cores = M4.replace(r#""sppci_cores": "10","#, "");
+    fn missing_numbers_list_cpu_gpu() {
+        let today = ["Apple M4", "Apple M4 (display)", MACOS];
         assert_eq!(
-            mac_parts("Apple M4", "10", "25769803776", &no_gpu_cores, OS),
+            macos_parts("Apple M4", "", "25769803776", M4_DISPLAYS, MACOS),
+            today
+        );
+        assert_eq!(macos_parts("Apple M4", "10", "", M4_DISPLAYS, MACOS), today);
+        let no_gpu_cores = M4_DISPLAYS.replace(r#""sppci_cores": "10","#, "");
+        assert_eq!(
+            macos_parts("Apple M4", "10", "25769803776", &no_gpu_cores, MACOS),
             today
         );
         assert_eq!(
-            mac_parts("Apple M4", "10", "25769803776", "", OS),
-            ["Apple M4", OS]
+            macos_parts("Apple M4", "10", "25769803776", "", MACOS),
+            ["Apple M4", MACOS]
         );
     }
 
     #[test]
-    fn an_intel_mac_keeps_its_cpu_and_gpus() {
+    fn intel_mac_lists_cpu_gpus() {
         let displays = r#"{"SPDisplaysDataType": [
             {"sppci_model": "Intel UHD Graphics 630"},
             {"sppci_model": "AMD Radeon Pro 5500M", "sppci_cores": "8",
              "spdisplays_ndrvs": [{"spdisplays_main": "spdisplays_yes"}]}
         ]}"#;
         assert_eq!(
-            mac_parts("Intel Core i9-9980HK", "8", "34359738368", displays, OS),
+            macos_parts("Intel Core i9-9980HK", "8", "34359738368", displays, MACOS),
             [
                 "Intel Core i9-9980HK",
                 "Intel UHD Graphics 630",
                 "AMD Radeon Pro 5500M (display)",
-                OS
+                MACOS
             ]
         );
     }
 
     #[test]
-    fn the_face_device_comes_from_the_log() {
+    fn gpu_cpu_counts_pool_across_runs() {
+        let mut drawn = DrawnOn::default();
+        for log in [
+            "segcam-motion: 300 frames, kept, 297 on the GPU (RTX 4070)\n",
+            "segcam-motion: 300 frames, kept, 300 on the GPU (RTX 4070)\n",
+        ] {
+            drawn.pool(drawn_on(log).unwrap());
+        }
+        assert_eq!(
+            path_cell(&drawn, None),
+            "GPU (RTX 4070), 597 of 600 frames, CPU 3 frames"
+        );
+    }
+
+    #[test]
+    fn path_cell_names_one_path() {
+        let all_gpu = drawn_on("segcam-motion: 300 frames, kept, 300 on the GPU (RTX 4070)");
+        assert_eq!(
+            path_cell(&all_gpu.unwrap(), Some("DirectML 0")),
+            "GPU (RTX 4070), 300 of 300 frames, faces on DirectML 0"
+        );
+        let kept = drawn_on("segcam-motion: 300 frames, kept, 0 on the GPU").unwrap();
+        assert_eq!(path_cell(&kept, None), "CPU, kept, 300 of 300 frames");
+        let fresh = drawn_on("segcam-motion: 300 frames, fresh, 0 on the GPU").unwrap();
+        assert_eq!(path_cell(&fresh, None), "CPU, fresh, 300 of 300 frames");
+    }
+
+    #[test]
+    fn adapter_name_keeps_commas() {
+        let drawn = drawn_on("segcam-motion: 1 frames, kept, 1 on the GPU (a, b)").unwrap();
+        assert_eq!(drawn.adapter, "a, b");
+    }
+
+    #[test]
+    fn unknown_cli_line_names_no_path() {
+        assert_eq!(drawn_on("segcam-motion: 300 frames"), None);
+        assert_eq!(drawn_on(""), None);
+    }
+
+    #[test]
+    fn face_device_read_from_log() {
         let up = "segcam Motion: face models on DirectML 0 (GPU), ready in 900 ms\n";
         assert_eq!(faces_device(up), Some("DirectML 0 (GPU)"));
         assert_eq!(faces_device("segcam Motion: no face models\n"), None);

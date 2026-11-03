@@ -79,6 +79,8 @@ pub struct Incremental {
     window_share: f64,
     /// The last render's draw hasn't come back from the GPU yet (browsers).
     unfinished: bool,
+    /// The GPU drew the last render's output.
+    drew_on_gpu: bool,
     /// Live renders act as if the face models were still loading.
     #[cfg(test)]
     models_held: bool,
@@ -157,6 +159,11 @@ impl Incremental {
         self.unfinished
     }
 
+    /// Whether the GPU drew the last render's output; `false` when the CPU did.
+    pub fn drew_on_gpu(&self) -> bool {
+        self.drew_on_gpu
+    }
+
     /// Draws with `drawer` from now on.
     #[cfg(test)]
     pub(crate) fn use_drawer(&mut self, drawer: Drawer) {
@@ -228,6 +235,7 @@ impl Incremental {
         out: &mut ViewMut<C>,
     ) {
         self.unfinished = false;
+        self.drew_on_gpu = false;
         if out.is_empty() {
             return;
         }
@@ -506,7 +514,9 @@ impl Incremental {
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
     ) {
+        self.drew_on_gpu = false;
         if let Err(fault) = self.try_draw(s, count, number, frame, out) {
+            self.drew_on_gpu = false;
             self.fall_back(&fault);
             self.draw_cpu(s, count, number, frame, out);
         }
@@ -596,7 +606,9 @@ impl Incremental {
             let motion = self
                 .motion(shows, &basis(s, shows, first))
                 .unwrap_or(&empty);
-            return gpu.draw_overlay(out, view, &motion.blobs, number, shows, s);
+            gpu.draw_overlay(out, view, &motion.blobs, number, shows, s)?;
+            self.drew_on_gpu = true;
+            return Ok(());
         }
         if s.mode != OutputMode::Swarm {
             self.draw_cpu(s, count, number, frame, out);
@@ -656,9 +668,12 @@ impl Incremental {
         if into && let Some(offer) = self.target.as_mut() {
             gpu.draw_swarm_into(&offer.frame, windows, frame.as_ref(), number, s, &shadow)?;
             offer.taken = true;
+            self.drew_on_gpu = true;
             return Ok(());
         }
-        gpu.draw_swarm(out, windows, frame.as_ref(), number, s, &shadow)
+        gpu.draw_swarm(out, windows, frame.as_ref(), number, s, &shadow)?;
+        self.drew_on_gpu = true;
+        Ok(())
     }
 
     pub fn reset(&mut self) {
