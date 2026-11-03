@@ -899,6 +899,7 @@ fn fingerprint<C: Channel>(view: &View<C>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::gpu::turn;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1029,13 +1030,6 @@ mod tests {
             ..Incremental::default()
         };
         assert!(finds_in(&mut state, &mut Frames(&frames[..1]), 1, 0) > 0);
-    }
-
-    /// The GPU tests take turns: several devices open at once on WARP crash it now and then
-    /// (an access violation in d3d10warp.dll) unless the D3D12 debug layer is on.
-    fn turn() -> std::sync::MutexGuard<'static, ()> {
-        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        TURN.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A device of the test's own, on the adapter `SEGCAM_GPU_ADAPTER` picks or on a software
