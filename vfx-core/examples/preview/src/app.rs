@@ -60,7 +60,7 @@ struct Preview {
     tracker: Option<face::Tracker>,
     /// This frame's face variables, held while no face is found.
     #[cfg(not(target_arch = "wasm32"))]
-    face: modulation::Face,
+    face_values: modulation::Face,
     /// What the effect said of its last render, asked once a frame.
     #[cfg(not(target_arch = "wasm32"))]
     report: vfx_core::Report,
@@ -229,7 +229,7 @@ impl Preview {
             #[cfg(not(target_arch = "wasm32"))]
             tracker: None,
             #[cfg(not(target_arch = "wasm32"))]
-            face: modulation::FACE_NONE,
+            face_values: modulation::FACE_NONE,
             #[cfg(not(target_arch = "wasm32"))]
             report: vfx_core::Report::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -412,10 +412,14 @@ impl Preview {
                 _ => modulation::FACE_NONE,
             };
             self.report = self.effects.report();
-            let needed = modulation::read_face(&mut face, &self.face, &self.report.readings);
-            self.face = face;
+            let needed = modulation::apply_face_readings(
+                &mut face,
+                &self.face_values,
+                &self.report.readings,
+            );
+            self.face_values = face;
             if let Some(tracker) = self.tracker.as_ref().filter(|_| !needed) {
-                tracker.hold(face);
+                tracker.hold_positions(face);
             }
             needed
         };
@@ -455,11 +459,11 @@ impl Preview {
                     .audio
                     .as_ref()
                     .map_or([0.0; 5], |a| a.levels(position)),
-                self.face,
+                self.face_values,
             );
         } else {
             #[cfg(not(target_arch = "wasm32"))]
-            let face = self.face;
+            let face = self.face_values;
             #[cfg(target_arch = "wasm32")]
             let face = modulation::FACE_NONE;
             self.sources = modulation::sources(self.time, None, [0.0; 5], face);

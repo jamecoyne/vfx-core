@@ -69,7 +69,7 @@ pub struct Blob {
     /// On a face: the box the model found, which `bounds` sizes for drawing.
     pub detected: Option<NormRect>,
     /// On a face from YuNet: its eyes, nose and mouth corners, normalized like `bounds`.
-    pub points: Option<[(f32, f32); 5]>,
+    pub landmarks: Option<[(f32, f32); 5]>,
 }
 
 /// 8-connected labelling. `mask` is 1 for foreground, 0 for background. Returns the largest
@@ -135,7 +135,7 @@ pub fn label(mask: &[u8], width: i32, height: i32, min_pixels: i32, max_count: i
             kind: SegmentKind::Motion,
             reused: None,
             detected: None,
-            points: None,
+            landmarks: None,
         });
     }
 

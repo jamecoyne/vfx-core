@@ -49,7 +49,7 @@ pub const FACE_NONE: Face = [
 /// Puts an effect's readings into `face`, by name. Says whether a tracker still has work: none
 /// when the readings name every variable, or say there's no face, when `held` stays in place.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn read_face(face: &mut Face, held: &Face, readings: &[vfx_core::Reading]) -> bool {
+pub fn apply_face_readings(face: &mut Face, held: &Face, readings: &[vfx_core::Reading]) -> bool {
     let reading = |name: &str| readings.iter().find(|r| r.name == name).map(|r| r.value);
     match reading("face") {
         None => true,
@@ -756,30 +756,39 @@ mod tests {
     }
 
     #[test]
-    fn readings_fill_the_face_variables_by_name() {
+    fn readings_fill_face_variables() {
         use vfx_core::Reading;
         let names: Vec<_> = VARIABLES[8..].iter().map(|(name, _)| *name).collect();
         let all: Vec<_> = names.iter().map(|n| Reading::new(*n, 0.25)).collect();
         let mut face = FACE_NONE;
-        assert!(!read_face(&mut face, &FACE_NONE, &all), "nothing left");
+        assert!(
+            !apply_face_readings(&mut face, &FACE_NONE, &all),
+            "nothing left"
+        );
         assert_eq!(face, [0.25; 12]);
 
         let mut face = FACE_NONE;
-        assert!(read_face(&mut face, &FACE_NONE, &[]), "no readings");
+        assert!(
+            apply_face_readings(&mut face, &FACE_NONE, &[]),
+            "no readings"
+        );
         assert_eq!(face, FACE_NONE);
 
-        let some = [Reading::new("face", 1.0), Reading::new("facex", 0.25)];
+        let partial = [Reading::new("face", 1.0), Reading::new("facex", 0.25)];
         let mut face = FACE_NONE;
-        assert!(read_face(&mut face, &FACE_NONE, &some), "the rest is left");
+        assert!(
+            apply_face_readings(&mut face, &FACE_NONE, &partial),
+            "the rest is left"
+        );
         assert_eq!(face[..3], [1.0, 0.25, FACE_NONE[2]]);
     }
 
     #[test]
-    fn a_reading_of_no_face_holds_the_positions() {
+    fn no_face_holds_positions() {
         let held = [0.25; 12];
         let mut face = FACE_NONE;
         let no_face = [vfx_core::Reading::new("face", 0.0)];
-        assert!(!read_face(&mut face, &held, &no_face));
+        assert!(!apply_face_readings(&mut face, &held, &no_face));
         assert_eq!(face[0], 0.0);
         assert_eq!(face[1..], held[1..]);
     }

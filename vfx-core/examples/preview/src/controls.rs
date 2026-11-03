@@ -516,7 +516,7 @@ pub fn panel(
                 ui.checkbox(&mut c.animate, "Animate")
                     .on_hover_text("Advances the clock behind the time variable and test patterns");
                 #[cfg(not(target_arch = "wasm32"))]
-                if crate::face::AVAILABLE {
+                if crate::face::HAS_TRACKER {
                     let mut tracking = status.face_tracking;
                     if ui
                         .checkbox(&mut tracking, "Detect faces")

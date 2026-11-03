@@ -55,7 +55,7 @@ static CHOSEN: OnceLock<Device> = OnceLock::new();
 
 /// The device [`fastest`] chose, once it has. Another user of the models follows this instead of
 /// running the trial again.
-pub fn chosen() -> Option<Device> {
+pub fn chosen_device() -> Option<Device> {
     CHOSEN.get().copied()
 }
 

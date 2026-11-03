@@ -85,7 +85,7 @@ pub struct Incremental {
     /// Whether the last render drew on the GPU; `None` before the first.
     drew_on_gpu: Option<bool>,
     /// Whether the last render looked for faces, and what it read off them.
-    faces_on: bool,
+    faces_wanted: bool,
     readings: Vec<Reading>,
     /// Live renders act as if the face models were still loading.
     #[cfg(test)]
@@ -526,7 +526,7 @@ impl Incremental {
         out: &mut ViewMut<C>,
     ) {
         self.drew_on_gpu = Some(false);
-        self.note_faces(s, number, number - count as i64 + 1);
+        self.update_face_readings(s, number, number - count as i64 + 1);
         if let Err(fault) = self.try_draw(s, count, number, frame, out) {
             self.drew_on_gpu = Some(false);
             self.fall_back(&fault);
@@ -535,13 +535,13 @@ impl Incremental {
     }
 
     /// Keeps what the report says of the faces of the frame this render shows.
-    fn note_faces(&mut self, s: &RenderSettings, number: i64, first: i64) {
-        self.faces_on = s.faces.any();
+    fn update_face_readings(&mut self, s: &RenderSettings, number: i64, first: i64) {
+        self.faces_wanted = s.faces.any();
         self.readings = if s.faces.face {
             let shows = self.shows(s, number, first);
             let motion = self.motion(shows, &basis(s, shows, first));
-            let models = crate::faces::runs_on().is_some();
-            crate::faces::readings(models, motion.map_or(&[], |m| &m.blobs))
+            let models_loaded = crate::faces::runs_on().is_some();
+            crate::faces::readings(models_loaded, motion.map_or(&[], |m| &m.blobs))
         } else {
             Vec::new()
         };
@@ -555,7 +555,7 @@ impl Incremental {
             _ => "CPU".to_owned(),
         });
         report.faces = crate::faces::runs_on()
-            .filter(|_| self.faces_on)
+            .filter(|_| self.faces_wanted)
             .map(str::to_owned);
         report.readings = self.readings.clone();
         report
@@ -574,9 +574,9 @@ impl Incremental {
             return Ok(());
         };
         gpu.begin();
-        let before = gpu.drawn;
+        let drawn_before = gpu.drawn;
         let drawn = self.draw_gpu(&mut gpu, s, count, number, frame, out);
-        self.drew_on_gpu = Some(drawn.is_ok() && gpu.drawn > before);
+        self.drew_on_gpu = Some(drawn.is_ok() && gpu.drawn > drawn_before);
         self.unfinished = drawn.is_ok() && gpu.unfinished;
         self.gpu = Some(gpu);
         drawn
@@ -1146,8 +1146,8 @@ mod tests {
         for n in 0..frames.len() {
             if n == 7 {
                 assert!(drawn(&on_gpu) > 0, "drawing on the GPU before the loss");
-                let told = on_gpu.report().draw.expect("a render to speak of");
-                assert_eq!(told, format!("GPU ({})", dev.info.name));
+                let draw = on_gpu.report().draw.expect("a render");
+                assert_eq!(draw, format!("GPU ({})", dev.info.name));
                 dev.device.destroy();
             }
             let (a, b) = (

@@ -124,7 +124,7 @@ fn faces_from_a_live_history_match_fresh_renders() {
 /// not the box segcam draws. Within a little, as the report's models can be on DirectML.
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn readings_are_what_the_model_finds() {
+fn readings_match_model_output() {
     use segcam_face::runtime::{Device, OrtYuNet};
     use segcam_face::{Detector, Pixels, YUNET_MODEL};
 
@@ -156,11 +156,11 @@ fn readings_are_what_the_model_finds() {
     let report = effect.report();
     assert_eq!(report.draw.as_deref(), Some("CPU"));
     assert!(report.faces.is_some());
-    let read = |name: &str| {
+    let reading_of = |name: &str| {
         let reading = report.readings.iter().find(|r| r.name == name);
         f64::from(reading.expect(name).value)
     };
-    assert_eq!(read("face"), 1.0);
+    assert_eq!(reading_of("face"), 1.0);
     for (name, wanted) in [
         ("facex", r.x + r.w / 2.0),
         ("facey", r.y + r.h / 2.0),
@@ -170,7 +170,11 @@ fn readings_are_what_the_model_finds() {
         ("mouthx", (points[3].0 + points[4].0) / 2.0),
         ("mouthy", (points[3].1 + points[4].1) / 2.0),
     ] {
-        assert!((read(name) - wanted).abs() < 0.02, "{name}: {}", read(name));
+        assert!(
+            (reading_of(name) - wanted).abs() < 0.02,
+            "{name}: {}",
+            reading_of(name)
+        );
     }
 }
 

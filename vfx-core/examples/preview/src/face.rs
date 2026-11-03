@@ -36,7 +36,7 @@ pub type Values = modulation::Face;
 use crate::modulation::{self, FACE_NONE as NONE};
 
 /// Whether this build has a tracker: without one, faces come only from effects' reports.
-pub const AVAILABLE: bool = cfg!(any(target_os = "macos", feature = "tracker"));
+pub const HAS_TRACKER: bool = cfg!(any(target_os = "macos", feature = "tracker"));
 
 /// segcam-face's YuNet, on the CPU until segcam has chosen a device, then on that device: the
 /// tracker never runs the trial itself. Sessions are per thread; the environment is shared.
@@ -46,7 +46,7 @@ pub struct Detector {
     yunet: Option<OrtYuNet>,
     device: Device,
     /// Whether it has tried segcam's device, which it does once.
-    followed: bool,
+    device_tried: bool,
 }
 
 #[cfg(all(not(target_os = "macos"), feature = "tracker"))]
@@ -58,16 +58,16 @@ impl Detector {
         Ok(Self {
             yunet: Some(yunet),
             device: Device::Cpu,
-            followed: false,
+            device_tried: false,
         })
     }
 
     /// Moves to the device segcam chose. Its turn waits out segcam's own load.
-    fn follow_device(&mut self) {
-        let Some(chosen) = runtime::chosen().filter(|_| !self.followed) else {
+    fn use_chosen_device(&mut self) {
+        let Some(chosen) = runtime::chosen_device().filter(|_| !self.device_tried) else {
             return;
         };
-        self.followed = true;
+        self.device_tried = true;
         if chosen == self.device {
             return;
         }
@@ -83,7 +83,7 @@ impl Detector {
 
     /// The best face in `pixels` (at `size`), or None.
     pub fn detect(&mut self, pixels: &[Argb<u8>], size: (u32, u32)) -> Option<Values> {
-        self.follow_device();
+        self.use_chosen_device();
         let (width, height) = (size.0 as usize, size.1 as usize);
         let image = Image {
             pixels: Pixels::Argb8(bytemuck::cast_slice(pixels)),
@@ -324,7 +324,7 @@ impl Tracker {
 
     /// While an effect's report reads the faces: holds its positions, with `face` at 0, so when
     /// the report stops, the variables carry on from there until this finds a face itself.
-    pub fn hold(&self, values: Values) {
+    pub fn hold_positions(&self, values: Values) {
         let mut s = self.shared.0.lock().unwrap();
         s.values = values;
         s.values[0] = 0.0;
@@ -361,9 +361,9 @@ mod tests {
     }
 
     #[test]
-    fn a_held_tracker_claims_no_face() {
+    fn held_tracker_reports_no_face() {
         let tracker = Tracker::start().unwrap();
-        tracker.hold([1.0; 12]);
+        tracker.hold_positions([1.0; 12]);
         let values = tracker.values();
         assert_eq!(values[0], 0.0);
         assert_eq!(values[1..], [1.0; 11]);
@@ -373,28 +373,28 @@ mod tests {
     /// device being released.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn segcams_models_load_beside_the_tracker() {
-        let test = "face::tests::the_tracker_shares_the_environment_and_follows_the_device";
-        let run = std::process::Command::new(std::env::current_exe().unwrap())
+    fn tracker_environment_in_own_process() {
+        let test = "face::tests::tracker_shares_environment";
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--ignored"])
             .status()
             .unwrap();
-        assert!(run.success());
+        assert!(status.success());
     }
 
     /// #68: with a second environment, whichever side loaded second failed.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    #[ignore = "run by segcams_models_load_beside_the_tracker"]
-    fn the_tracker_shares_the_environment_and_follows_the_device() {
+    #[ignore = "run by tracker_environment_in_own_process"]
+    fn tracker_shares_environment() {
         let flat = vec![Argb::default(); 320 * 240];
         let mut tracker = Detector::new().unwrap();
         let (_, device) = runtime::fastest(true, true).expect("segcam's models");
         tracker.detect(&flat, (320, 240));
         assert_eq!(tracker.device, device);
-        let mut later = Detector::new().unwrap();
-        later.detect(&flat, (320, 240));
-        assert_eq!(later.device, device);
+        let mut second_tracker = Detector::new().unwrap();
+        second_tracker.detect(&flat, (320, 240));
+        assert_eq!(second_tracker.device, device);
     }
 
     /// Finds the face in a photo given by FACE_TEST_IMAGE (one clear face).
