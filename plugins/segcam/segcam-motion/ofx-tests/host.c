@@ -106,12 +106,13 @@ static int edit_then_deliver(void) {
     output=img_new(0,0,320,180,kOfxBitDepthByte); output_props=image_props(&output);
     temporal_image=temporal;
     static unsigned char streamed[2][320*180*4], sequence[3][320*180*4];
-    /* The orders Resolve 21 starts a Deliver in, from frame 14: on macOS the last frame first, in
-       two orders seen, and on Windows the first frame three times. */
+    /* Orders a Deliver from frame 14 starts in. Resolve 21 renders the frame at the playhead first,
+       here the last, then steps back: both orders were seen on macOS. `harder` renders a later
+       frame once before the step back, from an older note, kept since it is the harder case. */
     static const int mac[]={23,15,14,16,17,18,19,20,21,22,23,14,14,14};
     static const int mac2[]={23,14,15,16,17,18,19,20,21,22,23,14,14,14};
-    static const int win[]={14,14,14,16,15,17,18,19,20,21,22,23};
-    int mac_n=sizeof mac/sizeof *mac, win_n=sizeof win/sizeof *win;
+    static const int harder[]={14,14,14,16,15,17,18,19,20,21,22,23};
+    int mac_n=sizeof mac/sizeof *mac, harder_n=sizeof harder/sizeof *harder;
     for(int m=0;m<2;m++) {
         int mode=m?3:0;
         OfxImageEffectHandle e=instance(mode,0);
@@ -158,8 +159,8 @@ static int edit_then_deliver(void) {
         replay(mode,"macOS order",mac,mac_n,15,15);
         replay(mode,"macOS order 2",mac2,mac_n,0,13);
         replay(mode,"macOS order 2",mac2,mac_n,15,15);
-        replay(mode,"Windows order",win,win_n,0,13);
-        replay(mode,"Windows order",win,win_n,15,15);
+        replay(mode,"harder order",harder,harder_n,0,13);
+        replay(mode,"harder order",harder,harder_n,15,15);
     }
     printf("edit then deliver: %d failures\n",failures);
     return failures?1:0;

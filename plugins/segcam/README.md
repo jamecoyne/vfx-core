@@ -38,7 +38,7 @@ flips the picture for a selfie camera. Every control is listed in the
 
 In Resolve and After Effects, a frame always renders the same, however you get to it. If you change
 an earlier frame of the clip, segcam picks the change up on the next render after you pause or
-jump.
+jump, and when a Deliver starts.
 
 ## What it needs
 
