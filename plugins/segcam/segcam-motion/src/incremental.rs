@@ -899,7 +899,7 @@ fn fingerprint<C: Channel>(view: &View<C>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::gpu::turn;
+    use super::gpu::gpu_test_lock;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -980,7 +980,7 @@ mod tests {
 
     /// Loads the models under the GPU tests' turn, since that opens devices too.
     fn wait_for_models() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         crate::faces::wait();
     }
 
@@ -1079,7 +1079,7 @@ mod tests {
     /// what the CPU draws, and no new instance draws on that device.
     #[test]
     fn a_lost_gpu_falls_back_to_the_cpu() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1108,7 +1108,7 @@ mod tests {
     /// new instances still draw on it and a render that didn't cause it isn't charged with it.
     #[test]
     fn an_error_leaves_the_device_usable() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         dev.misuse();
@@ -1129,7 +1129,7 @@ mod tests {
     /// draws, byte for byte, from what it kept.
     #[test]
     fn leaving_the_gpu_keeps_the_cpu_output() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1157,7 +1157,7 @@ mod tests {
     /// the CPU byte for byte, and the next render is back on the GPU.
     #[test]
     fn a_fault_falls_back_for_one_render() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1192,7 +1192,7 @@ mod tests {
     /// the GPU, so only what must hold either way is checked.
     #[test]
     fn a_slow_readback_falls_back_for_one_render() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1228,7 +1228,7 @@ mod tests {
     /// rest is over the GPU draws again.
     #[test]
     fn faults_close_together_rest_on_the_cpu() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1301,7 +1301,7 @@ mod tests {
     /// GPU draws again once the trail moves on; the instance never leaves it.
     #[test]
     fn a_full_atlas_falls_back_for_one_render() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1334,11 +1334,12 @@ mod tests {
     /// A growth the GPU refuses leaves the atlas as it was: it counts as full, no fault, and
     /// the GPU draws on with what it holds.
     #[test]
-    fn a_refused_growth_keeps_the_atlas() {
-        let _turn = turn();
+    fn refused_growth_keeps_atlas() {
+        let _lock = gpu_test_lock();
         let bytes = (W * H * 4) as u64 + 4096;
-        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-        let opened = gpu::refusing(&choice, bytes).or_else(|_| gpu::refusing("fallback", bytes));
+        let adapter_choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+        let opened = gpu::device_with_buffer_limit(&adapter_choice, bytes)
+            .or_else(|_| gpu::device_with_buffer_limit("fallback", bytes));
         let Ok(dev) = opened.map(Arc::new) else {
             eprintln!("no adapter: skipped");
             return;
