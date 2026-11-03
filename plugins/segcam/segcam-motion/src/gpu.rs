@@ -10,7 +10,9 @@
 //! comes back at the next render of the same frame.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -310,28 +312,8 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
             _ => Ok(dev),
         };
     }
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        // The D3D12 validation layer changes what DirectML finds in the same process, so it
-        // is on only with WGPU_VALIDATION=1.
-        flags: (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION)
-            .with_env(),
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: match choice {
-            "low" => wgpu::PowerPreference::LowPower,
-            _ => wgpu::PowerPreference::HighPerformance,
-        },
-        compatible_surface: None,
-        force_fallback_adapter: choice == "fallback",
-        apply_limit_buckets: false,
-    }))
-    .map_err(|e| NoGpu::NoAdapter(e.to_string()))?;
+    let adapter = pick_adapter(choice)?;
     let info = adapter.get_info();
-    if info.device_type == wgpu::DeviceType::Cpu && choice != "fallback" {
-        return Err(NoGpu::NoAdapter(format!("{} draws in software", info.name)));
-    }
     // The atlas grows with the trail: take as much of a binding as the adapter allows.
     let supported = adapter.limits();
     let required_limits = wgpu::Limits {
@@ -354,6 +336,65 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
         (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
         _ => Ok(dev),
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_adapter(choice: &str) -> Result<wgpu::Adapter, NoGpu> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        // The D3D12 validation layer changes what DirectML finds in the same process, so it
+        // is on only with WGPU_VALIDATION=1.
+        flags: (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION)
+            .with_env(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: match choice {
+            "low" => wgpu::PowerPreference::LowPower,
+            _ => wgpu::PowerPreference::HighPerformance,
+        },
+        compatible_surface: None,
+        force_fallback_adapter: choice == "fallback",
+        apply_limit_buckets: false,
+    }))
+    .map_err(|e| NoGpu::NoAdapter(e.to_string()))?;
+    let info = adapter.get_info();
+    if info.device_type == wgpu::DeviceType::Cpu && choice != "fallback" {
+        return Err(NoGpu::NoAdapter(format!("{} draws in software", info.name)));
+    }
+    Ok(adapter)
+}
+
+/// Drawers on it think any size binds, so growth reaches the device's own limit.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn device_with_buffer_limit(choice: &str, bytes: u64) -> Result<Device, NoGpu> {
+    let limits = wgpu::Limits {
+        max_storage_buffer_binding_size: bytes,
+        max_buffer_size: bytes,
+        ..wgpu::Limits::default()
+    };
+    test_device(pick_adapter(choice)?, limits)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn test_device(adapter: wgpu::Adapter, limits: wgpu::Limits) -> Result<Device, NoGpu> {
+    let info = adapter.get_info();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("segcam Motion"),
+        required_limits: limits,
+        ..wgpu::DeviceDescriptor::default()
+    }))
+    .map_err(|e| NoGpu::Failed(e.to_string()))?;
+    let (lost, errors) = watch(&device);
+    Ok(Device::build(device, queue, info, u64::MAX, lost, errors))
+}
+
+/// The GPU tests take turns: several devices open at once on WARP crash it now and then
+/// (an access violation in d3d10warp.dll) unless the D3D12 debug layer is on.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> MutexGuard<'static, ()> {
+    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+    GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Why a device was lost, once it is.
@@ -551,11 +592,39 @@ struct Atlas {
     words: u64,
     /// Free runs of words, by start.
     free: Vec<(u64, u64)>,
+    pending_growth: Option<PendingGrowth>,
+    /// The most words to ask for; it comes down as the GPU refuses.
+    ceiling: u64,
+    last_refusal: Option<Instant>,
+    smallest_logged_refusal: u64,
+}
+
+/// Not in use until the GPU answers: native backends at once, browsers some time later.
+struct PendingGrowth {
+    buffer: wgpu::Buffer,
+    words: u64,
+    refusal: Pin<Box<dyn Future<Output = Option<wgpu::Error>> + Send>>,
+}
+
+impl PendingGrowth {
+    fn new(dev: &Device, words: u64) -> Self {
+        let validation = dev.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let out_of_memory = dev.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let buffer = atlas_buffer(dev, words);
+        let out_of_memory = out_of_memory.pop();
+        let validation = validation.pop();
+        Self {
+            buffer,
+            words,
+            refusal: Box::pin(async move { out_of_memory.await.or(validation.await) }),
+        }
+    }
 }
 
 impl Atlas {
     /// 4 MB: hosts make instances often, and the atlas grows with the trail.
     const FIRST_WORDS: u64 = 1 << 20;
+    const GROWTH_RETRY_AFTER: Duration = Duration::from_secs(60);
 
     fn new(dev: &Device) -> Self {
         Self::with(dev, Self::FIRST_WORDS)
@@ -566,10 +635,15 @@ impl Atlas {
             buffer: atlas_buffer(dev, words),
             words,
             free: vec![(0, words)],
+            pending_growth: None,
+            ceiling: u64::MAX,
+            last_refusal: None,
+            smallest_logged_refusal: u64::MAX,
         }
     }
 
-    /// Room for `len` words, growing the atlas up to `limit` bytes; `None` when it is full.
+    /// Room for `len` words, growing the atlas up to `limit` bytes or as far as the GPU allows;
+    /// `None` when it is full or the GPU hasn't answered yet.
     fn alloc(&mut self, dev: &Device, len: u64, limit: u64) -> Option<u64> {
         let len = len.max(1);
         loop {
@@ -582,12 +656,48 @@ impl Atlas {
                 }
                 return Some(start);
             }
-            let limit = limit / 4;
-            let words = (self.words * 2).max(self.words + len).min(limit);
-            if words <= self.words {
-                return None;
+            if self.pending_growth.is_none() {
+                if self
+                    .last_refusal
+                    .is_some_and(|last| last.elapsed() >= Self::GROWTH_RETRY_AFTER)
+                {
+                    self.last_refusal = None;
+                    self.ceiling = u64::MAX;
+                }
+                let words = (self.words * 2)
+                    .max(self.words + len)
+                    .min(limit / 4)
+                    .min(self.ceiling);
+                if words <= self.words {
+                    return None;
+                }
+                self.pending_growth = Some(PendingGrowth::new(dev, words));
             }
-            let buffer = atlas_buffer(dev, words);
+            let pending = self.pending_growth.as_mut().expect("set above");
+            let answer = pending
+                .refusal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            let Poll::Ready(refusal) = answer else {
+                return None;
+            };
+            let PendingGrowth { buffer, words, .. } =
+                self.pending_growth.take().expect("set above");
+            if let Some(e) = refusal {
+                // Half the step next. Under an eighth of the atlas it isn't worth a copy.
+                let step = (words - self.words) / 2;
+                self.ceiling = self.words + if step < self.words / 8 { 0 } else { step };
+                self.last_refusal = Some(Instant::now());
+                if words < self.smallest_logged_refusal {
+                    self.smallest_logged_refusal = words;
+                    eprintln!(
+                        "segcam Motion: the GPU refused an atlas of {} MB, it holds {} MB ({e})",
+                        words / 250_000,
+                        self.words / 250_000
+                    );
+                }
+                continue;
+            }
             let mut encoder = dev.device.create_command_encoder(&Default::default());
             encoder.copy_buffer_to_buffer(&self.buffer, 0, &buffer, 0, self.words * 4);
             dev.queue.submit(Some(encoder.finish()));
@@ -1541,6 +1651,113 @@ fn ms(t: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn adapter_choice() -> String {
+        std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default()
+    }
+
+    fn atlas_accepts_writes(atlas: &Atlas, dev: &Device) -> bool {
+        let before = dev.errors().0;
+        dev.queue.write_buffer(&atlas.buffer, 0, &[0; 4]);
+        dev.errors().0 == before
+    }
+
+    /// wgpu's noop backend can't reserve this much, so OutOfMemory needs no GPU or allocation.
+    #[test]
+    fn out_of_memory_refuses_growth() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::NOOP,
+            // Validating indirect calls limits buffers to 4 GiB.
+            flags: wgpu::InstanceFlags::empty(),
+            backend_options: wgpu::BackendOptions {
+                noop: wgpu::NoopBackendOptions {
+                    enable: true,
+                    limits: Some(wgpu::Limits {
+                        max_buffer_size: 1 << 60,
+                        ..wgpu::Limits::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("the noop adapter");
+        let limits = adapter.limits();
+        let dev = test_device(adapter, limits).expect("a noop device");
+        let atlas = Atlas::with(&dev, 1024);
+        let errors = dev.errors().0;
+        let pending = PendingGrowth::new(&dev, 1 << 58);
+        let refusal = pollster::block_on(pending.refusal);
+        assert!(
+            matches!(refusal, Some(wgpu::Error::OutOfMemory { .. })),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            dev.errors().0,
+            errors,
+            "the refusal reached the device's errors"
+        );
+        assert!(atlas_accepts_writes(&atlas, &dev), "the atlas is invalid");
+        assert!(dev.lost().is_none(), "the device was lost");
+    }
+
+    #[test]
+    fn growth_retries_after_cooldown() {
+        let _lock = gpu_test_lock();
+        let bytes = 1 << 16;
+        let opened = device_with_buffer_limit(&adapter_choice(), bytes)
+            .or_else(|_| device_with_buffer_limit("fallback", bytes));
+        let Ok(dev) = opened else {
+            eprintln!("no adapter: skipped");
+            return;
+        };
+        let retry_due = || {
+            Instant::now()
+                .checked_sub(Atlas::GROWTH_RETRY_AFTER)
+                .expect("up for a minute")
+        };
+        let mut atlas = Atlas::with(&dev, 1024);
+        let errors = dev.errors().0;
+        let oversized = bytes;
+        assert!(atlas.alloc(&dev, oversized, u64::MAX).is_none());
+        let first_refusal = atlas.last_refusal.expect("the device refused");
+        let (words, logged) = (atlas.words, atlas.smallest_logged_refusal);
+        for _ in 0..3 {
+            assert!(atlas.alloc(&dev, oversized, u64::MAX).is_none());
+        }
+        assert_eq!(atlas.last_refusal, Some(first_refusal), "retried at once");
+
+        atlas.last_refusal = Some(retry_due());
+        assert!(atlas.alloc(&dev, oversized, u64::MAX).is_none());
+        assert!(
+            atlas
+                .last_refusal
+                .is_some_and(|retried| retried > first_refusal),
+            "never retried"
+        );
+        assert_eq!(
+            atlas.smallest_logged_refusal, logged,
+            "the same refusal logged twice"
+        );
+        assert!(atlas.words >= words);
+
+        let mut atlas = Atlas::with(&dev, 1024);
+        assert!(atlas.alloc(&dev, 1024, u64::MAX).is_some());
+        atlas.ceiling = 1024;
+        atlas.last_refusal = Some(Instant::now());
+        assert!(atlas.alloc(&dev, 1024, u64::MAX).is_none());
+        atlas.last_refusal = Some(retry_due());
+        assert!(atlas.alloc(&dev, 1024, u64::MAX).is_some(), "stayed capped");
+        assert!(atlas.words > 1024);
+        assert_eq!(
+            dev.errors().0,
+            errors,
+            "a refusal reached the device's errors"
+        );
+        assert!(atlas_accepts_writes(&atlas, &dev), "the atlas is invalid");
+    }
 
     /// A panic while the device opens, as a broken driver can cause, answers that the GPU
     /// failed instead of leaving every caller waiting.

@@ -899,6 +899,7 @@ fn fingerprint<C: Channel>(view: &View<C>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::gpu::gpu_test_lock;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -979,7 +980,7 @@ mod tests {
 
     /// Loads the models under the GPU tests' turn, since that opens devices too.
     fn wait_for_models() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         crate::faces::wait();
     }
 
@@ -1031,13 +1032,6 @@ mod tests {
         assert!(finds_in(&mut state, &mut Frames(&frames[..1]), 1, 0) > 0);
     }
 
-    /// The GPU tests take turns: several devices open at once on WARP crash it now and then
-    /// (an access violation in d3d10warp.dll) unless the D3D12 debug layer is on.
-    fn turn() -> std::sync::MutexGuard<'static, ()> {
-        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        TURN.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     /// A device of the test's own, on the adapter `SEGCAM_GPU_ADAPTER` picks or on a software
     /// one where there is none; `None` where there is no adapter at all.
     fn own_device() -> Option<Arc<gpu::Device>> {
@@ -1085,7 +1079,7 @@ mod tests {
     /// what the CPU draws, and no new instance draws on that device.
     #[test]
     fn a_lost_gpu_falls_back_to_the_cpu() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1114,7 +1108,7 @@ mod tests {
     /// new instances still draw on it and a render that didn't cause it isn't charged with it.
     #[test]
     fn an_error_leaves_the_device_usable() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         dev.misuse();
@@ -1135,7 +1129,7 @@ mod tests {
     /// draws, byte for byte, from what it kept.
     #[test]
     fn leaving_the_gpu_keeps_the_cpu_output() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1163,7 +1157,7 @@ mod tests {
     /// the CPU byte for byte, and the next render is back on the GPU.
     #[test]
     fn a_fault_falls_back_for_one_render() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1198,7 +1192,7 @@ mod tests {
     /// the GPU, so only what must hold either way is checked.
     #[test]
     fn a_slow_readback_falls_back_for_one_render() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1234,7 +1228,7 @@ mod tests {
     /// rest is over the GPU draws again.
     #[test]
     fn faults_close_together_rest_on_the_cpu() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1307,7 +1301,7 @@ mod tests {
     /// GPU draws again once the trail moves on; the instance never leaves it.
     #[test]
     fn a_full_atlas_falls_back_for_one_render() {
-        let _turn = turn();
+        let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = Incremental::default();
@@ -1333,6 +1327,49 @@ mod tests {
             "every frame fit the atlas: the test proves nothing"
         );
         assert_eq!(faults(&on_gpu), 0, "a full atlas is not a fault");
+        assert!(on_gpu.gpu().is_some(), "the instance left the GPU");
+        assert!(dev.lost().is_none(), "the device was given up");
+    }
+
+    #[test]
+    fn refused_growth_keeps_atlas() {
+        let _lock = gpu_test_lock();
+        let bytes = (W * H * 4) as u64 + 4096;
+        let adapter_choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+        let opened = gpu::device_with_buffer_limit(&adapter_choice, bytes)
+            .or_else(|_| gpu::device_with_buffer_limit("fallback", bytes));
+        let Ok(dev) = opened.map(Arc::new) else {
+            eprintln!("no adapter: skipped");
+            return;
+        };
+        let frames = crossing();
+        let mut cpu = Incremental::default();
+        let mut drawer = gpu::Drawer::on(dev.clone()).expect("a drawer on a working device");
+        // The usual first atlas is over the limit too.
+        drawer.small_atlas(1024);
+        let errors = dev.errors().0;
+        let mut on_gpu = Incremental::default();
+        on_gpu.use_drawer(drawer);
+        on_gpu.gpu_threshold(0.0);
+        for n in 0..frames.len() {
+            let (a, b) = (
+                render(&mut cpu, &frames, n),
+                render(&mut on_gpu, &frames, n),
+            );
+            assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
+        }
+        let drawn = drawn(&on_gpu);
+        assert!(drawn > 0, "nothing was drawn on the GPU");
+        assert!(
+            drawn < frames.len() as u64,
+            "every frame fit the atlas: the test proves nothing"
+        );
+        assert_eq!(faults(&on_gpu), 0, "a refused growth is not a fault");
+        assert_eq!(
+            dev.errors().0,
+            errors,
+            "a refusal reached the device's errors"
+        );
         assert!(on_gpu.gpu().is_some(), "the instance left the GPU");
         assert!(dev.lost().is_none(), "the device was given up");
     }
