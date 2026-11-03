@@ -18,7 +18,6 @@ const USAGE: &str = "usage: cargo vfx bench CLIP [--preset NAME]... [--depth 8|f
                the Matches column; it has to hold every row this run prints";
 
 const FRAMES: u32 = 300;
-/// The first frames are the clip start, the rest steady state.
 const FIRST_FRAMES: usize = 40;
 
 const PRESETS: [(&str, &[&str]); 5] = [
@@ -334,7 +333,6 @@ fn timed_run(cmd: &mut Command, raw: &Path, frame_bytes: usize) -> Result<TimedR
     Ok(TimedRun { ms, hashes, log })
 }
 
-/// A hash file's first line: what its hashes are of.
 fn hash_file_header(clip: u64, preset: &str, depth: &str) -> String {
     format!("clip {clip:016x} preset {preset} depth {depth}")
 }
@@ -358,13 +356,13 @@ fn parse_reference(text: &str, header: &str) -> Result<Vec<String>, String> {
     Ok(lines.map(str::to_owned).collect())
 }
 
-/// The frames that match, and out of how many: a run or a reference that stops short doesn't match.
+/// Out of the longer of the two, so a short run or reference doesn't match.
 fn count_matches(run: &[String], reference: &[String]) -> (usize, usize) {
     let same = run.iter().zip(reference).filter(|(a, b)| a == b).count();
     (same, run.len().max(reference.len()))
 }
 
-/// The hash of the decoded frames, which names the clip without its file name.
+/// Names the clip without its file name.
 fn decoded_frames_hash(raw: &Path, frame_bytes: usize) -> Result<u64, String> {
     let mut file = File::open(raw).map_err(|e| format!("{}: {e}", raw.display()))?;
     let mut frame = vec![0u8; frame_bytes];
@@ -382,7 +380,6 @@ fn decoded_frames_hash(raw: &Path, frame_bytes: usize) -> Result<u64, String> {
     }
 }
 
-/// Which path drew a run's frames, from the CLI's last line.
 #[derive(Debug, Default, PartialEq)]
 struct DrawnOn {
     frames: u64,
@@ -449,7 +446,6 @@ fn path_cell(drawn: &DrawnOn, faces: Option<&str>) -> String {
     }
 }
 
-/// The device from segcam's log line, which also says when no models loaded.
 fn faces_device(log: &str) -> Option<&str> {
     log.lines().find_map(|l| {
         let (_, device) = l.split_once("face models on ")?;
@@ -487,7 +483,6 @@ fn ms_cell(ms: Option<f64>) -> String {
     ms.map_or("no frames".to_owned(), |m| format!("{m:.1} ms"))
 }
 
-/// Width, height and frame rate of the clip's first video stream.
 fn probe(clip: &str) -> Result<(u32, u32, String), String> {
     let out = Command::new("ffprobe")
         .args(["-v", "error", "-select_streams", "v:0", "-of", "json"])
@@ -518,7 +513,6 @@ fn probe(clip: &str) -> Result<(u32, u32, String), String> {
     Ok((width, height, rate))
 }
 
-/// The clip's first frames as the raw ARGB the CLI reads.
 fn decode(clip: &str, raw: &Path) -> Result<(), String> {
     eprintln!("decoding the first {FRAMES} frames");
     // ffmpeg before 5.1 has only -vsync. The size is the coded one, so frames stay unrotated.
@@ -556,7 +550,7 @@ fn git(root: &Path, args: &[&str]) -> String {
     command_stdout("git", &[&["-C", &root], args].concat())
 }
 
-/// The hash folder's name: a dirty tree must not overwrite its commit's hashes.
+/// A dirty tree must not overwrite its commit's hashes.
 fn hash_folder(commit: &str, dirty: bool, cpu: bool) -> String {
     let dirty = if dirty { "-dirty" } else { "" };
     let cpu = if cpu { "-cpu" } else { "" };
@@ -572,8 +566,6 @@ fn command_stdout(program: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// CPU, GPUs and OS from the system: Windows adds each GPU's driver and which drives the display,
-/// macOS the chip's cores and memory, or an Intel Mac's GPUs and which drives the display.
 fn machine() -> String {
     let parts = if cfg!(windows) {
         windows_machine()
@@ -634,8 +626,7 @@ fn macos_machine() -> Vec<String> {
     )
 }
 
-/// Apple silicon's CPU and GPU are one chip, so it is named once, with what tells two models
-/// apart. Without those numbers, and on Intel, the CPU and each GPU are listed.
+/// Apple silicon's CPU and GPU are one chip, so it is named once.
 fn macos_parts(
     cpu: &str,
     cpu_cores: &str,

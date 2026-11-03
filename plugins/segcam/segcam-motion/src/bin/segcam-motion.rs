@@ -179,7 +179,6 @@ fn run<C: Depth>(
     let mut bytes = vec![0u8; pixels * 4];
     let mut frame = 0i64;
     let (mut on_gpu, mut adapter) = (0u64, String::new());
-    // Every input byte's channel value, worked out once: this runs on 8.3 M channels a frame.
     let levels: [C; 256] = std::array::from_fn(|b| C::from_unit(b as f32 / 255.0));
 
     while stdin.read_exact(&mut bytes).is_ok() {

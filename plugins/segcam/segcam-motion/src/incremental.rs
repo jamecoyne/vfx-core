@@ -79,7 +79,6 @@ pub struct Incremental {
     window_share: f64,
     /// The last render's draw hasn't come back from the GPU yet (browsers).
     unfinished: bool,
-    /// The GPU drew the last render's output.
     drew_on_gpu: bool,
     /// Live renders act as if the face models were still loading.
     #[cfg(test)]
@@ -159,7 +158,7 @@ impl Incremental {
         self.unfinished
     }
 
-    /// Whether the GPU drew the last render's output; `false` when the CPU did.
+    /// Whether the GPU drew the last render's output.
     pub fn drew_on_gpu(&self) -> bool {
         self.drew_on_gpu
     }
