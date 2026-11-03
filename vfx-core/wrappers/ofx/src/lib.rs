@@ -596,11 +596,11 @@ struct Kept {
 struct Rendered {
     frame: i64,
     ended: std::time::Instant,
-    jumped: bool,
+    broke_stream: bool,
 }
 
 /// Whether a render of `frame` is a step forward soon after the last.
-fn follows(last: Option<Rendered>, frame: i64) -> bool {
+fn steps_forward_soon(last: Option<Rendered>, frame: i64) -> bool {
     const GAP: std::time::Duration = std::time::Duration::from_secs(1);
     last.is_some_and(|last| last.ended.elapsed() < GAP && (1..=120).contains(&(frame - last.frame)))
 }
@@ -610,7 +610,7 @@ fn follows(last: Option<Rendered>, frame: i64) -> bool {
 /// render after a pause or a jump checks them all again, and so does the next, since Resolve may
 /// start a Deliver past a frame and step back to it, rendering the later frame just once.
 fn streaming(last: Option<Rendered>, frame: i64) -> bool {
-    follows(last, frame) && last.is_some_and(|last| !last.jumped)
+    steps_forward_soon(last, frame) && last.is_some_and(|last| !last.broke_stream)
 }
 
 fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
@@ -655,7 +655,7 @@ fn destroy_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
 }
 
 /// The instance's kept effect, if it has one.
-fn kept<'a>(effect: ImageEffect) -> Result<Option<&'a Kept>, OfxStatus> {
+fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a Kept>, OfxStatus> {
     let kept = effect_props(effect)?
         .get_pointer(PROP_INSTANCE_DATA)
         .unwrap_or(ptr::null_mut());
@@ -671,7 +671,7 @@ fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> 
     let range = [0, 1].map(|i| in_args.get_double(PROP_FRAME_RANGE, i));
     if let [Ok(first), Ok(last)] = range
         && last > first
-        && let Some(kept) = kept(effect)?
+        && let Some(kept) = kept_for_instance(effect)?
     {
         *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
@@ -679,7 +679,7 @@ fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> 
 }
 
 fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
-    if let Some(kept) = kept(effect)? {
+    if let Some(kept) = kept_for_instance(effect)? {
         let frame = in_args.get_double(PROP_TIME, 0)?.round() as i64;
         let last = *kept.last.lock().unwrap_or_else(|p| p.into_inner());
         let fixed = host::is_resolve() && streaming(last, frame);
@@ -687,7 +687,7 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Rendered {
             frame,
             ended: std::time::Instant::now(),
-            jumped: !follows(last, frame),
+            broke_stream: !steps_forward_soon(last, frame),
         });
         return rendered;
     }
@@ -848,7 +848,7 @@ mod tests {
                 last = Some(Rendered {
                     frame,
                     ended: std::time::Instant::now(),
-                    jumped: !follows(last, frame),
+                    broke_stream: !steps_forward_soon(last, frame),
                 });
                 streaming
             })

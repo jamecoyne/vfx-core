@@ -869,10 +869,12 @@ fn reused_faces(motion: &Motion, frame: i64) -> impl Iterator<Item = motion::Blo
         })
 }
 
-const HASH_K: u64 = 0x9e37_79b9_7f4a_7c15;
+const HASH_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 
 fn fold_hash(hashes: impl Iterator<Item = u64>) -> u64 {
-    hashes.fold(0, |h, l| (h ^ l).wrapping_mul(HASH_K).rotate_left(31))
+    hashes.fold(0, |h, l| {
+        (h ^ l).wrapping_mul(HASH_MULTIPLIER).rotate_left(31)
+    })
 }
 
 /// A hash of every pixel of a row, read as u64 words in four lanes so it's limited by memory
@@ -884,12 +886,12 @@ fn row_hash<C: Channel>(row: &[Argb<C>]) -> u64 {
     for chunk in words.chunks(4) {
         for (lane, word) in lanes.iter_mut().zip(chunk) {
             *lane = (*lane ^ u64::from_le_bytes(*word))
-                .wrapping_mul(HASH_K)
+                .wrapping_mul(HASH_MULTIPLIER)
                 .rotate_left(29);
         }
     }
     for &b in rest {
-        lanes[0] = (lanes[0] ^ u64::from(b)).wrapping_mul(HASH_K);
+        lanes[0] = (lanes[0] ^ u64::from(b)).wrapping_mul(HASH_MULTIPLIER);
     }
     fold_hash(lanes.into_iter())
 }
@@ -1125,7 +1127,7 @@ mod tests {
     /// A frame's print is the same on any thread, and tells a change in any pixel or a change
     /// in row order. Prints from both paths are compared when a host stops streaming.
     #[test]
-    fn a_print_is_the_same_on_threads_and_misses_nothing() {
+    fn threaded_fingerprint_matches_serial() {
         // An odd width leaves a row's last pixel out of the words of 8-bit frames.
         let (w, h) = (201, 130);
         let mut pixels: Vec<Argb<u8>> = (0..w * h)
