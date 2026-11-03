@@ -415,7 +415,7 @@ mod tests {
     use vfx_core::cpu::{Channel, FrameSource, Image};
 
     /// Every value of every channel, so a rounding on the way would show.
-    fn every_value(width: usize, height: usize) -> Vec<Argb<u8>> {
+    fn varied_pixels(width: usize, height: usize) -> Vec<Argb<u8>> {
         (0..width * height)
             .map(|i| Argb {
                 alpha: i as u8,
@@ -428,7 +428,7 @@ mod tests {
 
     /// A decoded frame reaches the history byte for byte, and only once for its time.
     #[test]
-    fn a_decoded_frame_reaches_the_history_as_decoded() {
+    fn decoded_frame_reaches_history() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut controls = crate::controls::Controls::default();
         controls.effect = find("segcam Motion (Rust)").unwrap();
@@ -436,7 +436,7 @@ mod tests {
         let make = catalog::entries()[controls.effect].make;
         let effect = CpuInstance::new(make, true).expect("a CPU effect");
         let mut stage = CpuStage::new(&gpu, effect, (64, 48));
-        let decoded = every_value(64, 48);
+        let decoded = varied_pixels(64, 48);
 
         stage.push(&gpu, Input::Ram(&[]), 0.0, &values, None);
         assert!(stage.history.is_empty(), "nothing has arrived yet");
@@ -460,7 +460,7 @@ mod tests {
     /// A frame on the GPU reaches the history in the right channels, rounded as the old float
     /// readback rounded it, give or take the GPU's rounding of a tie.
     #[test]
-    fn a_float_frame_reads_back_at_8_bit() {
+    fn float_frame_reads_at_8_bit() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut controls = crate::controls::Controls::default();
         controls.effect = find("segcam Motion (Rust)").unwrap();

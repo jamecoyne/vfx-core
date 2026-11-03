@@ -777,7 +777,7 @@ mod tests {
     }
 
     /// Renders and returns the output as float RGBA, however the effect made it.
-    fn render(
+    fn render_to_float(
         effects: &mut Effects,
         gpu: &Gpu,
         controls: &Controls,
@@ -801,9 +801,9 @@ mod tests {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
         let (controls, mut values) = shown("Flip");
-        let plain = render(&mut effects, &gpu, &controls, &values, 0.0);
+        let plain = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
         values.set("flip_x", ParamValue::Float(1.0)).unwrap();
-        let flipped = render(&mut effects, &gpu, &controls, &values, 0.0);
+        let flipped = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
 
         let (w, h) = PATTERN_SIZE;
         let at = |pixels: &[f32], x: u32, y: u32| {
@@ -830,7 +830,7 @@ mod tests {
             let mut controls = Controls::default();
             controls.effect = i;
             let values = controls.values().clone();
-            let out = render(&mut effects, &gpu, &controls, &values, 0.0);
+            let out = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
             assert_eq!(out.len(), (PATTERN_SIZE.0 * PATTERN_SIZE.1 * 4) as usize);
             assert!(out.iter().all(|v| v.is_finite()), "{}", entry.name);
         }
@@ -846,7 +846,7 @@ mod tests {
         values.set("output", ParamValue::Int(1)).unwrap();
         let mut out = Vec::new();
         for f in 0..6 {
-            out = render(&mut effects, &gpu, &controls, &values, f64::from(f) * 0.2);
+            out = render_to_float(&mut effects, &gpu, &controls, &values, f64::from(f) * 0.2);
         }
         let alpha: Vec<f32> = out.iter().skip(3).step_by(4).copied().collect();
         assert!(alpha.contains(&1.0), "nothing moved");
@@ -863,7 +863,7 @@ mod tests {
         let size = (64, 64);
         effects.start_stream(&gpu, "still".into(), size, None);
         let render = |effects: &mut Effects, time| {
-            let frame = render(effects, &gpu, &controls, &values, time);
+            let frame = render_to_float(effects, &gpu, &controls, &values, time);
             (effects.rendered(), frame)
         };
 
@@ -891,7 +891,7 @@ mod tests {
     /// A video frame in RAM comes out of segcam's first render, which shows its input, with
     /// not a byte changed; for a GPU effect it goes up as the float it always was.
     #[test]
-    fn a_video_frame_passes_through_unchanged() {
+    fn video_frame_passes_unchanged() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
         let (controls, values) = shown("segcam Motion (Rust)");
@@ -923,7 +923,7 @@ mod tests {
         }
 
         let (controls, values) = shown("Flip");
-        let out = render(&mut effects, &gpu, &controls, &values, 0.0);
+        let out = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
         let want: Vec<f32> = pixels
             .iter()
             .flat_map(|p| [p.red, p.green, p.blue, p.alpha].map(|b| f32::from(b) / 255.0))
@@ -934,7 +934,7 @@ mod tests {
     /// A new video of the same size starts over, even with a first frame at the time of the
     /// last one shown, as a one frame clip after another has.
     #[test]
-    fn a_new_video_replaces_the_picture() {
+    fn new_video_replaces_picture() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
         let (controls, values) = shown("segcam Motion (Rust)");

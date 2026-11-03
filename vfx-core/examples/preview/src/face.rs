@@ -137,10 +137,10 @@ pub struct Tracker {
 }
 
 /// A frame's pixels and size.
-type Picture = (Vec<Argb<u8>>, (u32, u32));
+type SizedFrame = (Vec<Argb<u8>>, (u32, u32));
 
 struct Shared {
-    frame: Option<Picture>,
+    frame: Option<SizedFrame>,
     /// The buffer of the last frame looked at, to copy the next into.
     spare: Vec<Argb<u8>>,
     values: Values,

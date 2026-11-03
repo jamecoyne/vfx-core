@@ -19,7 +19,7 @@ use vfx_core::cpu::{Argb, Channel};
 
 /// Decoded frames waiting for the loop, at most: enough for a render that runs long, few
 /// enough that a loop that stays behind shows the picture no more than this many frames late.
-const QUEUE: usize = 2;
+const MAX_QUEUED: usize = 2;
 
 /// File extensions treated as video when dropped on the window.
 const EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv"];
@@ -327,7 +327,7 @@ struct Playback {
     /// Bumped on every seek, so old reader threads know to stop.
     generation: u64,
     child: Option<Child>,
-    /// Oldest first, at most [`QUEUE`].
+    /// Oldest first, at most [`MAX_QUEUED`].
     queue: VecDeque<Decoded>,
     /// Buffers to decode into again, so a frame allocates nothing.
     spare: Vec<Vec<Argb<u8>>>,
@@ -337,7 +337,7 @@ struct Playback {
     start: f64,
     /// Frames the current decode has delivered.
     frames: u64,
-    /// Frames that arrived since the last [`Video::take_arrived`], dropped ones too.
+    /// Frames that arrived since the last [`Video::take_arrived_count`], dropped ones too.
     arrived: u64,
     playing: bool,
     /// A playing file reached its end (the caller loops it with `seek`).
@@ -419,8 +419,8 @@ impl Video {
         let size = self.info.frame_pixels();
         let (fps, duration) = (self.info.fps, self.info.duration);
         let mut pixels = s.spare.pop().unwrap_or_else(|| bytemuck::zeroed_vec(size));
-        let mut first = None;
-        let mut read = 0u32;
+        let mut first_frame_at = None;
+        let mut frames_read = 0u32;
         std::thread::spawn(move || {
             // Ends at the end of the file, or when a seek or drop kills this ffmpeg.
             while stdout
@@ -430,10 +430,10 @@ impl Video {
                 if !camera {
                     // Due by the clock from the first frame; a late one goes straight on.
                     let now = Instant::now();
-                    let since_first = Duration::from_secs_f64(f64::from(read) / fps);
-                    let due = *first.get_or_insert(now) + since_first;
+                    let since_first = Duration::from_secs_f64(f64::from(frames_read) / fps);
+                    let due = *first_frame_at.get_or_insert(now) + since_first;
                     std::thread::sleep(due.saturating_duration_since(now));
-                    read += 1;
+                    frames_read += 1;
                 }
                 let mut s = shared.lock().unwrap();
                 if s.generation != generation {
@@ -442,7 +442,7 @@ impl Video {
                 let time = (s.start + s.frames as f64 / fps).min(duration);
                 s.frames += 1;
                 s.arrived += 1;
-                let next = if s.queue.len() == QUEUE {
+                let next = if s.queue.len() == MAX_QUEUED {
                     s.queue.pop_front().map(|oldest| oldest.pixels)
                 } else {
                     s.spare.pop()
@@ -487,7 +487,7 @@ impl Video {
     }
 
     /// The frames that arrived from ffmpeg since the last call.
-    pub fn take_arrived(&self) -> u64 {
+    pub fn take_arrived_count(&self) -> u64 {
         std::mem::take(&mut self.shared.lock().unwrap().arrived)
     }
 
@@ -673,7 +673,7 @@ mod tests {
     }
 
     /// A 3 s, 25 fps clip for one test to play.
-    fn clip(name: &str) -> PathBuf {
+    fn test_clip(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("vfx-preview-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("clip.mp4");
@@ -693,7 +693,7 @@ mod tests {
     #[test]
     #[ignore]
     fn seeks_pauses_and_ends() {
-        let video = Video::open(Input::File(clip("seek-test")), 1920).unwrap();
+        let video = Video::open(Input::File(test_clip("seek-test")), 1920).unwrap();
         assert!(video.playing());
         let mut pixels = Vec::new();
 
@@ -725,11 +725,11 @@ mod tests {
     /// the clock stays with the frame it took.
     #[test]
     #[ignore]
-    fn a_slow_loop_loses_the_oldest_frames() {
-        let video = Video::open(Input::File(clip("queue-test")), 1920).unwrap();
-        wait_for("the first frame", || video.take_arrived() > 0);
+    fn slow_loop_drops_oldest_frames() {
+        let video = Video::open(Input::File(test_clip("queue-test")), 1920).unwrap();
+        wait_for("the first frame", || video.take_arrived_count() > 0);
         std::thread::sleep(Duration::from_millis(400));
-        let arrived = video.take_arrived();
+        let arrived = video.take_arrived_count();
         assert!(arrived <= 13, "{arrived} frames in 0.4 s at 25 fps");
 
         let mut pixels = Vec::new();
@@ -747,8 +747,8 @@ mod tests {
     /// One buffer taken in turn from videos of two sizes, as a layer's is when its video
     /// changes: a video only ever decodes into buffers of its own size.
     #[test]
-    fn a_buffer_of_another_size_is_not_decoded_into() {
-        let clip = clip("sizes-test");
+    fn wrong_size_buffer_not_decoded() {
+        let clip = test_clip("sizes-test");
         let large = Video::open(Input::File(clip.clone()), 160).unwrap();
         let small = Video::open(Input::File(clip), 80).unwrap();
         let mut pixels = Vec::new();
@@ -764,8 +764,8 @@ mod tests {
     /// The bytes of a frame are ffmpeg's plain RGBA decode, in ARGB order: the frame that
     /// reaches a history is the one the preview always decoded.
     #[test]
-    fn decoding_keeps_the_rgba_bytes() {
-        let clip = clip("bytes-test");
+    fn decoding_keeps_rgba_bytes() {
+        let clip = test_clip("bytes-test");
         for side in [160, 80] {
             let info = Info::probe(Input::File(clip.clone()), side).unwrap();
             let (w, h) = info.size;

@@ -415,7 +415,7 @@ impl Preview {
                 self.message = Some(e);
             }
 
-            self.counts.arrived += media.video.take_arrived();
+            self.counts.arrived += media.video.take_arrived_count();
             if let Some(pixels) = self.effects.take_video_frame(&media.video)
                 && let Some(tracker) = &self.tracker
             {
