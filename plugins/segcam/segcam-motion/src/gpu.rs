@@ -666,7 +666,7 @@ impl Atlas {
                 let step = (words - self.words) / 2;
                 self.ceiling = self.words + if step < self.words / 8 { 0 } else { step };
                 eprintln!(
-                    "segcam Motion: the GPU refused {} MB of atlas, staying at {} MB ({e})",
+                    "segcam Motion: the GPU refused an atlas of {} MB, it holds {} MB ({e})",
                     words / 250_000,
                     self.words / 250_000
                 );
