@@ -333,10 +333,11 @@ pub trait FrameSource {
 
     /// Whether a frame's pixels stay as they were handed over, so an effect that keeps work
     /// between renders needn't read an earlier frame again: true for a host's own copies of
-    /// the frames it was given ([`History`]), false where the host renders earlier frames
-    /// on request and an edit upstream can change them (OpenFX, After Effects). A source
-    /// that starts its numbering over hands out a different current frame, which an effect
-    /// still checks.
+    /// the frames it was given ([`History`]) and for OpenFX in Resolve while renders stream,
+    /// where earlier frames are taken as unchanged; false where the host renders earlier frames
+    /// on request and an edit upstream may have changed them (OpenFX otherwise, After Effects).
+    /// A source that starts its numbering over hands out a different current frame, which an
+    /// effect still checks.
     fn fixed(&self) -> bool {
         false
     }
