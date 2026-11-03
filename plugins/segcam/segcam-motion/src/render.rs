@@ -78,8 +78,8 @@ pub enum SwarmBackground {
     Black,
 }
 
-/// Which frames are analysed: every `stride`th by frame number, so about 30 a second as in
-/// segcam 1.1. A frame between two analyses shows the last one.
+/// Which frames are analysed: every `stride`th by frame number, so every frame up to about 60
+/// a second, as segcam 1.1 plays a file. A frame between two analyses shows the last one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cadence {
     pub stride: i64,
@@ -87,17 +87,16 @@ pub struct Cadence {
 
 impl Cadence {
     pub const EVERY_FRAME: Self = Self { stride: 1 };
-    /// The most analyses a second.
-    pub const RATE: f64 = 30.0;
+    /// What a higher frame rate comes down to, in analyses a second.
+    pub const RATE: f64 = 60.0;
     /// The longest stride, which [`previous_frames_needed`] reaches back for.
     pub const MAX_STRIDE: i64 = 4;
 
     /// For a clip at `frame_rate` frames a second; every frame where that isn't known.
     pub fn at(frame_rate: Option<f64>) -> Self {
-        // Just under the cap still counts as at it, so 29.97 analyses every frame.
         let stride = frame_rate
             .filter(|r| r.is_finite() && *r > 0.0)
-            .map_or(1, |r| (r / Self::RATE - 0.01).ceil() as i64);
+            .map_or(1, |r| (r / Self::RATE).round() as i64);
         Self {
             stride: stride.clamp(1, Self::MAX_STRIDE),
         }
@@ -122,8 +121,7 @@ pub struct RenderSettings {
     pub motion: MotionSettings,
     pub threshold: ThresholdSettings,
     pub faces: FaceParts,
-    /// How many analyses before each one build its background, so the same time at any frame
-    /// rate.
+    /// How many analyses before each one build its background.
     pub background_frames: i32,
     pub grid_width: i32,
     pub mirror: bool,
@@ -193,17 +191,18 @@ impl RenderSettings {
 }
 
 /// How many frames before the current one [`render`] wants to see: the background and the
-/// swarm's trail, or for the other outputs the background of the analysis the frame shows,
-/// at any frame rate. With faces on, a stride more: every 2nd analysis reuses the faces of the
-/// one before, with that frame's IDs.
+/// swarm's trail, or for the other outputs the background of the analysis the frame shows.
+/// With faces on, a stride more: every 2nd analysis reuses the faces of the one before, with
+/// that frame's IDs.
 pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
+    let stride = s.cadence.stride as i32;
     history_frames(s)
         + if s.mode == OutputMode::Swarm {
             s.trail_frames.max(1) - 1
         } else {
-            Cadence::MAX_STRIDE as i32 - 1
+            stride - 1
         }
-        + i32::from(s.faces.any()) * Cadence::MAX_STRIDE as i32
+        + i32::from(s.faces.any()) * stride
 }
 
 /// How many frames before a frame its detection reaches back: the background's analyses, for

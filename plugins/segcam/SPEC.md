@@ -39,13 +39,13 @@ Status: done (on `main`), PR (written, in review), todo.
 | F4 | While an editing host streams, earlier frames are taken as unchanged; the first render after a pause or jump and the one after it check them | Resolve export of frames 0 to 299 identical to stepping frame by frame ([ADR 3](decisions/0003-editing-promise.md)) | done |
 | F5 | An export's first renders check earlier frames | an edit followed by an immediate export renders the edited frames | done: Resolve 21 sends a one frame begin around every render, so how it starts an export does the check: a step back or a repeat isn't a stream, and the render after that checks too. On Windows (i7-12700K, H.264) and macOS (M4, H.264), one run each, an edit a few seconds before an export matched a fresh start; the replay in `ofx-tests/host.c` covers the orders seen |
 | F6 | A clip keeps its start: frames before the clip's first are never requested or used | Resolve render of a trimmed clip identical to the same frames rendered alone | done |
-| F7 | Faces run on every 2nd analysis, the even host frame numbers (`ctx.frame`) at 30 fps; the analysis between reuses the faces and window IDs of the one before, or runs faces if it isn't available ([ADR 2](decisions/0002-faces-every-2nd-frame.md)) | F3 still passes on a face fixture at 30 and 60 fps, with the analysis before missing, shuffled and backwards; face cost halved in Resolve and Resolume in the benchmark | done |
+| F7 | Faces run on every 2nd analysis, the even host frame numbers (`ctx.frame`) up to about 60 fps; the analysis between reuses the faces and window IDs of the one before, or runs faces if it isn't available ([ADR 2](decisions/0002-faces-every-2nd-frame.md)) | F3 still passes on a face fixture at 60 and 120 fps, with the analysis before missing, shuffled and backwards; face cost halved in Resolve and Resolume in the benchmark | done |
 | F8 | Swarm draws on the GPU by default where a hardware GPU exists; each render picks CPU or GPU by the window pixels it draws ([ADR 4](decisions/0004-gpu-by-default.md)) | GPU output within one level of the CPU path, at most 1 pixel in 10,000 off by over half a level, in the 30 offline cases and a lossless Resolve Deliver | done |
 | F9 | No GPU, a failing GPU, or one lost mid render falls back to the CPU path without a wrong frame | the lost device test: every frame after the loss equals the CPU path byte for byte | done |
 | F10 | Overlay draws on the CPU | Overlay output byte for byte with the CLI | done |
 | F11 | Parameter `name`s are frozen from 1.0 | a test listing the shipped `name`s fails if one changes (to add with the tag) | done |
 | F12 | Windows plugins load the DirectML that ships next to them, not the system's | faces use DirectML on Windows 10 with an old system32 copy; the tests check the same | done |
-| F13 | Swarm as in segcam 1.1: a window stays until Swarm max tiles newer ones push it out, within Trail frames; analysis about 30 frames a second from the host's frame rate, the frames between showing the last; Background counts analyses, so the same time at any frame rate ([ADR 6](decisions/0006-swarm-as-in-1-1.md)) | F3 passes at 60 fps, with the analysis a frame shows missing, shuffled and backwards; the benchmark's 1.1 look preset | done |
+| F13 | Swarm as in segcam 1.1: a window stays until Swarm max tiles newer ones push it out, within Trail frames; analysis of every frame up to about 60 fps from the host's frame rate, every 2nd at 120, the frames between showing the last; Background counts analyses ([ADR 6](decisions/0006-swarm-as-in-1-1.md)) | F3 passes at 120 fps, with the analysis a frame shows missing, shuffled and backwards; the benchmark's 1.1 look preset | done |
 | F14 | The core API a host implements is listed in [DEVELOPING.md](../../docs/DEVELOPING.md#what-a-host-implements); a PR that adds to it adds a row ([ADR 7](decisions/0007-core-api.md)) | the table names every public trait method, `Context` field and `Gpu` function on `main` | done |
 
 ## 4. Host behaviour
@@ -56,7 +56,7 @@ Status: done (on `main`), PR (written, in review), todo.
 | Depth | float | 8, 16 and 32 bit | 8 bit |
 | Kept state | a cache under F3, F4 | none between renders (each is fresh) | kept for the run; holds the current frame in full, and of earlier frames what the trail draws, so a setting changed live reaches new windows only |
 | Frame number | timeline frame | time divided by frame length | frames received, back to 0 on a seek back or resize |
-| Analysis (F13) | about 30 a second, from the project's frame rate | same, from the frame length | every frame: no frame rate |
+| Analysis (F13) | every frame up to about 60 fps, from the project's frame rate | same, from the frame length | every frame: no frame rate |
 | Faces every 2nd analysis (F7) | halves face cost | same output, same cost as today: one detection per render, since every render is fresh | halves face cost |
 
 ## 5. Non functional requirements
