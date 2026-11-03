@@ -1331,8 +1331,6 @@ mod tests {
         assert!(dev.lost().is_none(), "the device was given up");
     }
 
-    /// A growth the GPU refuses leaves the atlas as it was: it counts as full, no fault, and
-    /// the GPU draws on with what it holds.
     #[test]
     fn refused_growth_keeps_atlas() {
         let _lock = gpu_test_lock();

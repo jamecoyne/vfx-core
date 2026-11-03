@@ -338,7 +338,6 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
     }
 }
 
-/// The adapter `choice` asks for, unless it draws in software and that wasn't asked for.
 #[cfg(not(target_arch = "wasm32"))]
 fn pick_adapter(choice: &str) -> Result<wgpu::Adapter, NoGpu> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -366,7 +365,7 @@ fn pick_adapter(choice: &str) -> Result<wgpu::Adapter, NoGpu> {
     Ok(adapter)
 }
 
-/// A device with a validation error for a buffer over `bytes`, while drawers think it takes any.
+/// Drawers on it think any size binds, so growth reaches the device's own limit.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn device_with_buffer_limit(choice: &str, bytes: u64) -> Result<Device, NoGpu> {
     let limits = wgpu::Limits {
@@ -593,18 +592,14 @@ struct Atlas {
     words: u64,
     /// Free runs of words, by start.
     free: Vec<(u64, u64)>,
-    /// A bigger buffer waiting for the GPU's answer.
     pending_growth: Option<PendingGrowth>,
     /// The most words to ask for; it comes down as the GPU refuses.
     ceiling: u64,
-    /// When the GPU last refused, to retry after [`Atlas::GROWTH_RETRY_AFTER`].
     last_refusal: Option<Instant>,
-    /// The smallest refused size logged so far.
     smallest_logged_refusal: u64,
 }
 
-/// A bigger buffer for the atlas, not in use until the GPU has answered. Native backends answer
-/// at once, browsers some time later.
+/// Not in use until the GPU answers: native backends at once, browsers some time later.
 struct PendingGrowth {
     buffer: wgpu::Buffer,
     words: u64,
@@ -629,7 +624,6 @@ impl PendingGrowth {
 impl Atlas {
     /// 4 MB: hosts make instances often, and the atlas grows with the trail.
     const FIRST_WORDS: u64 = 1 << 20;
-    /// A device can be short of memory for a while, and an instance can live a whole show.
     const GROWTH_RETRY_AFTER: Duration = Duration::from_secs(60);
 
     fn new(dev: &Device) -> Self {
@@ -1662,15 +1656,13 @@ mod tests {
         std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default()
     }
 
-    /// Writes to the atlas and reports whether that made a device error, as an invalid buffer does.
     fn atlas_accepts_writes(atlas: &Atlas, dev: &Device) -> bool {
         let before = dev.errors().0;
         dev.queue.write_buffer(&atlas.buffer, 0, &[0; 4]);
         dev.errors().0 == before
     }
 
-    /// wgpu's noop backend gives a real OutOfMemory: it can't reserve this much, so it allocates
-    /// nothing and needs no GPU.
+    /// wgpu's noop backend can't reserve this much, so OutOfMemory needs no GPU or allocation.
     #[test]
     fn out_of_memory_refuses_growth() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -1711,7 +1703,6 @@ mod tests {
         assert!(dev.lost().is_none(), "the device was lost");
     }
 
-    /// After a refusal no render retries until [`Atlas::GROWTH_RETRY_AFTER`] has passed.
     #[test]
     fn growth_retries_after_cooldown() {
         let _lock = gpu_test_lock();
@@ -1752,7 +1743,6 @@ mod tests {
         );
         assert!(atlas.words >= words);
 
-        // A retry after memory came free lifts the old ceiling.
         let mut atlas = Atlas::with(&dev, 1024);
         assert!(atlas.alloc(&dev, 1024, u64::MAX).is_some());
         atlas.ceiling = 1024;
