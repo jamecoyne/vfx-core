@@ -1336,4 +1336,48 @@ mod tests {
         assert!(on_gpu.gpu().is_some(), "the instance left the GPU");
         assert!(dev.lost().is_none(), "the device was given up");
     }
+
+    /// A growth the GPU refuses leaves the atlas as it was: it counts as full, no fault, and
+    /// the GPU draws on with what it holds.
+    #[test]
+    fn a_refused_growth_keeps_the_atlas() {
+        let _turn = turn();
+        let bytes = (W * H * 4) as u64 + 4096;
+        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+        let opened = gpu::refusing(&choice, bytes).or_else(|_| gpu::refusing("fallback", bytes));
+        let Ok(dev) = opened.map(Arc::new) else {
+            eprintln!("no adapter: skipped");
+            return;
+        };
+        let frames = crossing();
+        let mut cpu = Incremental::default();
+        let mut drawer = gpu::Drawer::on(dev.clone()).expect("a drawer on a working device");
+        // The usual first atlas is over the limit too.
+        drawer.small_atlas(1024);
+        let errors = dev.errors().0;
+        let mut on_gpu = Incremental::default();
+        on_gpu.use_drawer(drawer);
+        on_gpu.gpu_threshold(0.0);
+        for n in 0..frames.len() {
+            let (a, b) = (
+                render(&mut cpu, &frames, n),
+                render(&mut on_gpu, &frames, n),
+            );
+            assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
+        }
+        let drawn = drawn(&on_gpu);
+        assert!(drawn > 0, "nothing was drawn on the GPU");
+        assert!(
+            drawn < frames.len() as u64,
+            "every frame fit the atlas: the test proves nothing"
+        );
+        assert_eq!(faults(&on_gpu), 0, "a refused growth is not a fault");
+        assert_eq!(
+            dev.errors().0,
+            errors,
+            "a refusal reached the device's errors"
+        );
+        assert!(on_gpu.gpu().is_some(), "the instance left the GPU");
+        assert!(dev.lost().is_none(), "the device was given up");
+    }
 }
