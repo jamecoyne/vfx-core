@@ -838,6 +838,9 @@ mod tests {
         let mut effects = Effects::new(&gpu);
         let (controls, mut values) = shown("segcam Motion (Rust)");
         values.set("output", ParamValue::Int(1)).unwrap();
+        values.set("detect", ParamValue::Int(0)).unwrap();
+        values.set("eyes", ParamValue::Bool(false)).unwrap();
+        values.set("mouth", ParamValue::Bool(false)).unwrap();
         let mut out = Vec::new();
         for f in 0..6 {
             out = render_to_float(&mut effects, &gpu, &controls, &values, f64::from(f) * 0.2);

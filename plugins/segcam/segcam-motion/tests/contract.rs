@@ -1,6 +1,8 @@
 //! segcam Motion keeps work between renders, so it is checked against the contract every
 //! host relies on: whatever it keeps, a render gives what a fresh effect renders.
 
+mod motion_only;
+
 use segcam_motion::SegcamMotion;
 use segcam_motion::gpu::NoGpu;
 use vfx_core::cpu::Argb;
@@ -52,7 +54,7 @@ fn make_gpu_or_cpu() -> Processor {
 }
 
 fn with(changes: &[(&str, ParamValue)]) -> ParamValues {
-    let mut values = ParamValues::new(SegcamMotion::default().params());
+    let mut values = motion_only::motion_only(SegcamMotion::default().params());
     for (name, value) in changes {
         values.set(name, *value).expect("a segcam parameter");
     }

@@ -12,11 +12,11 @@ use crate::{
     SwarmBackground, ThresholdSettings,
 };
 
-/// The controls, with segcam's units (percentages are 0-100), ranges and defaults
-/// (those of [`RenderSettings::default`]).
+/// The controls, with segcam's units (percentages are 0-100), ranges and defaults: those of
+/// [`RenderSettings::default`], but Detect and the face parts start as segcam 1.1 does.
 pub const PARAMS: &[ParamSpec] = &[
     ParamSpec::choice("output", &OutputMode::NAMES, 0).label("Output"),
-    ParamSpec::choice("detect", &["Motion", "Threshold", "Faces only"], 0).label("Detect"),
+    ParamSpec::choice("detect", &["Motion", "Threshold", "Faces only"], 2).label("Detect"),
     ParamSpec::float("sensitivity", 0.0, 100.0, 86.4)
         .label("Sensitivity")
         .group("Motion")
@@ -56,10 +56,8 @@ pub const PARAMS: &[ParamSpec] = &[
     ParamSpec::toggle("face", false)
         .label("Face")
         .group("Faces"),
-    ParamSpec::toggle("eyes", false)
-        .label("Eyes")
-        .group("Faces"),
-    ParamSpec::toggle("mouth", false)
+    ParamSpec::toggle("eyes", true).label("Eyes").group("Faces"),
+    ParamSpec::toggle("mouth", true)
         .label("Mouth")
         .group("Faces"),
     ParamSpec::toggle("body", false)
@@ -248,9 +246,15 @@ mod tests {
     use vfx_core::cpu::{Argb, History, ViewMut};
 
     #[test]
-    fn defaults_are_the_cores() {
+    fn controls_start_as_1_1() {
         let mut s = settings(&ParamValues::new(PARAMS), false);
         let core = RenderSettings {
+            detect: Detect::FacesOnly,
+            faces: FaceParts {
+                eyes: true,
+                mouth: true,
+                ..FaceParts::default()
+            },
             straight_alpha: true,
             ..RenderSettings::default()
         };
@@ -329,9 +333,14 @@ mod tests {
         };
         let mut effect = SegcamMotion::default();
         let mut params = ParamValues::new(PARAMS);
-        params
-            .set("output", vfx_core::ParamValue::Int(1))
-            .expect("output is an int");
+        for (name, value) in [
+            ("output", vfx_core::ParamValue::Int(1)),
+            ("detect", vfx_core::ParamValue::Int(0)),
+            ("eyes", vfx_core::ParamValue::Bool(false)),
+            ("mouth", vfx_core::ParamValue::Bool(false)),
+        ] {
+            params.set(name, value).expect("a segcam parameter");
+        }
         let mut history = History::<u8>::default();
         history.resize(w, h);
         let mut out = vec![Argb::<u8>::default(); (w * h) as usize];

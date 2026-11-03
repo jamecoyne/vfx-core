@@ -1,6 +1,9 @@
 //! Analysis at up to about 60 a second, as in segcam 1.1: which frames are analysed at a frame rate,
 //! what the frames between show, and that a seek back starts the count again.
 
+mod motion_only;
+
+use motion_only::motion_only;
 use segcam_motion::motion::{self, LumaGrid};
 use segcam_motion::render::{copy_scaled, downsample, draw_overlay};
 use segcam_motion::{
@@ -249,7 +252,7 @@ fn background_counts_analyses() {
 /// Renders `frames` through `effect` one at a time, as Resolume and the preview hand them
 /// over, at 120 frames a second.
 fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]) -> Vec<Frame> {
-    let mut values = ParamValues::new(effect.params());
+    let mut values = motion_only(effect.params());
     values
         .set("output", ParamValue::Int(3))
         .expect("output is a choice");
@@ -337,7 +340,7 @@ fn holding_only_the_current_frame_changes_nothing() {
     let frames = crossing(40);
     for output in 0..4 {
         for (trail, max_tiles) in [(60, 100), (12, 3)] {
-            let mut values = ParamValues::new(SegcamMotion::with_gpu(false).params());
+            let mut values = motion_only(SegcamMotion::with_gpu(false).params());
             for (name, value) in [
                 ("output", output),
                 ("background", 4),
@@ -366,7 +369,7 @@ fn holding_only_the_current_frame_changes_nothing() {
 fn a_setting_changed_live_leaves_the_windows_up() {
     let frames = crossing(24);
     let mut effect = SegcamMotion::with_gpu(false);
-    let mut values = ParamValues::new(effect.params());
+    let mut values = motion_only(effect.params());
     values.set("output", ParamValue::Int(3)).expect("a choice");
     values
         .set("background", ParamValue::Int(4))

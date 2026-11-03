@@ -4,6 +4,7 @@
 //! most 180 pixels tall); the tests pass with a note when it isn't set.
 #![cfg(not(target_arch = "wasm32"))]
 
+mod motion_only;
 mod portrait;
 
 use portrait::{H, W, drifting, frame, portrait};
@@ -20,7 +21,7 @@ fn make() -> Processor {
 
 /// Face, eyes and mouth on, with `changes`.
 fn faces_with(changes: &[(&str, ParamValue)]) -> ParamValues {
-    let mut values = ParamValues::new(SegcamMotion::default().params());
+    let mut values = motion_only::motion_only(SegcamMotion::default().params());
     for name in ["face", "eyes", "mouth"] {
         values.set(name, ParamValue::Bool(true)).expect("a toggle");
     }

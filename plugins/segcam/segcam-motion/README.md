@@ -57,7 +57,7 @@ own when the host doesn't hand that frame over. The face modes don't run in the 
 | | Choices or range | Default |
 | --- | --- | --- |
 | Output | Overlay, Motion matte, Box matte, Swarm | Overlay |
-| Detect | Motion, Threshold, Faces only | Motion |
+| Detect | Motion, Threshold, Faces only | Faces only |
 | Mirror | on or off | off |
 | Sensitivity (Motion) | 0 to 100 percent | 86.4 |
 | Adaptation (Motion) | 0.1 to 50 percent | 6 |
@@ -68,7 +68,8 @@ own when the host doesn't hand that frame over. The face modes don't run in the 
 | Level (Threshold) | 0 to 255 | 170 |
 | Auto level (Threshold) | on or off | off |
 | Invert (Threshold) | on or off | off |
-| Face, Eyes, Mouth, Body (Faces) | on or off each | off |
+| Face, Body (Faces) | on or off each | off |
+| Eyes, Mouth (Faces) | on or off each | on |
 | Boxes (Overlay) | on or off | on |
 | Labels (Overlay) | on or off | on |
 | Box color (Overlay) | red, green, blue | 0.25, 1.0, 0.4 |

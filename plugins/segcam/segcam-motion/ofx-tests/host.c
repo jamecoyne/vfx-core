@@ -21,6 +21,9 @@ static OfxPropertySetHandle temporal(OfxImageClipHandle c, OfxTime t) {
 static OfxImageEffectHandle instance(int mode, int premult) {
     OfxImageEffectHandle e = make_instance(kOfxImageEffectContextFilter);
     set_param(e, "output", mode, 0);
+    set_param(e, "detect", 0, 0);
+    set_param(e, "eyes", 0, 0);
+    set_param(e, "mouth", 0, 0);
     ClipRec *src = clip_find(e, "Source");
     setDouble(src->props, kOfxImageEffectPropFrameRange, 0, 0);
     setDouble(src->props, kOfxImageEffectPropFrameRange, 1, 31);

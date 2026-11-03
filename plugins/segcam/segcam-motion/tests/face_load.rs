@@ -3,6 +3,7 @@
 //! like `faces.rs`; passes with a note when `SEGCAM_FACE_PORTRAIT` isn't set.
 #![cfg(not(target_arch = "wasm32"))]
 
+mod motion_only;
 mod portrait;
 
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ const TRAIL: i64 = 4;
 const LIMIT: Duration = Duration::from_secs(180);
 
 fn params(output: i32, parts: &[&str]) -> ParamValues {
-    let mut values = ParamValues::new(SegcamMotion::default().params());
+    let mut values = motion_only::motion_only(SegcamMotion::default().params());
     values.set("output", ParamValue::Int(output)).unwrap();
     values.set("background", ParamValue::Int(4)).unwrap();
     values.set("trail", ParamValue::Int(TRAIL as i32)).unwrap();
