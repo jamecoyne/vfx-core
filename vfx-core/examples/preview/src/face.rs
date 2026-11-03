@@ -136,12 +136,10 @@ pub struct Tracker {
     shared: Arc<(Mutex<Shared>, Condvar)>,
 }
 
-/// A frame's pixels and size.
 type SizedFrame = (Vec<Argb<u8>>, (u32, u32));
 
 struct Shared {
     frame: Option<SizedFrame>,
-    /// The buffer of the last frame looked at, to copy the next into.
     spare: Vec<Argb<u8>>,
     values: Values,
     stop: bool,

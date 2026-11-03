@@ -15,8 +15,7 @@ use crate::cpu_stage::{self, CpuStage};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::video::Video;
 
-/// GPU frames are straight-alpha, gamma-encoded RGBA32F, as in the plugins. A CPU effect
-/// takes 8 bit and hands back 8 bit (see [`CpuStage`]).
+/// GPU frames are straight-alpha, gamma-encoded RGBA32F, as in the plugins.
 pub const FRAME_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 /// Generated patterns render at this size; dropped images keep their own.
@@ -203,7 +202,6 @@ pub fn frame_fits(pixels: &[f32], size: (u32, u32)) -> bool {
     pixels.len() == (size.0 * size.1 * 4) as usize
 }
 
-/// Decoded pixels as the float frames a GPU effect takes: straight alpha, gamma-encoded.
 #[cfg(not(target_arch = "wasm32"))]
 fn to_float(pixels: &[Argb<u8>], width: usize, float: &mut Vec<f32>) {
     float.resize(pixels.len() * 4, 0.0);
@@ -216,8 +214,7 @@ fn to_float(pixels: &[Argb<u8>], width: usize, float: &mut Vec<f32>) {
     });
 }
 
-/// A video's newest frame in RAM. A CPU effect takes it as it is; it goes up as float only
-/// when a GPU effect is shown.
+/// A video's newest frame in RAM, uploaded as float only while a GPU effect is shown.
 #[cfg(not(target_arch = "wasm32"))]
 struct VideoFrame {
     /// Empty until the first arrives.
@@ -226,12 +223,9 @@ struct VideoFrame {
     on_gpu: bool,
 }
 
-/// The output of the last render, in RAM.
 #[cfg(not(target_arch = "wasm32"))]
 pub enum Output<'a> {
-    /// A CPU effect's picture as it is; empty until the first.
     Cpu(&'a [Argb<u8>]),
-    /// A GPU effect's, read back as float RGBA.
     Gpu(Vec<f32>),
 }
 
@@ -349,7 +343,6 @@ pub struct Effects {
     /// With a playing video as the source, its frame; `image` is that frame for a GPU effect.
     #[cfg(not(target_arch = "wasm32"))]
     video: Option<VideoFrame>,
-    /// The fed layer's frame from a video, kept for the next.
     #[cfg(not(target_arch = "wasm32"))]
     layer_pixels: Vec<Argb<u8>>,
     /// A decoded frame as float, kept for the next.
@@ -360,7 +353,7 @@ pub struct Effects {
     layer_name: Option<String>,
     /// The streamed video's frames a second, for effects that pace their work by it.
     frame_rate: Option<f64>,
-    /// Reads a GPU effect's results back for exports; made on first use for the current size.
+    /// Reads results back for exports; made on first use for the current size.
     #[cfg(not(target_arch = "wasm32"))]
     readback: Option<Readback>,
     generator: Pass,
@@ -488,8 +481,6 @@ impl Effects {
         }
     }
 
-    /// Replaces the fed layer's pixels with `video`'s newest frame, if the shown effect
-    /// reads a layer and the frame is the current size.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn take_layer_frame(&mut self, gpu: &Gpu, video: &Video) {
         let fresh = video.take_newest(&mut self.layer_pixels).is_some();
@@ -559,7 +550,6 @@ impl Effects {
         }
     }
 
-    /// Makes a `size` source called `name` that [`Effects::take_video_frame`] fills.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn start_video(&mut self, gpu: &Gpu, name: String, size: (u32, u32), frame_rate: f64) {
         self.start_stream(gpu, name, size, Some(frame_rate));
@@ -570,7 +560,6 @@ impl Effects {
         });
     }
 
-    /// Takes `video`'s next frame as the source, returning its pixels when there was one.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn take_video_frame(&mut self, video: &Video) -> Option<&[Argb<u8>]> {
         let frame = self.video.as_mut()?;
@@ -744,8 +733,7 @@ impl Effects {
         gpu.queue.submit(Some(encoder.finish()));
     }
 
-    /// The last render's output for a recording: a CPU effect's from RAM, a GPU effect's read
-    /// back, blocking until the GPU is done.
+    /// The last render's output: a CPU effect's from RAM, a GPU effect's read back, blocking.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn output(&mut self, gpu: &Gpu) -> Output<'_> {
         match &self.stage.run {
@@ -776,7 +764,6 @@ mod tests {
         (controls, values)
     }
 
-    /// Renders and returns the output as float RGBA, however the effect made it.
     fn render_to_float(
         effects: &mut Effects,
         gpu: &Gpu,
@@ -888,8 +875,7 @@ mod tests {
         assert_ne!(before, after);
     }
 
-    /// A video frame in RAM comes out of segcam's first render, which shows its input, with
-    /// not a byte changed; for a GPU effect it goes up as the float it always was.
+    /// segcam's first render shows its input, so a frame in RAM comes out unchanged.
     #[test]
     fn video_frame_passes_unchanged() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
@@ -931,8 +917,7 @@ mod tests {
         assert_eq!(out, want);
     }
 
-    /// A new video of the same size starts over, even with a first frame at the time of the
-    /// last one shown, as a one frame clip after another has.
+    /// Both videos' first frames have time 0, which must not read as the same frame.
     #[test]
     fn new_video_replaces_picture() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();

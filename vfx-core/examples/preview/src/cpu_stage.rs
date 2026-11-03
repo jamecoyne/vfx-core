@@ -1,7 +1,5 @@
 //! Runs a [`CpuEffect`] in the preview: each render adds the input to a history of recent
-//! frames (the preview hands over one frame at a time, as Resolume does), renders on the CPU
-//! and uploads the result as 8 bit. A decoded video frame goes into the history as it is; a
-//! frame on the GPU (a pattern, an image, the browser's video) is read back at 8 bit first.
+//! frames (the preview hands over one frame at a time, as Resolume does) and renders on the CPU.
 //!
 //! `time` names the frame: a render at a new time adds the input as the next frame, one at
 //! the same time renders that frame again (with whatever the parameters are now), and a
@@ -17,9 +15,7 @@ use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, Gpu, ParamValues};
 use vfx_host::{CpuInstance, by_rows};
 
-/// What a render starts from.
 pub enum Input<'a> {
-    /// A frame on the GPU, read back when it is new.
     Gpu(&'a Frame),
     /// A decoded frame in RAM; empty until the first arrives.
     #[cfg(not(target_arch = "wasm32"))]
@@ -41,7 +37,6 @@ pub struct CpuStage {
     shown: Vec<Argb<u8>>,
     upload: Vec<u8>,
     output: Frame,
-    /// Made when the first frame on the GPU needs reading.
     reader: Option<Reader>,
 }
 
@@ -73,7 +68,6 @@ impl CpuStage {
         self.rendered_with = None;
     }
 
-    /// The frame the last picture is in.
     pub fn output(&self) -> &Frame {
         &self.output
     }
@@ -84,7 +78,6 @@ impl CpuStage {
         &self.shown
     }
 
-    /// Room for the frame at `time` in the history, starting over if it comes before the last.
     fn next_frame(
         &mut self,
         time: f64,
@@ -102,7 +95,6 @@ impl CpuStage {
         self.history.next(before, held)
     }
 
-    /// Adds the input to the history if it is a new frame.
     fn push(
         &mut self,
         gpu: &Gpu,
@@ -227,7 +219,6 @@ impl CpuStage {
     }
 }
 
-/// Draws a float frame into an 8 bit one: the GPU's rounding in place of a float readback.
 const EIGHT_BIT_WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
 
@@ -244,10 +235,10 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Reads input frames back to the CPU at 8 bit. On the desktop it waits for each one, so every
-/// frame an export renders is in the history. Browsers can't wait on the GPU, so the web build
-/// maps each frame without waiting and takes it at a later render: the output runs a frame or
-/// two behind the input.
+/// Reads input frames back to the CPU. On the desktop it waits for each one, so every frame
+/// an export renders is in the history. Browsers can't wait on the GPU, so the web build
+/// maps each frame without waiting and takes it at a later render: the output runs a frame
+/// or two behind the input.
 struct Reader {
     eight_bit: Frame,
     pass: Pass,
@@ -426,7 +417,6 @@ mod tests {
             .collect()
     }
 
-    /// A decoded frame reaches the history byte for byte, and only once for its time.
     #[test]
     fn decoded_frame_reaches_history() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
@@ -457,8 +447,7 @@ mod tests {
         assert!(stage.reader.is_none(), "RAM frames need no readback");
     }
 
-    /// A frame on the GPU reaches the history in the right channels, rounded as the old float
-    /// readback rounded it, give or take the GPU's rounding of a tie.
+    /// Within 1 level of the float readback: the GPU rounds a tie its own way.
     #[test]
     fn float_frame_reads_at_8_bit() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
@@ -470,7 +459,6 @@ mod tests {
         let (w, h) = (256usize, 64usize);
         let mut stage = CpuStage::new(&gpu, effect, (w as u32, h as u32));
 
-        // Steps finer than a level, with every channel different.
         let float: Vec<f32> = (0..w * h)
             .flat_map(|i| {
                 let v = (i % 4096) as f32 / 4095.0;

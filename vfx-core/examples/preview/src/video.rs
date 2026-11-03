@@ -1,11 +1,8 @@
 //! Video files as a source, decoded by `ffmpeg` / `ffprobe` processes on PATH (native
 //! only).
 //!
-//! Live playback: ffmpeg decodes to raw 8 bit ARGB frames on a pipe, the layout a CPU effect's
-//! history takes as is. A reader thread takes a file's frames from the pipe at its frame rate
-//! and queues them with their times; the loop takes them in order, and a loop that falls
-//! behind loses the oldest, so the picture never trails the clock. Recording writes the output
-//! through [`Encoder`].
+//! Live playback: ffmpeg writes raw ARGB frames to a pipe, and a reader thread queues them with
+//! their times. A loop that falls behind loses the oldest. Recording goes through [`Encoder`].
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -17,8 +14,7 @@ use std::time::{Duration, Instant};
 
 use vfx_core::cpu::{Argb, Channel};
 
-/// Decoded frames waiting for the loop, at most: enough for a render that runs long, few
-/// enough that a loop that stays behind shows the picture no more than this many frames late.
+/// Also how many frames late a loop that stays behind shows the picture.
 const MAX_QUEUED: usize = 2;
 
 /// File extensions treated as video when dropped on the window.
@@ -264,9 +260,8 @@ impl Info {
         (self.size.0 * self.size.1) as usize
     }
 
-    /// ffmpeg arguments that decode this input to raw 8 bit ARGB at `size` on stdout, from
-    /// `start` seconds (files only). `Pace::OneFrame` stops after the first frame. Not `-re`:
-    /// it hands over the first half second at once, which the queue would lose at every loop.
+    /// ffmpeg arguments that decode this input to raw ARGB at `size` on stdout, from `start`
+    /// seconds (files only). No `-re`: it hands over the first half second at once.
     fn decode_command(&self, start: f64, pace: Pace) -> Command {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error"]);
@@ -459,8 +454,7 @@ impl Video {
         Ok(())
     }
 
-    /// Swaps the oldest waiting frame into `pixels`, whose old buffer is decoded into again,
-    /// and returns its time. None when nothing arrived since the last call.
+    /// Swaps the oldest waiting frame into `pixels`, recycling the old buffer; returns its time.
     pub fn take_frame(&self, pixels: &mut Vec<Argb<u8>>) -> Option<f64> {
         let mut s = self.shared.lock().unwrap();
         let frame = s.queue.pop_front()?;
@@ -473,8 +467,7 @@ impl Video {
         Some(frame.time)
     }
 
-    /// As [`Video::take_frame`], skipping to the newest waiting frame, for a layer that
-    /// has no history to keep whole.
+    /// As [`Video::take_frame`], skipping to the newest waiting frame.
     pub fn take_newest(&self, pixels: &mut Vec<Argb<u8>>) -> Option<f64> {
         {
             let mut s = self.shared.lock().unwrap();
@@ -486,13 +479,11 @@ impl Video {
         self.take_frame(pixels)
     }
 
-    /// The frames that arrived from ffmpeg since the last call.
     pub fn take_arrived_count(&self) -> u64 {
         std::mem::take(&mut self.shared.lock().unwrap().arrived)
     }
 
-    /// Where playback is in the file (or how long a camera has run), in seconds: the frame
-    /// last taken.
+    /// Where playback is in the file (or how long a camera has run), in seconds.
     pub fn position(&self) -> f64 {
         self.shared.lock().unwrap().position
     }
@@ -560,7 +551,6 @@ const RECORD_FPS: u32 = 30;
 pub struct Encoder {
     child: Child,
     stdin: Option<ChildStdin>,
-    /// A float frame as 8 bit, kept for the next.
     raw: Vec<Argb<u8>>,
 }
 
@@ -588,7 +578,6 @@ impl Encoder {
         })
     }
 
-    /// Writes one output frame as it is.
     pub fn write(&mut self, pixels: &[Argb<u8>]) -> Result<(), String> {
         self.stdin
             .as_mut()
@@ -597,7 +586,6 @@ impl Encoder {
             .map_err(|_| "ffmpeg stopped accepting frames".to_string())
     }
 
-    /// Writes one output frame of a GPU effect (float RGBA).
     pub fn write_float(&mut self, pixels: &[f32]) -> Result<(), String> {
         let mut raw = std::mem::take(&mut self.raw);
         raw.clear();
@@ -672,7 +660,6 @@ mod tests {
         }
     }
 
-    /// A 3 s, 25 fps clip for one test to play.
     fn test_clip(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("vfx-preview-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -711,8 +698,7 @@ mod tests {
         );
         assert!(!video.ended());
 
-        // Playing on from 2 s reaches the end of the 3 s clip in about a second, with its
-        // last frames taken.
+        // Playing on from 2 s reaches the end of the 3 s clip in about a second.
         video.seek(2.0, true).unwrap();
         wait_for("the end", || {
             video.take_frame(&mut pixels);
@@ -721,8 +707,6 @@ mod tests {
         assert!(video.position() > 2.8, "{}", video.position());
     }
 
-    /// A loop that falls behind gets the newest frames in order, each with its own time, and
-    /// the clock stays with the frame it took.
     #[test]
     #[ignore]
     fn slow_loop_drops_oldest_frames() {
@@ -744,8 +728,7 @@ mod tests {
         );
     }
 
-    /// One buffer taken in turn from videos of two sizes, as a layer's is when its video
-    /// changes: a video only ever decodes into buffers of its own size.
+    /// One buffer taken in turn from two sizes, as a layer's is when its video changes.
     #[test]
     fn wrong_size_buffer_not_decoded() {
         let clip = test_clip("sizes-test");
@@ -761,8 +744,7 @@ mod tests {
         }
     }
 
-    /// The bytes of a frame are ffmpeg's plain RGBA decode, in ARGB order: the frame that
-    /// reaches a history is the one the preview always decoded.
+    /// A frame's bytes are ffmpeg's plain RGBA decode, in ARGB order.
     #[test]
     fn decoding_keeps_rgba_bytes() {
         let clip = test_clip("bytes-test");
