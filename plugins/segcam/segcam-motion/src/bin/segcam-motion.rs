@@ -178,6 +178,8 @@ fn run<C: Depth>(
     let (mut stdin, mut stdout) = (io::stdin().lock(), io::stdout().lock());
     let mut bytes = vec![0u8; pixels * 4];
     let mut frame = 0i64;
+    let (mut on_gpu, mut adapter) = (0u64, String::new());
+    let levels: [C; 256] = std::array::from_fn(|b| C::from_unit(b as f32 / 255.0));
 
     while stdin.read_exact(&mut bytes).is_ok() {
         let argb = bytes
@@ -185,10 +187,10 @@ fn run<C: Depth>(
             .0
             .iter()
             .map(|&[alpha, red, green, blue]| Argb {
-                alpha: C::from_unit(f32::from(alpha) / 255.0),
-                red: C::from_unit(f32::from(red) / 255.0),
-                green: C::from_unit(f32::from(green) / 255.0),
-                blue: C::from_unit(f32::from(blue) / 255.0),
+                alpha: levels[usize::from(alpha)],
+                red: levels[usize::from(red)],
+                green: levels[usize::from(green)],
+                blue: levels[usize::from(blue)],
             })
             .collect();
         ring.frames.push_back(argb);
@@ -205,6 +207,15 @@ fn run<C: Depth>(
             None => segcam_motion::render(&settings, &mut ring, count, frame, &mut view),
         }
 
+        if let Some(state) = &kept
+            && state.drew_on_gpu()
+        {
+            on_gpu += 1;
+            if let Some(gpu) = state.gpu() {
+                adapter.clone_from(&gpu.adapter().name);
+            }
+        }
+
         for (dst, p) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&out) {
             *dst = [p.alpha, p.red, p.green, p.blue]
                 .map(|c| (c.to_unit().clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
@@ -214,6 +225,13 @@ fn run<C: Depth>(
         }
         frame += 1;
     }
-    eprintln!("segcam-motion: {frame} frames");
+    // `cargo vfx bench` reads the path from here.
+    let how = if kept.is_some() { "kept" } else { "fresh" };
+    let adapter = if on_gpu > 0 {
+        format!(" ({adapter})")
+    } else {
+        String::new()
+    };
+    eprintln!("segcam-motion: {frame} frames, {how}, {on_gpu} on the GPU{adapter}");
     ExitCode::SUCCESS
 }

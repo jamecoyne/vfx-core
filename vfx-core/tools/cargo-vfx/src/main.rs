@@ -15,6 +15,7 @@
 //! cargo vfx check --quick [-p PACKAGE]...      while iterating: fmt, core clippy, changed tests
 //! cargo vfx check --full                       before a pull request: CI's steps and the harnesses
 //! cargo vfx new NAME                           a new effect crate in vfx-core/effects/NAME
+//! cargo vfx bench CLIP [OPTIONS]               segcam's offline benchmark rows, on any clip
 //! ```
 //!
 //! Every command first checks that no two effects share an identity. Builds turn on the
@@ -30,12 +31,14 @@ use std::process::{Command, ExitCode};
 
 use vfx_build::Metadata;
 
+mod bench;
 mod check;
 mod new;
 mod tiers;
 
 const USAGE: &str = "usage: cargo vfx <list|build|package|install|preview|env|check> [-p EFFECT]... \
-[--hosts ae,ofx,ffgl] [--debug] [--native] [-- ARGS]\n       cargo vfx check [--quick|--full] [-p PACKAGE]...\n       cargo vfx new NAME";
+[--hosts ae,ofx,ffgl] [--debug] [--native] [-- ARGS]\n       cargo vfx check [--quick|--full] [-p PACKAGE]...\n       cargo vfx new NAME
+       cargo vfx bench CLIP [--preset NAME]... [--depth 8|float] [--runs N] [--cpu] [--reference DIR]";
 
 const MEDIACORE: &str = "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore";
 const MAC_OFX: &str = "/Library/OFX/Plugins";
@@ -105,6 +108,10 @@ fn parse_args() -> Result<Options, String> {
         tier: None,
         rest: Vec::new(),
     };
+    if o.command == "bench" {
+        o.rest.extend(it);
+        return Ok(o);
+    }
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-p" | "--package" => o.packages.push(it.next().ok_or("-p needs a package")?),
@@ -200,6 +207,9 @@ fn dispatch(o: &Options) -> Result<(), String> {
         return new::new(&root, name);
     }
     let (all, root, target) = workspace()?;
+    if o.command == "bench" {
+        return bench::run(&o.rest, &root, &target);
+    }
     if let Some(tier) = o.tier {
         // Here -p names any package: the ones `--quick` tests.
         report(check::check(&all, &root), all.len())?;
