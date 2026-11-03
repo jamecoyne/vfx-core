@@ -866,8 +866,8 @@ fn the_start_of_a_clip_is_worked_out_once() {
         mode: OutputMode::Swarm,
         ..RenderSettings::default()
     };
-    assert_eq!(previous_frames_needed(&swarm) + 1, 76);
-    let frames: Vec<Image<u8>> = (0..84)
+    assert_eq!(previous_frames_needed(&swarm) + 1, 124);
+    let frames: Vec<Image<u8>> = (0..132)
         .map(|f| frame_with_square(W, H, 10 + f % 48 * 6, 60 + f % 5 * 4, 40))
         .collect();
     for s in [RenderSettings::default(), swarm] {
@@ -909,4 +909,19 @@ fn a_fixed_source_that_starts_over_is_noticed() {
             assert!(out.pixels == cold.pixels, "{:?}: frame {n}", s.mode);
         }
     }
+}
+
+#[test]
+fn oldest_grid_stays_out_of_mask() {
+    let flat = LumaGrid {
+        width: 192,
+        height: 108,
+        pixels: vec![40; 192 * 108],
+    };
+    let mut history = vec![flat.clone(); RenderSettings::default().background_frames as usize];
+    for y in 40..60 {
+        history[0].pixels[y * 192 + 90..y * 192 + 110].fill(240);
+    }
+    let found = motion::detect(&history, &flat, &MotionSettings::default());
+    assert!(found.blobs.is_empty());
 }
