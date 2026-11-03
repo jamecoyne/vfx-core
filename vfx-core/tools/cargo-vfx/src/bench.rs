@@ -514,7 +514,7 @@ fn output(program: &str, args: &[&str]) -> String {
 }
 
 /// CPU, GPUs and OS from the system: Windows adds each GPU's driver and which drives the display,
-/// macOS which drives the display.
+/// macOS the chip's cores and memory, or an Intel Mac's GPUs and which drives the display.
 fn machine() -> String {
     let parts = if cfg!(windows) {
         windows_machine()
@@ -561,10 +561,50 @@ fn driver_number(gpu: &str, driver: &str) -> String {
 }
 
 fn macos_machine() -> Vec<String> {
-    let text = output("system_profiler", &["SPDisplaysDataType", "-json"]);
-    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    let mut parts = vec![output("sysctl", &["-n", "machdep.cpu.brand_string"])];
-    for gpu in json["SPDisplaysDataType"].as_array().into_iter().flatten() {
+    let sysctl = |key: &str| output("sysctl", &["-n", key]);
+    mac_parts(
+        &sysctl("machdep.cpu.brand_string"),
+        &sysctl("hw.physicalcpu"),
+        &sysctl("hw.memsize"),
+        &output("system_profiler", &["SPDisplaysDataType", "-json"]),
+        &format!(
+            "macOS {} {}",
+            output("sw_vers", &["-productVersion"]),
+            output("sw_vers", &["-buildVersion"])
+        ),
+    )
+}
+
+/// Apple silicon's CPU and GPU are one chip, so it is named once, with what tells two models
+/// apart. Without those numbers, and on Intel, the CPU and each GPU are listed.
+fn mac_parts(
+    cpu: &str,
+    cpu_cores: &str,
+    memory_bytes: &str,
+    displays: &str,
+    os: &str,
+) -> Vec<String> {
+    let json: serde_json::Value = serde_json::from_str(displays).unwrap_or_default();
+    let gpus = json["SPDisplaysDataType"].as_array();
+    let chip = || {
+        let [gpu] = gpus?.as_slice() else {
+            return None;
+        };
+        if gpu["sppci_model"].as_str()? != cpu {
+            return None;
+        }
+        let gpu_cores: u32 = gpu["sppci_cores"].as_str()?.parse().ok()?;
+        let cpu_cores: u32 = cpu_cores.parse().ok()?;
+        let gb = memory_bytes.parse::<u64>().ok()? >> 30;
+        Some(format!(
+            "{cpu}, {cpu_cores} CPU cores, {gpu_cores} GPU cores, {gb} GB"
+        ))
+    };
+    if let Some(chip) = chip() {
+        return vec![chip, os.to_owned()];
+    }
+    let mut parts = vec![cpu.to_owned()];
+    for gpu in gpus.into_iter().flatten() {
         let name = gpu["sppci_model"].as_str().unwrap_or("unknown");
         let display = gpu["spdisplays_ndrvs"]
             .as_array()
@@ -575,11 +615,7 @@ fn macos_machine() -> Vec<String> {
             name.to_owned()
         });
     }
-    parts.push(format!(
-        "macOS {} {}",
-        output("sw_vers", &["-productVersion"]),
-        output("sw_vers", &["-buildVersion"])
-    ));
+    parts.push(os.to_owned());
     parts
 }
 
@@ -647,6 +683,54 @@ mod tests {
         }
         assert!(reference_hashes("a\nb\n", &this).is_err());
         assert!(reference_hashes("", &this).is_err());
+    }
+
+    const M4: &str = r#"{"SPDisplaysDataType": [{
+        "sppci_model": "Apple M4", "sppci_cores": "10",
+        "spdisplays_ndrvs": [{"spdisplays_main": "spdisplays_yes"}]
+    }]}"#;
+    const OS: &str = "macOS 27.2 26B123";
+
+    #[test]
+    fn apple_silicon_is_one_chip() {
+        assert_eq!(
+            mac_parts("Apple M4", "10", "25769803776", M4, OS),
+            ["Apple M4, 10 CPU cores, 10 GPU cores, 24 GB", OS]
+        );
+    }
+
+    #[test]
+    fn apple_silicon_without_its_numbers_lists_what_it_has() {
+        let today = ["Apple M4", "Apple M4 (display)", OS];
+        assert_eq!(mac_parts("Apple M4", "", "25769803776", M4, OS), today);
+        assert_eq!(mac_parts("Apple M4", "10", "", M4, OS), today);
+        let no_gpu_cores = M4.replace(r#""sppci_cores": "10","#, "");
+        assert_eq!(
+            mac_parts("Apple M4", "10", "25769803776", &no_gpu_cores, OS),
+            today
+        );
+        assert_eq!(
+            mac_parts("Apple M4", "10", "25769803776", "", OS),
+            ["Apple M4", OS]
+        );
+    }
+
+    #[test]
+    fn an_intel_mac_keeps_its_cpu_and_gpus() {
+        let displays = r#"{"SPDisplaysDataType": [
+            {"sppci_model": "Intel UHD Graphics 630"},
+            {"sppci_model": "AMD Radeon Pro 5500M", "sppci_cores": "8",
+             "spdisplays_ndrvs": [{"spdisplays_main": "spdisplays_yes"}]}
+        ]}"#;
+        assert_eq!(
+            mac_parts("Intel Core i9-9980HK", "8", "34359738368", displays, OS),
+            [
+                "Intel Core i9-9980HK",
+                "Intel UHD Graphics 630",
+                "AMD Radeon Pro 5500M (display)",
+                OS
+            ]
+        );
     }
 
     #[test]

@@ -58,8 +58,9 @@ and rows from before this command don't. The frame hashes go to `target/bench/CO
 a changed tree); that folder is the `--reference` of a later run on the same clip
 (`target/bench/COMMIT-cpu` for a `--cpu` run, which matches overlay; the GPU's swarm stays within a
 level of the CPU's, so it differs there). It prints the machine column from the system: paste it,
-don't retype it. Windows gives every GPU with its driver and the one driving the display, macOS the
-GPU and the display, Linux the GPUs `lspci` lists.
+don't retype it. Windows gives every GPU with its driver and the one driving the display, an Apple
+silicon Mac the chip with its CPU cores, GPU cores and memory, an Intel Mac its GPUs and the display,
+Linux the GPUs `lspci` lists.
 
 - Two runs of each, one timed run on a machine at a time. Builds count as load.
 - Report the median and p95 ms per render, for the first 40 frames and for the rest separately.
