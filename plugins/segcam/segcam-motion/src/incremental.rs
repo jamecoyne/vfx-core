@@ -1,13 +1,12 @@
 //! segcam Motion worked out incrementally: each frame's grid, motion and tiles are kept, with
 //! a hash of the pixels they came from. Where earlier frames can change upstream (OpenFX), a
-//! render reads every frame it depends on and works out again only what a changed frame feeds,
-//! so an edit reaches it however far back it is. Where they are taken as unchanged
-//! ([`FrameSource::fixed`]: a host's own history of frames, as in Resolume and the preview, and
-//! Resolve while it streams), it reads only the frames it hasn't worked out, and the current
-//! one, so an edit in Resolve is caught when that frame is rendered or at the next check.
-//! Results come from each frame and the settings alone, so render order doesn't change the
-//! output. Motion whose background is cut short by the start of the frames, as at the start of
-//! a clip, is kept with the frame it starts at.
+//! render reads every frame it depends on and works out again only what a changed frame feeds.
+//! Where they are taken as unchanged ([`FrameSource::fixed`]: a host's own history of frames, as
+//! in Resolume and the preview, or Resolve while it streams), it reads only the frames it hasn't
+//! worked out, and the current one, so an edit in Resolve shows when that frame renders
+//! or at the next check. Results come from each frame and the settings
+//! alone, so render order doesn't change the output. Motion whose background is cut short by
+//! the start of the frames, as at the start of a clip, is kept with the frame it starts at.
 //!
 //! A host that holds only its newest frames ([`FrameSource::held`]) can't hand the others over
 //! again. What was cut from them stays as it was cut, so new settings reach new windows only,
@@ -322,8 +321,7 @@ impl Incremental {
                     }
                     Some(_) if fixed && self.prints.contains_key(&frame) => {}
                     Some(v) => {
-                        // A check against a kept hash can come for every frame of a render, as
-                        // after a pause; a frame read for the first time costs more elsewhere.
+                        // After a pause every frame has a kept hash to check: those go on threads.
                         let print = current.filter(|_| frame == number).unwrap_or_else(|| {
                             if self.prints.contains_key(&frame) {
                                 fingerprint_on_threads(v)
@@ -877,8 +875,7 @@ fn fold_hash(hashes: impl Iterator<Item = u64>) -> u64 {
     })
 }
 
-/// A hash of every pixel of a row, read as u64 words in four lanes so it's limited by memory
-/// bandwidth.
+/// A hash of a row, read as u64 words in four lanes so it's limited by memory bandwidth.
 fn row_hash<C: Channel>(row: &[Argb<C>]) -> u64 {
     let mut lanes = [0u64; 4];
     let bytes: &[u8] = bytemuck::cast_slice(row);
@@ -896,8 +893,7 @@ fn row_hash<C: Channel>(row: &[Argb<C>]) -> u64 {
     fold_hash(lanes.into_iter())
 }
 
-/// A hash of every pixel, from the rows' hashes in order, so [`fingerprint_on_threads`] gives
-/// the same one.
+/// A hash of every pixel, from the rows' hashes in order, so any thread count gives the same one.
 fn fingerprint<C: Channel>(view: &View<C>) -> u64 {
     fold_hash((0..view.height).map(|y| row_hash(view.row(y))))
 }
@@ -1124,8 +1120,7 @@ mod tests {
         );
     }
 
-    /// A frame's print is the same on any thread, and tells a change in any pixel or a change
-    /// in row order. Prints from both paths are compared when a host stops streaming.
+    /// Prints from both paths are compared when a host stops streaming.
     #[test]
     fn threaded_fingerprint_matches_serial() {
         // An odd width leaves a row's last pixel out of the words of 8-bit frames.

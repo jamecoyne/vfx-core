@@ -599,16 +599,13 @@ struct Rendered {
     broke_stream: bool,
 }
 
-/// Whether a render of `frame` is a step forward soon after the last.
 fn steps_forward_soon(last: Option<Rendered>, frame: i64) -> bool {
     const GAP: std::time::Duration = std::time::Duration::from_secs(1);
     last.is_some_and(|last| last.ended.elapsed() < GAP && (1..=120).contains(&(frame - last.frame)))
 }
 
-/// Whether a render of `frame` continues a stream of renders, as playback and Deliver make.
-/// Nothing upstream is edited mid-stream, so its earlier frames are taken as unchanged; the first
-/// render after a pause or a jump checks them all again, and so does the next, since Resolve may
-/// start a Deliver past a frame and step back to it, rendering the later frame just once.
+/// Whether a render of `frame` continues a stream, so earlier frames are taken as unchanged. The
+/// render that breaks a stream and the next check them: an export can still step back after it.
 fn streaming(last: Option<Rendered>, frame: i64) -> bool {
     steps_forward_soon(last, frame) && last.is_some_and(|last| !last.broke_stream)
 }
@@ -654,7 +651,6 @@ fn destroy_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     Ok(())
 }
 
-/// The instance's kept effect, if it has one.
 fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a Kept>, OfxStatus> {
     let kept = effect_props(effect)?
         .get_pointer(PROP_INSTANCE_DATA)
@@ -663,9 +659,8 @@ fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a Kept>, OfxSta
     Ok(unsafe { kept.cast::<Kept>().as_ref() })
 }
 
-/// A sequence render, such as a Deliver, can follow an edit however recent the last render, so
-/// its first frame doesn't continue a stream and checks every earlier frame. Hosts send this
-/// for single frames too, so a range of one frame leaves the stream alone.
+/// Ends the stream, so the next render checks earlier frames. Hosts send this for single frames
+/// too, Resolve around every render, so a range of one frame leaves the stream alone.
 fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
     LOG.note("begin sequence render");
     let range = [0, 1].map(|i| in_args.get_double(PROP_FRAME_RANGE, i));

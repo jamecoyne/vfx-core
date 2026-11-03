@@ -39,15 +39,14 @@ static void render_frame(OfxImageEffectHandle e, int t) {
     CHECK(action(kOfxImageEffectActionRender,e,args,NULL)==kOfxStatOK,"render failed at %d",t);
     CHECK(images_out==0,"image leak");
 }
-/* Changes frames `from` to `to` or changes them back, as a grade upstream would. */
+/* Inverts frames `from` to `to`; a second call changes them back. */
 static void edit_frames(int from, int to) {
     for(int t=from;t<=to;t++) {
         unsigned char *data=history[t].data;
         for(size_t i=0;i<(size_t)320*180*4;i++) if(i%4!=3) data[i]^=0xff;
     }
 }
-/* Whether `pixels` is what a fresh instance renders of frame t. A kept instance's renders come
-   first, and these after, so a cold render doesn't stretch the gap a stream depends on. */
+/* Call after a kept instance's renders: a cold render would stretch the gap a stream needs. */
 static int same_as_fresh(int mode, int t, const unsigned char *pixels) {
     OfxImageEffectHandle fresh=instance(mode,0);
     render_frame(fresh,t);
@@ -59,10 +58,8 @@ static void begin_sequence(OfxImageEffectHandle e, int first, int last) {
     setDouble(sequence,kOfxImageEffectPropFrameRange,1,last);
     CHECK(action(kOfxImageEffectActionBeginSequenceRender,e,sequence,NULL)==kOfxStatOK,"begin sequence failed");
 }
-/* Plays frames 6 to 23, plays again up to 13, edits frames `from` to `to`, and renders `order`
-   straight after, a begin for one frame before each render, as Resolve does. A step back or a
-   repeat checks earlier frames, and so does the render after it; any other step forward streams,
-   reading the frame and the few a check dropped. Every frame's last render equals a fresh one. */
+/* A step back or a repeat checks earlier frames, and so does the render after it; other steps
+   stream, reading the frame and the few a check dropped. Each frame's last render equals fresh. */
 static void replay_order(int mode, const char *name, const int *order, int n, int from, int to) {
     OfxImageEffectHandle e=instance(mode,0);
     for(int t=6;t<=23;t++) render_frame(e,t);
@@ -88,9 +85,6 @@ static void replay_order(int mode, const char *name, const int *order, int n, in
     }
     edit_frames(from,to);
 }
-/* As Resolve: a stream of renders takes earlier frames as unchanged, and a sequence render
-   straight after an edit checks them on its first frame, then streams again. A host's begin for
-   one frame at a time leaves the stream as it was. */
 static int deliver_after_edit(void) {
     as_resolve=1;
     setString(host.host,kOfxPropName,0,"DaVinci Resolve");
@@ -106,9 +100,8 @@ static int deliver_after_edit(void) {
     output=img_new(0,0,320,180,kOfxBitDepthByte); output_props=image_props(&output);
     temporal_image=temporal;
     static unsigned char streamed[2][320*180*4], sequence[3][320*180*4];
-    /* Orders a Deliver from frame 14 starts in. Resolve 21 renders the frame at the playhead first,
-       here the last, then steps back: the first two were seen on macOS. `late_step_back` renders a
-       later frame once before the step back, from an older note, kept as the harder case. */
+    /* The first two were seen on macOS: the frame at the playhead, then a step back to the range.
+       `late_step_back` is from an older note, kept as the harder case. */
     static const int swapped_start[]={23,15,14,16,17,18,19,20,21,22,23,14,14,14};
     static const int forward_start[]={23,14,15,16,17,18,19,20,21,22,23,14,14,14};
     static const int late_step_back[]={14,14,14,16,15,17,18,19,20,21,22,23};
