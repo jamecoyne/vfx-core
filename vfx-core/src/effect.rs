@@ -168,8 +168,7 @@ pub trait CpuEffect: Send {
         false
     }
 
-    /// Where the last render's work ran and what it found, which a host can't see from outside.
-    /// Cheap enough to ask every frame. The default says nothing.
+    /// Where the last render's work ran and what it found. Hosts may ask every frame.
     fn report(&self) -> Report {
         Report::default()
     }
@@ -180,9 +179,9 @@ pub trait CpuEffect: Send {
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Report {
-    /// Where it drew, in words for a status line: "CPU", "GPU (NVIDIA GeForce RTX 4070)".
+    /// Where it drew: "CPU", "GPU (NVIDIA GeForce RTX 4070)".
     pub draw: Option<String>,
-    /// Where its face models run, in words for a status line: "DirectML 0", "CPU", "Vision".
+    /// Where its face models run: "DirectML 0", "CPU", "Vision".
     pub faces: Option<String>,
     /// What it found. A host uses the names it knows and ignores the rest.
     pub readings: Vec<Reading>,

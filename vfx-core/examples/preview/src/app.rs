@@ -58,10 +58,9 @@ struct Preview {
     /// Runs while face tracking is switched on.
     #[cfg(not(target_arch = "wasm32"))]
     tracker: Option<face::Tracker>,
-    /// This frame's face variables, held while no face is found.
+    /// Held while no face is found.
     #[cfg(not(target_arch = "wasm32"))]
     face_values: modulation::Face,
-    /// What the effect said of its last render, asked once a frame.
     #[cfg(not(target_arch = "wasm32"))]
     report: vfx_core::Report,
     /// Cameras found at startup.

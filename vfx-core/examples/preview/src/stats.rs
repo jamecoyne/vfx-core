@@ -70,7 +70,6 @@ pub struct What {
 pub struct Snapshot {
     pub counts: Counts,
     pub what: What,
-    /// What the effect said of a render this past second.
     pub report: Report,
     /// Over the last second: frames in, renders and new frames a second, and a render's mean
     /// and longest time in ms (a CPU effect's).
@@ -253,7 +252,7 @@ pub fn source_text(s: &Snapshot) -> String {
     }
 }
 
-/// Where the effect says its work runs: ", draw GPU (RTX 4070), faces DirectML 0".
+/// ", draw GPU (RTX 4070), faces DirectML 0".
 pub fn report_text(report: &Report) -> String {
     let mut text = String::new();
     if let Some(draw) = &report.draw {

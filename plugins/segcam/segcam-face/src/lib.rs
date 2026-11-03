@@ -20,9 +20,8 @@ use std::sync::{Mutex, MutexGuard};
 pub use picodet::Body;
 pub use yunet::Face;
 
-/// Held while making or releasing a D3D12 device, ONNX Runtime's on DirectML or wgpu's. One made
-/// on one thread while another releases one can deadlock (seen on NVIDIA, inside the driver and
-/// D3D12).
+/// Held while making or releasing a D3D12 device. One made on one thread while another releases
+/// one can deadlock (seen on NVIDIA, inside the driver and D3D12).
 pub fn device_turn() -> MutexGuard<'static, ()> {
     static TURN: Mutex<()> = Mutex::new(());
     TURN.lock().unwrap_or_else(|e| e.into_inner())

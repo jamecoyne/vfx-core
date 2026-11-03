@@ -2,10 +2,8 @@
 //! as positions from 0 to 1 across the frame (origin top left, like the vignette
 //! centre).
 //!
-//! Uses OpenCV's YuNet detector (MIT licence), which finds the face box and five points,
-//! not a full face mesh, so there's no mouth-open or blink. On macOS it runs here through
-//! ONNX Runtime on the CPU (models/face_detection_yunet_2023mar.onnx), as segcam-face uses
-//! Vision there. Elsewhere it is segcam-face's, in that crate's one ONNX Runtime environment.
+//! OpenCV's YuNet (MIT licence): a face box and five points, no mesh, so no mouth-open or blink.
+//! macOS runs it here on the CPU through ONNX Runtime; elsewhere it is segcam-face's.
 
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
@@ -35,17 +33,16 @@ const MIN_SCORE: f32 = 0.6;
 pub type Values = modulation::Face;
 use crate::modulation::{self, FACE_NONE as NONE};
 
-/// Whether this build has a tracker: without one, faces come only from effects' reports.
+/// Without a tracker, faces come only from effects' reports.
 pub const HAS_TRACKER: bool = cfg!(any(target_os = "macos", feature = "tracker"));
 
 /// segcam-face's YuNet, on the CPU until segcam has chosen a device, then on that device: the
-/// tracker never runs the trial itself. Sessions are per thread; the environment is shared.
+/// tracker never runs the trial itself.
 #[cfg(all(not(target_os = "macos"), feature = "tracker"))]
 pub struct Detector {
     /// Only `None` while dropping.
     yunet: Option<OrtYuNet>,
     device: Device,
-    /// Whether it has tried segcam's device, which it does once.
     device_tried: bool,
 }
 
@@ -62,7 +59,7 @@ impl Detector {
         })
     }
 
-    /// Moves to the device segcam chose. Its turn waits out segcam's own load.
+    /// The turn waits out segcam's own load.
     fn use_chosen_device(&mut self) {
         let Some(chosen) = runtime::chosen_device().filter(|_| !self.device_tried) else {
             return;
@@ -81,7 +78,6 @@ impl Detector {
         }
     }
 
-    /// The best face in `pixels` (at `size`), or None.
     pub fn detect(&mut self, pixels: &[Argb<u8>], size: (u32, u32)) -> Option<Values> {
         self.use_chosen_device();
         let (width, height) = (size.0 as usize, size.1 as usize);
@@ -95,7 +91,6 @@ impl Detector {
         let face = faces.first()?;
         let r = face.rect;
         let [a, b, nose, mouth_a, mouth_b] = face.landmarks;
-        // Named by their side of the screen, so mirrored footage doesn't swap them.
         let (left, right) = if a.0 <= b.0 { (a, b) } else { (b, a) };
         Some(
             [
@@ -322,8 +317,8 @@ impl Tracker {
         self.shared.0.lock().unwrap().values
     }
 
-    /// While an effect's report reads the faces: holds its positions, with `face` at 0, so when
-    /// the report stops, the variables carry on from there until this finds a face itself.
+    /// While an effect's report reads the faces: its positions with `face` at 0, so the variables
+    /// carry on from there when the report stops.
     pub fn hold_positions(&self, values: Values) {
         let mut s = self.shared.0.lock().unwrap();
         s.values = values;
@@ -382,7 +377,6 @@ mod tests {
         assert!(status.success());
     }
 
-    /// #68: with a second environment, whichever side loaded second failed.
     #[cfg(not(target_os = "macos"))]
     #[test]
     #[ignore = "run by tracker_environment_in_own_process"]

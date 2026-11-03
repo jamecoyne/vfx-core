@@ -65,7 +65,7 @@ mod models {
         let _ = MODELS.set(Mutex::new(segmenter));
     }
 
-    /// Where the models run, once they have loaded: "DirectML 0", "CPU", "Vision".
+    /// "DirectML 0", "CPU" or "Vision", once the models have loaded.
     pub fn runs_on() -> Option<&'static str> {
         RUNS_ON.get().map(String::as_str)
     }
@@ -202,9 +202,8 @@ pub fn runs_on() -> Option<&'static str> {
     None
 }
 
-/// The best face in `blobs` as readings for a host, positions from 0 to 1 of the source frame:
-/// what the model found, not the box segcam draws. Without a face, just `face` at 0, so a host
-/// can hold the last positions. Without `models_loaded`, nothing: nobody looked, so a host may.
+/// The best face in `blobs`, 0 to 1 of the source frame: the model's box, not the one segcam
+/// draws. No face: `face` at 0 alone. No models: nothing, so a host's own tracker can run.
 pub fn readings(models_loaded: bool, blobs: &[Blob]) -> Vec<Reading> {
     if !models_loaded {
         return Vec::new();

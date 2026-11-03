@@ -82,9 +82,8 @@ pub struct Incremental {
     window_share: f64,
     /// The last render's draw hasn't come back from the GPU yet (browsers).
     unfinished: bool,
-    /// Whether the last render drew on the GPU; `None` before the first.
+    /// `None` before the first render.
     drew_on_gpu: Option<bool>,
-    /// Whether the last render looked for faces, and what it read off them.
     faces_wanted: bool,
     readings: Vec<Reading>,
     /// Live renders act as if the face models were still loading.
@@ -534,7 +533,6 @@ impl Incremental {
         }
     }
 
-    /// Keeps what the report says of the faces of the frame this render shows.
     fn update_face_readings(&mut self, s: &RenderSettings, number: i64, first: i64) {
         self.faces_wanted = s.faces.any();
         self.readings = if s.faces.face {
@@ -547,7 +545,6 @@ impl Incremental {
         };
     }
 
-    /// Where the last render drew, where the face models run and the faces it found.
     pub fn report(&self) -> Report {
         let mut report = Report::default();
         report.draw = self.drew_on_gpu.map(|on_gpu| match &self.gpu {

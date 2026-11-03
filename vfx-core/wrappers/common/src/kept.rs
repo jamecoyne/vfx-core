@@ -119,8 +119,7 @@ impl CpuInstance {
         self.kept.is_some() && self.with(|e| e.unfinished())
     }
 
-    /// What the kept effect says of its last render (see [`CpuEffect::report`]); an effect that
-    /// isn't kept has no last render to speak of.
+    /// The kept effect's [`CpuEffect::report`]; an effect that isn't kept has none.
     pub fn report(&self) -> Report {
         match &self.kept {
             Some(_) => self.with(|e| e.report()),

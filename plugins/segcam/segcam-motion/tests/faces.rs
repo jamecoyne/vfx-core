@@ -120,8 +120,7 @@ fn faces_from_a_live_history_match_fresh_renders() {
     }
 }
 
-/// A face variable means the same from the report and from a tracker: the model's box and points,
-/// not the box segcam draws. Within a little, as the report's models can be on DirectML.
+/// Within a little, as the report's models can be on DirectML.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn readings_match_model_output() {
