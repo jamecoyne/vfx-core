@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use crate::font;
-use crate::incremental::Incremental;
+use crate::incremental::IncrementalRenderer;
 use crate::motion::{
     Blob, LumaGrid, Motion, MotionSettings, NormRect, SegmentKind, ThresholdSettings,
 };
@@ -662,5 +662,5 @@ pub fn render<C: Depth>(
     frame_number: i64,
     out: &mut ViewMut<C>,
 ) {
-    Incremental::default().advance(s, frames, frame_count, frame_number, out);
+    IncrementalRenderer::default().render_frame(s, frames, frame_count, frame_number, out);
 }

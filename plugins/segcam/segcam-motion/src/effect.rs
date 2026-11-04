@@ -8,7 +8,7 @@ use vfx_core::cpu::{FrameSource, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Report, Unit};
 
 use crate::{
-    AnalysisStep, Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode,
+    AnalysisStep, Color, Detect, FaceParts, IncrementalRenderer, MotionSettings, OutputMode,
     RenderSettings, SwarmBackground, ThresholdSettings,
 };
 
@@ -135,10 +135,10 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
     }
 }
 
-/// segcam Motion. It keeps what it works out for each frame (see [`Incremental`]), so a host
+/// segcam Motion. It keeps what it works out for each frame (see [`IncrementalRenderer`]), so a host
 /// that keeps the instance works out only what changed since the last render.
 pub struct SegcamMotion {
-    state: Incremental,
+    state: IncrementalRenderer,
 }
 
 impl Default for SegcamMotion {
@@ -151,16 +151,16 @@ impl Default for SegcamMotion {
 impl SegcamMotion {
     /// With `gpu` false, always on the CPU.
     pub fn with_gpu(gpu: bool) -> Self {
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         state.use_gpu(gpu);
         Self { state }
     }
 
     /// On the GPU from `share` of the canvas in window pixels (see
-    /// [`Incremental::gpu_threshold`]); 0 draws every swarm render there.
+    /// [`IncrementalRenderer::set_gpu_min_coverage`]); 0 draws every swarm render there.
     pub fn with_gpu_threshold(share: f64) -> Self {
         let mut effect = Self::with_gpu(true);
-        effect.state.gpu_threshold(share);
+        effect.state.set_gpu_min_coverage(share);
         effect
     }
 }
@@ -212,9 +212,9 @@ impl CpuEffect for SegcamMotion {
         };
         let (state, n) = (&mut self.state, ctx.frame);
         match output {
-            ImageMut::U8(mut out) => state.advance(&s, frames, count, n, &mut out),
-            ImageMut::U16(mut out) => state.advance(&s, frames, count, n, &mut out),
-            ImageMut::F32(mut out) => state.advance(&s, frames, count, n, &mut out),
+            ImageMut::U8(mut out) => state.render_frame(&s, frames, count, n, &mut out),
+            ImageMut::U16(mut out) => state.render_frame(&s, frames, count, n, &mut out),
+            ImageMut::F32(mut out) => state.render_frame(&s, frames, count, n, &mut out),
         }
     }
 

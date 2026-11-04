@@ -9,7 +9,7 @@ use segcam_motion::pixel::make_pixel;
 use segcam_motion::render::{PixelRect, blob_label, downsample, fit_text, text_width};
 use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, draw_window, make_tile};
 use segcam_motion::{
-    Argb, Blob, Channel, Color, Detect, FaceParts, Incremental, MotionSettings, NormRect,
+    Argb, Blob, Channel, Color, Detect, FaceParts, IncrementalRenderer, MotionSettings, NormRect,
     OutputMode, RenderSettings, SegmentKind, SwarmBackground, ThresholdSettings, View, ViewMut,
     font, previous_frames_needed, render, segment_label,
 };
@@ -352,11 +352,11 @@ fn live_windows_show_the_current_frame() {
             .0
             .pixels
     };
-    let mut state = Incremental::default();
+    let mut state = IncrementalRenderer::default();
     for n in [20, 3, 29, 28, 4, 12, 29] {
         let mut out = Image::new(W, H);
         let mut source = MemoryFrames::new(&frames[..=n]);
-        state.advance(
+        state.render_frame(
             &live_settings,
             &mut source,
             n + 1,
@@ -604,11 +604,11 @@ fn threshold_swarm_renders_the_same_in_any_order() {
         ..threshold_settings(ThresholdSettings::default())
     };
     let cold = |n: usize| render_frames(&s, &frames[..=n], n as i64).0.pixels;
-    let mut state = Incremental::default();
+    let mut state = IncrementalRenderer::default();
     for n in [20, 3, 29, 28, 4, 12, 29] {
         let mut out = Image::new(W, H);
         let mut source = MemoryFrames::new(&frames[..=n]);
-        state.advance(&s, &mut source, n + 1, n as i64, &mut out.view_mut());
+        state.render_frame(&s, &mut source, n + 1, n as i64, &mut out.view_mut());
         assert!(out.pixels == cold(n), "frame {n}");
     }
 }
@@ -697,7 +697,7 @@ impl FrameSource for GappyFrames<'_> {
 
 /// Renders the last of `frames` through `state`, with the frames in `missing` unavailable.
 fn render_kept(
-    state: &mut Incremental,
+    state: &mut IncrementalRenderer,
     s: &RenderSettings,
     frames: &[Image<u8>],
     missing: &[usize],
@@ -708,7 +708,7 @@ fn render_kept(
         missing,
     };
     let last = frames.len() - 1;
-    state.advance(
+    state.render_frame(
         s,
         &mut source,
         frames.len(),
@@ -743,13 +743,13 @@ fn edits_to_earlier_frames_reach_the_render() {
             s.mode
         );
 
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         let _ = render_kept(&mut state, &s, &frames, &[]);
         let again = render_kept(&mut state, &s, &edited, &[]);
         assert!(again.pixels == cold.pixels, "{:?}: same frame", s.mode);
 
         // Playback stepping onto a frame it hasn't seen, after the frames before it changed.
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         let _ = render_kept(&mut state, &s, &frames[..last], &[]);
         let next = render_kept(&mut state, &s, &edited, &[]);
         assert!(next.pixels == cold.pixels, "{:?}: next frame", s.mode);
@@ -765,9 +765,9 @@ fn a_missing_frame_is_read_again() {
         let full = render_frames(&s, &frames, last as i64).0;
         let gap = [last - 4, last - 3, last - 2, last - 1];
 
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         let without = render_kept(&mut state, &s, &frames, &gap);
-        let mut cold = Incremental::default();
+        let mut cold = IncrementalRenderer::default();
         assert!(
             without.pixels == render_kept(&mut cold, &s, &frames, &gap).pixels,
             "{:?}: the gap renders like a cold render with the gap",
@@ -795,7 +795,7 @@ fn swarm_sees_edits_that_keep_the_grid() {
     let grid = |img: &Image<u8>| downsample(&img.view(), s.grid_width);
     assert!(grid(&edited[last]) == grid(&frames[last]));
 
-    let mut state = Incremental::default();
+    let mut state = IncrementalRenderer::default();
     let _ = render_kept(&mut state, &s, &frames, &[]);
     let out = render_kept(&mut state, &s, &edited, &[]);
     assert!(out.pixels == render_frames(&s, &edited, last as i64).0.pixels);
@@ -821,7 +821,7 @@ impl FrameSource for FixedFrames<'_> {
 /// Renders frame `n` of `frames` through `state` from a fixed source: the output, and how
 /// many frames were read.
 fn render_fixed(
-    state: &mut Incremental,
+    state: &mut IncrementalRenderer,
     s: &RenderSettings,
     frames: &[Image<u8>],
     n: usize,
@@ -831,7 +831,7 @@ fn render_fixed(
         images: &frames[..=n],
         reads: 0,
     };
-    state.advance(s, &mut source, n + 1, n as i64, &mut out.view_mut());
+    state.render_frame(s, &mut source, n + 1, n as i64, &mut out.view_mut());
     (out, source.reads)
 }
 
@@ -842,14 +842,14 @@ fn a_fixed_source_reads_only_new_frames() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let cold = |n: usize| render_frames(&s, &frames[..=n], n as i64).0.pixels;
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         for n in 0..frames.len() {
             let (out, reads) = render_fixed(&mut state, &s, &frames, n);
             assert!(out.pixels == cold(n), "{:?}: frame {n}", s.mode);
             // The current frame, checked and then drawn, and nothing earlier.
             assert!(reads <= 2, "{:?}: frame {n} read {reads}", s.mode);
         }
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         for n in [29, 3, 17, 18, 2, 29, 0, 12] {
             let (out, _) = render_fixed(&mut state, &s, &frames, n);
             assert!(out.pixels == cold(n), "{:?}: shuffled, frame {n}", s.mode);
@@ -872,7 +872,7 @@ fn the_start_of_a_clip_is_worked_out_once() {
         .collect();
     for s in [RenderSettings::default(), swarm] {
         let needed = previous_frames_needed(&s) as usize;
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         for n in 0..frames.len() {
             // What an OpenFX host hands over: the frames asked for, from the start of the clip.
             let clip = &frames[n.saturating_sub(needed)..=n];
@@ -881,7 +881,7 @@ fn the_start_of_a_clip_is_worked_out_once() {
                 images: clip,
                 reads: 0,
             };
-            state.advance(&s, &mut source, clip.len(), n as i64, &mut out.view_mut());
+            state.render_frame(&s, &mut source, clip.len(), n as i64, &mut out.view_mut());
             let reads = source.reads;
             let cold = render_frames(&s, clip, n as i64).0;
             assert!(out.pixels == cold.pixels, "{:?}: frame {n}", s.mode);
@@ -899,7 +899,7 @@ fn a_fixed_source_that_starts_over_is_noticed() {
         let other: Vec<Image<u8>> = (0..frames.len() as i32)
             .map(|f| frame_with_square(W, H, 300 - f * 9, 20, 30))
             .collect();
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         for n in 0..12 {
             let _ = render_fixed(&mut state, &s, &frames, n);
         }

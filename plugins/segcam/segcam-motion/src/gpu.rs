@@ -3,7 +3,7 @@
 //! goes into an atlas kept for the trail when a render first draws it on the GPU. Each output
 //! pixel replays what the CPU path does to it (`gpu.wgsl`), so the two agree within a level. The CPU
 //! path stays the reference and the fallback; Overlay draws there unless asked
-//! ([`crate::Incremental::gpu_overlay`]). The device opens in the background, and renders draw
+//! ([`crate::IncrementalRenderer::gpu_overlay`]). The device opens in the background, and renders draw
 //! on the CPU until it is ready. A render the GPU fails is drawn on the CPU and the next one
 //! tries the GPU again, or after a few close together, one a while later; a lost device is
 //! given up by every instance. In browsers it draws on the device the host shares, and a draw

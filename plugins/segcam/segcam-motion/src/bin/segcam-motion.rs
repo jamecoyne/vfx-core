@@ -16,8 +16,8 @@ use std::process::ExitCode;
 
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
-    AnalysisStep, Argb, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View,
-    ViewMut,
+    AnalysisStep, Argb, Detect, IncrementalRenderer, OutputMode, RenderSettings, SwarmBackground,
+    View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, Image};
 
@@ -149,11 +149,11 @@ fn main() -> ExitCode {
     // Waiting for the device here puts every frame on it.
     let gpu =
         (!cpu && segcam_motion::gpu::wanted() && segcam_motion::gpu::status().is_ok()).then(|| {
-            let mut state = Incremental::default();
+            let mut state = IncrementalRenderer::default();
             state.use_gpu(true);
             state
         });
-    let state = gpu.or_else(|| kept.then(Incremental::default));
+    let state = gpu.or_else(|| kept.then(IncrementalRenderer::default));
     if float {
         run::<f32>(width, height, settings, state)
     } else {
@@ -165,7 +165,7 @@ fn run<C: Depth>(
     width: i32,
     height: i32,
     settings: RenderSettings,
-    mut kept: Option<Incremental>,
+    mut kept: Option<IncrementalRenderer>,
 ) -> ExitCode {
     let pixels = width as usize * height as usize;
     let keep = segcam_motion::previous_frames_needed(&settings) as usize + 1;
@@ -204,7 +204,7 @@ fn run<C: Depth>(
         let count = ring.frames.len();
         let mut view = ViewMut::from_pixels(&mut out, width, height);
         match &mut kept {
-            Some(state) => state.advance(&settings, &mut ring, count, frame, &mut view),
+            Some(state) => state.render_frame(&settings, &mut ring, count, frame, &mut view),
             None => segcam_motion::render(&settings, &mut ring, count, frame, &mut view),
         }
 
@@ -212,8 +212,8 @@ fn run<C: Depth>(
             && state.drew_on_gpu()
         {
             on_gpu += 1;
-            if let Some(gpu) = state.gpu() {
-                adapter.clone_from(&gpu.adapter().name);
+            if let Some(drawer) = state.drawer() {
+                adapter.clone_from(&drawer.adapter().name);
             }
         }
 
