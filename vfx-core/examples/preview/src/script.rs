@@ -386,6 +386,9 @@ fn stats_line(elapsed: f64, span: f64, worst: Duration, s: &Snapshot, delta: Cou
     if let Some(faces) = &s.report.faces {
         text += &format!(" faces={faces:?}");
     }
+    if let Some(fault) = &s.device_fault {
+        text += &format!(" fault={fault:?}");
+    }
     text
 }
 

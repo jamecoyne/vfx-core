@@ -10,7 +10,7 @@ use std::time::Duration;
 use egui::Ui;
 #[cfg(not(target_arch = "wasm32"))]
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use vfx_core::Report;
+use vfx_core::{DeviceFaults, Gpu, Report};
 use web_time::Instant;
 
 const INTERVAL: Duration = Duration::from_secs(1);
@@ -82,6 +82,8 @@ pub struct Snapshot {
     pub counts: Counts,
     pub shown: ShownEffect,
     pub report: Report,
+    /// A lost device or the errors the shared device has reported, in words.
+    pub device_fault: Option<String>,
     /// Over the last second: frames in, renders and new frames a second, and a render's mean
     /// and longest time in ms (a CPU effect's).
     pub source: f32,
@@ -113,6 +115,7 @@ impl Default for Snapshot {
                 screen_counts_drawn: false,
             },
             report: Report::default(),
+            device_fault: None,
             source: 0.0,
             rendered: 0.0,
             screen: 0.0,
@@ -251,6 +254,7 @@ impl Sampler {
                 self.longest_render = Duration::ZERO;
             }
             self.last = Some(Instant::now());
+            self.snapshot.device_fault = device_fault_text(&Gpu::shared_faults());
             self.last_counts = counts;
             #[cfg(not(target_arch = "wasm32"))]
             self.load.read_into(&mut self.snapshot);
@@ -273,6 +277,21 @@ fn gpu_percent() -> Option<f32> {
     let rest = text.split("\"Device Utilization %\"=").nth(1)?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+/// What a host's user should know about the device, if anything: its loss, or how many errors it
+/// has reported and the first line of the last.
+fn device_fault_text(faults: &DeviceFaults) -> Option<String> {
+    if let Some(why) = faults.lost() {
+        return Some(format!("GPU lost: {why}"));
+    }
+    let (count, last) = faults.errors();
+    (count > 0).then(|| {
+        format!(
+            "GPU errors {count}: {}",
+            last.lines().next().unwrap_or_default()
+        )
+    })
 }
 
 /// The source slot's text.
@@ -315,6 +334,10 @@ pub fn effect_text(s: &Snapshot) -> String {
 /// Draws the bar, source to screen, then the machine.
 pub fn bar(ui: &mut Ui, s: &Snapshot) {
     ui.horizontal_wrapped(|ui| {
+        if let Some(fault) = &s.device_fault {
+            ui.colored_label(egui::Color32::from_rgb(230, 120, 90), fault);
+            ui.separator();
+        }
         ui.monospace(format!("{} × {}", s.shown.size.0, s.shown.size.1));
         ui.separator();
         ui.monospace(source_text(s));
@@ -343,4 +366,34 @@ fn machine_load(ui: &mut Ui, s: &Snapshot) {
         Some(gpu) => ui.monospace(format!("GPU {gpu:.0}%")),
         None => ui.label(egui::RichText::new("GPU n/a").monospace().weak()),
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_error_reaches_the_fault_text() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let faults = DeviceFaults::watch(&gpu.device);
+        assert_eq!(device_fault_text(&faults), None);
+        let zero_sized = wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 0,
+                height: 0,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let _ = gpu.device.create_texture(&zero_sized);
+        let text = device_fault_text(&faults).expect("an error");
+        assert!(text.starts_with("GPU errors 1: "), "{text}");
+        assert_eq!(text.lines().count(), 1);
+    }
 }

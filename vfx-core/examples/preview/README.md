@@ -48,7 +48,8 @@ over the second (the run, on the `done` line); a GPU effect's work ends on the G
 neither, and for a CPU effect drawing into the output frame the times stop at its submit. `frames` counts passes of the app's loop, which a visible window paces by vsync and
 which repeats the last frame when nothing new came in; `--frames N` stops after that many.
 `cpu` is the machine's, `app_cpu` this process's as a share of one core, and `gpu` is `n/a`
-where the OS doesn't report it. Under `--quiet` loops are unpaced and each waits for the GPU,
+where the OS doesn't report it. A `fault` key follows, and the bar starts with it in colour, once
+the shared device is lost or reports an error. Under `--quiet` loops are unpaced and each waits for the GPU,
 nothing is presented so `screen` is 0, and a test pattern (which changes every loop) shows
 the effect's throughput in `rendered`.
 
