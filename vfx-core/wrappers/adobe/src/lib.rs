@@ -694,7 +694,11 @@ fn cpu_pre_render(
 ) -> Result<(), ae::Error> {
     let values = params::read(params, specs())?;
     let ctx = context(in_data);
-    let wanted = cpu_instance()?.frames_before(&values, ctx.frame_rate);
+    // Slow setup starts here, so a render and Multi-Frame Rendering's other threads don't wait in it.
+    let wanted = cpu_instance()?.with(|effect| {
+        effect.values_known(&values);
+        effect.frames_before(&values, ctx.frame_rate)
+    });
 
     // CPU effects see the whole frame, so ask for the whole layer whatever region After
     // Effects wants back.
