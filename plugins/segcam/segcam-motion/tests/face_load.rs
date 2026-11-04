@@ -45,7 +45,7 @@ fn render(
 }
 
 #[test]
-fn renders_during_the_load_and_after_match_fresh_renders() {
+fn renders_during_and_after_load_match_fresh() {
     let Some(p) = portrait() else { return };
     let clip = drifting(&p);
     let all = ["face", "eyes", "mouth", "body"];

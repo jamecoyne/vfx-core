@@ -1770,7 +1770,7 @@ mod tests {
     /// A panic while the device opens, as a broken driver can cause, answers that the GPU
     /// failed instead of leaving every caller waiting.
     #[test]
-    fn a_panic_while_opening_is_a_failed_gpu() {
+    fn panic_while_opening_is_a_failed_gpu() {
         static OPENED: OnceLock<Opened> = OnceLock::new();
         let opening =
             std::thread::spawn(|| open_and_publish(&OPENED, || panic!("a broken driver")));

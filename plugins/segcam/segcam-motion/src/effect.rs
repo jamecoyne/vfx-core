@@ -251,7 +251,7 @@ mod tests {
     use vfx_core::cpu::{Argb, History, ViewMut};
 
     #[test]
-    fn controls_start_as_1_1() {
+    fn default_params_match_segcam_1_1() {
         let mut s = settings_from_params(&ParamValues::new(PARAMS), false);
         let expected = RenderSettings {
             detection_mode: DetectionMode::FacesOnly,
@@ -328,7 +328,7 @@ mod tests {
 
     /// Driven the way a streaming host drives it: one frame at a time, kept in a history.
     #[test]
-    fn finds_motion_through_the_effect_interface() {
+    fn history_driven_matte_keeps_moving_square() {
         let (w, h) = (160, 90);
         let grey = |v: u8| Argb {
             alpha: 255,

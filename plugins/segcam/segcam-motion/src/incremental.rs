@@ -1080,7 +1080,7 @@ mod tests {
 
     /// While the models load a live render doesn't look for faces, and looks once they are up.
     #[test]
-    fn a_live_render_finds_no_faces_during_the_load() {
+    fn live_render_skips_faces_until_models_load() {
         wait_for_models();
         let frames = crossing();
         let mut state = IncrementalRenderer {
@@ -1106,7 +1106,7 @@ mod tests {
 
     /// A render that may be exported doesn't draw without faces: it waits for the models.
     #[test]
-    fn an_editing_render_looks_for_faces_during_the_load() {
+    fn non_live_render_waits_for_face_models() {
         wait_for_models();
         let frames = crossing();
         let mut state = IncrementalRenderer {
@@ -1162,7 +1162,7 @@ mod tests {
     /// A device lost between renders, as when a driver resets, leaves the instance drawing
     /// what the CPU draws, and no new instance draws on that device.
     #[test]
-    fn a_lost_gpu_falls_back_to_the_cpu() {
+    fn lost_gpu_falls_back_to_the_cpu() {
         let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
@@ -1197,7 +1197,7 @@ mod tests {
 
     /// Prints from both paths are compared when a host stops streaming.
     #[test]
-    fn threaded_fingerprint_matches_serial() {
+    fn parallel_frame_hash_matches_serial() {
         // An odd width leaves a row's last pixel out of the words of 8-bit frames.
         let (w, h) = (201, 130);
         let mut pixels: Vec<Argb<u8>> = (0..w * h)
@@ -1244,7 +1244,7 @@ mod tests {
     /// A validation error leaves the device usable: it is counted, not kept as a failure, so
     /// new instances still draw on it and a render that didn't cause it isn't charged with it.
     #[test]
-    fn an_error_leaves_the_device_usable() {
+    fn error_leaves_the_device_usable() {
         let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
@@ -1265,7 +1265,7 @@ mod tests {
     /// An instance taken off the GPU mid sequence draws from then on what a CPU only instance
     /// draws, byte for byte, from what it kept.
     #[test]
-    fn leaving_the_gpu_keeps_the_cpu_output() {
+    fn disabling_gpu_mid_sequence_matches_cpu() {
         let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
@@ -1296,7 +1296,7 @@ mod tests {
     /// A render the GPU can't take, here a canvas larger than the device binds, is drawn on
     /// the CPU byte for byte, and the next render is back on the GPU.
     #[test]
-    fn a_fault_falls_back_for_one_render() {
+    fn fault_falls_back_for_one_render() {
         let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
@@ -1335,7 +1335,7 @@ mod tests {
     /// the GPU with a fresh readback buffer. Whether the first draw is in time depends on
     /// the GPU, so only what must hold either way is checked.
     #[test]
-    fn a_slow_readback_falls_back_for_one_render() {
+    fn slow_readback_falls_back_for_one_render() {
         let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
@@ -1375,34 +1375,34 @@ mod tests {
     /// renders, the renders are the CPU's byte for byte and don't touch the GPU, and once the
     /// rest is over the GPU draws again.
     #[test]
-    fn faults_close_together_rest_on_the_cpu() {
+    fn repeated_gpu_faults_cool_down_then_recover() {
         let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
         let mut on_gpu = on_device(&dev);
         // Frames 0, 2 and 4 fault; from 5 the instance rests, until the test ends it at 8.
-        let resting_frames = 5..8;
+        let cooldown_frames = 5..8;
         for n in 0..frames.len() {
             let drawer = on_gpu.drawer.as_mut().expect("on the GPU");
-            let failing = n < 8 && n % 2 == 0 || resting_frames.contains(&n);
+            let failing = n < 8 && n % 2 == 0 || cooldown_frames.contains(&n);
             drawer.set_max_binding_bytes(if failing { 1024 } else { u64::MAX });
-            if n == resting_frames.end {
+            if n == cooldown_frames.end {
                 assert!(
                     drawer.in_fault_cooldown(),
                     "still trying the GPU at frame {n}"
                 );
                 drawer.set_cooldown(Duration::ZERO);
             }
-            let resting = drawer.in_fault_cooldown();
+            let in_cooldown = drawer.in_fault_cooldown();
             let (before, faulted) = (drawn(&on_gpu), faults(&on_gpu));
             let (a, b) = (
                 render(&mut cpu, &frames, n),
                 render(&mut on_gpu, &frames, n),
             );
             assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
-            assert_eq!(resting, resting_frames.contains(&n), "frame {n}");
-            if resting {
+            assert_eq!(in_cooldown, cooldown_frames.contains(&n), "frame {n}");
+            if in_cooldown {
                 assert_eq!(a, b, "resting frame {n} isn't the CPU's");
                 assert_eq!(drawn(&on_gpu), before, "resting frame {n} drew on the GPU");
                 assert_eq!(faults(&on_gpu), faulted, "resting frame {n} tried the GPU");
@@ -1416,7 +1416,7 @@ mod tests {
 
     /// A host holding only the current frame: tiles the pile stopped drawing keep no pixels.
     #[test]
-    fn tiles_the_pile_stopped_drawing_drop_their_pixels() {
+    fn undrawn_tiles_release_pixels() {
         let frames = crossing();
         let s = RenderSettings {
             mode: OutputMode::Swarm,
@@ -1491,7 +1491,7 @@ mod tests {
     /// An atlas too small for the trail draws the renders it can't hold on the CPU, and the
     /// GPU draws again once the trail moves on; the instance never leaves it.
     #[test]
-    fn a_full_atlas_falls_back_for_one_render() {
+    fn full_atlas_falls_back_for_one_render() {
         let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();

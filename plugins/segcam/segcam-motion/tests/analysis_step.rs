@@ -61,7 +61,7 @@ fn cold(s: &RenderSettings, frames: &[Frame], number: usize) -> Frame {
 }
 
 #[test]
-fn step_at_each_frame_rate() {
+fn analysis_step_follows_frame_rate() {
     let every = |rate| AnalysisStep::for_frame_rate(rate).every;
     assert_eq!(every(None), 1);
     for rate in [
@@ -90,7 +90,7 @@ fn step_at_each_frame_rate() {
 
 /// Between analyses no window spawns, so the swarm holds still.
 #[test]
-fn the_swarm_holds_between_analyses() {
+fn swarm_holds_between_analyses() {
     let frames = crossing(24);
     let s = RenderSettings {
         mode: OutputMode::Swarm,
@@ -123,7 +123,7 @@ fn as_host(s: &RenderSettings, frames: &[Frame], number: usize) -> Frame {
 /// With no background the trail starts at the first frame handed over. When that frame falls
 /// between analyses it spawns nothing, so the oldest windows don't come and go.
 #[test]
-fn the_oldest_trail_frame_waits_for_its_analysis() {
+fn oldest_trail_frame_between_analyses_spawns_no_windows() {
     let frames = crossing(24);
     let n = 21;
     let s = RenderSettings {
@@ -188,7 +188,7 @@ impl FrameSource for Gappy<'_> {
 
 /// A frame whose analysis the host can't hand over analyses itself, over the analyses before.
 #[test]
-fn a_missing_analysis_is_stood_in_for() {
+fn missing_analysis_analyses_current_frame() {
     let frames = crossing(24);
     let n = 15;
     let at = |analysis_step| RenderSettings {
@@ -226,7 +226,7 @@ fn a_missing_analysis_is_stood_in_for() {
 /// Background counts analyses: every 2nd frame of a clip at 120 fps finds what the clip of those
 /// frames finds at 60.
 #[test]
-fn background_counts_analyses() {
+fn background_counts_analyses_not_frames() {
     let frames = crossing(40);
     let at_60: Vec<Frame> = frames.iter().step_by(2).cloned().collect();
     let boxes = |s: &RenderSettings, frames: &[Frame], number: usize| {
@@ -287,7 +287,7 @@ fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]
 /// A seek back starts the frame count over, so the analyses fall on the new frames as they
 /// would for a fresh effect.
 #[test]
-fn seek_back_restarts_count() {
+fn seek_back_restarts_analysis_cadence() {
     let frames = crossing(30);
     let mut effect = SegcamMotion::default();
     let mut history = History::default();
@@ -341,7 +341,7 @@ fn live(
 /// A kept effect works from what it kept: a host holding only the current frame shows what one
 /// holding them all shows, in every mode, at any rate, with tiles pushed out and buried.
 #[test]
-fn holding_only_the_current_frame_changes_nothing() {
+fn holding_only_current_frame_matches_full_history() {
     let frames = crossing(40);
     for output in 0..4 {
         for (trail, max_tiles) in [(60, 100), (12, 3)] {
@@ -371,7 +371,7 @@ fn holding_only_the_current_frame_changes_nothing() {
 /// Frames whose pixels are gone can't be cut again: a setting changed live reaches new windows
 /// only, as in segcam 1.1, and the windows up stay.
 #[test]
-fn a_setting_changed_live_leaves_the_windows_up() {
+fn live_setting_change_keeps_windows() {
     let frames = crossing(24);
     let mut effect = SegcamMotion::with_gpu(false);
     let mut values = motion_only(effect.params());

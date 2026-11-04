@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn kept_only_where_the_host_can_keep() {
+    fn effect_kept_only_when_host_allows() {
         let kept = CpuInstance::new(make, true).expect("a CPU effect");
         assert!(kept.is_kept());
         assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));

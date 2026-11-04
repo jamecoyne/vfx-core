@@ -58,7 +58,7 @@ impl FrameSource for Source<'_> {
 }
 
 /// How often a frame is rendered again while the effect says it is unfinished.
-const TRIES: usize = 8;
+const MAX_UNFINISHED_RERENDERS: usize = 8;
 
 fn render(
     effect: &mut dyn CpuEffect,
@@ -73,7 +73,7 @@ fn render(
         frame_rate: clip.frame_rate,
         ..Context::at(number as f64 / clip.frame_rate.unwrap_or(30.0))
     };
-    for _ in 0..TRIES {
+    for _ in 0..MAX_UNFINISHED_RERENDERS {
         let mut source = Source {
             clip,
             first: number - count + 1,
@@ -94,7 +94,7 @@ fn render(
         }
     }
     Err(format!(
-        "frame {number} is still unfinished after {TRIES} renders"
+        "frame {number} is still unfinished after {MAX_UNFINISHED_RERENDERS} renders"
     ))
 }
 
@@ -290,13 +290,13 @@ mod tests {
     }
 
     #[test]
-    fn an_effect_that_reads_its_frames_keeps_the_contract() {
+    fn effect_rereading_frames_passes_contract() {
         let make = || Processor::Cpu(Box::new(Sums::default()));
         assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
     }
 
     #[test]
-    fn an_effect_that_trusts_what_it_kept_breaks_it() {
+    fn effect_trusting_cached_frames_fails_contract() {
         let make = || {
             Processor::Cpu(Box::new(Sums {
                 trust: true,
@@ -389,13 +389,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unfinished_render_counts_once_finished() {
+    fn unfinished_render_compared_after_it_finishes() {
         let make = || Processor::Cpu(Box::new(Late::default()));
         assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
     }
 
     #[test]
-    fn a_render_that_never_finishes_breaks_it() {
+    fn never_finishing_render_fails_contract() {
         let make = || {
             Processor::Cpu(Box::new(Late {
                 never: true,

@@ -98,7 +98,7 @@ fn argb(bytes: &[u8]) -> Pixels {
 }
 
 #[test]
-fn a_swarm_drawn_into_a_host_frame_is_the_one_read_back() {
+fn swarm_in_host_frame_matches_readback() {
     let Some(gpu) = shared() else {
         eprintln!("no hardware GPU adapter: skipped");
         return;

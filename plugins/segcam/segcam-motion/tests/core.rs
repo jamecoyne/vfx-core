@@ -136,7 +136,7 @@ fn grid_keeps_aspect_and_orientation() {
 }
 
 #[test]
-fn first_frame_is_only_a_reference() {
+fn first_frame_detects_no_motion() {
     let g = downsample(&frame_with_square::<u8>(W, H, 100, 50, 40).view(), 192);
     assert!(
         motion::detect_motion(&[], &g, &MotionSettings::default())
@@ -146,7 +146,7 @@ fn first_frame_is_only_a_reference() {
 }
 
 #[test]
-fn still_frame_never_moves() {
+fn static_frames_detect_no_motion() {
     let history: Vec<LumaGrid> = (0..10)
         .map(|_| downsample(&frame_with_square::<u8>(W, H, 100, 50, 40).view(), 192))
         .collect();
@@ -159,7 +159,7 @@ fn still_frame_never_moves() {
 }
 
 #[test]
-fn jumping_square_is_found_where_it_lands_and_where_it_left() {
+fn jump_yields_blobs_at_old_and_new_positions() {
     let history: Vec<LumaGrid> = (0..10)
         .map(|_| downsample(&frame_with_square::<u8>(W, H, 40, 60, 48).view(), 192))
         .collect();
@@ -211,7 +211,7 @@ fn sensitivity_maps_onto_segcams_threshold() {
 }
 
 #[test]
-fn depths_see_the_same_thing() {
+fn all_depths_detect_same_blobs() {
     let (a, b, c) = (
         blobs_for_moving_square::<u8>(),
         blobs_for_moving_square::<u16>(),
@@ -296,7 +296,7 @@ fn crossing<C: Channel>() -> Vec<Image<C>> {
 }
 
 #[test]
-fn swarm_piles_frozen_tiles_on_a_clear_canvas() {
+fn swarm_draws_frozen_tiles_on_transparent_canvas() {
     let s = swarm_settings();
     assert_eq!(previous_frames_needed(&s), 23);
     let frames = crossing::<u8>();
@@ -374,7 +374,7 @@ fn live_windows_show_the_current_frame() {
 }
 
 #[test]
-fn swarm_trail_survives_frame_sized_segments() {
+fn frame_sized_segments_keep_trail_windows() {
     // A band flashing black and white over most of each frame is one huge blob every frame;
     // its top edge creeps down 2 px a frame, so every older tile's title bar peeks out above
     // the newer one: two rows each, the bar's bright hairline over its darker second row.
@@ -477,7 +477,7 @@ fn window_tile(content_rect: PixelRect) -> Tile {
 }
 
 #[test]
-fn window_chrome_matches_the_bake() {
+fn window_chrome_matches_baked_pixels() {
     // 1080 lines: the chrome at 1x. Grey behind, so the shadow shows.
     let mut canvas = Image::<u8>::new(720, 1080);
     canvas.pixels.fill(Argb {
@@ -532,24 +532,32 @@ fn window_chrome_matches_the_bake() {
 }
 
 #[test]
-fn labels_and_font() {
+fn segment_label_formats_kind_frame_index() {
     assert_eq!(segment_label(SegmentKind::Motion, 412, 0), "motion#412.1");
     assert_eq!(
         segment_label(SegmentKind::ThresholdRegion, 7, 1),
         "blob#7.2"
     );
+}
+
+#[test]
+fn reused_face_label_keeps_original_id() {
     let face = Blob {
         kind: SegmentKind::Face,
         reused_from: Some((6, 2)),
         ..Blob::default()
     };
-    assert_eq!(
-        blob_label(&face, 7, 0),
-        "face#6.3",
-        "a reused face keeps its ID"
-    );
+    assert_eq!(blob_label(&face, 7, 0), "face#6.3");
+}
+
+#[test]
+fn unknown_glyph_falls_back_to_question_mark() {
     assert!(font::glyph('m')[2] != 0 && font::glyph('#')[0] != 0);
     assert_eq!(font::glyph('~'), font::glyph('?'));
+}
+
+#[test]
+fn fit_text_truncates_with_dots() {
     assert_eq!(
         fit_text("LO.FI.SCI.FI motion#1.1", text_width("LO.FI", 1), 1),
         "LO..."
@@ -655,7 +663,7 @@ fn first_window_shown(s: &RenderSettings, frames: &[Image<u8>], number: i64) -> 
 }
 
 #[test]
-fn a_window_stays_until_newer_ones_push_it_out() {
+fn window_stays_until_newer_ones_push_it_out() {
     let frames = squares_in_rows(32);
     let s = RenderSettings {
         mode: OutputMode::Swarm,
@@ -676,7 +684,7 @@ fn a_window_stays_until_newer_ones_push_it_out() {
 }
 
 #[test]
-fn faces_on_a_frame_without_people_change_nothing() {
+fn no_faces_leaves_output_unchanged() {
     let frames = jump();
     let all = FaceParts {
         face: true,
@@ -748,7 +756,7 @@ fn painted_out(frames: &[Image<u8>], range: std::ops::Range<usize>) -> Vec<Image
 /// An edit upstream that only touches frames before the one rendered, as a keyframed grade
 /// or a paint fix can, reaches the render: kept work for those frames isn't trusted blindly.
 #[test]
-fn edits_to_earlier_frames_reach_the_render() {
+fn earlier_frame_edit_invalidates_cache() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let last = frames.len() - 1;
@@ -775,7 +783,7 @@ fn edits_to_earlier_frames_reach_the_render() {
 
 /// A frame the host couldn't hand over is read again next time, not kept as empty.
 #[test]
-fn a_missing_frame_is_read_again() {
+fn missing_frame_is_read_again() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let last = frames.len() - 1;
@@ -802,7 +810,7 @@ fn a_missing_frame_is_read_again() {
 
 /// A change upstream that leaves the luma grid as it was still drops the kept tiles.
 #[test]
-fn swarm_sees_edits_that_keep_the_grid() {
+fn alpha_only_edit_invalidates_swarm_tiles() {
     let s = swarm_settings();
     let frames = crossing::<u8>();
     let last = frames.len() - 1;
@@ -855,7 +863,7 @@ fn render_fixed(
 /// From a fixed source a kept state reads only what it lacks, and still renders what a cold
 /// render does, in any order.
 #[test]
-fn a_fixed_source_reads_only_new_frames() {
+fn fixed_source_reads_only_new_frames() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let cold = |n: usize| render_frames(&s, &frames[..=n], n as i64).0.pixels;
@@ -878,7 +886,7 @@ fn a_fixed_source_reads_only_new_frames() {
 /// each of the first 76, whose background runs past the start, is worked out once: every
 /// render after the first reads only its own frame, and matches a cold render.
 #[test]
-fn the_start_of_a_clip_is_worked_out_once() {
+fn clip_start_frames_are_analysed_once() {
     let swarm = RenderSettings {
         mode: OutputMode::Swarm,
         ..RenderSettings::default()
@@ -910,7 +918,7 @@ fn the_start_of_a_clip_is_worked_out_once() {
 /// A fixed source that starts its numbering over (a seek back, a new clip) hands over a
 /// different current frame, and what was kept goes.
 #[test]
-fn a_fixed_source_that_starts_over_is_noticed() {
+fn fixed_source_restart_clears_cache() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let other: Vec<Image<u8>> = (0..frames.len() as i32)
@@ -929,7 +937,7 @@ fn a_fixed_source_that_starts_over_is_noticed() {
 }
 
 #[test]
-fn oldest_grid_stays_out_of_mask() {
+fn decayed_oldest_grid_yields_no_blobs() {
     let flat = LumaGrid {
         width: 192,
         height: 108,
