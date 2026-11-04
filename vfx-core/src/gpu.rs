@@ -1,4 +1,51 @@
 use std::fmt;
+use std::sync::{Arc, LazyLock, Mutex};
+
+/// What a device reported through its error and loss callbacks. wgpu holds one of each per device
+/// and its default error handler panics, so one place installs them and everyone reads this.
+#[derive(Clone, Default)]
+pub struct DeviceFaults {
+    errors: Arc<Mutex<(u64, String)>>,
+    lost: Arc<Mutex<Option<String>>>,
+}
+
+impl DeviceFaults {
+    /// Takes over `device`'s callbacks. Each new error message goes to stderr once.
+    pub fn watch(device: &wgpu::Device) -> Self {
+        let faults = Self::default();
+        faults.install(device);
+        faults
+    }
+
+    fn install(&self, device: &wgpu::Device) {
+        let errors = self.errors.clone();
+        device.on_uncaptured_error(Arc::new(move |e| {
+            if let Ok(mut errors) = errors.lock() {
+                let message = e.to_string();
+                if errors.1 != message {
+                    eprintln!("GPU error: {message}");
+                }
+                *errors = (errors.0 + 1, message);
+            }
+        }));
+        let lost = self.lost.clone();
+        device.set_device_lost_callback(move |reason, e| {
+            if let Ok(mut lost) = lost.lock() {
+                lost.get_or_insert(format!("{reason:?}: {e}"));
+            }
+        });
+    }
+
+    /// How many errors the device has reported, and the last one.
+    pub fn errors(&self) -> (u64, String) {
+        self.errors.lock().map_or((0, String::new()), |e| e.clone())
+    }
+
+    /// Why the device was lost, once it is.
+    pub fn lost(&self) -> Option<String> {
+        self.lost.lock().ok().and_then(|lost| lost.clone())
+    }
+}
 
 /// The device and queue every effect renders with.
 pub struct Gpu {
@@ -38,8 +85,10 @@ impl Gpu {
 
     /// Lets CPU effects draw on this device: in browsers, where they can't open their own, and
     /// in hosts that offer their output a GPU frame on it ([`crate::CpuEffect::render_to`]).
-    /// Effects pick their device on first use, so a host shares it before they render.
+    /// Effects pick their device on first use, so a host shares it before they render. This takes
+    /// over the device's error and loss callbacks; read them with [`Gpu::shared_faults`].
     pub fn share(&self) {
+        SHARED_FAULTS.install(&self.device);
         let parts = Some((self.device.clone(), self.queue.clone()));
         #[cfg(target_arch = "wasm32")]
         SHARED.with(|s| *s.borrow_mut() = parts);
@@ -57,7 +106,15 @@ impl Gpu {
         let parts = SHARED.lock().unwrap_or_else(|e| e.into_inner()).clone();
         parts.map(|(device, queue)| Self { device, queue })
     }
+
+    /// What the device shared with [`Gpu::share`] has reported.
+    pub fn shared_faults() -> DeviceFaults {
+        SHARED_FAULTS.clone()
+    }
 }
+
+// One record across shares, so a clone an effect already holds stays current.
+static SHARED_FAULTS: LazyLock<DeviceFaults> = LazyLock::new(DeviceFaults::default);
 
 // Browsers' wgpu objects stay on their thread.
 #[cfg(target_arch = "wasm32")]

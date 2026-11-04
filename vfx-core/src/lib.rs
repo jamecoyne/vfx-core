@@ -17,7 +17,7 @@ mod shader;
 pub use chain::EffectChain;
 pub use effect::{Context, CpuEffect, Effect, Processor, Reading, Region, Report, Target};
 pub use frame::{Frame, Readback};
-pub use gpu::{Gpu, GpuError};
+pub use gpu::{DeviceFaults, Gpu, GpuError};
 pub use param::{ParamError, ParamKind, ParamSpec, ParamValue, ParamValues, Requires, Unit};
 
 /// Re-exported so hosts can match the exact wgpu version the core was built against.

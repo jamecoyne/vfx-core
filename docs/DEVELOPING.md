@@ -103,6 +103,7 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `Effect` (GPU): `params`, `prepare`, `render`, `layer_inputs`, `layer_name`, `render_layers`, `region` | vfx-core | from the start |
 | `CpuEffect`: `params`, `frames_before` (the frame rate since #57), `render` | vfx-core | from the start |
 | `CpuEffect::keeps_state` | vfx-core | #11 |
+| `DeviceFaults`, `Gpu::shared_faults` (the error and loss callbacks of a device, which `Gpu::share` takes over) | vfx-core | #87 |
 | `CpuEffect::clear_history` (forget earlier frames, keeping GPU resources; default `false`, and the host rebuilds the effect) | vfx-core | #100 |
 | `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core | #47 |
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |

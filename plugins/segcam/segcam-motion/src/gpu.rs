@@ -22,7 +22,7 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
-use vfx_core::wgpu;
+use vfx_core::{DeviceFaults, wgpu};
 
 use crate::chrome;
 use crate::font;
@@ -43,11 +43,13 @@ pub struct GpuContext {
     layout: wgpu::BindGroupLayout,
     overlay: wgpu::ComputePipeline,
     swarm: wgpu::ComputePipeline,
-    /// Why the device was lost; from then on nothing draws on it.
-    lost: Lost,
-    /// How many errors the device has reported and the last one. A render that sees the count
-    /// move falls back; the device stays.
-    errors: Errors,
+    /// A render that sees the device's error count move falls back and the device stays; once the
+    /// device is lost, nothing draws on it.
+    faults: DeviceFaults,
+    /// Whether a host shared this device. Only then can a host's frame be on it: wgpu compares
+    /// devices by an id unique within one `Instance`, so a device opened here can compare equal
+    /// to a host's.
+    host_shared: bool,
     /// An atlas built ahead for the first drawer, so its first render doesn't allocate one.
     preallocated_atlas: Mutex<Option<Atlas>>,
     /// What writes the swarm into a host's frame, per frame format, made on first use.
@@ -66,7 +68,7 @@ struct Unpack {
 impl GpuContext {
     /// Whether `device` is this one.
     pub(crate) fn wraps(&self, device: &wgpu::Device) -> bool {
-        self.device == *device
+        self.host_shared && self.device == *device
     }
 
     /// The unpack for frames of `format`.
@@ -145,11 +147,11 @@ impl GpuContext {
     }
 
     pub(crate) fn lost(&self) -> Option<String> {
-        self.lost.lock().ok().and_then(|f| f.clone())
+        self.faults.lost()
     }
 
     pub(crate) fn errors(&self) -> (u64, String) {
-        self.errors.lock().map_or((0, String::new()), |e| e.clone())
+        self.faults.errors()
     }
 
     /// Makes the device report a validation error: a write at an odd offset.
@@ -291,14 +293,19 @@ fn open_and_publish(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<Gpu
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
-    // A host that shows frames from the GPU shares the device they're on (FFGL), so the swarm
-    // can draw its output there. The host doesn't track its errors, so this does.
-    // An adapter asked for by name still gets a device of its own.
+    // A host that shows frames from the GPU shares the device they're on, so the swarm can draw
+    // its output there. An adapter asked for by name still gets a device of its own.
     if choice.is_empty()
         && let Some(gpu) = vfx_core::Gpu::shared()
     {
-        let (lost, errors) = track_device_errors(&gpu.device);
-        let dev = on_shared(gpu, lost, errors);
+        let dev = on_shared(gpu);
+        // The formats hosts offer, built here so the first offered render doesn't stall on it.
+        for format in [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba32Float,
+        ] {
+            dev.unpack(format);
+        }
         return match (dev.lost(), dev.errors()) {
             (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
             _ => Ok(dev),
@@ -319,11 +326,11 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| NoGpu::Failed(e.to_string()))?;
-    let (lost, errors) = track_device_errors(&device);
+    let faults = DeviceFaults::watch(&device);
     let max_binding = supported
         .max_storage_buffer_binding_size
         .min(supported.max_buffer_size);
-    let dev = GpuContext::build(device, queue, info, max_binding, lost, errors);
+    let dev = GpuContext::build(device, queue, info, max_binding, faults, false);
     match (dev.lost(), dev.errors()) {
         (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
         _ => Ok(dev),
@@ -377,14 +384,14 @@ fn test_device(adapter: wgpu::Adapter, limits: wgpu::Limits) -> Result<GpuContex
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| NoGpu::Failed(e.to_string()))?;
-    let (lost, errors) = track_device_errors(&device);
+    let faults = DeviceFaults::watch(&device);
     Ok(GpuContext::build(
         device,
         queue,
         info,
         u64::MAX,
-        lost,
-        errors,
+        faults,
+        false,
     ))
 }
 
@@ -396,49 +403,23 @@ pub(crate) fn gpu_test_lock() -> MutexGuard<'static, ()> {
     GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Why a device was lost, once it is.
-type Lost = Arc<Mutex<Option<String>>>;
-/// How many errors a device has reported, and the last one.
-type Errors = Arc<Mutex<(u64, String)>>;
-
-/// Counts `device`'s errors, keeping the last, and notes why it was lost.
-#[cfg(not(target_arch = "wasm32"))]
-fn track_device_errors(device: &wgpu::Device) -> (Lost, Errors) {
-    let errors = Arc::new(Mutex::new((0, String::new())));
-    let noted = errors.clone();
-    device.on_uncaptured_error(Arc::new(move |e| {
-        if let Ok(mut n) = noted.lock() {
-            *n = (n.0 + 1, e.to_string());
-        }
-    }));
-    let lost = Arc::new(Mutex::new(None));
-    let noted = lost.clone();
-    device.set_device_lost_callback(move |reason, e| {
-        if let Ok(mut l) = noted.lock() {
-            l.get_or_insert(format!("{reason:?}: {e}"));
-        }
-    });
-    (lost, errors)
-}
-
 /// Draws on a device a host shared ([`vfx_core::Gpu::share`]), binding as much as it allows.
-fn on_shared(gpu: vfx_core::Gpu, lost: Lost, errors: Errors) -> GpuContext {
+fn on_shared(gpu: vfx_core::Gpu) -> GpuContext {
     let limits = gpu.device.limits();
     let max_binding = limits
         .max_storage_buffer_binding_size
         .min(limits.max_buffer_size);
     let info = gpu.device.adapter_info();
-    GpuContext::build(gpu.device, gpu.queue, info, max_binding, lost, errors)
+    let faults = vfx_core::Gpu::shared_faults();
+    GpuContext::build(gpu.device, gpu.queue, info, max_binding, faults, true)
 }
 
 // Browsers can't wait for a device inside a render, so this draws on the one the host shared.
-// Its error and loss callbacks stay the host's.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn open(_choice: &str) -> Result<GpuContext, NoGpu> {
     let gpu =
         vfx_core::Gpu::shared().ok_or_else(|| NoGpu::NoAdapter("the host shared no GPU".into()))?;
-    let (lost, errors) = Default::default();
-    Ok(on_shared(gpu, lost, errors))
+    Ok(on_shared(gpu))
 }
 
 impl GpuContext {
@@ -448,8 +429,8 @@ impl GpuContext {
         queue: wgpu::Queue,
         info: wgpu::AdapterInfo,
         max_binding: u64,
-        lost: Lost,
-        errors: Errors,
+        faults: DeviceFaults,
+        host_shared: bool,
     ) -> Self {
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
@@ -507,8 +488,8 @@ impl GpuContext {
             device,
             queue,
             info,
-            lost,
-            errors,
+            faults,
+            host_shared,
             preallocated_atlas: Mutex::new(None),
             #[cfg(not(target_arch = "wasm32"))]
             unpacks: Mutex::new(Vec::new()),
