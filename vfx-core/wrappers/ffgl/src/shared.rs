@@ -1000,8 +1000,9 @@ impl InteropSlot {
             "warning: zero-copy path unavailable, using RAM: {error}"
         ));
         match error {
-            InteropError::Unsupported(_) => self.disabled = true,
-            InteropError::Failed(_) | InteropError::Hung => {
+            // A setup that hung has leaked its images, so another try could leak more.
+            InteropError::Unsupported(_) | InteropError::Hung => self.disabled = true,
+            InteropError::Failed(_) => {
                 self.no_setup_before = Some(Instant::now() + RETRY_AFTER);
             }
         }
