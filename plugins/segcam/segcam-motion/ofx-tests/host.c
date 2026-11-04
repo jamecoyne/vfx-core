@@ -62,7 +62,8 @@ static void begin_sequence(OfxImageEffectHandle e, int first, int last) {
     CHECK(action(kOfxImageEffectActionBeginSequenceRender,e,sequence,NULL)==kOfxStatOK,"begin sequence failed");
 }
 /* A step back or a repeat checks earlier frames, and so does the render after it; other steps
-   stream, reading the frame and the few a check dropped. Each frame's last render equals fresh. */
+   stream, reading the frames stepped over, since none are kept ahead, and the few a check dropped.
+   Each frame's last render equals fresh. */
 static void replay_order(int mode, const char *name, const int *order, int n, int from, int to) {
     OfxImageEffectHandle e=instance(mode,0);
     for(int t=6;t<=23;t++) render_frame(e,t);
@@ -75,7 +76,7 @@ static void replay_order(int mode, const char *name, const int *order, int n, in
         begin_sequence(e,t,t);
         render_frame(e,t);
         int read=reads;
-        if(t>previous && !broke_stream) CHECK(read<=3,"%s, mode %d, edit %d to %d: a stream read %d frames at %d",name,mode,from,to,read,t);
+        if(t>previous && !broke_stream) CHECK(read<=3 || read<=t-previous+1,"%s, mode %d, edit %d to %d: a stream read %d frames at %d",name,mode,from,to,read,t);
         else CHECK(read>2,"%s, mode %d, edit %d to %d: a check read %d frames at %d",name,mode,from,to,read,t);
         broke_stream=t<=previous;
         previous=t;
