@@ -515,6 +515,8 @@ unsafe fn process_cpu(
         cpu.output_pixels
             .resize(w as usize * h as usize, Argb::default());
     }
+    // FFGL has no frame rate call, and a live host hands over frames as they come, so the effect
+    // gets no rate: it takes every frame it is handed.
     let frames_before = cpu.effect.frames_before(&values, None);
     let frames_held = cpu.effect.frames_held(&values, None);
     let canvas = cpu.argb_transfer.as_ref().expect("made above");

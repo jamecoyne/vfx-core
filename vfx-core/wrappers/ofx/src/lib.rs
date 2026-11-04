@@ -331,6 +331,10 @@ fn region_of_definition(
     in_args: Props,
     out_args: Props,
 ) -> Result<OfxStatus, OfxStatus> {
+    // A CPU effect never grows, so a host's frequent asks needn't read parameters or make an effect.
+    if vfx_host::plugin().kind == Kind::Cpu {
+        return Ok(STAT_REPLY_DEFAULT);
+    }
     let time = in_args.get_double(PROP_TIME, 0)?;
     let r = gpu_effect_region(&param_values(effect, time)?, [1.0, 1.0]);
     if !r.grows {
