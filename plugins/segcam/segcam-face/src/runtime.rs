@@ -2,7 +2,6 @@
 
 use std::fmt;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ort::environment::Environment;
@@ -274,12 +273,9 @@ fn time_runs(
     times[TIMED_RUNS / 2]
 }
 
-static CPU_THREADS: AtomicUsize = AtomicUsize::new(0);
-
-/// Caps the CPU threads for models loaded from here on; 0 leaves it to ONNX Runtime.
-pub fn set_cpu_threads(threads: usize) {
-    CPU_THREADS.store(threads, Ordering::Relaxed);
-}
+/// Threads for the models on the CPU, where ONNX Runtime would otherwise size to the whole machine
+/// and compete with the render for its cores. Detection runs no less often with these.
+const CPU_THREADS: usize = 2;
 
 fn session(model: &[u8], device: Device) -> ort::Result<Session> {
     // ONNX Runtime allows one environment per process, and threads load models side by side.
@@ -293,10 +289,7 @@ fn session(model: &[u8], device: Device) -> ort::Result<Session> {
         .map_err(|e| ort::Error::new(e.clone()))?;
     let builder = Session::builder(environment)?;
     let mut builder = match device {
-        Device::Cpu => match CPU_THREADS.load(Ordering::Relaxed) {
-            0 => builder,
-            threads => builder.with_intra_threads(threads)?,
-        },
+        Device::Cpu => builder.with_intra_threads(CPU_THREADS)?,
         // DirectML can't use memory patterns or run nodes in parallel.
         #[cfg(windows)]
         Device::DirectMl(adapter) => builder
