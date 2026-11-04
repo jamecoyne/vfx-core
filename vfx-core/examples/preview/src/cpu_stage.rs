@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn decoded_frame_reaches_history() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let mut controls = crate::controls::Controls::default();
         controls.effect = find("segcam Motion (Rust)").unwrap();
         let values = controls.values().clone();
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     #[ignore = "run by output_frame_test_in_own_process"]
     fn output_frame_matches_ram_path() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         if gpu.device.adapter_info().device_type == wgpu::DeviceType::Cpu {
             eprintln!("no hardware GPU adapter: skipped");
             return;
@@ -663,7 +663,7 @@ mod tests {
     /// Within 1 level of the float readback: the GPU rounds a tie its own way.
     #[test]
     fn float_frame_reads_at_8_bit() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let mut controls = crate::controls::Controls::default();
         controls.effect = find("segcam Motion (Rust)").unwrap();
         let values = controls.values().clone();

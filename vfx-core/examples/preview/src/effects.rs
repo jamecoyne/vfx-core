@@ -809,10 +809,24 @@ mod tests {
     use crate::catalog::find;
     use vfx_core::ParamValue;
 
+    /// Turns off what would load segcam's face models. Their device trial runs on a thread of its
+    /// own past the end of a test, where a turn can't cover it.
+    fn without_face_models(controls: &mut Controls) {
+        for (name, value) in [
+            ("detect", ParamValue::Int(0)),
+            ("eyes", ParamValue::Bool(false)),
+            ("mouth", ParamValue::Bool(false)),
+        ] {
+            // Other effects have no such parameters.
+            let _ = controls.params[controls.effect].set(name, value);
+        }
+    }
+
     fn shown(name: &str) -> (Controls, ParamValues) {
         let mut controls = Controls::default();
         controls.animate = false;
         controls.effect = find(name).unwrap();
+        without_face_models(&mut controls);
         let values = controls.values().clone();
         (controls, values)
     }
@@ -838,7 +852,7 @@ mod tests {
     /// Flip, off and then on, and checks the result is mirrored.
     #[test]
     fn flip_mirrors_the_frame() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
         let (controls, mut values) = shown("Flip");
@@ -861,16 +875,18 @@ mod tests {
         );
     }
 
-    /// Every effect in the catalog renders with its defaults, and switching between them
+    /// Every effect in the catalog renders with its defaults but face models, and switching
+    /// between them
     /// works. segcam's first frame is a reference, so it shows the input unchanged.
     #[test]
     fn every_effect_renders() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
         for (i, entry) in catalog::entries().iter().enumerate() {
             let mut controls = Controls::default();
             controls.effect = i;
+            without_face_models(&mut controls);
             let values = controls.values().clone();
             let out = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
             assert_eq!(out.len(), (PATTERN_SIZE.0 * PATTERN_SIZE.1 * 4) as usize);
@@ -882,7 +898,7 @@ mod tests {
     /// motion matte is opaque somewhere and clear somewhere else.
     #[test]
     fn segcam_finds_the_moving_disc() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
         let (controls, mut values) = shown("segcam Motion (Rust)");
@@ -902,7 +918,7 @@ mod tests {
     /// A clear starts the history over at the next frame, with the source still there.
     #[test]
     fn clear_history_starts_over_from_the_next_frame() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
         let (controls, values) = shown("segcam Motion (Rust)");
@@ -923,7 +939,7 @@ mod tests {
     /// still reaches the output.
     #[test]
     fn repeated_picture_is_not_new() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
         let (controls, values) = shown("segcam Motion (Rust)");
@@ -958,7 +974,7 @@ mod tests {
     /// segcam's first render shows its input, so a frame in RAM comes out unchanged.
     #[test]
     fn video_frame_passes_unchanged() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
         let (controls, values) = shown("segcam Motion (Rust)");
@@ -1001,7 +1017,7 @@ mod tests {
     /// Both videos' first frames have time 0, which must not read as the same frame.
     #[test]
     fn new_video_replaces_picture() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
         let (controls, values) = shown("segcam Motion (Rust)");

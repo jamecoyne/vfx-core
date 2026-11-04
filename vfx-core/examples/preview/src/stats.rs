@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn device_error_reaches_the_fault_text() {
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let (_turn, gpu) = crate::test_gpu();
         let faults = DeviceFaults::watch(&gpu.device);
         assert_eq!(device_fault_text(&faults), None);
         let zero_sized = wgpu::TextureDescriptor {

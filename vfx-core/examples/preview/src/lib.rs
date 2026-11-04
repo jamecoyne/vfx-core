@@ -36,3 +36,12 @@ mod web_media;
 mod web_record;
 
 pub use app::run;
+
+/// A device for a test, and the turn to hold while using it. Drivers can deadlock when one test
+/// releases a device while another makes one, so GPU tests here run one at a time.
+#[cfg(test)]
+fn test_gpu() -> (std::sync::MutexGuard<'static, ()>, vfx_core::Gpu) {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    (turn, pollster::block_on(vfx_core::Gpu::headless()).unwrap())
+}
