@@ -86,7 +86,9 @@ impl Image<'_> {
             Pixels::Rgba8(d) => [d[i], d[i + 1], d[i + 2]].map(f32::from),
             Pixels::Bgra8(d) => [d[i + 2], d[i + 1], d[i]].map(f32::from),
             Pixels::Argb8(d) => [d[i + 1], d[i + 2], d[i + 3]].map(f32::from),
-            Pixels::Argb16(d) => [d[i + 1], d[i + 2], d[i + 3]].map(|v| byte(f32::from(v) / 32768.0)),
+            Pixels::Argb16(d) => {
+                [d[i + 1], d[i + 2], d[i + 3]].map(|v| byte(f32::from(v) / 32768.0))
+            }
             Pixels::ArgbF32(d) => [d[i + 1], d[i + 2], d[i + 3]].map(byte),
             Pixels::RgbaF32(d) => [d[i], d[i + 1], d[i + 2]].map(|v| v.clamp(0.0, 1.0) * 255.0),
         }
@@ -111,6 +113,20 @@ impl Rect {
         }
         let overlap = w * h;
         overlap / (self.w * self.h + other.w * other.h - overlap)
+    }
+
+    /// The smallest rectangle holding `points`.
+    fn bounding(points: impl IntoIterator<Item = (f64, f64)>) -> Rect {
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (x, y) in points {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+        Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        }
     }
 
     fn clamped(self) -> Rect {
@@ -138,13 +154,11 @@ pub enum Kind {
     Body,
 }
 
-/// A found face, face part or body. The parts of one face share its number.
+/// A found face, face part or body.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Segment {
     pub kind: Kind,
-    pub number: u64,
     pub rect: Rect,
-    pub score: f32,
     /// On a face, the box the model found, before it was sized to match segcam 1.1.
     pub detected: Option<Rect>,
     /// On a face, YuNet's five points (see [`Face::landmarks`]). Vision gives none.
@@ -196,7 +210,7 @@ impl Segmenter {
         }
     }
 
-    /// The `parts` in `image`: each face and then its parts, then the bodies, each with a new number.
+    /// The `parts` in `image`: each face and then its parts, then the bodies.
     pub fn find(&mut self, image: &Image, parts: Parts) -> &[Segment] {
         match self {
             #[cfg(target_os = "macos")]
@@ -205,18 +219,6 @@ impl Segmenter {
             Self::Ort(segmenter, _) => segmenter.find(image, parts),
             #[cfg(not(any(target_os = "macos", feature = "onnx")))]
             _ => unreachable!("without a backend, best() makes no segmenter: {image:?} {parts:?}"),
-        }
-    }
-
-    /// Numbers faces after `last` from now on, so numbers stay unique across segmenters.
-    pub fn continue_after(&mut self, last: u64) {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Vision(segmenter) => segmenter.continue_after(last),
-            #[cfg(feature = "onnx")]
-            Self::Ort(segmenter, _) => segmenter.continue_after(last),
-            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
-            _ => unreachable!("without a backend, best() makes no segmenter: {last}"),
         }
     }
 }
@@ -241,12 +243,11 @@ pub struct FaceSegmenter<D, M, B> {
     pub detector: D,
     pub mesh: Option<M>,
     pub bodies: Option<B>,
-    next_number: u64,
     segments: Vec<Segment>,
 }
 
 /// Face boxes are square, as tall as YuNet's box and moved down by this fraction of its height.
-const FACE_DROP: f64 = 0.09;
+const FACE_OFFSET_Y: f64 = 0.09;
 /// The smallest eye or mouth box, as a fraction of the frame.
 const MIN_PART: f64 = 0.02;
 
@@ -256,7 +257,7 @@ const EYE_HEIGHT: f64 = 0.18;
 const MOUTH_WIDTH: f64 = 1.35;
 const MOUTH_HEIGHT: f64 = 0.2;
 /// The mouth box sits below the line between the mouth corners by this fraction of its height.
-const MOUTH_DROP: f64 = 0.1;
+const MOUTH_OFFSET_Y: f64 = 0.1;
 /// Eye and mouth boxes are the mesh's outlines scaled by these factors.
 const EYE_OUTLINE_SCALE: f64 = 1.7;
 const LIP_OUTLINE_SCALE: f64 = 1.27;
@@ -267,17 +268,11 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
             detector,
             mesh,
             bodies,
-            next_number: 0,
             segments: Vec::new(),
         }
     }
 
-    /// Numbers faces after `last` from now on, so numbers stay unique across segmenters.
-    pub fn continue_after(&mut self, last: u64) {
-        self.next_number = self.next_number.max(last);
-    }
-
-    /// The `parts` in `image`: each face and then its parts, then the bodies, each with a new number.
+    /// The `parts` in `image`: each face and then its parts, then the bodies.
     pub fn find(&mut self, image: &Image, parts: Parts) -> &[Segment] {
         self.segments.clear();
         let mut bodies = self.bodies.take();
@@ -297,24 +292,22 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
         });
         self.bodies = bodies;
         for body in found {
-            self.next_number += 1;
-            self.push(Kind::Body, body.rect, body.score);
+            self.push(Kind::Body, body.rect);
         }
         &self.segments
     }
 
     fn push_face(&mut self, image: &Image, face: &Face, parts: Parts) {
-        self.next_number += 1;
         let r = face.rect;
         if parts.face {
             let w = r.h * image.height as f64 / image.width.max(1) as f64;
             let square = Rect {
                 x: r.x + (r.w - w) / 2.0,
-                y: r.y + r.h * FACE_DROP,
+                y: r.y + r.h * FACE_OFFSET_Y,
                 w,
                 h: r.h,
             };
-            self.push(Kind::Face, square.clamped(), face.score);
+            self.push(Kind::Face, square.clamped());
             if let Some(pushed) = self.segments.last_mut() {
                 pushed.detected = Some(r);
                 pushed.landmarks = Some(face.landmarks);
@@ -327,17 +320,17 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
         };
         if let Some(points) = outline {
             let bound = |indices: &[usize], scale: f64| {
-                part_around(indices.iter().map(|&i| points[i]), scale)
+                scaled_bounding_box(indices.iter().map(|&i| points[i]), scale)
             };
             if parts.eyes {
                 let left = bound(&mesh::LEFT_EYE, EYE_OUTLINE_SCALE);
                 let right = bound(&mesh::RIGHT_EYE, EYE_OUTLINE_SCALE);
-                self.push(Kind::EyeLeft, left, face.score);
-                self.push(Kind::EyeRight, right, face.score);
+                self.push(Kind::EyeLeft, left);
+                self.push(Kind::EyeRight, right);
             }
             if parts.mouth {
                 let mouth = bound(&mesh::OUTER_LIPS, LIP_OUTLINE_SCALE);
-                self.push(Kind::Mouth, mouth, face.score);
+                self.push(Kind::Mouth, mouth);
             }
             return;
         }
@@ -345,8 +338,8 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
         let [left_eye, right_eye, _nose, mouth_left, mouth_right] = face.landmarks;
         if parts.eyes {
             let (w, h) = (r.w * EYE_WIDTH, r.h * EYE_HEIGHT);
-            self.push(Kind::EyeLeft, part(left_eye, w, h), face.score);
-            self.push(Kind::EyeRight, part(right_eye, w, h), face.score);
+            self.push(Kind::EyeLeft, box_around(left_eye, w, h));
+            self.push(Kind::EyeRight, box_around(right_eye, w, h));
         }
         if parts.mouth {
             let (w, h) = (
@@ -355,18 +348,16 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
             );
             let centre = (
                 (mouth_left.0 + mouth_right.0) / 2.0,
-                (mouth_left.1 + mouth_right.1) / 2.0 + h * MOUTH_DROP,
+                (mouth_left.1 + mouth_right.1) / 2.0 + h * MOUTH_OFFSET_Y,
             );
-            self.push(Kind::Mouth, part(centre, w, h), face.score);
+            self.push(Kind::Mouth, box_around(centre, w, h));
         }
     }
 
-    fn push(&mut self, kind: Kind, rect: Rect, score: f32) {
+    fn push(&mut self, kind: Kind, rect: Rect) {
         self.segments.push(Segment {
             kind,
-            number: self.next_number,
             rect,
-            score,
             detected: None,
             landmarks: None,
         });
@@ -374,20 +365,38 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
 }
 
 /// The bounding box of `points`, scaled about its centre.
-fn part_around(points: impl Iterator<Item = (f64, f64)>, scale: f64) -> Rect {
-    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    for (x, y) in points {
-        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+fn scaled_bounding_box(points: impl Iterator<Item = (f64, f64)>, scale: f64) -> Rect {
+    let b = Rect::bounding(points);
+    box_around((b.x + b.w / 2.0, b.y + b.h / 2.0), b.w * scale, b.h * scale)
+}
+
+/// Non-maximum suppression: from the best score down, keeps up to `max` items that overlap no kept
+/// item by more than `threshold`.
+fn non_max_suppression<T>(
+    mut items: Vec<T>,
+    rect: impl Fn(&T) -> Rect,
+    score: impl Fn(&T) -> f32,
+    threshold: f32,
+    max: usize,
+) -> Vec<T> {
+    items.sort_by(|a, b| score(b).total_cmp(&score(a)));
+    let mut kept: Vec<T> = Vec::new();
+    for item in items {
+        if kept.len() == max {
+            break;
+        }
+        if kept
+            .iter()
+            .all(|k| rect(k).iou(&rect(&item)) <= f64::from(threshold))
+        {
+            kept.push(item);
+        }
     }
-    part(
-        ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
-        (x1 - x0) * scale,
-        (y1 - y0) * scale,
-    )
+    kept
 }
 
 /// A `w` x `h` box around `centre`, at least [`MIN_PART`] on each side and clamped to the frame.
-fn part(centre: (f64, f64), w: f64, h: f64) -> Rect {
+fn box_around(centre: (f64, f64), w: f64, h: f64) -> Rect {
     let (w, h) = (w.max(MIN_PART), h.max(MIN_PART));
     Rect {
         x: centre.0 - w / 2.0,
@@ -414,7 +423,10 @@ mod tests {
 
     #[test]
     fn deep_argb_reads_as_the_8_bit_value() {
-        assert_eq!(rgb(Pixels::Argb8(&[255, 10, 128, 255])), [10.0, 128.0, 255.0]);
+        assert_eq!(
+            rgb(Pixels::Argb8(&[255, 10, 128, 255])),
+            [10.0, 128.0, 255.0]
+        );
         let white = 32768.0;
         let from_8_bit = |v: f32| (v / 255.0 * white) as u16;
         assert_eq!(

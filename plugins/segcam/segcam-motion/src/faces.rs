@@ -47,11 +47,11 @@ mod models {
         MODELS.wait();
     }
 
-    /// A broken runtime can panic; that is no models, not an answer that never comes.
+    /// A panic in a broken runtime counts as no models, so [`wait`] and [`ready`] still get an answer.
     fn load() {
         let _turn = segcam_face::device_turn();
         let started = Instant::now();
-        let segmenter = catch_unwind(AssertUnwindSafe(warmed)).unwrap_or(None);
+        let segmenter = catch_unwind(AssertUnwindSafe(load_warmed_segmenter)).unwrap_or(None);
         match &segmenter {
             Some(segmenter) => {
                 let device = segmenter.runs_on();
@@ -74,7 +74,7 @@ mod models {
 
     /// The best segmenter after a first run, since Vision loads its own models on its first
     /// request.
-    fn warmed() -> Option<Segmenter> {
+    fn load_warmed_segmenter() -> Option<Segmenter> {
         let mut segmenter = Segmenter::best()?;
         let grey = vec![128; 64 * 36 * 4];
         let image = Image {
@@ -197,7 +197,7 @@ mod live {
                 if Arc::strong_count(&answer) == 1 {
                     return;
                 }
-                // A broken runtime can panic; that is no faces, not an answer that never comes.
+                // A panic in a broken runtime counts as no faces, so the request still gets an answer.
                 let blobs = catch_unwind(AssertUnwindSafe(|| {
                     super::find_in(&pixels, width, height, parts, cells)
                 }))
@@ -381,10 +381,10 @@ pub fn readings(models_loaded: bool, blobs: &[Blob]) -> Vec<Reading> {
     if !models_loaded {
         return Vec::new();
     }
-    let Some(at) = blobs.iter().position(|b| b.kind == SegmentKind::Face) else {
+    let Some(face_index) = blobs.iter().position(|b| b.kind == SegmentKind::Face) else {
         return vec![Reading::new("face", 0.0)];
     };
-    let face = blobs[at];
+    let face = blobs[face_index];
     let found = face.detected_bounds.unwrap_or(face.bounds);
     let (x, y, w, h) = (found.x, found.y, found.w, found.h);
     let mut readings = vec![
@@ -407,7 +407,7 @@ pub fn readings(models_loaded: bool, blobs: &[Blob]) -> Vec<Reading> {
         push_point("mouthx", "mouthy", mouth);
     } else {
         // Vision has only the parts asked for, right behind their face.
-        for part in blobs[at + 1..]
+        for part in blobs[face_index + 1..]
             .iter()
             .take_while(|b| b.kind != SegmentKind::Face)
         {

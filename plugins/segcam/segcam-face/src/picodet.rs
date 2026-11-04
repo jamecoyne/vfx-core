@@ -55,7 +55,7 @@ pub fn bodies(
             }
             let [left, top, right, bottom] = std::array::from_fn(|side| {
                 let start = i * 4 * BINS + side * BINS;
-                distance(&reg[start..start + BINS]) * stride as f64
+                expected_bin_distance(&reg[start..start + BINS]) * stride as f64
             });
             let s = stride as f64;
             let (cx, cy) = (((i % cols) as f64 + 0.5) * s, ((i / cols) as f64 + 0.5) * s);
@@ -71,11 +71,17 @@ pub fn bodies(
             }
         }
     }
-    suppress(found, nms_threshold)
+    crate::non_max_suppression(
+        found,
+        |body| body.rect,
+        |body| body.score,
+        nms_threshold,
+        usize::MAX,
+    )
 }
 
 /// The expected bin of a softmax over `bins`: one side's distance in strides.
-fn distance(bins: &[f32]) -> f64 {
+fn expected_bin_distance(bins: &[f32]) -> f64 {
     let top = bins.iter().copied().fold(f32::MIN, f32::max);
     let weights: Vec<f64> = bins.iter().map(|&b| f64::from(b - top).exp()).collect();
     let total: f64 = weights.iter().sum();
@@ -85,21 +91,6 @@ fn distance(bins: &[f32]) -> f64 {
         .map(|(bin, w)| bin as f64 * w)
         .sum::<f64>()
         / total
-}
-
-/// Non-maximum suppression: keeps the best body of each overlapping group.
-fn suppress(mut bodies: Vec<Body>, threshold: f32) -> Vec<Body> {
-    bodies.sort_by(|a, b| b.score.total_cmp(&a.score));
-    let mut kept: Vec<Body> = Vec::new();
-    for body in bodies {
-        if kept
-            .iter()
-            .all(|k| k.rect.iou(&body.rect) <= f64::from(threshold))
-        {
-            kept.push(body);
-        }
-    }
-    kept
 }
 
 #[cfg(test)]

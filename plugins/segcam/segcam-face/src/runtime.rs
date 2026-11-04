@@ -81,7 +81,7 @@ pub fn fastest(mesh: bool, bodies: bool) -> Option<(OrtSegmenter, Device)> {
                 .iter()
                 .map(|trial| (trial.device, trial.time))
                 .collect();
-            let best = trials.into_iter().nth(preferred(&times)?)?;
+            let best = trials.into_iter().nth(preferred_trial_index(&times)?)?;
             (
                 best.detector,
                 best.mesh,
@@ -115,15 +115,14 @@ const TIMED_RUNS: usize = 9;
 const MAX_ADAPTERS: u32 = 8;
 
 /// How much longer than the CPU DirectML may take in the trial and still be picked. The trial
-/// runs the models alone with every core free; in a render the CPU kernels share the cores with
-/// the analysis and the host. On an APU where the two timed close, the runs that picked the CPU
-/// used three times the CPU and rendered 10 to 20 ms slower (#66).
+/// runs the models alone with every core free, where in a render the CPU kernels share the cores
+/// with the analysis and the host, so the CPU's time flatters it (#66).
 #[cfg(windows)]
 pub const DIRECTML_MARGIN: f64 = 1.5;
 
 /// Which of `times` (each trial's device and time, fastest first) to keep: the fastest, unless
 /// that is the CPU and a DirectML adapter came within `DIRECTML_MARGIN` of it.
-fn preferred(times: &[(Device, Duration)]) -> Option<usize> {
+fn preferred_trial_index(times: &[(Device, Duration)]) -> Option<usize> {
     #[cfg(windows)]
     if let Some(&(Device::Cpu, cpu)) = times.first() {
         let close = |time: &Duration| time.as_secs_f64() <= cpu.as_secs_f64() * DIRECTML_MARGIN;
@@ -418,38 +417,38 @@ mod tests {
 
     #[test]
     fn no_trials_pick_nothing() {
-        assert_eq!(preferred(&[]), None);
+        assert_eq!(preferred_trial_index(&[]), None);
     }
 
     #[test]
-    fn the_fastest_is_kept_when_it_is_alone_or_on_directml() {
-        assert_eq!(preferred(&[(Device::Cpu, ms(10))]), Some(0));
+    fn fastest_trial_kept_when_alone_or_on_directml() {
+        assert_eq!(preferred_trial_index(&[(Device::Cpu, ms(10))]), Some(0));
         #[cfg(windows)]
         assert_eq!(
-            preferred(&[(Device::DirectMl(0), ms(8)), (Device::Cpu, ms(10))]),
+            preferred_trial_index(&[(Device::DirectMl(0), ms(8)), (Device::Cpu, ms(10))]),
             Some(0)
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn directml_close_behind_the_cpu_is_picked() {
+    fn directml_close_behind_cpu_is_picked() {
         let times = [
             (Device::Cpu, ms(10)),
             (Device::DirectMl(1), ms(14)),
             (Device::DirectMl(0), ms(15)),
         ];
-        assert_eq!(preferred(&times), Some(1));
+        assert_eq!(preferred_trial_index(&times), Some(1));
         assert_eq!(
-            preferred(&[(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(15))]),
+            preferred_trial_index(&[(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(15))]),
             Some(1)
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn a_cpu_more_than_the_margin_faster_is_kept() {
+    fn cpu_faster_by_more_than_margin_is_kept() {
         let times = [(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(16))];
-        assert_eq!(preferred(&times), Some(0));
+        assert_eq!(preferred_trial_index(&times), Some(0));
     }
 }

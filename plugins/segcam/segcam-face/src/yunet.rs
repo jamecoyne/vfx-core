@@ -50,7 +50,13 @@ pub fn faces(
     nms_threshold: f32,
     max_faces: usize,
 ) -> Vec<Face> {
-    let mut faces = suppress(decode(outputs, score_threshold), nms_threshold, max_faces);
+    let mut faces = crate::non_max_suppression(
+        decode(outputs, score_threshold),
+        |face| face.rect,
+        |face| face.score,
+        nms_threshold,
+        max_faces,
+    );
     let (fw, fh) = (image.width as f64 * scale, image.height as f64 * scale);
     for face in &mut faces {
         let r = face.rect;
@@ -106,22 +112,4 @@ fn decode(outputs: &[&[f32]; 12], threshold: f32) -> Vec<Face> {
         }
     }
     faces
-}
-
-/// Non-maximum suppression: keeps the best face of each overlapping group.
-fn suppress(mut faces: Vec<Face>, threshold: f32, max: usize) -> Vec<Face> {
-    faces.sort_by(|a, b| b.score.total_cmp(&a.score));
-    let mut kept: Vec<Face> = Vec::new();
-    for face in faces {
-        if kept.len() == max {
-            break;
-        }
-        if kept
-            .iter()
-            .all(|k| k.rect.iou(&face.rect) <= f64::from(threshold))
-        {
-            kept.push(face);
-        }
-    }
-    kept
 }
