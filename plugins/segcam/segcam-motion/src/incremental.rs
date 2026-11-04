@@ -59,21 +59,47 @@ struct AnalysisKey {
     face_source: Option<(i64, i64)>,
 }
 
+/// What a render knows of a frame's pixels from having read them.
+#[derive(Clone, Copy, PartialEq)]
+enum PixelsRead {
+    /// Their hash: an upstream edit can leave the luma grid unchanged.
+    Hash(u64),
+    /// A live source numbers each frame once, so it doesn't pay for a hash. Any later check that
+    /// does hash the frame finds it changed, so it is worked out again.
+    NotHashed,
+}
+
+/// A frame's analysis, with the key it was computed for.
+struct KeptAnalysis {
+    key: AnalysisKey,
+    segments: Segmentation,
+}
+
+/// A frame's tiles, with the key and mirroring they were cut for.
+struct KeptTiles {
+    key: AnalysisKey,
+    mirror: bool,
+    tiles: Vec<Tile>,
+}
+
+/// What is kept of one frame. Each part comes and goes on its own: a change to a frame drops the
+/// analysis of the frames that used it as background, and keeps their grids.
+#[derive(Default)]
+struct KeptFrame {
+    grid: Option<LumaGrid>,
+    read: Option<PixelsRead>,
+    analysis: Option<KeptAnalysis>,
+    tiles: Option<KeptTiles>,
+}
+
 #[derive(Default)]
 pub struct IncrementalRenderer {
     history_format: Option<HistoryFormat>,
-    grids: BTreeMap<i64, LumaGrid>,
-    /// Hash of each frame's pixels: an upstream edit can leave the luma grid unchanged.
-    frame_hashes: BTreeMap<i64, u64>,
-    motion: BTreeMap<i64, (AnalysisKey, Segmentation)>,
-    /// Tiles by frame, with the key and mirroring they were cut for.
-    tiles: BTreeMap<i64, (AnalysisKey, bool, Vec<Tile>)>,
+    kept: BTreeMap<i64, KeptFrame>,
     /// Created on the first GPU render after the device opens, not per instance, because hosts
     /// create instances often. A frame's tiles enter the atlas on first GPU draw.
     drawer: Option<Box<Drawer>>,
-    atlas_allocations: BTreeMap<i64, AtlasAllocation>,
-    /// A live render out of atlas stops drawing frames older than this.
-    oldest_frame_in_atlas: Option<i64>,
+    atlas: AtlasPlacements,
     /// Whether the last render's source is live, so it must not stall to stay exact.
     source_is_live: bool,
     gpu_wanted: bool,
@@ -174,7 +200,7 @@ impl IncrementalRenderer {
 
     fn set_drawer(&mut self, drawer: Option<Box<Drawer>>) {
         self.drawer = drawer;
-        self.atlas_allocations.clear();
+        self.atlas.frames.clear();
     }
 
     /// Draws Overlay on the GPU too. Off by default: while frames go through host memory, the
@@ -289,20 +315,16 @@ impl IncrementalRenderer {
         let numbers_identify_frames = fixed && frames.live();
         let mut current_hash = None;
         if numbers_identify_frames {
-            if self
-                .frame_hashes
-                .last_key_value()
-                .is_some_and(|(&newest, _)| number < newest)
-            {
+            let newest_read = self.kept.iter().rev().find(|(_, k)| k.read.is_some());
+            if newest_read.is_some_and(|(&newest, _)| number < newest) {
                 self.clear_history();
             }
         } else if fixed {
             frames.with_frame((number - first) as usize, &mut |image| {
                 current_hash = image.and_then(C::view).map(|v| frame_hash(&v));
             });
-            if current_hash
-                .is_none_or(|hash| self.frame_hashes.get(&number).is_some_and(|k| *k != hash))
-            {
+            let read = self.kept.get(&number).and_then(|k| k.read);
+            if current_hash.is_none_or(|hash| read.is_some_and(|r| r != PixelsRead::Hash(hash))) {
                 self.clear_history();
             }
         }
@@ -316,7 +338,9 @@ impl IncrementalRenderer {
         // A hash vouches for what a frame's pixels gave. Those of a frame out of the source's reach
         // get released, so a source that hands it over again later has it worked out again.
         if fixed && held != i64::MAX {
-            self.frame_hashes = self.frame_hashes.split_off(&oldest_held_frame);
+            for (_, kept) in self.kept.range_mut(..oldest_held_frame) {
+                kept.read = None;
+            }
         }
         if swarm {
             self.pin_unreadable_frames(s, first, number, oldest_held_frame);
@@ -342,27 +366,29 @@ impl IncrementalRenderer {
                         self.invalidate_frame(frame, invalidation_reach);
                         missing.insert(frame);
                     }
-                    Some(_) if fixed && self.frame_hashes.contains_key(&frame) => {}
+                    Some(_) if fixed && self.read_before(frame).is_some() => {}
                     Some(v) => {
-                        // Revalidating existing hashes reads every frame, so hash in parallel.
-                        let hash = current_hash.filter(|_| frame == number).unwrap_or_else(|| {
-                            if numbers_identify_frames {
-                                0
-                            } else if self.frame_hashes.contains_key(&frame) {
-                                frame_hash_parallel(v)
-                            } else {
-                                frame_hash(v)
-                            }
-                        });
-                        if self.frame_hashes.get(&frame) != Some(&hash) {
+                        let before = self.read_before(frame);
+                        let read = if numbers_identify_frames {
+                            PixelsRead::NotHashed
+                        } else if let Some(hash) = current_hash.filter(|_| frame == number) {
+                            PixelsRead::Hash(hash)
+                        } else if before.is_some() {
+                            // Checking kept frames reads every one, so hash in parallel.
+                            PixelsRead::Hash(frame_hash_parallel(v))
+                        } else {
+                            PixelsRead::Hash(frame_hash(v))
+                        };
+                        if before != Some(read) {
                             // A fixed source's frame read for the first time can't have
                             // changed what later frames computed from it; in other sources
                             // an uncached frame may have.
                             if !fixed {
                                 self.invalidate_frame(frame, invalidation_reach);
                             }
-                            self.grids.insert(frame, downsample(v, s.grid_width));
-                            self.frame_hashes.insert(frame, hash);
+                            let kept = self.kept.entry(frame).or_default();
+                            kept.grid = Some(downsample(v, s.grid_width));
+                            kept.read = Some(read);
                         }
                     }
                 }
@@ -380,12 +406,16 @@ impl IncrementalRenderer {
                         Some(motion) => motion.clone(),
                         None => {
                             let empty = LumaGrid::default();
-                            let grid = self.grids.get(&frame).unwrap_or(&empty);
+                            let grid = self
+                                .kept
+                                .get(&frame)
+                                .and_then(|k| k.grid.as_ref())
+                                .unwrap_or(&empty);
                             let mut motion = match s.detection_mode {
                                 DetectionMode::Motion => {
                                     let history = (key.background_start..frame)
                                         .filter(|k| k.rem_euclid(s.analysis_step.every) == 0)
-                                        .map(|k| self.grids.get(&k).unwrap_or(&empty));
+                                        .map(|k| self.grid(k).unwrap_or(&empty));
                                     motion::detect_motion(history, grid, &s.motion)
                                 }
                                 DetectionMode::Threshold => {
@@ -404,7 +434,7 @@ impl IncrementalRenderer {
                                 .face_source
                                 .filter(|_| {
                                     !missing.contains(&source_frame)
-                                        && self.grids.contains_key(&source_frame)
+                                        && self.grid(source_frame).is_some()
                                 })
                                 .and_then(|_| self.cached_motion(source_frame, &source_key));
                             if let Some(before) = source_motion {
@@ -427,7 +457,10 @@ impl IncrementalRenderer {
                                     motion.blobs.extend(found);
                                 }
                             }
-                            self.motion.insert(frame, (key, motion.clone()));
+                            self.kept.entry(frame).or_default().analysis = Some(KeptAnalysis {
+                                key,
+                                segments: motion.clone(),
+                            });
                             motion
                         }
                     };
@@ -450,8 +483,12 @@ impl IncrementalRenderer {
                             s.mirror,
                             include_reused_faces,
                         );
-                        self.tiles.insert(frame, (key, s.mirror, tiles));
-                        self.atlas_allocations.remove(&frame);
+                        self.kept.entry(frame).or_default().tiles = Some(KeptTiles {
+                            key,
+                            mirror: s.mirror,
+                            tiles,
+                        });
+                        self.atlas.frames.remove(&frame);
                         if held_windows_leaving {
                             self.live_faces.windows_cut_on(frame);
                         }
@@ -489,16 +526,19 @@ impl IncrementalRenderer {
             .filter(|&f| f < oldest_held_frame)
         {
             let key = analysis_key(s, frame, first);
-            let motion = self
-                .motion
-                .entry(frame)
-                .or_insert((key, Segmentation::default()));
-            motion.0 = key;
-            let tiles = self
-                .tiles
-                .entry(frame)
-                .or_insert((key, s.mirror, Vec::new()));
-            (tiles.0, tiles.1) = (key, s.mirror);
+            let kept = self.kept.entry(frame).or_default();
+            kept.analysis
+                .get_or_insert_with(|| KeptAnalysis {
+                    key,
+                    segments: Segmentation::default(),
+                })
+                .key = key;
+            let tiles = kept.tiles.get_or_insert_with(|| KeptTiles {
+                key,
+                mirror: s.mirror,
+                tiles: Vec::new(),
+            });
+            (tiles.key, tiles.mirror) = (key, s.mirror);
         }
     }
 
@@ -513,16 +553,18 @@ impl IncrementalRenderer {
         (width, height): (i32, i32),
         oldest_held_frame: i64,
     ) {
-        if self.tiles.range(..oldest_held_frame).next().is_none() {
+        let mut older = self.kept.range(..oldest_held_frame);
+        if !older.any(|(_, kept)| kept.tiles.is_some()) {
             return;
         }
         let visible: BTreeSet<(i64, usize)> =
-            build_pile(&self.tiles, s, count, number, width, height)
+            build_pile(&self.kept, s, count, number, width, height)
                 .visible_entries()
                 .map(|p| (p.frame, p.index))
                 .collect();
-        for (&frame, (_, _, tiles)) in self.tiles.range_mut(..oldest_held_frame) {
-            for (index, tile) in tiles.iter_mut().enumerate() {
+        for (&frame, kept) in self.kept.range_mut(..oldest_held_frame) {
+            let tiles = kept.tiles.iter_mut().flat_map(|cut| cut.tiles.iter_mut());
+            for (index, tile) in tiles.enumerate() {
                 if !visible.contains(&(frame, index)) {
                     tile.hidden = true;
                     tile.pixels = Vec::new();
@@ -531,11 +573,13 @@ impl IncrementalRenderer {
             }
         }
         let oldest_displayed_analysis = number - AnalysisStep::MAX_EVERY;
-        for (_, (_, motion)) in self
-            .motion
+        for (_, kept) in self
+            .kept
             .range_mut(..oldest_held_frame.min(oldest_displayed_analysis))
         {
-            motion.mask = Vec::new();
+            if let Some(analysis) = &mut kept.analysis {
+                analysis.segments.mask = Vec::new();
+            }
         }
     }
 
@@ -563,7 +607,7 @@ impl IncrementalRenderer {
             (analysis_key(s, frame, first)
                 .background_start
                 .max(oldest_held_frame)..frame)
-                .filter(|k| k.rem_euclid(s.analysis_step.every) == 0 && !self.grids.contains_key(k))
+                .filter(|&k| k.rem_euclid(s.analysis_step.every) == 0 && self.grid(k).is_none())
         };
         for frame in frames_to_analyse(s, number, first)
             .into_iter()
@@ -623,7 +667,7 @@ impl IncrementalRenderer {
             .map(str::to_owned);
         report.readings = self.readings.clone();
         report.gpu_fault = self.last_reported_fault.clone();
-        report.out_of_gpu_memory = self.oldest_frame_in_atlas.is_some();
+        report.out_of_gpu_memory = self.atlas.oldest_frame.is_some();
         report
     }
 
@@ -675,7 +719,7 @@ impl IncrementalRenderer {
         out: &mut ViewMut<C>,
     ) {
         let first = number - count as i64 + 1;
-        let pile = build_pile(&self.tiles, s, count, number, out.width, out.height);
+        let pile = build_pile(&self.kept, s, count, number, out.width, out.height);
         let (analysis_frame, motion) = self.displayed_analysis(s, number, first);
         draw_output(out, s, frame, motion, analysis_frame, pile.visible());
     }
@@ -741,79 +785,26 @@ impl IncrementalRenderer {
         };
         let m = SwarmMetrics::new(h);
         let shadow = swarm::shadow_kernel(m.scale);
-        let pile = build_pile(&self.tiles, s, count, number, w, h);
+        let pile = build_pile(&self.kept, s, count, number, w, h);
         let mut visible: Vec<PileEntry> = pile.visible_entries().collect();
-        // Only a live render goes without windows, and a live stream can end with some left out.
-        if !self.source_is_live {
-            self.oldest_frame_in_atlas = None;
-        }
-        if let Some(oldest) = self.oldest_frame_in_atlas {
-            let dropping = visible.iter().any(|p| p.frame < oldest);
-            visible.retain(|p| p.frame >= oldest);
-            // The trail has moved past what was dropped.
-            if !dropping {
-                self.oldest_frame_in_atlas = None;
-            }
-        }
+        self.atlas
+            .leave_out_dropped(&mut visible, self.source_is_live);
         let window_pixel_count = window_pixels(visible.iter().map(|p| p.tile), &m, &shadow, w, h);
-        let motion = cached_motion(&self.motion, number, &analysis_key(s, number, first))
-            .unwrap_or(&NO_SEGMENTS);
-        if window_pixel_count * 1000 < canvas_pixels * min_coverage_permille {
-            draw_output(
-                out,
-                s,
-                frame,
-                motion,
-                number,
-                visible.iter().map(|p| p.tile),
-            );
+        let enough_windows = window_pixel_count * 1000 >= canvas_pixels * min_coverage_permille;
+        let live = self.source_is_live;
+        if !enough_windows
+            || !self
+                .atlas
+                .place(&self.kept, &visible, drawer, (w, h), &shadow, live)?
+        {
+            let motion = cached_analysis(&self.kept, number, &analysis_key(s, number, first))
+                .unwrap_or(&NO_SEGMENTS);
+            let windows = visible.iter().map(|p| p.tile);
+            draw_output(out, s, frame, motion, number, windows);
             return Ok(());
         }
-        // Only frames with a visible tile keep atlas allocations, newest first. A render that may
-        // be exported must be exact, so a full atlas draws it on the CPU and frames leaving the
-        // trail free space for the next. A CPU draw would stall a live render, so that one gives
-        // up its oldest windows instead, or waits a render for a growing atlas.
-        let wanted: BTreeSet<i64> = visible.iter().map(|p| p.frame).collect();
-        self.atlas_allocations.retain(|f, _| wanted.contains(f));
-        for &f in wanted.iter().rev() {
-            if self.atlas_allocations.contains_key(&f)
-                || self.oldest_frame_in_atlas.is_some_and(|oldest| f < oldest)
-            {
-                continue;
-            }
-            let Some((_, _, tiles)) = self.tiles.get(&f) else {
-                continue;
-            };
-            loop {
-                if let Some(allocation) = drawer.upload_tiles(tiles, (w, h), &shadow)? {
-                    self.atlas_allocations.insert(f, allocation);
-                    break;
-                }
-                if !self.source_is_live {
-                    draw_output(
-                        out,
-                        s,
-                        frame,
-                        motion,
-                        number,
-                        visible.iter().map(|p| p.tile),
-                    );
-                    return Ok(());
-                }
-                if drawer.atlas_growing() {
-                    break;
-                }
-                let evicted = self.atlas_allocations.keys().next().copied();
-                let Some(oldest) = evicted.filter(|&oldest| oldest < f) else {
-                    self.oldest_frame_in_atlas = Some(f + 1);
-                    break;
-                };
-                self.atlas_allocations.remove(&oldest);
-                self.oldest_frame_in_atlas = Some(oldest + 1);
-            }
-        }
         let windows = visible.iter().filter_map(|p| {
-            let allocation = self.atlas_allocations.get(&p.frame)?;
+            let allocation = self.atlas.frames.get(&p.frame)?;
             Some((p.tile, allocation.slots[p.index]))
         });
         if into_target && let Some(offer) = self.target.as_mut() {
@@ -830,12 +821,8 @@ impl IncrementalRenderer {
     /// Clears every frame. Dropping the allocations frees their atlas space; the drawer keeps its
     /// buffers, its atlas at the size it grew to, and its fault and refusal history.
     pub fn clear_history(&mut self) {
-        self.grids.clear();
-        self.frame_hashes.clear();
-        self.motion.clear();
-        self.tiles.clear();
-        self.atlas_allocations.clear();
-        self.oldest_frame_in_atlas = None;
+        self.kept.clear();
+        self.atlas = AtlasPlacements::default();
         self.live_faces.forget();
         self.unfinished = false;
         if let Some(drawer) = &mut self.drawer {
@@ -847,57 +834,139 @@ impl IncrementalRenderer {
     fn is_cached(&self, frame: i64, key: &AnalysisKey, s: &RenderSettings) -> bool {
         self.cached_motion(frame, key).is_some()
             && (s.mode != OutputMode::Swarm
-                || cached_tiles(&self.tiles, frame, key, s.mirror).is_some())
+                || cached_tiles(&self.kept, frame, key, s.mirror).is_some())
     }
 
     fn cached_motion(&self, frame: i64, key: &AnalysisKey) -> Option<&Segmentation> {
-        cached_motion(&self.motion, frame, key)
+        cached_analysis(&self.kept, frame, key)
+    }
+
+    fn grid(&self, frame: i64) -> Option<&LumaGrid> {
+        self.kept.get(&frame)?.grid.as_ref()
+    }
+
+    fn read_before(&self, frame: i64) -> Option<PixelsRead> {
+        self.kept.get(&frame)?.read
     }
 
     /// Drops `frame`'s cached data, and the motion and tiles of the `dependents` frames after it.
     fn invalidate_frame(&mut self, frame: i64, dependents: i64) {
-        self.grids.remove(&frame);
-        self.frame_hashes.remove(&frame);
+        if let Some(kept) = self.kept.get_mut(&frame) {
+            kept.grid = None;
+            kept.read = None;
+        }
         for later in frame..=frame + dependents {
-            self.motion.remove(&later);
-            self.tiles.remove(&later);
-            self.atlas_allocations.remove(&later);
+            if let Some(kept) = self.kept.get_mut(&later) {
+                kept.analysis = None;
+                kept.tiles = None;
+            }
+            self.atlas.frames.remove(&later);
         }
     }
 
     fn retain_frames(&mut self, frames: RangeInclusive<i64>) {
-        self.grids.retain(|f, _| frames.contains(f));
-        self.frame_hashes.retain(|f, _| frames.contains(f));
-        self.motion.retain(|f, _| frames.contains(f));
-        self.tiles.retain(|f, _| frames.contains(f));
-        self.atlas_allocations.retain(|f, _| frames.contains(f));
+        self.kept.retain(|f, _| frames.contains(f));
+        self.atlas.frames.retain(|f, _| frames.contains(f));
     }
 }
 
-/// The cached motion of `frame`, if computed for `key`.
-fn cached_motion<'a>(
-    kept: &'a BTreeMap<i64, (AnalysisKey, Segmentation)>,
+/// Where kept frames' tiles sit in the atlas. It stays apart from [`KeptFrame`] because a draw
+/// changes it while the windows it draws borrow their tiles.
+#[derive(Default)]
+struct AtlasPlacements {
+    frames: BTreeMap<i64, AtlasAllocation>,
+    /// A live render out of atlas stops drawing frames older than this.
+    oldest_frame: Option<i64>,
+}
+
+impl AtlasPlacements {
+    /// Takes out the windows a live render gave up for space, until the trail has moved past them.
+    /// Only a live render goes without windows, and a live stream can end with some left out.
+    fn leave_out_dropped(&mut self, visible: &mut Vec<PileEntry>, live: bool) {
+        if !live {
+            self.oldest_frame = None;
+        }
+        if let Some(oldest) = self.oldest_frame {
+            let dropping = visible.iter().any(|p| p.frame < oldest);
+            visible.retain(|p| p.frame >= oldest);
+            if !dropping {
+                self.oldest_frame = None;
+            }
+        }
+    }
+
+    /// Gives every frame with a `visible` window a place, newest first, and only those keep one.
+    /// `false` when a render that may be exported doesn't fit: it has to be exact, so it draws on
+    /// the CPU and frames leaving the trail free space for the next. A CPU draw would stall a
+    /// `live` render, so that one gives up its oldest windows instead, or waits a render for a
+    /// growing atlas.
+    fn place(
+        &mut self,
+        kept: &BTreeMap<i64, KeptFrame>,
+        visible: &[PileEntry],
+        drawer: &mut Drawer,
+        canvas: (i32, i32),
+        shadow: &swarm::ShadowKernel,
+        live: bool,
+    ) -> Result<bool, Fault> {
+        let wanted: BTreeSet<i64> = visible.iter().map(|p| p.frame).collect();
+        self.frames.retain(|f, _| wanted.contains(f));
+        for &f in wanted.iter().rev() {
+            if self.frames.contains_key(&f) || self.oldest_frame.is_some_and(|oldest| f < oldest) {
+                continue;
+            }
+            let Some(cut) = kept.get(&f).and_then(|k| k.tiles.as_ref()) else {
+                continue;
+            };
+            loop {
+                if let Some(allocation) = drawer.upload_tiles(&cut.tiles, canvas, shadow)? {
+                    self.frames.insert(f, allocation);
+                    break;
+                }
+                if !live {
+                    return Ok(false);
+                }
+                if drawer.atlas_growing() {
+                    break;
+                }
+                let evicted = self.frames.keys().next().copied();
+                let Some(oldest) = evicted.filter(|&oldest| oldest < f) else {
+                    self.oldest_frame = Some(f + 1);
+                    break;
+                };
+                self.frames.remove(&oldest);
+                self.oldest_frame = Some(oldest + 1);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// The analysis of `frame`, if computed for `key`.
+fn cached_analysis<'a>(
+    kept: &'a BTreeMap<i64, KeptFrame>,
     frame: i64,
     key: &AnalysisKey,
 ) -> Option<&'a Segmentation> {
-    kept.get(&frame).filter(|(b, _)| b == key).map(|(_, m)| m)
+    let analysis = kept.get(&frame)?.analysis.as_ref()?;
+    (analysis.key == *key).then_some(&analysis.segments)
 }
 
-/// The cached tiles of `frame`, if cut for `key` and `mirror`.
+/// The tiles of `frame`, if cut for `key` and `mirror`.
 fn cached_tiles<'a>(
-    kept: &'a BTreeMap<i64, (AnalysisKey, bool, Vec<Tile>)>,
+    kept: &'a BTreeMap<i64, KeptFrame>,
     frame: i64,
     key: &AnalysisKey,
     mirror: bool,
 ) -> Option<&'a [Tile]> {
-    let (b, m, tiles) = kept.get(&frame)?;
-    (b == key && *m == mirror).then_some(tiles.as_slice())
+    let cut = kept.get(&frame)?.tiles.as_ref()?;
+    (cut.key == *key && cut.mirror == mirror).then_some(cut.tiles.as_slice())
 }
 
 /// The pile of the `kept` tiles a swarm render of frame `number`, the last of `count`, draws
 /// from on a `width` x `height` canvas; empty for other outputs.
 fn build_pile<'a>(
-    kept: &'a BTreeMap<i64, (AnalysisKey, bool, Vec<Tile>)>,
+    kept: &'a BTreeMap<i64, KeptFrame>,
     s: &RenderSettings,
     count: usize,
     number: i64,
@@ -1214,8 +1283,7 @@ mod tests {
         let mut state = IncrementalRenderer::default();
         render(&mut state, &frames, 10);
         render(&mut state, &frames, 2);
-        assert!(state.frame_hashes.keys().all(|&frame| frame <= 2));
-        assert!(state.motion.keys().all(|&frame| frame <= 2));
+        assert!(state.kept.keys().all(|&frame| frame <= 2));
     }
 
     const ALL_PARTS: FaceParts = FaceParts {
@@ -1424,7 +1492,7 @@ mod tests {
                 state.live_faces.hold(ALL_PARTS, vec![face], 0, 0);
                 continue;
             }
-            let (_, motion) = &state.motion[&(n as i64)];
+            let motion = &state.kept[&(n as i64)].analysis.as_ref().unwrap().segments;
             let shown = motion
                 .blobs
                 .iter()
@@ -1891,9 +1959,10 @@ mod tests {
         // The current frame's are dropped by the next render.
         let last = frames.len() as i64 - 1;
         let tiles: Vec<&Tile> = state
-            .tiles
+            .kept
             .range(..last)
-            .flat_map(|(_, (_, _, t))| t)
+            .filter_map(|(_, kept)| kept.tiles.as_ref())
+            .flat_map(|cut| &cut.tiles)
             .collect();
         let with_pixels = tiles.iter().filter(|t| !t.pixels.is_empty()).count();
         assert!(tiles.len() > 2, "the clip spawned too few tiles");
@@ -1971,10 +2040,7 @@ mod tests {
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             state.render_frame(&s, &mut history, count, n as i64, view);
         }
-        assert!(
-            state.oldest_frame_in_atlas.is_some(),
-            "the atlas never filled"
-        );
+        assert!(state.atlas.oldest_frame.is_some(), "the atlas never filled");
         assert_eq!(drawn(&state), frames.len() as u64, "a render left the GPU");
         assert_eq!(faults(&state), 0);
         assert!(state.report().out_of_gpu_memory);
@@ -2008,15 +2074,12 @@ mod tests {
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             state.render_frame(&s, &mut history, count, n as i64, view);
         }
-        assert!(
-            state.oldest_frame_in_atlas.is_some(),
-            "the atlas never filled"
-        );
+        assert!(state.atlas.oldest_frame.is_some(), "the atlas never filled");
         let n = frames.len() - 1;
         let after = render(&mut state, &frames, n);
         let fresh = render(&mut IncrementalRenderer::default(), &frames, n);
         assert!(within_a_level(&fresh, &after));
-        assert_eq!(state.oldest_frame_in_atlas, None);
+        assert_eq!(state.atlas.oldest_frame, None);
     }
 
     /// An atlas too small for the trail draws the renders it can't hold on the CPU, and the
