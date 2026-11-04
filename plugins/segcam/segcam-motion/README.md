@@ -84,11 +84,13 @@ The group is in brackets. Some sliders show a narrower range than the limit.
 It asks for the frames of the **Background** analyses before the current one, plus **Trail
 frames** - 1 in Swarm mode and 3 in the others (see below), through `CpuEffect::frames_before`.
 It keeps each frame's grid, motion and tiles
-until they age out (`src/incremental.rs`), with a hash of the frame's pixels. Every render
-still reads each frame it depends on, so an edit upstream reaches it however far back it
-is, but only a frame whose pixels changed is worked out again, along with the motion and
-tiles it feeds. A frame the host couldn't hand over counts as empty for that render and is
-read again next time. The output is the same in any render order. After Effects still makes
+until they age out (`src/incremental.rs`), with a hash of the frame's pixels. A render
+reads each frame it depends on, so an edit upstream reaches it however far back it is, and
+only a frame whose pixels changed is worked out again, along with the motion and tiles it
+feeds. While Resolve streams, a render reads the current frame and those it hasn't worked out,
+so an edit is caught when that frame is rendered, or at the next check: the first two renders
+after a pause or a jump. A frame the host couldn't hand over counts as empty for that render
+and is read again next time. The output is the same in any render order. After Effects still makes
 a new effect per render, so its cache and Multi-Frame Rendering are unchanged.
 
 Like segcam 1.1 it analyses about 30 frames a second. Where the host says the frame rate

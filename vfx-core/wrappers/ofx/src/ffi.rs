@@ -140,6 +140,7 @@ pub const ACTION_GET_ROD: &CStr = c"OfxImageEffectActionGetRegionOfDefinition";
 pub const ACTION_GET_ROIS: &CStr = c"OfxImageEffectActionGetRegionsOfInterest";
 pub const ACTION_RENDER: &CStr = c"OfxImageEffectActionRender";
 pub const ACTION_GET_FRAMES_NEEDED: &CStr = c"OfxImageEffectActionGetFramesNeeded";
+pub const ACTION_BEGIN_SEQUENCE_RENDER: &CStr = c"OfxImageEffectActionBeginSequenceRender";
 
 // Plugin and contexts.
 pub const IMAGE_EFFECT_PLUGIN_API: &CStr = c"OfxImageEffectPluginAPI";

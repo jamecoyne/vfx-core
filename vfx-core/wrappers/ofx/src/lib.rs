@@ -140,6 +140,9 @@ fn dispatch(
             render_gpu(effect, in_args)?;
         }
         STAT_OK
+    } else if action == ACTION_BEGIN_SEQUENCE_RENDER && cpu {
+        begin_sequence(effect, in_args)?;
+        STAT_OK
     } else {
         STAT_REPLY_DEFAULT
     })
@@ -588,19 +591,23 @@ struct Kept {
     last: std::sync::Mutex<Option<Rendered>>,
 }
 
-/// A frame rendered and when it finished.
+/// A frame rendered, when it finished, and whether it didn't follow on from the one before.
 #[derive(Clone, Copy)]
 struct Rendered {
     frame: i64,
     ended: std::time::Instant,
+    broke_stream: bool,
 }
 
-/// Whether a render of `frame` continues a stream of renders, as playback and Deliver make:
-/// a step forward soon after the last. Nothing upstream is edited mid-stream, so its earlier
-/// frames are taken as unchanged; the first render after a pause checks them all again.
-fn streaming(last: Option<Rendered>, frame: i64) -> bool {
+fn steps_forward_soon(last: Option<Rendered>, frame: i64) -> bool {
     const GAP: std::time::Duration = std::time::Duration::from_secs(1);
     last.is_some_and(|last| last.ended.elapsed() < GAP && (1..=120).contains(&(frame - last.frame)))
+}
+
+/// Whether a render of `frame` continues a stream, so earlier frames are taken as unchanged. The
+/// render that breaks a stream and the next check them: an export can still step back after it.
+fn streaming(last: Option<Rendered>, frame: i64) -> bool {
+    steps_forward_soon(last, frame) && last.is_some_and(|last| !last.broke_stream)
 }
 
 fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
@@ -644,12 +651,30 @@ fn destroy_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     Ok(())
 }
 
-fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a Kept>, OfxStatus> {
     let kept = effect_props(effect)?
         .get_pointer(PROP_INSTANCE_DATA)
         .unwrap_or(ptr::null_mut());
     // SAFETY: set from a Box in create-instance and freed only in destroy-instance.
-    if let Some(kept) = unsafe { kept.cast::<Kept>().as_ref() } {
+    Ok(unsafe { kept.cast::<Kept>().as_ref() })
+}
+
+/// Ends the stream, so the next render checks earlier frames. Hosts send this for single frames
+/// too, Resolve around every render, so a range of one frame leaves the stream alone.
+fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+    LOG.note("begin sequence render");
+    let range = [0, 1].map(|i| in_args.get_double(PROP_FRAME_RANGE, i));
+    if let [Ok(first), Ok(last)] = range
+        && last > first
+        && let Some(kept) = kept_for_instance(effect)?
+    {
+        *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+    Ok(())
+}
+
+fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+    if let Some(kept) = kept_for_instance(effect)? {
         let frame = in_args.get_double(PROP_TIME, 0)?.round() as i64;
         let last = *kept.last.lock().unwrap_or_else(|p| p.into_inner());
         let fixed = host::is_resolve() && streaming(last, frame);
@@ -657,6 +682,7 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Rendered {
             frame,
             ended: std::time::Instant::now(),
+            broke_stream: !steps_forward_soon(last, frame),
         });
         return rendered;
     }
@@ -817,6 +843,7 @@ mod tests {
                 last = Some(Rendered {
                     frame,
                     ended: std::time::Instant::now(),
+                    broke_stream: !steps_forward_soon(last, frame),
                 });
                 streaming
             })
@@ -826,9 +853,9 @@ mod tests {
     #[test]
     fn forward_steps_stream_and_anything_else_checks_again() {
         // How Resolve 21 starts a Deliver, then playback skipping, a seek back and a jump.
-        let frames = [0, 0, 0, 2, 1, 3, 4, 7, 5, 200];
+        let frames = [0, 0, 0, 2, 1, 3, 4, 7, 5, 200, 201, 202];
         let expected = [
-            false, false, false, true, false, true, true, true, false, false,
+            false, false, false, false, false, false, true, true, false, false, false, true,
         ];
         assert_eq!(streamed(&frames), expected);
     }

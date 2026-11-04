@@ -1,9 +1,10 @@
 //! segcam Motion worked out incrementally: each frame's grid, motion and tiles are kept, with
 //! a hash of the pixels they came from. Where earlier frames can change upstream (OpenFX), a
-//! render still reads every frame it depends on and works out again only what a changed frame
-//! feeds, so an edit reaches it however far back it is. Where they can't (a host's own history
-//! of frames, as in Resolume and the preview: [`FrameSource::fixed`]), it reads only the frames
-//! it hasn't worked out, and the current one. Results come from each frame and the settings
+//! render reads every frame it depends on and works out again only what a changed frame feeds.
+//! Where they are taken as unchanged ([`FrameSource::fixed`]: a host's own history of frames, as
+//! in Resolume and the preview, or Resolve while it streams), it reads only the frames it hasn't
+//! worked out, and the current one, so an edit in Resolve shows when that frame renders
+//! or at the next check. Results come from each frame and the settings
 //! alone, so render order doesn't change the output. Motion whose background is cut short by
 //! the start of the frames, as at the start of a clip, is kept with the frame it starts at.
 //!
@@ -16,6 +17,7 @@ use std::ops::RangeInclusive;
 use vfx_core::cpu::FrameSource;
 #[cfg(not(target_arch = "wasm32"))]
 use vfx_core::wgpu;
+use vfx_plugin::vfx_host::by_rows;
 
 use crate::gpu::{self, Cut, Drawer, Fault};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
@@ -326,9 +328,14 @@ impl Incremental {
                     }
                     Some(_) if fixed && self.prints.contains_key(&frame) => {}
                     Some(v) => {
-                        let print = current
-                            .filter(|_| frame == number)
-                            .unwrap_or_else(|| fingerprint(v));
+                        // After a pause every frame has a kept hash to check: those go on threads.
+                        let print = current.filter(|_| frame == number).unwrap_or_else(|| {
+                            if self.prints.contains_key(&frame) {
+                                fingerprint_on_threads(v)
+                            } else {
+                                fingerprint(v)
+                            }
+                        });
                         if self.prints.get(&frame) != Some(&print) {
                             // A fixed source's frame read for the first time can't have
                             // changed what later frames worked out from it; elsewhere a
@@ -874,27 +881,44 @@ fn reused_faces(motion: &Motion, frame: i64) -> impl Iterator<Item = motion::Blo
         })
 }
 
-/// A hash of every pixel, read as u64 words in four lanes so it's limited by memory bandwidth.
-fn fingerprint<C: Channel>(view: &View<C>) -> u64 {
-    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+const HASH_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
+
+fn fold_hash(hashes: impl Iterator<Item = u64>) -> u64 {
+    hashes.fold(0, |h, l| {
+        (h ^ l).wrapping_mul(HASH_MULTIPLIER).rotate_left(31)
+    })
+}
+
+/// A hash of a row, read as u64 words in four lanes so it's limited by memory bandwidth.
+fn row_hash<C: Channel>(row: &[Argb<C>]) -> u64 {
     let mut lanes = [0u64; 4];
-    for y in 0..view.height {
-        let bytes: &[u8] = bytemuck::cast_slice(view.row(y));
-        let (words, rest) = bytes.as_chunks::<8>();
-        for chunk in words.chunks(4) {
-            for (lane, word) in lanes.iter_mut().zip(chunk) {
-                *lane = (*lane ^ u64::from_le_bytes(*word))
-                    .wrapping_mul(K)
-                    .rotate_left(29);
-            }
-        }
-        for &b in rest {
-            lanes[0] = (lanes[0] ^ u64::from(b)).wrapping_mul(K);
+    let bytes: &[u8] = bytemuck::cast_slice(row);
+    let (words, rest) = bytes.as_chunks::<8>();
+    for chunk in words.chunks(4) {
+        for (lane, word) in lanes.iter_mut().zip(chunk) {
+            *lane = (*lane ^ u64::from_le_bytes(*word))
+                .wrapping_mul(HASH_MULTIPLIER)
+                .rotate_left(29);
         }
     }
-    lanes
-        .iter()
-        .fold(0, |h: u64, &l| (h ^ l).wrapping_mul(K).rotate_left(31))
+    for &b in rest {
+        lanes[0] = (lanes[0] ^ u64::from(b)).wrapping_mul(HASH_MULTIPLIER);
+    }
+    fold_hash(lanes.into_iter())
+}
+
+/// A hash of every pixel, from the rows' hashes in order, so any thread count gives the same one.
+fn fingerprint<C: Channel>(view: &View<C>) -> u64 {
+    fold_hash((0..view.height).map(|y| row_hash(view.row(y))))
+}
+
+/// [`fingerprint`] on the threads hosts convert rows on.
+fn fingerprint_on_threads<C: Channel>(view: &View<C>) -> u64 {
+    let mut rows = vec![0u64; view.height as usize];
+    by_rows(&mut rows, 1, |y, hash| {
+        hash[0] = row_hash(view.row(y as i32));
+    });
+    fold_hash(rows.into_iter())
 }
 
 #[cfg(test)]
@@ -1102,6 +1126,52 @@ mod tests {
             gpu::Drawer::on(dev).is_none(),
             "a new instance draws on the lost device"
         );
+    }
+
+    /// Prints from both paths are compared when a host stops streaming.
+    #[test]
+    fn threaded_fingerprint_matches_serial() {
+        // An odd width leaves a row's last pixel out of the words of 8-bit frames.
+        let (w, h) = (201, 130);
+        let mut pixels: Vec<Argb<u8>> = (0..w * h)
+            .map(|i| {
+                let v = (i * 7919 % 256) as u8;
+                Argb {
+                    alpha: 255,
+                    red: v,
+                    green: v.wrapping_add(1),
+                    blue: v.wrapping_add(2),
+                }
+            })
+            .collect();
+        let print = |pixels: &[Argb<u8>]| {
+            let view = View::from_pixels(pixels, w, h);
+            let serial = fingerprint(&view);
+            assert_eq!(fingerprint_on_threads(&view), serial);
+            serial
+        };
+        let before = print(&pixels);
+        let last = pixels.len() - 1;
+        for at in [0, w as usize - 1, last / 2, last] {
+            pixels[at].green ^= 1;
+            assert_ne!(print(&pixels), before, "a change at pixel {at}");
+            pixels[at].green ^= 1;
+        }
+        assert_eq!(print(&pixels), before);
+        let (top, bottom) = pixels.split_at_mut(w as usize);
+        top.swap_with_slice(&mut bottom[..w as usize]);
+        assert_ne!(print(&pixels), before, "two rows swapped");
+
+        let floats: Vec<Argb<f32>> = (0..w * h)
+            .map(|i| Argb {
+                alpha: 1.0,
+                red: i as f32 / 7.0,
+                green: 0.25,
+                blue: 0.5,
+            })
+            .collect();
+        let view = View::from_pixels(&floats, w, h);
+        assert_eq!(fingerprint_on_threads(&view), fingerprint(&view));
     }
 
     /// A validation error leaves the device usable: it is counted, not kept as a failure, so
