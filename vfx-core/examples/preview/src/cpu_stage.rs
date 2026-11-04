@@ -73,12 +73,14 @@ impl CpuStage {
         self.effect.clear_history();
         self.last_time = None;
         self.rendered_with = None;
-        // Frames still on their way belong to the old source. When a loop lands here the reader
-        // is out in `push_input`, and its frames stay valid.
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.reader = None;
-        }
+        // RAM holds nothing of the new source, so Record skips until it does, and its first picture
+        // compares as new even if it equals the old one.
+        self.shown.clear();
+        self.upload_pending = false;
+        self.output_drawn_on_gpu = false;
+        // What the reader holds, on the GPU or on its way, belongs to the old source. When a loop
+        // lands here the reader is out in `push_input`, and that stays valid.
+        self.reader = None;
     }
 
     /// Follows a new frame size, keeping the effect and its GPU resources.
@@ -567,6 +569,44 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    /// After a switch to a new source of the same size, Record has nothing until a new frame, and
+    /// a first picture equal to the old one still reaches the output frame.
+    #[test]
+    fn source_switch_leaves_no_old_picture() {
+        let (_turn, gpu) = crate::test_gpu();
+        let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu(false)));
+        let effect = CpuInstance::new(make, true).expect("a CPU effect");
+        let mut stage = CpuStage::new(&gpu, effect, (32, 32));
+        let mut values = ParamValues::new(SegcamMotion::with_gpu(false).params());
+        for (name, value) in [
+            ("detect", ParamValue::Int(0)),
+            ("eyes", ParamValue::Bool(false)),
+            ("mouth", ParamValue::Bool(false)),
+        ] {
+            values.set(name, value).expect(name);
+        }
+        let input = Frame::new(&gpu, 32, 32, crate::effects::FRAME_FORMAT);
+        input.write(&gpu, bytemuck::cast_slice(&vec![0.5f32; 32 * 32 * 4]));
+        stage.render(&gpu, Input::Gpu(&input), &values, 0.0, None, false);
+        let old = stage.shown().to_vec();
+        assert_eq!(old.len(), 32 * 32);
+
+        stage.restart();
+        assert!(stage.shown().is_empty());
+        assert!(stage.reader.is_none());
+        let waiting = stage.render(&gpu, Input::Ram(&[]), &values, 0.0, None, false);
+        assert!(!waiting.new_picture);
+        assert!(stage.shown().is_empty());
+
+        let first = stage.render(&gpu, Input::Ram(&old), &values, 0.0, None, false);
+        assert!(first.new_picture);
+        let p = old[0];
+        assert_eq!(
+            stage.output().read_rgba8(&gpu)[..4],
+            [p.red, p.green, p.blue, p.alpha]
+        );
     }
 
     /// A swarm drawn straight into the output frame against the same swarm kept in RAM, then the
