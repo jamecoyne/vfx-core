@@ -109,6 +109,7 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |
 | `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core | #59 |
 | `CpuEffect::render_to` and `Target` (a host's GPU frame the effect may draw its output into instead) | vfx-core | #70 |
+| `CpuEffect::can_draw_to_target` (whether a render can use a `Target`, so a host allocates one only then; default `false`) | vfx-core | #88 |
 | `CpuEffect::report`, `Report`, `Reading` (where the last render's work ran and what it found; default empty) | vfx-core | #68 |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core | from the start |
 | `Context::frame_rate` | vfx-core | #50 |
@@ -126,6 +127,7 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `CpuInstance::values_known` | vfx-host | #59 |
 | `CpuInstance::render_to` | vfx-host | #70 |
 | `CpuInstance::report` | vfx-host | #68 |
+| `CpuInstance::can_draw_to_target` | vfx-host | #88 |
 | `plugin::register`, `plugin`, `gpu` | vfx-host | #10 |
 | `controls::layout` | vfx-host | from the start |
 | `by_rows` (a frame in row bands over a work queue) | vfx-host | #38 |

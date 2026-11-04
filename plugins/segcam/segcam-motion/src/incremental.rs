@@ -138,6 +138,11 @@ impl IncrementalRenderer {
         }
     }
 
+    /// Whether Swarm is to draw on the GPU where there is one (see [`Self::use_gpu`]).
+    pub fn gpu_wanted(&self) -> bool {
+        self.gpu_wanted
+    }
+
     /// The drawer, once a render has drawn on the GPU.
     pub fn drawer(&self) -> Option<&Drawer> {
         self.drawer.as_deref()
