@@ -5,6 +5,8 @@ use web_time::Instant;
 
 use crate::catalog;
 use crate::controls::{self, Controls, Status};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::effects::Output;
 use crate::effects::{self, Effects};
 use crate::modulation::{self, Expressions, Sources};
 #[cfg(target_arch = "wasm32")]
@@ -300,7 +302,7 @@ impl Preview {
         self.message = match opened {
             Ok(video) => {
                 self.effects
-                    .start_stream(&self.gpu, name, video.info.size, Some(video.info.fps));
+                    .start_video(&self.gpu, name, video.info.size, video.info.fps);
                 let file = video.info.file();
                 self.media = Some(Media {
                     sound: self
@@ -413,11 +415,11 @@ impl Preview {
                 self.message = Some(e);
             }
 
-            if let Some(pixels) = media.video.take_frame() {
-                self.effects.write_source(&self.gpu, &pixels);
-                if let Some(tracker) = &self.tracker {
-                    tracker.submit(pixels, media.video.info.size);
-                }
+            self.counts.arrived += media.video.take_arrived_count();
+            if let Some(pixels) = self.effects.take_video_frame(&media.video)
+                && let Some(tracker) = &self.tracker
+            {
+                tracker.submit(pixels, media.video.info.size);
             }
             let position = media.video.position();
             frame_time = position;
@@ -440,13 +442,9 @@ impl Preview {
         let values = self
             .exprs
             .apply(c.effect, c.values(), &self.sources, dt as f32);
-        let recording = self.is_recording();
-        #[allow(unused_variables)]
-        let frame = self
-            .effects
-            .render(&self.gpu, c, &values, frame_time, recording);
+        self.effects.render(&self.gpu, c, &values, frame_time);
         #[cfg(not(target_arch = "wasm32"))]
-        self.record_frame(frame);
+        self.record_frame();
     }
 
     fn is_quiet(&self) -> bool {
@@ -466,15 +464,18 @@ impl Preview {
     /// Writes one recorded frame. A frame of another size, or a failed write, stops the
     /// recording and removes its partial file.
     #[cfg(not(target_arch = "wasm32"))]
-    fn record_frame(&mut self, frame: Option<Vec<f32>>) {
-        let (Some(recording), Some(pixels)) = (self.recording.as_mut(), frame) else {
+    fn record_frame(&mut self) {
+        let Some(recording) = self.recording.as_mut() else {
             return;
         };
-        let size_now = self.effects.size();
-        let result = if size_now == recording.size && effects::frame_fits(&pixels, size_now) {
-            recording.encoder.write(&pixels)
-        } else {
+        let result = if self.effects.size() != recording.size {
             Err("the frame size changed".to_string())
+        } else {
+            match self.effects.output(&self.gpu) {
+                Output::Cpu([]) => Ok(()), // no picture yet
+                Output::Cpu(pixels) => recording.encoder.write(pixels),
+                Output::Gpu(pixels) => recording.encoder.write_float(&pixels),
+            }
         };
         if let Err(e) = result {
             self.stop_recording_early(&e);
@@ -673,7 +674,7 @@ impl Preview {
             self.counts.render_time += rendered.render_time.unwrap_or_default();
             self.unshown |= rendered.new_picture;
             let source = match &self.media {
-                Some(media) => stats::SourceRate::Fps(media.video.info.fps),
+                Some(_) => stats::SourceRate::Video,
                 None if self.effects.image_name().is_some() => stats::SourceRate::Still,
                 None => stats::SourceRate::Pattern,
             };
@@ -1408,9 +1409,7 @@ impl Preview {
                 {
                     self.message = Some(e);
                 }
-                if let Some(pixels) = video.take_frame() {
-                    self.effects.write_layer(&self.gpu, &pixels);
-                }
+                self.effects.take_layer_frame(&self.gpu, video);
             }
             Layer::Still { image, fed } => {
                 if *fed != Some(size) {

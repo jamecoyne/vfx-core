@@ -1,6 +1,5 @@
-//! Runs a [`CpuEffect`] in the preview, which works on GPU frames: each render reads the
-//! input back, adds it to a history of recent frames (the preview hands over one frame at
-//! a time, as Resolume does), renders on the CPU and uploads the result.
+//! Runs a [`CpuEffect`] in the preview: each render adds the input to a history of recent
+//! frames (the preview hands over one frame at a time, as Resolume does) and renders on the CPU.
 //!
 //! `time` names the frame: a render at a new time adds the input as the next frame, one at
 //! the same time renders that frame again (with whatever the parameters are now), and a
@@ -11,10 +10,17 @@ use std::time::Duration;
 
 use web_time::Instant;
 
-use crate::effects::Rendered;
-use vfx_core::cpu::{Argb, Channel, History, ImageMut, ViewMut};
+use crate::effects::{Pass, Rendered};
+use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, Gpu, ParamValues};
 use vfx_host::{CpuInstance, by_rows};
+
+pub enum Input<'a> {
+    Gpu(&'a Frame),
+    /// A decoded frame in RAM; empty until the first arrives.
+    #[cfg(not(target_arch = "wasm32"))]
+    Ram(&'a [Argb<u8>]),
+}
 
 pub struct CpuStage {
     effect: CpuInstance,
@@ -27,10 +33,11 @@ pub struct CpuStage {
     rendered_with: Option<ParamValues>,
     /// Time spent so far on the render in progress, over its unfinished calls.
     rendering: Duration,
-    /// The picture in the output frame, and the same as float RGBA for its upload.
+    /// The picture in the output frame, and the same as RGBA for its upload.
     shown: Vec<Argb<u8>>,
-    upload: Vec<f32>,
-    reader: Reader,
+    upload: Vec<u8>,
+    output: Frame,
+    reader: Option<Reader>,
 }
 
 impl CpuStage {
@@ -47,52 +54,87 @@ impl CpuStage {
             rendered_with: None,
             rendering: Duration::ZERO,
             shown: Vec::new(),
-            upload: vec![0.0; pixels * 4],
-            reader: Reader::new(gpu, size),
+            upload: vec![0; pixels * 4],
+            output: Frame::new(gpu, size.0, size.1, wgpu::TextureFormat::Rgba8Unorm),
+            reader: None,
         }
     }
 
-    /// Reads the input back if it is a new frame and adds it to the history.
+    /// Starts over for a new source, whose first frame may have the time of the last one here.
+    pub fn restart(&mut self) {
+        self.history.clear();
+        self.effect.reset();
+        self.last_time = None;
+        self.rendered_with = None;
+    }
+
+    pub fn output(&self) -> &Frame {
+        &self.output
+    }
+
+    /// The last picture in RAM; empty until the first.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn shown(&self) -> &[Argb<u8>] {
+        &self.shown
+    }
+
+    fn next_frame(
+        &mut self,
+        time: f64,
+        values: &ParamValues,
+        frame_rate: Option<f64>,
+    ) -> &mut [Argb<u8>] {
+        if self.last_time.is_some_and(|last| time < last) {
+            self.history.clear();
+            self.effect.reset();
+        }
+        self.last_time = Some(time);
+        self.rendered_with = None;
+        let before = self.effect.frames_before(values, frame_rate);
+        let held = self.effect.frames_held(values, frame_rate);
+        self.history.next(before, held)
+    }
+
     fn push(
         &mut self,
         gpu: &Gpu,
-        input: &Frame,
+        input: Input,
         time: f64,
         values: &ParamValues,
         frame_rate: Option<f64>,
     ) {
-        let Self {
-            reader,
-            history,
-            effect,
-            last_time,
-            rendered_with,
-            size,
-            ..
-        } = self;
-        let width = size.0 as usize;
-        let read = reader.read(gpu, input, time, *last_time, |time, rgba, pitch| {
-            if last_time.is_some_and(|last| time < last) {
-                history.clear();
-                effect.reset();
+        match input {
+            Input::Gpu(frame) => {
+                let mut reader = self
+                    .reader
+                    .take()
+                    .unwrap_or_else(|| Reader::new(gpu, self.size));
+                let width = self.size.0 as usize;
+                reader.read(gpu, frame, time, self.last_time, |time, rgba, pitch| {
+                    let frame = self.next_frame(time, values, frame_rate);
+                    by_rows(frame, width, |y, dst| {
+                        let src = &rgba[y * pitch..][..width * 4];
+                        for (dst, &[red, green, blue, alpha]) in
+                            dst.iter_mut().zip(src.as_chunks::<4>().0)
+                        {
+                            *dst = Argb {
+                                alpha,
+                                red,
+                                green,
+                                blue,
+                            };
+                        }
+                    });
+                });
+                self.reader = Some(reader);
             }
-            *last_time = Some(time);
-            let before = effect.frames_before(values, frame_rate);
-            let frame = history.next(before, effect.frames_held(values, frame_rate));
-            by_rows(frame, width, |y, dst| {
-                let src = &rgba[y * pitch..][..width * 4];
-                for (dst, &[r, g, b, a]) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
-                    *dst = Argb {
-                        alpha: u8::from_unit(a),
-                        red: u8::from_unit(r),
-                        green: u8::from_unit(g),
-                        blue: u8::from_unit(b),
-                    };
+            #[cfg(not(target_arch = "wasm32"))]
+            Input::Ram(pixels) => {
+                if !pixels.is_empty() && self.last_time != Some(time) {
+                    self.next_frame(time, values, frame_rate)
+                        .copy_from_slice(pixels);
                 }
-            });
-        });
-        if read {
-            *rendered_with = None;
+            }
         }
     }
 
@@ -132,7 +174,7 @@ impl CpuStage {
             by_rows(&mut self.upload, width * 4, |y, dst| {
                 let src = &shown[y * width..][..width];
                 for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
-                    *dst = [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit);
+                    *dst = [p.red, p.green, p.blue, p.alpha];
                 }
             });
         }
@@ -146,8 +188,7 @@ impl CpuStage {
     pub fn render(
         &mut self,
         gpu: &Gpu,
-        input: &Frame,
-        output: &Frame,
+        input: Input,
         values: &ParamValues,
         time: f64,
         frame_rate: Option<f64>,
@@ -162,28 +203,47 @@ impl CpuStage {
         }
         if self.history.is_empty() {
             // Nothing read back yet (the web build reads a frame late): show the input.
-            let mut encoder = gpu.device.create_command_encoder(&Default::default());
-            encoder.copy_texture_to_texture(
-                input.texture.as_image_copy(),
-                output.texture.as_image_copy(),
-                input.texture.size(),
-            );
-            gpu.queue.submit(Some(encoder.finish()));
+            if let Some(reader) = &self.reader {
+                let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                encoder.copy_texture_to_texture(
+                    reader.eight_bit.texture.as_image_copy(),
+                    self.output.texture.as_image_copy(),
+                    self.output.texture.size(),
+                );
+                gpu.queue.submit(Some(encoder.finish()));
+            }
         } else if rendered.new_picture {
-            output.write(gpu, bytemuck::cast_slice(&self.upload));
+            self.output.write(gpu, &self.upload);
         }
         rendered
     }
 }
+
+const EIGHT_BIT_WGSL: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32(i & 1u) * 4.0 - 1.0;
+    let y = f32(i & 2u) * 2.0 - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(src, vec2<i32>(pos.xy), 0);
+}
+"#;
 
 /// Reads input frames back to the CPU. On the desktop it waits for each one, so every frame
 /// an export renders is in the history. Browsers can't wait on the GPU, so the web build
 /// maps each frame without waiting and takes it at a later render: the output runs a frame
 /// or two behind the input.
 struct Reader {
+    eight_bit: Frame,
+    pass: Pass,
     buffer: wgpu::Buffer,
     pitch: u32,
-    size: (u32, u32),
     #[cfg(target_arch = "wasm32")]
     in_flight: Option<InFlight>,
 }
@@ -204,7 +264,8 @@ const FAILED: u8 = 2;
 
 impl Reader {
     fn new(gpu: &Gpu, size: (u32, u32)) -> Self {
-        let pitch = (size.0 * 16).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let pitch = (size.0 * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("CPU effect readback"),
             size: u64::from(pitch) * u64::from(size.1),
@@ -212,47 +273,66 @@ impl Reader {
             mapped_at_creation: false,
         });
         Self {
+            eight_bit: Frame::new(gpu, size.0, size.1, format),
+            pass: Pass::new(
+                &gpu.device,
+                EIGHT_BIT_WGSL,
+                wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                format,
+            ),
             buffer,
             pitch,
-            size,
             #[cfg(target_arch = "wasm32")]
             in_flight: None,
         }
     }
 
     fn copy(&self, gpu: &Gpu, input: &Frame) {
+        let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pass.layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&input.view),
+            }],
+        });
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        self.pass.draw(&mut encoder, &bind, &self.eight_bit.view);
         encoder.copy_texture_to_buffer(
-            input.texture.as_image_copy(),
+            self.eight_bit.texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &self.buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.pitch),
-                    rows_per_image: Some(self.size.1),
+                    rows_per_image: Some(self.eight_bit.height),
                 },
             },
-            input.texture.size(),
+            self.eight_bit.texture.size(),
         );
         gpu.queue.submit(Some(encoder.finish()));
     }
 
-    /// Hands `f` the mapped buffer as float RGBA rows `pitch` floats apart, with the time
-    /// of the frame in it, then unmaps it.
-    fn take(&self, time: f64, f: impl FnOnce(f64, &[f32], usize)) {
+    /// Hands `f` the mapped buffer as RGBA rows `pitch` bytes apart, with the time of the
+    /// frame in it, then unmaps it.
+    fn take(&self, time: f64, f: impl FnOnce(f64, &[u8], usize)) {
         let data = self
             .buffer
             .slice(..)
             .get_mapped_range()
             .expect("readback is mapped");
-        f(time, bytemuck::cast_slice(&data), self.pitch as usize / 4);
+        f(time, &data, self.pitch as usize);
         drop(data);
         self.buffer.unmap();
     }
 
     /// Reads the input back if it is a new frame (a time other than `last`) and hands it
-    /// to `f` as float RGBA rows `pitch` floats apart, with the time it was rendered at.
-    /// The buffer is unmapped again when this returns. True when `f` ran.
+    /// to `f` as RGBA rows `pitch` bytes apart, with the time it was rendered at.
+    /// The buffer is unmapped again when this returns.
     #[cfg(not(target_arch = "wasm32"))]
     fn read(
         &mut self,
@@ -260,10 +340,10 @@ impl Reader {
         input: &Frame,
         time: f64,
         last: Option<f64>,
-        f: impl FnOnce(f64, &[f32], usize),
-    ) -> bool {
+        f: impl FnOnce(f64, &[u8], usize),
+    ) {
         if last == Some(time) {
-            return false;
+            return;
         }
         self.copy(gpu, input);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -279,7 +359,6 @@ impl Reader {
             .expect("map callback dropped")
             .expect("readback failed to map");
         self.take(time, f);
-        true
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -289,24 +368,24 @@ impl Reader {
         input: &Frame,
         time: f64,
         last: Option<f64>,
-        f: impl FnOnce(f64, &[f32], usize),
-    ) -> bool {
+        f: impl FnOnce(f64, &[u8], usize),
+    ) {
         use std::sync::atomic::{AtomicU8, Ordering};
         if let Some(flight) = self.in_flight.take() {
             match flight.state.load(Ordering::Acquire) {
                 MAPPED => {
                     self.take(flight.time, f);
-                    return true;
+                    return;
                 }
                 FAILED => {} // a new frame is read below; the lost one is skipped
                 _ => {
                     self.in_flight = Some(flight);
-                    return false; // still on its way; the next render looks again
+                    return; // still on its way; the next render looks again
                 }
             }
         }
         if last == Some(time) {
-            return false;
+            return;
         }
         self.copy(gpu, input);
         let state = std::sync::Arc::new(AtomicU8::new(PENDING));
@@ -317,6 +396,93 @@ impl Reader {
                 done.store(if r.is_ok() { MAPPED } else { FAILED }, Ordering::Release);
             });
         self.in_flight = Some(InFlight { time, state });
-        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{self, find};
+    use vfx_core::cpu::{Channel, FrameSource, Image};
+
+    /// Every value of every channel, so a rounding on the way would show.
+    fn varied_pixels(width: usize, height: usize) -> Vec<Argb<u8>> {
+        (0..width * height)
+            .map(|i| Argb {
+                alpha: i as u8,
+                red: (i / 2) as u8,
+                green: !(i as u8),
+                blue: (i * 7) as u8,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn decoded_frame_reaches_history() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut controls = crate::controls::Controls::default();
+        controls.effect = find("segcam Motion (Rust)").unwrap();
+        let values = controls.values().clone();
+        let make = catalog::entries()[controls.effect].make;
+        let effect = CpuInstance::new(make, true).expect("a CPU effect");
+        let mut stage = CpuStage::new(&gpu, effect, (64, 48));
+        let decoded = varied_pixels(64, 48);
+
+        stage.push(&gpu, Input::Ram(&[]), 0.0, &values, None);
+        assert!(stage.history.is_empty(), "nothing has arrived yet");
+        stage.push(&gpu, Input::Ram(&decoded), 0.0, &values, None);
+        stage.push(&gpu, Input::Ram(&decoded), 0.0, &values, None);
+        assert_eq!(stage.history.frame_number(), 0);
+
+        let mut seen = Vec::new();
+        stage.history.with_frame(0, &mut |image| {
+            let Some(Image::U8(view)) = image else {
+                panic!("8 bit frames");
+            };
+            for y in 0..view.height {
+                seen.extend_from_slice(view.row(y));
+            }
+        });
+        assert_eq!(seen, decoded);
+        assert!(stage.reader.is_none(), "RAM frames need no readback");
+    }
+
+    /// Within 1 level of the float readback: the GPU rounds a tie its own way.
+    #[test]
+    fn float_frame_reads_at_8_bit() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut controls = crate::controls::Controls::default();
+        controls.effect = find("segcam Motion (Rust)").unwrap();
+        let values = controls.values().clone();
+        let make = catalog::entries()[controls.effect].make;
+        let effect = CpuInstance::new(make, true).expect("a CPU effect");
+        let (w, h) = (256usize, 64usize);
+        let mut stage = CpuStage::new(&gpu, effect, (w as u32, h as u32));
+
+        let float: Vec<f32> = (0..w * h)
+            .flat_map(|i| {
+                let v = (i % 4096) as f32 / 4095.0;
+                [v, 1.0 - v, v * 0.5, 0.25 + v * 0.75]
+            })
+            .collect();
+        let input = Frame::new(&gpu, w as u32, h as u32, crate::effects::FRAME_FORMAT);
+        input.write(&gpu, bytemuck::cast_slice(&float));
+        stage.push(&gpu, Input::Gpu(&input), 0.0, &values, None);
+
+        stage.history.with_frame(0, &mut |image| {
+            let Some(Image::U8(view)) = image else {
+                panic!("8 bit frames");
+            };
+            for y in 0..view.height {
+                for (x, p) in view.row(y).iter().enumerate() {
+                    let f = &float[(y as usize * w + x) * 4..][..4];
+                    let got = [p.red, p.green, p.blue, p.alpha];
+                    for (got, &f) in got.into_iter().zip(f) {
+                        let want = i32::from(u8::from_unit(f));
+                        assert!((i32::from(got) - want).abs() <= 1, "{got} for {f}");
+                    }
+                }
+            }
+        });
     }
 }

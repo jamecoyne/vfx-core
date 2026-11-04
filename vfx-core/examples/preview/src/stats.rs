@@ -19,6 +19,8 @@ pub struct Counts {
     pub render_time: Duration,
     /// Pictures presented in the window that differ from the one before.
     pub screen: u64,
+    /// Frames that arrived from a video or camera, taken or not.
+    pub arrived: u64,
 }
 
 impl Counts {
@@ -27,6 +29,7 @@ impl Counts {
             rendered: self.rendered - earlier.rendered,
             render_time: self.render_time - earlier.render_time,
             screen: self.screen - earlier.screen,
+            arrived: self.arrived - earlier.arrived,
         }
     }
 
@@ -45,8 +48,8 @@ pub enum SourceRate {
     Pattern,
     /// A dropped image.
     Still,
-    /// A video or camera, at its frame rate.
-    Fps(f64),
+    /// A video or camera, at the rate its frames arrive.
+    Video,
 }
 
 /// The effect and source of the moment, which the loop knows and the bar names.
@@ -66,8 +69,9 @@ pub struct What {
 pub struct Snapshot {
     pub counts: Counts,
     pub what: What,
-    /// Over the last second: renders and new frames a second, and a render's mean and
-    /// longest time in ms (a CPU effect's).
+    /// Over the last second: frames in, renders and new frames a second, and a render's mean
+    /// and longest time in ms (a CPU effect's).
+    pub source: f32,
     pub rendered: f32,
     pub screen: f32,
     pub render_ms: Option<f32>,
@@ -94,6 +98,7 @@ impl Default for Snapshot {
                 source: SourceRate::default(),
                 size: (0, 0),
             },
+            source: 0.0,
             rendered: 0.0,
             screen: 0.0,
             render_ms: None,
@@ -185,6 +190,7 @@ impl Sampler {
             if let Some(last) = self.last {
                 let seconds = last.elapsed().as_secs_f32();
                 let done = counts.since(self.last_counts);
+                self.snapshot.source = done.arrived as f32 / seconds;
                 self.snapshot.rendered = done.rendered as f32 / seconds;
                 self.snapshot.screen = done.screen as f32 / seconds;
                 self.snapshot.render_ms = done.render_ms().map(|ms| ms as f32);
@@ -224,11 +230,11 @@ fn gpu_percent() -> Option<f32> {
 }
 
 /// The source slot's text.
-pub fn source_text(source: SourceRate) -> String {
-    match source {
+pub fn source_text(s: &Snapshot) -> String {
+    match s.what.source {
         SourceRate::Pattern => "source pattern".to_owned(),
         SourceRate::Still => "source still".to_owned(),
-        SourceRate::Fps(fps) => format!("source {fps:.0} fps"),
+        SourceRate::Video => format!("source {:.0} fps", s.source),
     }
 }
 
@@ -251,7 +257,7 @@ pub fn bar(ui: &mut Ui, s: &Snapshot) {
     ui.horizontal_wrapped(|ui| {
         ui.monospace(format!("{} × {}", s.what.size.0, s.what.size.1));
         ui.separator();
-        ui.monospace(source_text(s.what.source));
+        ui.monospace(source_text(s));
         ui.separator();
         ui.monospace(effect_text(s));
         ui.separator();

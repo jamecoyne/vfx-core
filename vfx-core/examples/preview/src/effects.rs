@@ -1,15 +1,21 @@
 //! Everything on the effects side of the preview: a test-pattern generator (or an image
 //! or video someone dropped on the window), the one effect being shown, and a pass that
-//! turns the float result into an 8-bit texture egui can draw.
+//! turns the result into an 8-bit texture egui can draw.
 
+#[cfg(not(target_arch = "wasm32"))]
+use vfx_core::Readback;
+#[cfg(not(target_arch = "wasm32"))]
+use vfx_core::cpu::{Argb, Channel};
 use vfx_core::effects::PixelConvert;
-use vfx_core::{EffectChain, Frame, Gpu, ParamValues, Processor, Readback};
+use vfx_core::{EffectChain, Frame, Gpu, ParamValues, Processor};
 
 use crate::catalog;
 use crate::controls::Controls;
-use crate::cpu_stage::CpuStage;
+use crate::cpu_stage::{self, CpuStage};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::video::Video;
 
-/// Frames are straight-alpha, gamma-encoded RGBA32F, as in the plugins.
+/// GPU frames are straight-alpha, gamma-encoded RGBA32F, as in the plugins.
 pub const FRAME_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 /// Generated patterns render at this size; dropped images keep their own.
@@ -105,13 +111,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 "#;
 
 /// A fullscreen-triangle pass with one bind group.
-struct Pass {
+pub struct Pass {
     pipeline: wgpu::RenderPipeline,
-    layout: wgpu::BindGroupLayout,
+    pub layout: wgpu::BindGroupLayout,
 }
 
 impl Pass {
-    fn new(
+    pub fn new(
         device: &wgpu::Device,
         wgsl: &str,
         entry: wgpu::BindingType,
@@ -163,7 +169,7 @@ impl Pass {
         Self { pipeline, layout }
     }
 
-    fn draw(
+    pub fn draw(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         bind: &wgpu::BindGroup,
@@ -194,6 +200,33 @@ impl Pass {
 /// Whether `pixels` is one float RGBA frame of `size`.
 pub fn frame_fits(pixels: &[f32], size: (u32, u32)) -> bool {
     pixels.len() == (size.0 * size.1 * 4) as usize
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn to_float(pixels: &[Argb<u8>], width: usize, float: &mut Vec<f32>) {
+    float.resize(pixels.len() * 4, 0.0);
+    let table: [f32; 256] = std::array::from_fn(|b| (b as u8).to_unit());
+    vfx_host::by_rows(float, width * 4, |y, dst| {
+        let src = &pixels[y * width..][..width];
+        for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+            *dst = [p.red, p.green, p.blue, p.alpha].map(|b| table[usize::from(b)]);
+        }
+    });
+}
+
+/// A video's newest frame in RAM, uploaded as float only while a GPU effect is shown.
+#[cfg(not(target_arch = "wasm32"))]
+struct VideoFrame {
+    /// Empty until the first arrives.
+    pixels: Vec<Argb<u8>>,
+    time: f64,
+    on_gpu: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub enum Output<'a> {
+    Cpu(&'a [Argb<u8>]),
+    Gpu(Vec<f32>),
 }
 
 /// Size-dependent frames, rebuilt when the source size changes.
@@ -307,12 +340,21 @@ pub struct Effects {
     frames: Frames,
     /// A dropped image, uploaded once, used instead of the generated pattern.
     image: Option<(String, Frame)>,
+    /// With a playing video as the source, its frame; `image` is that frame for a GPU effect.
+    #[cfg(not(target_arch = "wasm32"))]
+    video: Option<VideoFrame>,
+    #[cfg(not(target_arch = "wasm32"))]
+    layer_pixels: Vec<Argb<u8>>,
+    /// A decoded frame as float, kept for the next.
+    #[cfg(not(target_arch = "wasm32"))]
+    float: Vec<f32>,
     /// The fed layer's name, when a video, webcam or image is its source; its pixels are
     /// written into `frames.layer` (see [`Effects::write_layer`]).
     layer_name: Option<String>,
     /// The streamed video's frames a second, for effects that pace their work by it.
     frame_rate: Option<f64>,
     /// Reads results back for exports; made on first use for the current size.
+    #[cfg(not(target_arch = "wasm32"))]
     readback: Option<Readback>,
     generator: Pass,
     display_pass: Pass,
@@ -346,8 +388,15 @@ impl Effects {
         Self {
             frames: Frames::new(gpu, PATTERN_SIZE),
             image: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            video: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            layer_pixels: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            float: Vec::new(),
             layer_name: None,
             frame_rate: None,
+            #[cfg(not(target_arch = "wasm32"))]
             readback: None,
             generator,
             display_pass,
@@ -391,7 +440,10 @@ impl Effects {
     fn set_size(&mut self, gpu: &Gpu, size: (u32, u32)) {
         if self.frames.size != size {
             self.frames = Frames::new(gpu, size);
-            self.readback = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.readback = None;
+            }
             self.reset(gpu);
         }
     }
@@ -429,6 +481,19 @@ impl Effects {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn take_layer_frame(&mut self, gpu: &Gpu, video: &Video) {
+        let fresh = video.take_newest(&mut self.layer_pixels).is_some();
+        if fresh && self.stage.layers > 0 && video.info.size == self.frames.size {
+            to_float(
+                &self.layer_pixels,
+                video.info.size.0 as usize,
+                &mut self.float,
+            );
+            self.write_layer(gpu, &self.float);
+        }
+    }
+
     pub fn image_name(&self) -> Option<&str> {
         self.image.as_ref().map(|(name, _)| name.as_str())
     }
@@ -458,6 +523,7 @@ impl Effects {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         self.image = Some((name, frame));
+        self.video = None;
         Ok(())
     }
 
@@ -475,6 +541,31 @@ impl Effects {
         self.frame_rate = frame_rate;
         let frame = Frame::new(gpu, size.0, size.1, FRAME_FORMAT);
         self.image = Some((name, frame));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.video = None;
+        }
+        if let Run::Cpu(stage) = &mut self.stage.run {
+            stage.restart();
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_video(&mut self, gpu: &Gpu, name: String, size: (u32, u32), frame_rate: f64) {
+        self.start_stream(gpu, name, size, Some(frame_rate));
+        self.video = Some(VideoFrame {
+            pixels: Vec::new(),
+            time: 0.0,
+            on_gpu: false,
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn take_video_frame(&mut self, video: &Video) -> Option<&[Argb<u8>]> {
+        let frame = self.video.as_mut()?;
+        frame.time = video.take_frame(&mut frame.pixels)?;
+        frame.on_gpu = false;
+        Some(&frame.pixels)
     }
 
     /// Replaces the source's pixels (float RGBA at the source size).
@@ -501,6 +592,10 @@ impl Effects {
     /// Goes back to the generated patterns.
     pub fn clear_image(&mut self, gpu: &Gpu) {
         self.frame_rate = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.video = None;
+        }
         if self.image.take().is_some() {
             self.set_size(gpu, self.pattern_size);
         }
@@ -549,19 +644,13 @@ impl Effects {
     }
 
     /// Renders one frame of `controls`' effect with `values` (its parameters, after
-    /// expressions). With `capture`, also reads the result back (float RGBA, blocking
-    /// until the GPU is done) for exports.
-    pub fn render(
-        &mut self,
-        gpu: &Gpu,
-        controls: &Controls,
-        values: &ParamValues,
-        time: f64,
-        capture: bool,
-    ) -> Option<Vec<f32>> {
+    /// expressions). A video's frame has its own time, in place of `time`.
+    pub fn render(&mut self, gpu: &Gpu, controls: &Controls, values: &ParamValues, time: f64) {
         if self.stage.effect != controls.effect {
             self.stage = Stage::new(gpu, controls.effect, self.frames.size);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let time = self.video.as_ref().map_or(time, |video| video.time);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         let source = match &self.image {
             Some((_, frame)) => frame,
@@ -585,15 +674,23 @@ impl Effects {
         } else {
             &[]
         };
-        let result = &self.frames.output;
         match &mut self.stage.run {
             Run::Gpu {
                 chain,
                 index,
                 drawn,
             } => {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(video) = &mut self.video
+                    && !video.on_gpu
+                    && !video.pixels.is_empty()
+                {
+                    video.on_gpu = true;
+                    to_float(&video.pixels, source.width as usize, &mut self.float);
+                    source.write(gpu, bytemuck::cast_slice(&self.float));
+                }
                 *chain.params_mut(*index) = values.clone();
-                chain.render_with_layers(gpu, source, layers, result, time);
+                chain.render_with_layers(gpu, source, layers, &self.frames.output, time);
                 let new_picture = drawn
                     .as_ref()
                     .is_none_or(|(at, with)| *at != time || with != values);
@@ -607,10 +704,21 @@ impl Effects {
                 };
             }
             Run::Cpu(stage) => {
-                self.rendered = stage.render(gpu, source, result, values, time, self.frame_rate);
+                #[cfg(not(target_arch = "wasm32"))]
+                let input = match &self.video {
+                    Some(video) => cpu_stage::Input::Ram(&video.pixels),
+                    None => cpu_stage::Input::Gpu(source),
+                };
+                #[cfg(target_arch = "wasm32")]
+                let input = cpu_stage::Input::Gpu(source);
+                self.rendered = stage.render(gpu, input, values, time, self.frame_rate);
             }
         }
 
+        let result = match &self.stage.run {
+            Run::Gpu { .. } => &self.frames.output,
+            Run::Cpu(stage) => stage.output(),
+        };
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.display_pass.layout,
@@ -623,12 +731,22 @@ impl Effects {
         self.display_pass
             .draw(&mut encoder, &bind, &self.frames.display_view);
         gpu.queue.submit(Some(encoder.finish()));
+    }
 
-        capture.then(|| {
-            self.readback
-                .get_or_insert_with(|| Readback::new(gpu, result))
-                .read_f32(gpu, result)
-        })
+    /// The last render's output: a CPU effect's from RAM, a GPU effect's read back, blocking.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn output(&mut self, gpu: &Gpu) -> Output<'_> {
+        match &self.stage.run {
+            Run::Gpu { .. } => {
+                let result = &self.frames.output;
+                let pixels = self
+                    .readback
+                    .get_or_insert_with(|| Readback::new(gpu, result))
+                    .read_f32(gpu, result);
+                Output::Gpu(pixels)
+            }
+            Run::Cpu(stage) => Output::Cpu(stage.shown()),
+        }
     }
 }
 
@@ -646,6 +764,23 @@ mod tests {
         (controls, values)
     }
 
+    fn render_to_float(
+        effects: &mut Effects,
+        gpu: &Gpu,
+        controls: &Controls,
+        values: &ParamValues,
+        time: f64,
+    ) -> Vec<f32> {
+        effects.render(gpu, controls, values, time);
+        match effects.output(gpu) {
+            Output::Gpu(pixels) => pixels,
+            Output::Cpu(pixels) => pixels
+                .iter()
+                .flat_map(|p| [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit))
+                .collect(),
+        }
+    }
+
     /// Renders the moving-disc pattern (a left-to-right red gradient underneath) through
     /// Flip, off and then on, and checks the result is mirrored.
     #[test]
@@ -653,9 +788,9 @@ mod tests {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
         let (controls, mut values) = shown("Flip");
-        let plain = effects.render(&gpu, &controls, &values, 0.0, true).unwrap();
+        let plain = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
         values.set("flip_x", ParamValue::Float(1.0)).unwrap();
-        let flipped = effects.render(&gpu, &controls, &values, 0.0, true).unwrap();
+        let flipped = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
 
         let (w, h) = PATTERN_SIZE;
         let at = |pixels: &[f32], x: u32, y: u32| {
@@ -682,7 +817,7 @@ mod tests {
             let mut controls = Controls::default();
             controls.effect = i;
             let values = controls.values().clone();
-            let out = effects.render(&gpu, &controls, &values, 0.0, true).unwrap();
+            let out = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
             assert_eq!(out.len(), (PATTERN_SIZE.0 * PATTERN_SIZE.1 * 4) as usize);
             assert!(out.iter().all(|v| v.is_finite()), "{}", entry.name);
         }
@@ -698,9 +833,7 @@ mod tests {
         values.set("output", ParamValue::Int(1)).unwrap();
         let mut out = Vec::new();
         for f in 0..6 {
-            out = effects
-                .render(&gpu, &controls, &values, f64::from(f) * 0.2, true)
-                .unwrap();
+            out = render_to_float(&mut effects, &gpu, &controls, &values, f64::from(f) * 0.2);
         }
         let alpha: Vec<f32> = out.iter().skip(3).step_by(4).copied().collect();
         assert!(alpha.contains(&1.0), "nothing moved");
@@ -717,8 +850,8 @@ mod tests {
         let size = (64, 64);
         effects.start_stream(&gpu, "still".into(), size, None);
         let render = |effects: &mut Effects, time| {
-            let frame = effects.render(&gpu, &controls, &values, time, true);
-            (effects.rendered(), frame.unwrap())
+            let frame = render_to_float(effects, &gpu, &controls, &values, time);
+            (effects.rendered(), frame)
         };
 
         effects.write_source(&gpu, &vec![0.25; 64 * 64 * 4]);
@@ -740,6 +873,71 @@ mod tests {
         let (changed, after) = render(&mut effects, 4.0);
         assert!(changed.finished && changed.new_picture);
         assert_ne!(before, after);
+    }
+
+    /// segcam's first render shows its input, so a frame in RAM comes out unchanged.
+    #[test]
+    fn video_frame_passes_unchanged() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut effects = Effects::new(&gpu);
+        let (controls, values) = shown("segcam Motion (Rust)");
+        let pixels: Vec<Argb<u8>> = (0..64 * 64)
+            .map(|i: usize| Argb {
+                alpha: 255,
+                red: i as u8,
+                green: (i / 3) as u8,
+                blue: !(i as u8),
+            })
+            .collect();
+        effects.start_video(&gpu, "clip".into(), (64, 64), 60.0);
+        effects.render(&gpu, &controls, &values, 0.0);
+        assert!(!effects.rendered().finished, "no frame has arrived");
+
+        effects.video.as_mut().unwrap().pixels = pixels.clone();
+        effects.render(&gpu, &controls, &values, 0.0);
+        let Output::Cpu(out) = effects.output(&gpu) else {
+            panic!("segcam is a CPU effect");
+        };
+        assert_eq!(out, pixels);
+        // The texture the display pass reads holds the same picture in RGBA order.
+        let Run::Cpu(stage) = &effects.stage.run else {
+            panic!("segcam is a CPU effect");
+        };
+        let on_gpu = stage.output().read_rgba8(&gpu);
+        for (p, rgba) in pixels.iter().zip(on_gpu.as_chunks::<4>().0) {
+            assert_eq!([p.red, p.green, p.blue, p.alpha], *rgba);
+        }
+
+        let (controls, values) = shown("Flip");
+        let out = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
+        let want: Vec<f32> = pixels
+            .iter()
+            .flat_map(|p| [p.red, p.green, p.blue, p.alpha].map(|b| f32::from(b) / 255.0))
+            .collect();
+        assert_eq!(out, want);
+    }
+
+    /// Both videos' first frames have time 0, which must not read as the same frame.
+    #[test]
+    fn new_video_replaces_picture() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut effects = Effects::new(&gpu);
+        let (controls, values) = shown("segcam Motion (Rust)");
+        for shade in [64, 192] {
+            let grey = Argb {
+                alpha: 255,
+                red: shade,
+                green: shade,
+                blue: shade,
+            };
+            effects.start_video(&gpu, "clip".into(), (64, 64), 60.0);
+            effects.video.as_mut().unwrap().pixels = vec![grey; 64 * 64];
+            effects.render(&gpu, &controls, &values, 0.0);
+            let Output::Cpu(out) = effects.output(&gpu) else {
+                panic!("segcam is a CPU effect");
+            };
+            assert!(out.iter().all(|p| *p == grey), "shade {shade}");
+        }
     }
 }
 

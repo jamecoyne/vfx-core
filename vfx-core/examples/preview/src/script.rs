@@ -335,7 +335,7 @@ fn counts_text(seconds: f64, worst: Duration, what: &What, done: Counts) -> Stri
     let source = match what.source {
         SourceRate::Pattern => "pattern".to_owned(),
         SourceRate::Still => "still".to_owned(),
-        SourceRate::Fps(fps) => format!("{fps:.1}"),
+        SourceRate::Video => format!("{:.1}", done.arrived as f64 / seconds),
     };
     let mut text = format!(
         "effect={} on={} source={source} rendered={:.1}",
@@ -480,7 +480,7 @@ mod tests {
                 effect: "segcam Motion",
                 slug: "segcam-motion",
                 on_cpu: true,
-                source: SourceRate::Fps(59.94),
+                source: SourceRate::Video,
                 size: (1920, 1080),
             },
             ..Default::default()
@@ -489,10 +489,11 @@ mod tests {
             rendered: 60,
             render_time: Duration::from_millis(600),
             screen: 30,
+            arrived: 59,
         };
         assert_eq!(
             line(1.0, 1.0, Duration::from_millis(20), &s, done),
-            "stats t=1.0 effect=segcam-motion on=cpu source=59.9 rendered=60.0 rendered_ms=10.0 \
+            "stats t=1.0 effect=segcam-motion on=cpu source=59.0 rendered=60.0 rendered_ms=10.0 \
              worst_ms=20.0 screen=30.0 size=1920x1080 cpu=0.0 app_cpu=0.0 mem_mb=0 gpu=n/a"
         );
         let s = Snapshot {
@@ -509,6 +510,7 @@ mod tests {
             rendered: 120,
             render_time: Duration::ZERO,
             screen: 120,
+            arrived: 0,
         };
         assert_eq!(
             line(2.0, 1.0, Duration::ZERO, &s, done),
