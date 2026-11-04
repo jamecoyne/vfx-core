@@ -429,18 +429,17 @@ fn fetch_image(clip: Clip, time: OfxTime) -> Result<Option<FetchedImage>, OfxSta
     Ok(Some(fetched))
 }
 
-/// The host's time (frames) in seconds.
-fn seconds(effect: ImageEffect, time: OfxTime) -> Result<f64, OfxStatus> {
-    let rate = effect_props(effect)?
-        .get_double(PROP_FRAME_RATE, 0)
-        .unwrap_or(24.0);
-    Ok(if rate > 0.0 { time / rate } else { time })
-}
-
-/// The project's frames a second, if the host says.
+/// The project's frames a second, if the host gives a usable rate.
 fn frame_rate(effect: ImageEffect) -> Result<Option<f64>, OfxStatus> {
     let rate = effect_props(effect)?.get_double(PROP_FRAME_RATE, 0).ok();
     Ok(rate.filter(|r| *r > 0.0))
+}
+
+/// The host's time, in frames, in seconds. Seconds need some rate, so a host that gives none
+/// counts at 24 frames a second; [`Context::frame_rate`] stays `None` for it, so an effect can tell
+/// the rate is unknown.
+fn seconds(time: OfxTime, frame_rate: Option<f64>) -> f64 {
+    time / frame_rate.unwrap_or(24.0)
 }
 
 /// Canonical point values (full-resolution pixels, y up) to normalised canvas coordinates.
@@ -492,15 +491,16 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         .as_ref()
         .map(|l| unsafe { image::decode(&l.image, canvas) });
 
+    let rate = frame_rate(effect)?;
     let job = pipeline::Job {
         spec: pipeline::Spec {
             values: &values,
             ctx: Context {
-                time: seconds(effect, time)?,
+                time: seconds(time, rate),
                 frame: time.round() as i64,
                 scale: scale.map(|s| s as f32),
                 premultiplied: false,
-                frame_rate: frame_rate(effect)?,
+                frame_rate: rate,
             },
             width: canvas.width() as u32,
             height: canvas.height() as u32,
@@ -717,7 +717,7 @@ fn render_cpu_effect(
     let frame_count = (cpu_effect.frames_before(&values, rate) + 1)
         .min((time - clip_start_time).max(0.0) as usize + 1);
     let ctx = Context {
-        time: seconds(effect, time)?,
+        time: seconds(time, rate),
         frame: time.round() as i64,
         // CPU effects see whole frames; a host may leave the scale out.
         scale: [0, 1].map(|i| in_args.get_double(PROP_RENDER_SCALE, i).unwrap_or(1.0) as f32),
@@ -852,6 +852,12 @@ mod tests {
                 streaming
             })
             .collect()
+    }
+
+    #[test]
+    fn seconds_and_frame_rate_agree_on_the_rate() {
+        assert_eq!(seconds(48.0, Some(60.0)), 0.8);
+        assert_eq!(seconds(48.0, None), 2.0);
     }
 
     #[test]
