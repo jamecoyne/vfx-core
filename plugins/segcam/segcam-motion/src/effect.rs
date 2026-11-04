@@ -11,11 +11,20 @@ use crate::{
     RenderSettings, SwarmBackground, ThresholdSettings,
 };
 
+/// Detect starts as segcam 1.1 does, on faces. Browsers have no face models, where that would
+/// show nothing at all.
+const DETECT_DEFAULT: i32 = if cfg!(target_arch = "wasm32") { 0 } else { 2 };
+
 /// The controls, with segcam's units (percentages are 0-100), ranges and defaults: those of
 /// [`RenderSettings::default`], but Detect and the face parts start as segcam 1.1 does.
 pub const PARAMS: &[ParamSpec] = &[
     ParamSpec::choice("output", &OutputMode::NAMES, 0).label("Output"),
-    ParamSpec::choice("detect", &["Motion", "Threshold", "Faces only"], 2).label("Detect"),
+    ParamSpec::choice(
+        "detect",
+        &["Motion", "Threshold", "Faces only"],
+        DETECT_DEFAULT,
+    )
+    .label("Detect"),
     ParamSpec::float("sensitivity", 0.0, 100.0, 86.4)
         .label("Sensitivity")
         .group("Motion")
