@@ -64,7 +64,7 @@ class Variant:
         # The plugin only offers GPU-native rendering for 32 bpc float.
         if self.depth == 32 and self.accel == "METAL":
             return "GPU-native"
-        return "CPU (frames through RAM)"
+        return "GPU effect, frames through RAM"
 
 
 VARIANTS = [

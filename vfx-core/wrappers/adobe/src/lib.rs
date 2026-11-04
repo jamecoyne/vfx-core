@@ -218,9 +218,9 @@ pub unsafe fn entry_v3(
 /// Checkout IDs for SmartFX. They pair `checkout_layer` in pre-render with
 /// `checkout_layer_pixels` in render. A CPU effect's earlier frames take IDs from 1: ID
 /// `k` is the frame `k` before the current one.
-const INPUT_ID: i32 = 0;
-const LAYER_ID: i32 = 1;
-const INPUT_INDEX: i32 = 0;
+const CURRENT_FRAME_CHECKOUT_ID: i32 = 0;
+const SECOND_LAYER_CHECKOUT_ID: i32 = 1;
+const EFFECT_LAYER_PARAM_INDEX: i32 = 0;
 
 fn specs() -> &'static [ParamSpec] {
     vfx_host::plugin().params()
@@ -383,10 +383,10 @@ fn gpu_render_native(
     let callbacks = extra.callbacks();
     let has_layer = has_layer_param() && params.index(params::LAYER).is_some();
     let mut input = callbacks
-        .checkout_layer_pixels(INPUT_ID as u32)?
+        .checkout_layer_pixels(CURRENT_FRAME_CHECKOUT_ID as u32)?
         .ok_or(ae::Error::BadCallbackParameter)?;
     let mut layer = if has_layer {
-        callbacks.checkout_layer_pixels(LAYER_ID as u32)?
+        callbacks.checkout_layer_pixels(SECOND_LAYER_CHECKOUT_ID as u32)?
     } else {
         None
     };
@@ -441,9 +441,9 @@ fn gpu_render_native(
         })
     })();
 
-    callbacks.checkin_layer_pixels(INPUT_ID as u32)?;
+    callbacks.checkin_layer_pixels(CURRENT_FRAME_CHECKOUT_ID as u32)?;
     if has_layer {
-        callbacks.checkin_layer_pixels(LAYER_ID as u32)?;
+        callbacks.checkin_layer_pixels(SECOND_LAYER_CHECKOUT_ID as u32)?;
     }
     result
 }
@@ -454,8 +454,8 @@ fn gpu_pre_render(
     params: &ae::Parameters<Key>,
 ) -> Result<(), ae::Error> {
     let values = params::read(params, specs())?;
-    let r = region(&values, scale(in_data));
-    let [reach_x, reach_y] = r.reach;
+    let effect_region = region(&values, scale(in_data));
+    let [reach_x, reach_y] = effect_region.reach;
     let request = extra.output_request();
 
     // An effect that reads past each pixel needs that much more input.
@@ -473,11 +473,11 @@ fn gpu_pre_render(
             in_data.time_scale(),
         )
     };
-    let input = checkout(INPUT_INDEX, INPUT_ID)?;
+    let input = checkout(EFFECT_LAYER_PARAM_INDEX, CURRENT_FRAME_CHECKOUT_ID)?;
     if has_layer_param()
         && let Some(index) = params.index(params::LAYER)
     {
-        checkout(index as i32, LAYER_ID)?;
+        checkout(index as i32, SECOND_LAYER_CHECKOUT_ID)?;
     }
 
     // After Effects trims the input to a mask's bounds, so an output that doesn't grow is
@@ -486,7 +486,7 @@ fn gpu_pre_render(
     let input_max: ae::Rect = input.max_result_rect.into();
     let mut result = grow(input.result_rect.into(), reach_x, reach_y);
     let mut max = grow(input_max, reach_x, reach_y);
-    if !r.grows {
+    if !effect_region.grows {
         let bounds = union(layer_bounds(in_data), input_max);
         result = intersect(result, bounds);
         max = intersect(max, bounds);
@@ -510,11 +510,11 @@ fn gpu_render(
     let callbacks = extra.callbacks();
     let has_layer = has_layer_param() && params.index(params::LAYER).is_some();
     let input = callbacks
-        .checkout_layer_pixels(INPUT_ID as u32)?
+        .checkout_layer_pixels(CURRENT_FRAME_CHECKOUT_ID as u32)?
         .ok_or(ae::Error::BadCallbackParameter)?;
     // No pixels when the layer menu is set to None.
     let layer = if has_layer {
-        callbacks.checkout_layer_pixels(LAYER_ID as u32)?
+        callbacks.checkout_layer_pixels(SECOND_LAYER_CHECKOUT_ID as u32)?
     } else {
         None
     };
@@ -532,9 +532,9 @@ fn gpu_render(
         )
     });
 
-    callbacks.checkin_layer_pixels(INPUT_ID as u32)?;
+    callbacks.checkin_layer_pixels(CURRENT_FRAME_CHECKOUT_ID as u32)?;
     if has_layer {
-        callbacks.checkin_layer_pixels(LAYER_ID as u32)?;
+        callbacks.checkin_layer_pixels(SECOND_LAYER_CHECKOUT_ID as u32)?;
     }
     result
 }
@@ -550,7 +550,9 @@ fn render_frame(
     ctx: Context,
 ) -> Result<(), ae::Error> {
     let depth = Depth::from_bits(input.bit_depth()).ok_or(ae::Error::BadCallbackParameter)?;
-    LOG.note(&format!("render path: CPU (frames through RAM), {depth:?}"));
+    LOG.note(&format!(
+        "render path: GPU effect, frames through RAM, {depth:?}"
+    ));
     if Depth::from_bits(output.bit_depth()) != Some(depth) {
         return Err(ae::Error::BadCallbackParameter);
     }
@@ -560,7 +562,7 @@ fn render_frame(
     }
     let origin = output.origin();
     map_points(&mut values, [origin.h, origin.v], (width, height));
-    let place = |l: &ae::Layer| Placement {
+    let placement = |l: &ae::Layer| Placement {
         canvas_width: width,
         canvas_height: height,
         dx: (l.origin().h - origin.h) as isize,
@@ -574,7 +576,7 @@ fn render_frame(
             l.width(),
             l.height(),
             d,
-            place(l),
+            placement(l),
         ))
     };
     let canvas = decode(input)?;
@@ -645,7 +647,7 @@ fn union(a: ae::Rect, b: ae::Rect) -> ae::Rect {
     }
 }
 
-fn scaled(size: i32, r: ae::RationalScale) -> i32 {
+fn scaled_rounding_up(size: i32, r: ae::RationalScale) -> i32 {
     if r.den == 0 {
         size
     } else {
@@ -659,8 +661,8 @@ fn layer_bounds(in_data: &ae::InData) -> ae::Rect {
     ae::Rect {
         left: 0,
         top: 0,
-        right: scaled(in_data.width(), in_data.downsample_x()),
-        bottom: scaled(in_data.height(), in_data.downsample_y()),
+        right: scaled_rounding_up(in_data.width(), in_data.downsample_x()),
+        bottom: scaled_rounding_up(in_data.height(), in_data.downsample_y()),
     }
 }
 
@@ -678,7 +680,7 @@ fn intersect(a: ae::Rect, b: ae::Rect) -> ae::Rect {
 // CPU effects
 
 /// What a CPU effect's pre-render works out and its render needs.
-struct Plan {
+struct CpuPreRenderPlan {
     values: ParamValues,
     /// How many frames were checked out, the current one included.
     frame_count: usize,
@@ -706,8 +708,14 @@ fn cpu_pre_render(
         in_data.time_scale(),
     );
     let callbacks = extra.callbacks();
-    let current =
-        callbacks.checkout_layer(INPUT_INDEX, INPUT_ID, &request, now, step, time_scale)?;
+    let current = callbacks.checkout_layer(
+        EFFECT_LAYER_PARAM_INDEX,
+        CURRENT_FRAME_CHECKOUT_ID,
+        &request,
+        now,
+        step,
+        time_scale,
+    )?;
 
     // Then the frames before it, nearest first, stopping at the start of the layer.
     let mut frame_count = 1;
@@ -716,8 +724,14 @@ fn cpu_pre_render(
         if time < 0 {
             break;
         }
-        let previous =
-            callbacks.checkout_layer(INPUT_INDEX, k, &request, time, step, time_scale)?;
+        let previous = callbacks.checkout_layer(
+            EFFECT_LAYER_PARAM_INDEX,
+            k,
+            &request,
+            time,
+            step,
+            time_scale,
+        )?;
         if ae::Rect::from(previous.result_rect).is_empty() {
             break;
         }
@@ -727,7 +741,7 @@ fn cpu_pre_render(
     extra.set_result_rect(current.result_rect.into());
     extra.set_max_result_rect(current.max_result_rect.into());
     extra.set_returns_extra_pixels(true);
-    extra.set_pre_render_data(Plan {
+    extra.set_pre_render_data(CpuPreRenderPlan {
         values,
         frame_count,
         ctx,
@@ -749,7 +763,7 @@ struct LayerFrames<'a, C> {
 impl<C: CpuDepth> FrameSource for LayerFrames<'_, C> {
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
         let id = (self.frame_count - 1 - index) as i32;
-        if id == INPUT_ID {
+        if id == CURRENT_FRAME_CHECKOUT_ID {
             f(self.current.and_then(view::<C>).map(C::image));
             return;
         }
@@ -768,14 +782,14 @@ impl<C: CpuDepth> FrameSource for LayerFrames<'_, C> {
     }
 }
 
-fn bits<C: CpuDepth>() -> i16 {
+fn channel_bits<C: CpuDepth>() -> i16 {
     (size_of::<C>() * 8) as i16
 }
 
 /// A layer's pixels in place, if it is at the depth being rendered.
 fn view<C: CpuDepth>(layer: &ae::Layer) -> Option<View<'_, C>> {
     let stride = usize::try_from(layer.row_bytes()).ok()?;
-    (layer.bit_depth() == bits::<C>()).then(|| {
+    (layer.bit_depth() == channel_bits::<C>()).then(|| {
         View::new(
             layer.buffer(),
             layer.width() as i32,
@@ -794,11 +808,11 @@ fn cpu_instance() -> Result<vfx_host::CpuInstance, ae::Error> {
 
 fn cpu_render(extra: &ae::SmartRenderExtra) -> Result<(), ae::Error> {
     let plan = extra
-        .pre_render_data::<Plan>()
+        .pre_render_data::<CpuPreRenderPlan>()
         .ok_or(ae::Error::BadCallbackParameter)?;
     let instance = cpu_instance()?;
     let callbacks = extra.callbacks();
-    let current = callbacks.checkout_layer_pixels(INPUT_ID as u32)?;
+    let current = callbacks.checkout_layer_pixels(CURRENT_FRAME_CHECKOUT_ID as u32)?;
     let result = (|| {
         let mut output = callbacks
             .checkout_output()?
@@ -810,22 +824,26 @@ fn cpu_render(extra: &ae::SmartRenderExtra) -> Result<(), ae::Error> {
         ));
         instance.with(|effect| {
             catch_unwind(AssertUnwindSafe(|| match output.bit_depth() {
-                8 => render_as::<u8>(effect, plan, callbacks, current.as_ref(), &mut output),
-                16 => render_as::<u16>(effect, plan, callbacks, current.as_ref(), &mut output),
-                32 => render_as::<f32>(effect, plan, callbacks, current.as_ref(), &mut output),
+                8 => render_at_depth::<u8>(effect, plan, callbacks, current.as_ref(), &mut output),
+                16 => {
+                    render_at_depth::<u16>(effect, plan, callbacks, current.as_ref(), &mut output)
+                }
+                32 => {
+                    render_at_depth::<f32>(effect, plan, callbacks, current.as_ref(), &mut output)
+                }
                 _ => Err(ae::Error::BadCallbackParameter),
             }))
             .unwrap_or(Err(ae::Error::BadCallbackParameter))
         })
     })();
     // Every way out checks the current frame back in.
-    callbacks.checkin_layer_pixels(INPUT_ID as u32)?;
+    callbacks.checkin_layer_pixels(CURRENT_FRAME_CHECKOUT_ID as u32)?;
     result
 }
 
-fn render_as<C: CpuDepth>(
+fn render_at_depth<C: CpuDepth>(
     effect: &mut dyn CpuEffect,
-    plan: &Plan,
+    plan: &CpuPreRenderPlan,
     callbacks: ae::SmartRenderCallbacks,
     current: Option<&ae::Layer>,
     output: &mut ae::Layer,
@@ -875,8 +893,8 @@ pub fn render_legacy(
         }
         Processor::Cpu(_) => {
             let instance = cpu_instance()?;
-            struct One<'a, C>(&'a ae::Layer, std::marker::PhantomData<C>);
-            impl<C: CpuDepth> FrameSource for One<'_, C> {
+            struct SingleFrame<'a, C>(&'a ae::Layer, std::marker::PhantomData<C>);
+            impl<C: CpuDepth> FrameSource for SingleFrame<'_, C> {
                 fn with_frame(&mut self, _index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
                     f(view::<C>(self.0).map(C::image));
                 }
@@ -886,14 +904,14 @@ pub fn render_legacy(
             match out_layer.bit_depth() {
                 8 => {
                     let out = ViewMut::<u8>::new(out_layer.buffer_mut(), w, h, stride);
-                    let mut one = One::<u8>(in_layer, std::marker::PhantomData);
+                    let mut one = SingleFrame::<u8>(in_layer, std::marker::PhantomData);
                     instance
                         .render(&mut one, 1, u8::image_mut(out), &values, &ctx)
                         .map_err(|_| ae::Error::BadCallbackParameter)?;
                 }
                 16 => {
                     let out = ViewMut::<u16>::new(out_layer.buffer_mut(), w, h, stride);
-                    let mut one = One::<u16>(in_layer, std::marker::PhantomData);
+                    let mut one = SingleFrame::<u16>(in_layer, std::marker::PhantomData);
                     instance
                         .render(&mut one, 1, u16::image_mut(out), &values, &ctx)
                         .map_err(|_| ae::Error::BadCallbackParameter)?;
