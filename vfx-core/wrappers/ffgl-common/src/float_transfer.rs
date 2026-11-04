@@ -1,4 +1,4 @@
-//! RAM transfers: GL converts the host's pixels before readback and after upload.
+//! The host's texture to straight, top-down RGBA floats in RAM and back: GL converts the host's pixels before readback and after upload.
 
 use crate::gl;
 
@@ -13,15 +13,15 @@ void main() {
 }
 ";
 
-pub struct Canvas {
+pub struct FloatTransfer {
     pub size: (u32, u32),
     input: gl::Texture,
-    target: gl::Target,
+    target: gl::TextureFramebuffer,
     to_canvas: gl::Blit,
     from_canvas: gl::Blit,
 }
 
-impl Canvas {
+impl FloatTransfer {
     /// # Safety
     /// The host's GL context must be current.
     pub unsafe fn new(size: (u32, u32)) -> Result<Self, String> {
@@ -37,7 +37,7 @@ impl Canvas {
             };
             let mut input = gl::Texture::new();
             input.allocate(size);
-            let target = match gl::Target::new(input.handle, gl::TEXTURE_2D, size) {
+            let target = match gl::TextureFramebuffer::new(input.handle, gl::TEXTURE_2D, size) {
                 Ok(target) => target,
                 Err(e) => {
                     input.delete();

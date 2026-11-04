@@ -17,7 +17,7 @@ use vfx_core::{Context, ParamValues};
 use vfx_core::{Frame, Gpu};
 use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
-use crate::{LOG, gl, ram};
+use crate::{LOG, float_transfer, gl};
 
 /// How long a frame waits for the GPU before the instance goes through RAM, so a GPU that hangs
 /// without being lost stalls a show for a bounded time: this wait once, then whatever the effect's
@@ -510,7 +510,7 @@ pub struct Interop {
     vulkan_finished: SharedSemaphore,
     /// Signalled by GL when it releases the images, waited on by Vulkan.
     gl_finished: SharedSemaphore,
-    input_framebuffer: gl::Target,
+    input_framebuffer: gl::TextureFramebuffer,
     host_to_canvas: gl::Blit,
     canvas_to_host: gl::Blit,
 }
@@ -545,13 +545,14 @@ impl Interop {
                 vulkan_finished.delete();
                 cleanup();
             };
-            let input_framebuffer = gl::Target::new(input.gl_texture, gl::TEXTURE_2D, size)
-                .inspect_err(|_| cleanup())?;
+            let input_framebuffer =
+                gl::TextureFramebuffer::new(input.gl_texture, gl::TEXTURE_2D, size)
+                    .inspect_err(|_| cleanup())?;
             let host_to_canvas = gl::Blit::new(gl::TO_CANVAS).inspect_err(|_| {
                 input_framebuffer.delete();
                 cleanup();
             })?;
-            let canvas_to_host = gl::Blit::new(ram::FROM_CANVAS).inspect_err(|_| {
+            let canvas_to_host = gl::Blit::new(float_transfer::FROM_CANVAS).inspect_err(|_| {
                 host_to_canvas.delete();
                 input_framebuffer.delete();
                 cleanup();

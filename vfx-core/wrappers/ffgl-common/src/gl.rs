@@ -692,13 +692,13 @@ impl Texture {
 
 /// A framebuffer drawing into a texture, for pixel conversion or an IOSurface.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub struct Target {
+pub struct TextureFramebuffer {
     fbo: GLuint,
     size: (u32, u32),
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-impl Target {
+impl TextureFramebuffer {
     /// # Safety
     /// The context must be current and `texture` a `target` texture of `size`.
     pub unsafe fn new(texture: GLuint, target: GLenum, size: (u32, u32)) -> Result<Self, String> {

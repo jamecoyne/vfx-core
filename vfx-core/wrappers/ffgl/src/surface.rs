@@ -210,7 +210,7 @@ pub struct Interop {
     size: (u32, u32),
     input: Shared,
     output: Shared,
-    input_target: gl::Target,
+    input_target: gl::TextureFramebuffer,
     to_canvas: gl::Blit,
     from_canvas: gl::Blit,
 }
@@ -228,8 +228,9 @@ impl Interop {
                 input.delete();
                 output.delete();
             };
-            let input_target = gl::Target::new(input.gl_texture, gl::TEXTURE_RECTANGLE, size)
-                .inspect_err(|_| cleanup())?;
+            let input_target =
+                gl::TextureFramebuffer::new(input.gl_texture, gl::TEXTURE_RECTANGLE, size)
+                    .inspect_err(|_| cleanup())?;
             let to_canvas = gl::Blit::new(gl::TO_CANVAS).inspect_err(|_| {
                 input_target.delete();
                 cleanup();

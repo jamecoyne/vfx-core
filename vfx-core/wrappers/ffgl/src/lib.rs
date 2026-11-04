@@ -30,10 +30,10 @@ use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
 use vfx_core::{Context, ParamValues};
 use vfx_host::{Kind, diag, pipeline};
 
+#[cfg(target_os = "windows")]
+use vfx_ffgl_common::float_transfer;
 #[cfg(not(target_os = "windows"))]
 use vfx_ffgl_common::frame;
-#[cfg(target_os = "windows")]
-use vfx_ffgl_common::ram;
 use vfx_ffgl_common::{ffi, gl};
 
 use ffi::*;
@@ -151,7 +151,7 @@ struct Instance {
     output_texture: gl::Texture,
     cpu_effect: Option<CpuEffectState>,
     #[cfg(target_os = "windows")]
-    float_transfer: Option<ram::Canvas>,
+    float_transfer: Option<float_transfer::FloatTransfer>,
     #[cfg(target_os = "macos")]
     interop: Option<surface::Interop>,
     #[cfg(target_os = "windows")]
@@ -759,7 +759,7 @@ unsafe fn process_gpu(
             if let Some(old) = instance.float_transfer.take() {
                 unsafe { old.delete() };
             }
-            match unsafe { ram::Canvas::new((w, h)) } {
+            match unsafe { float_transfer::FloatTransfer::new((w, h)) } {
                 Ok(canvas) => instance.float_transfer = Some(canvas),
                 Err(e) => {
                     LOG.note(&format!(

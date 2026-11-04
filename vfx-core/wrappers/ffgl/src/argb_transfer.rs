@@ -28,7 +28,7 @@ void main() {
 pub struct ArgbTransfer {
     pub size: (u32, u32),
     argb_texture: gl::Texture,
-    argb_framebuffer: gl::Target,
+    argb_framebuffer: gl::TextureFramebuffer,
     to_argb: gl::Blit,
     from_argb: gl::Blit,
 }
@@ -49,16 +49,16 @@ impl ArgbTransfer {
             };
             let mut argb_texture = gl::Texture::new();
             argb_texture.allocate_bytes(size);
-            let argb_framebuffer = match gl::Target::new(argb_texture.handle, gl::TEXTURE_2D, size)
-            {
-                Ok(framebuffer) => framebuffer,
-                Err(e) => {
-                    argb_texture.delete();
-                    to_argb.delete();
-                    from_argb.delete();
-                    return Err(e);
-                }
-            };
+            let argb_framebuffer =
+                match gl::TextureFramebuffer::new(argb_texture.handle, gl::TEXTURE_2D, size) {
+                    Ok(framebuffer) => framebuffer,
+                    Err(e) => {
+                        argb_texture.delete();
+                        to_argb.delete();
+                        from_argb.delete();
+                        return Err(e);
+                    }
+                };
             Ok(Self {
                 size,
                 argb_texture,
