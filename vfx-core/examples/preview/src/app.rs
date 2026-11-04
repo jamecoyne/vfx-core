@@ -16,14 +16,14 @@ use crate::web_media;
 use crate::{audio, face, script, video};
 use vfx_core::Gpu;
 use winit::application::ApplicationHandler;
-#[cfg(not(target_arch = "wasm32"))]
 use winit::event::ElementState;
 use winit::event::WindowEvent;
 #[cfg(not(target_arch = "wasm32"))]
 use winit::event_loop::ControlFlow;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::keyboard::Key;
 #[cfg(not(target_arch = "wasm32"))]
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::NamedKey;
 use winit::window::{Window, WindowId};
 
 struct Preview {
@@ -732,6 +732,16 @@ impl Preview {
         }
     }
 
+    /// A key the panel didn't take, as segcam 1.1's keys where one maps onto a parameter.
+    fn handle_key(&mut self, key: &Key) {
+        let Key::Character(key) = key else {
+            return;
+        };
+        if key == "c" {
+            self.effects.clear_history(&self.gpu);
+        }
+    }
+
     /// Plays or pauses a video file (not a webcam).
     #[cfg(not(target_arch = "wasm32"))]
     fn toggle_play(&mut self) {
@@ -882,6 +892,9 @@ impl Preview {
             self.effects.use_pattern_source(&self.gpu);
             self.message = None;
             self.refresh_display_texture();
+        }
+        if actions.clear_history {
+            self.effects.clear_history(&self.gpu);
         }
         #[cfg(not(target_arch = "wasm32"))]
         self.handle_media_actions(&actions);
@@ -1228,7 +1241,6 @@ impl ApplicationHandler<GpuSetup> for App {
         let Some(preview) = self.preview.as_mut() else {
             return;
         };
-        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
         let consumed = preview
             .egui_state
             .on_window_event(&preview.window, &event)
@@ -1257,6 +1269,13 @@ impl ApplicationHandler<GpuSetup> for App {
                     && event.logical_key == Key::Named(NamedKey::Space) =>
             {
                 preview.toggle_play();
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if !consumed
+                    && !preview.egui.egui_wants_keyboard_input()
+                    && event.state == ElementState::Pressed =>
+            {
+                preview.handle_key(&event.logical_key);
             }
             WindowEvent::RedrawRequested if !preview.is_quiet() => {
                 preview.draw();

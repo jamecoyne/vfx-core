@@ -3,6 +3,11 @@
 The repository's preview: one effect at a time, on a test pattern, an image, a video file
 or a webcam. [docs/DEVELOPING.md](../../../docs/DEVELOPING.md#the-preview) describes it.
 
+## Keys
+
+`c` clears the shown effect's earlier frames, as the Clear button does. Space plays and pauses a
+video on the desktop, and Escape quits there.
+
 ## Scripted runs
 
 Flags set the preview up and measure it, so a measurement is a command and needs no clicks.

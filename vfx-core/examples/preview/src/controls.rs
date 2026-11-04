@@ -89,6 +89,8 @@ impl Controls {
 /// What the panel reports back to the app.
 #[derive(Default)]
 pub struct Actions {
+    /// Clear was pressed: the shown effect forgets earlier frames.
+    pub clear_history: bool,
     pub use_pattern: bool,
     /// Open a file picker for a layer's video or image.
     #[cfg(not(target_arch = "wasm32"))]
@@ -485,6 +487,16 @@ fn effect_box(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("Reset").clicked() {
                 c.params[effect] = ParamValues::new(&c.specs[effect]);
+            }
+            if ui
+                .button("Clear")
+                .on_hover_text(
+                    "Forgets earlier frames, so the collage or trail starts empty (key: c). \
+                     Motion takes a moment to come back.",
+                )
+                .clicked()
+            {
+                actions.clear_history = true;
             }
         });
     });

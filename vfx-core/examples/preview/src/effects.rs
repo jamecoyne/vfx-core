@@ -465,6 +465,19 @@ impl Effects {
         self.keep_output_in_ram = keep;
     }
 
+    /// Makes the shown effect forget earlier frames, as a new source would, and leaves the source
+    /// playing. A motion effect also forgets its background, so motion takes a moment to come
+    /// back.
+    pub fn clear_history(&mut self, gpu: &Gpu) {
+        match &mut self.stage.run {
+            EffectRun::Cpu(stage) => stage.restart(),
+            // A GPU effect's state is in its chain.
+            EffectRun::Gpu { .. } => {
+                self.stage = EffectStage::new(gpu, self.stage.effect, self.frames.size);
+            }
+        }
+    }
+
     /// Whether the last output was drawn on the GPU, not uploaded from RAM.
     pub fn output_drawn_on_gpu(&self) -> bool {
         match &self.stage.run {
@@ -875,6 +888,26 @@ mod tests {
         let alpha: Vec<f32> = out.iter().skip(3).step_by(4).copied().collect();
         assert!(alpha.contains(&1.0), "nothing moved");
         assert!(alpha.contains(&0.0), "everything moved");
+    }
+
+    /// A clear starts the history over at the next frame, with the source still there.
+    #[test]
+    fn clear_history_starts_over_from_the_next_frame() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut effects = Effects::new(&gpu);
+        effects.keep_output_in_ram(true);
+        let (controls, values) = shown("segcam Motion (Rust)");
+        effects.start_stream(&gpu, "clip".into(), (64, 64), None);
+        for (f, shade) in [0.25, 0.75, 0.25].into_iter().enumerate() {
+            effects.write_source(&gpu, &vec![shade; 64 * 64 * 4]);
+            render_to_float(&mut effects, &gpu, &controls, &values, f as f64);
+        }
+        effects.clear_history(&gpu);
+        effects.write_source(&gpu, &vec![0.75; 64 * 64 * 4]);
+        let first = render_to_float(&mut effects, &gpu, &controls, &values, 3.0);
+        assert!(effects.last_outcome().finished);
+        // segcam's first render shows its input.
+        assert!(first.iter().all(|v| (v - 0.75).abs() < 0.01));
     }
 
     /// A render that draws the same picture again is finished but not new, and a new one
