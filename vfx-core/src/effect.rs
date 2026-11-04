@@ -193,6 +193,8 @@ pub struct Report {
     pub faces: Option<String>,
     /// What it found. A host uses the names it knows and ignores the rest.
     pub readings: Vec<Reading>,
+    /// The last time the GPU failed a render, why; the render was drawn another way.
+    pub gpu_fault: Option<String>,
 }
 
 /// A named number an effect found ([`Report::readings`]).

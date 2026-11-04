@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::Gpu;
 
 /// A GPU texture that effects read from or render into.
@@ -136,6 +138,10 @@ impl Frame {
     }
 }
 
+/// How long a readback waits for the GPU. A hung GPU must cost a live host a blank frame rather
+/// than freeze it.
+const READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A reusable readback buffer for frames of one size and format on the same device.
 pub struct Readback {
     buffer: wgpu::Buffer,
@@ -162,7 +168,8 @@ impl Readback {
         }
     }
 
-    /// Reads RGBA32F straight into float storage. Blocks until the GPU finishes.
+    /// Reads RGBA32F straight into float storage. Blocks until the GPU finishes, up to
+    /// [`READBACK_TIMEOUT`]; past that the pixels are zero.
     pub fn read_f32(&mut self, gpu: &Gpu, frame: &Frame) -> Vec<f32> {
         assert_eq!(frame.format, wgpu::TextureFormat::Rgba32Float);
         let mut out = vec![0.0f32; (frame.width * frame.height * 4) as usize];
@@ -176,6 +183,18 @@ impl Readback {
     }
 
     fn read_into(&mut self, gpu: &Gpu, frame: &Frame, out: &mut [u8], row_stride: u32) {
+        self.read_within(gpu, frame, out, row_stride, READBACK_TIMEOUT);
+    }
+
+    /// Leaves `out` as it was if the GPU doesn't finish in `timeout`.
+    fn read_within(
+        &mut self,
+        gpu: &Gpu,
+        frame: &Frame,
+        out: &mut [u8],
+        row_stride: u32,
+        timeout: Duration,
+    ) {
         assert_eq!(self.size, (frame.width, frame.height, frame.format));
         let row_bytes = frame.width * frame.bytes_per_pixel();
         let gpu_pitch = self.gpu_pitch;
@@ -201,19 +220,30 @@ impl Readback {
             },
             extent(frame.width, frame.height),
         );
-        gpu.queue.submit(Some(encoder.finish()));
+        let submission_index = gpu.queue.submit(Some(encoder.finish()));
 
         let slice = buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed during readback");
-        rx.recv()
-            .expect("map callback dropped")
-            .expect("failed to map readback buffer");
+        let wait = wgpu::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: Some(timeout),
+        };
+        // Another thread's poll may be the one that calls back, a moment later.
+        let mapped = gpu
+            .device
+            .poll(wait)
+            .map_err(|e| e.to_string())
+            .and_then(|_| rx.recv_timeout(timeout).map_err(|e| e.to_string()))
+            .and_then(|mapped| mapped.map_err(|e| e.to_string()));
+        if let Err(why) = mapped {
+            eprintln!("GPU readback failed: {why}");
+            // The map may still be pending on this buffer, so the next read takes a new one.
+            *self = Self::new(gpu, frame);
+            return;
+        }
 
         let data = slice.get_mapped_range().expect("readback range is mapped");
         for (src, dst) in data
@@ -232,5 +262,27 @@ fn extent(width: u32, height: u32) -> wgpu::Extent3d {
         width,
         height,
         depth_or_array_layers: 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readback_recovers_after_timeout() {
+        let Ok(gpu) = pollster::block_on(Gpu::headless()) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let frame = Frame::new(&gpu, 256, 256, wgpu::TextureFormat::Rgba32Float);
+        let input: Vec<f32> = (0..256 * 256 * 4).map(|i| i as f32).collect();
+        frame.write(&gpu, bytemuck::cast_slice(&input));
+        let mut readback = Readback::new(&gpu, &frame);
+        let row_stride = frame.width * frame.bytes_per_pixel();
+        let mut out = vec![0u8; (row_stride * frame.height) as usize];
+        // Whether a zero wait finishes first is the driver's; neither result may break the next.
+        readback.read_within(&gpu, &frame, &mut out, row_stride, Duration::ZERO);
+        assert_eq!(readback.read_f32(&gpu, &frame), input);
     }
 }

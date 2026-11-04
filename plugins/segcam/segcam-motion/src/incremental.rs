@@ -559,6 +559,7 @@ impl IncrementalRenderer {
             .filter(|_| self.faces_wanted)
             .map(str::to_owned);
         report.readings = self.readings.clone();
+        report.gpu_fault = self.last_reported_fault.clone();
         report
     }
 
