@@ -296,9 +296,12 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
     if choice.is_empty()
         && let Some(gpu) = vfx_core::Gpu::shared()
     {
+        // The host may have reported errors of its own before this.
+        let errors_before = vfx_core::Gpu::shared_faults().errors().0;
         let dev = on_shared(gpu);
         return match (dev.lost(), dev.errors()) {
-            (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
+            (Some(e), _) => Err(NoGpu::Failed(e)),
+            (None, (count, e)) if count != errors_before => Err(NoGpu::Failed(e)),
             _ => Ok(dev),
         };
     }
@@ -400,6 +403,10 @@ fn on_shared(gpu: vfx_core::Gpu) -> GpuContext {
     let max_binding = limits
         .max_storage_buffer_binding_size
         .min(limits.max_buffer_size);
+    // A phone's browser may end the page rather than refuse an allocation, so an atlas there stops
+    // at what 1080p needs at long trails, and a live render drops its oldest windows past that.
+    #[cfg(target_arch = "wasm32")]
+    let max_binding = max_binding.min(256 << 20);
     let info = gpu.device.adapter_info();
     let faults = vfx_core::Gpu::shared_faults();
     let dev = GpuContext::build(gpu.device, gpu.queue, info, max_binding, faults, true);
@@ -680,7 +687,8 @@ impl Atlas {
             encoder.copy_buffer_to_buffer(&self.buffer, 0, &buffer, 0, self.words * 4);
             dev.queue.submit(Some(encoder.finish()));
             self.free(self.words, words - self.words);
-            self.buffer = buffer;
+            // A browser otherwise holds the old buffer until its garbage collector runs.
+            std::mem::replace(&mut self.buffer, buffer).destroy();
             self.words = words;
         }
     }
@@ -902,7 +910,12 @@ impl Drawer {
     pub fn begin_render(&mut self) {
         self.uploaded_frame = None;
         self.unfinished = false;
-        self.errors_at_render_start = self.dev.errors().0;
+        // A browser reports errors in a later task, after this render has finished, so there the
+        // count carries over and the next render falls back.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.errors_at_render_start = self.dev.errors().0;
+        }
     }
 
     /// Abandons an in-flight draw: its frames were just cleared, and a later render of a reused

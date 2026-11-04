@@ -138,8 +138,7 @@ impl Frame {
     }
 }
 
-/// How long a readback waits for the GPU. A hung GPU must cost a live host a blank frame rather
-/// than freeze it.
+/// How long a readback waits for the GPU before it fails, so a hung GPU can't freeze a host.
 const READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A reusable readback buffer for frames of one size and format on the same device.
@@ -168,8 +167,9 @@ impl Readback {
         }
     }
 
-    /// Reads RGBA32F straight into float storage. Blocks until the GPU finishes, up to
-    /// [`READBACK_TIMEOUT`]; past that the pixels are zero.
+    /// Reads RGBA32F straight into float storage. Blocks until the GPU finishes, and panics if it
+    /// doesn't within [`READBACK_TIMEOUT`]: hosts catch that and pass the input through, which an
+    /// export must not mistake for a rendered frame.
     pub fn read_f32(&mut self, gpu: &Gpu, frame: &Frame) -> Vec<f32> {
         assert_eq!(frame.format, wgpu::TextureFormat::Rgba32Float);
         let mut out = vec![0.0f32; (frame.width * frame.height * 4) as usize];
@@ -183,10 +183,11 @@ impl Readback {
     }
 
     fn read_into(&mut self, gpu: &Gpu, frame: &Frame, out: &mut [u8], row_stride: u32) {
-        self.read_within(gpu, frame, out, row_stride, READBACK_TIMEOUT);
+        if let Err(why) = self.read_within(gpu, frame, out, row_stride, READBACK_TIMEOUT) {
+            panic!("GPU readback failed: {why}");
+        }
     }
 
-    /// Leaves `out` as it was if the GPU doesn't finish in `timeout`.
     fn read_within(
         &mut self,
         gpu: &Gpu,
@@ -194,7 +195,7 @@ impl Readback {
         out: &mut [u8],
         row_stride: u32,
         timeout: Duration,
-    ) {
+    ) -> Result<(), String> {
         assert_eq!(self.size, (frame.width, frame.height, frame.format));
         let row_bytes = frame.width * frame.bytes_per_pixel();
         let gpu_pitch = self.gpu_pitch;
@@ -239,10 +240,9 @@ impl Readback {
             .and_then(|_| rx.recv_timeout(timeout).map_err(|e| e.to_string()))
             .and_then(|mapped| mapped.map_err(|e| e.to_string()));
         if let Err(why) = mapped {
-            eprintln!("GPU readback failed: {why}");
             // The map may still be pending on this buffer, so the next read takes a new one.
             *self = Self::new(gpu, frame);
-            return;
+            return Err(why);
         }
 
         let data = slice.get_mapped_range().expect("readback range is mapped");
@@ -254,6 +254,7 @@ impl Readback {
         }
         drop(data);
         buffer.unmap();
+        Ok(())
     }
 }
 
@@ -282,7 +283,7 @@ mod tests {
         let row_stride = frame.width * frame.bytes_per_pixel();
         let mut out = vec![0u8; (row_stride * frame.height) as usize];
         // Whether a zero wait finishes first is the driver's; neither result may break the next.
-        readback.read_within(&gpu, &frame, &mut out, row_stride, Duration::ZERO);
+        let _ = readback.read_within(&gpu, &frame, &mut out, row_stride, Duration::ZERO);
         assert_eq!(readback.read_f32(&gpu, &frame), input);
     }
 }

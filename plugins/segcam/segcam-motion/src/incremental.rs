@@ -699,7 +699,15 @@ impl IncrementalRenderer {
         let m = SwarmMetrics::new(h);
         let shadow = swarm::shadow_kernel(m.scale);
         let pile = build_pile(&self.tiles, s, count, number, w, h);
-        let visible: Vec<PileEntry> = pile.visible_entries().collect();
+        let mut visible: Vec<PileEntry> = pile.visible_entries().collect();
+        if let Some(oldest) = self.oldest_frame_in_atlas {
+            let dropping = visible.iter().any(|p| p.frame < oldest);
+            visible.retain(|p| p.frame >= oldest);
+            // The trail has moved past what was dropped.
+            if !dropping {
+                self.oldest_frame_in_atlas = None;
+            }
+        }
         let window_pixel_count = window_pixels(visible.iter().map(|p| p.tile), &m, &shadow, w, h);
         let motion = cached_motion(&self.motion, number, &analysis_key(s, number, first))
             .unwrap_or(&NO_SEGMENTS);
@@ -747,9 +755,6 @@ impl IncrementalRenderer {
                 }
                 if drawer.atlas_growing() {
                     break;
-                }
-                if self.oldest_frame_in_atlas.is_none() {
-                    eprintln!("segcam Motion: the atlas is full; dropping the oldest windows");
                 }
                 let evicted = self.atlas_allocations.keys().next().copied();
                 let Some(oldest) = evicted.filter(|&oldest| oldest < f) else {
