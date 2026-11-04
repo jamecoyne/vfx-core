@@ -30,7 +30,7 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --grid columns                        (192)
   --trail frames  --max-tiles n         (60, 100)
   --preset 1.1                          (segcam 1.1's look; later options change it)
-  --fps rate                            (the clip's; analyses up to about 60 a second)
+  --fps rate                            (the clip's; sets how often it analyses)
   --keep                                (keep work between frames on the CPU too)
   --detect motion|threshold|faces       (motion)
   --face  --eyes  --mouth  --body       (off; segcam-face's models)

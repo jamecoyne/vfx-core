@@ -1,4 +1,4 @@
-//! Analysis at up to about 60 a second, as in segcam 1.1: which frames are analysed at a frame rate,
+//! Analysis at about segcam 1.1's rate: which frames are analysed at a frame rate,
 //! what the frames between show, and that a seek back starts the count again.
 
 mod motion_only;
@@ -69,9 +69,14 @@ fn step_at_each_frame_rate() {
     ] {
         assert_eq!(stride(Some(rate)), 1, "{rate}");
     }
-    for rate in [96.0, 100.0, 119.88, 120.0] {
-        assert_eq!(stride(Some(rate)), 2, "{rate}");
+    for rate in [89.9, 90.0, 96.0, 100.0, 119.88, 120.0, 149.9] {
+        let want = if rate < 90.0 { 1 } else { 2 };
+        assert_eq!(stride(Some(rate)), want, "{rate}");
     }
+    for rate in [150.0, 180.0, 209.9] {
+        assert_eq!(stride(Some(rate)), 3, "{rate}");
+    }
+    assert_eq!(stride(Some(210.0)), Cadence::MAX_STRIDE);
     assert_eq!(stride(Some(240.0)), Cadence::MAX_STRIDE);
     assert_eq!(stride(Some(480.0)), Cadence::MAX_STRIDE);
     assert_eq!(stride(Some(0.0)), 1);

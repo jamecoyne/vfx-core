@@ -23,11 +23,11 @@ order, so a render works from the frames before it, which the host fetches or ke
 - Window life by count. The pile already retires windows by count; Trail frames is now how far
   back windows can come from, a limit 1.1 doesn't have. Its default goes from 24 to 60 frames,
   so in most scenes the count decides.
-- Analysis at 1.1's rate for a file, from the frame rate the host gives: every frame up to about
-  60 fps, every 2nd by number at 120, every 4th at 240 and above. The frames between show the last
-  analysis, its boxes and IDs, and spawn no windows. Where the host gives no frame rate (Resolume),
-  every frame.
-- Faces on every 2nd analysis, as ADR 2 says; up to about 60 fps those are the even frames.
+- Analysis near 1.1's rate for a file, from the frame rate the host gives: the frames whose number
+  divides by round(rate / 60), at most 4. That is every frame below 90 fps, every 2nd below 150,
+  every 3rd below 210, every 4th from there. The frames between show the last analysis, its boxes
+  and IDs, and spawn no windows. Where the host gives no frame rate (Resolume), every frame.
+- Faces on every 2nd analysis, as ADR 2 says; below 90 fps those are the even frames.
 - A "1.1 look" benchmark preset, so numbers compare with the app like for like.
 
 ## Options considered
@@ -41,19 +41,19 @@ order, so a render works from the frames before it, which the host fetches or ke
 
 ## Consequences
 
-- Output changes on purpose: Swarm through the trail default, and every output above about 90 fps
+- Output changes on purpose: Swarm through the trail default, and every output from 90 fps
   where the host gives the frame rate.
 - The background counts analyses, as 1.1's adapts once per analysis, so the same setting covers
-  half the time at 60 fps that it does at 30, as in 1.1. A render above about 90 fps reads as many
-  more frames as the stride asks for.
+  half the time at 60 fps that it does at 30, as in 1.1. A render from 90 fps reads as many more
+  frames as the step asks for.
 - With every frame analysed an editing host hands over every frame in the range, where every 2nd
   frame was enough at 60 fps.
 - Live hosts hold the current frame only (`CpuEffect::frames_held`). Earlier frames live on as
   their grids, segments and the tiles the pile still draws, so a setting changed live reaches new
   windows only, as in 1.1, and the first frames after it don't work out the trail again.
 - 1.1's swarm cap is 100 at start and 60 from the show's cue; the default stays 100.
-- Outside Swarm a render reads a stride less one more, so the analysis a frame shows is always
-  there. With faces on it reads a stride more, so the analysis whose faces it reuses is there too.
+- Outside Swarm a render reads back to the last analysis, so the analysis a frame shows is always
+  there. With faces on it reads one step more, so the analysis whose faces it reuses is there too.
 - The first version of this ADR had the analysis at about 30 a second, capped by frame rate. That
   read 1.1 wrong: the 30 was a count from the show under a debugger and the camera's cap. On a
   60 fps clip it made half of 1.1's windows ([#79](https://github.com/jamecoyne/vfx-core/issues/79)).

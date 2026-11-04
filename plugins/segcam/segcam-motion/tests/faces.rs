@@ -1,5 +1,5 @@
 //! Faces run on every 2nd analysis, and the analysis between reuses the faces of the one
-//! before: up to 60 fps, even frames run them and odd frames reuse them. Checked on a real portrait
+//! before: below 90 fps, even frames run them and odd frames reuse them. Checked on a real portrait
 //! the face models find, read from the file `SEGCAM_FACE_PORTRAIT` names (a binary PPM, P6, at
 //! most 180 pixels tall); the tests pass with a note when it isn't set.
 #![cfg(not(target_arch = "wasm32"))]

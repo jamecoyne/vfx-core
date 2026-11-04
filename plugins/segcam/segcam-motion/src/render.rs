@@ -78,8 +78,8 @@ pub enum SwarmBackground {
     Black,
 }
 
-/// Which frames are analysed: every `stride`th by frame number, so every frame up to about 60
-/// a second, as segcam 1.1 plays a file. A frame between two analyses shows the last one.
+/// Which frames are analysed: those whose number divides by `stride`, which is the frame rate
+/// over [`Cadence::RATE`], rounded, at most 4. A frame between two analyses shows the last one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cadence {
     pub stride: i64,
@@ -87,9 +87,9 @@ pub struct Cadence {
 
 impl Cadence {
     pub const EVERY_FRAME: Self = Self { stride: 1 };
-    /// What a higher frame rate comes down to, in analyses a second.
+    /// The analyses a second a high frame rate comes down to, as segcam 1.1 plays a file.
     pub const RATE: f64 = 60.0;
-    /// The longest stride, which [`previous_frames_needed`] reaches back for.
+    /// The largest `stride`.
     pub const MAX_STRIDE: i64 = 4;
 
     /// For a clip at `frame_rate` frames a second; every frame where that isn't known.
@@ -171,9 +171,8 @@ impl Default for RenderSettings {
 }
 
 impl RenderSettings {
-    /// segcam 1.1's own look, for comparing with the app: Swarm of motion and every face part,
-    /// on a transparent canvas, with the longest trail so windows go by count. Give it the
-    /// clip's frame rate to analyse as often as 1.1 does.
+    /// segcam 1.1's look, for comparing with the app: Swarm of motion and every face part, the
+    /// longest trail so windows go by count, analysing as 1.1 does at the clip's `frame_rate`.
     pub fn look_1_1(frame_rate: Option<f64>) -> Self {
         Self {
             mode: OutputMode::Swarm,
@@ -190,10 +189,8 @@ impl RenderSettings {
     }
 }
 
-/// How many frames before the current one [`render`] wants to see: the background and the
-/// swarm's trail, or for the other outputs the background of the analysis the frame shows.
-/// With faces on, a stride more: every 2nd analysis reuses the faces of the one before, with
-/// that frame's IDs.
+/// How many frames before the current one [`render`] wants: the background, the swarm's trail or
+/// the way back to the analysis shown, and with faces the analysis whose faces it reuses.
 pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
     let stride = s.cadence.stride as i32;
     history_frames(s)
