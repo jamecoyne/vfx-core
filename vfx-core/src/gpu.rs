@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 /// What a device reported through its error and loss callbacks. wgpu holds one of each per device
 /// and its default error handler panics, so one place installs them and everyone reads this.
@@ -51,12 +51,18 @@ impl DeviceFaults {
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// Lives as long as this device's callbacks, so what one device reports can't reach another.
+    faults: DeviceFaults,
 }
 
 impl Gpu {
     /// Wraps a device the host already owns, so effects run on the host's own GPU context.
     pub fn from_parts(device: wgpu::Device, queue: wgpu::Queue) -> Self {
-        Self { device, queue }
+        Self {
+            device,
+            queue,
+            faults: DeviceFaults::default(),
+        }
     }
 
     /// Requests a GPU with no window surface. Async, so the caller picks the executor.
@@ -80,16 +86,18 @@ impl Gpu {
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .map_err(|e| GpuError(e.to_string()))?;
-        Ok(Self { device, queue })
+        Ok(Self::from_parts(device, queue))
     }
 
     /// Lets CPU effects draw on this device: in browsers, where they can't open their own, and
     /// in hosts that offer their output a GPU frame on it ([`crate::CpuEffect::render_to`]).
     /// Effects pick their device on first use, so a host shares it before they render. This takes
-    /// over the device's error and loss callbacks; read them with [`Gpu::shared_faults`].
+    /// over the device's error and loss callbacks; read them with [`Gpu::faults`]. Sharing the same
+    /// `Gpu` again keeps its record. Sharing another replaces it for later readers, and a clone
+    /// taken earlier goes on following its own device.
     pub fn share(&self) {
-        SHARED_FAULTS.install(&self.device);
-        let parts = Some((self.device.clone(), self.queue.clone()));
+        self.faults.install(&self.device);
+        let parts = Some(self.parts());
         #[cfg(target_arch = "wasm32")]
         SHARED.with(|s| *s.borrow_mut() = parts);
         #[cfg(not(target_arch = "wasm32"))]
@@ -98,33 +106,44 @@ impl Gpu {
         }
     }
 
+    fn parts(&self) -> GpuParts {
+        (self.device.clone(), self.queue.clone(), self.faults.clone())
+    }
+
     /// The device a host shared with [`Gpu::share`].
     pub fn shared() -> Option<Self> {
         #[cfg(target_arch = "wasm32")]
         let parts = SHARED.with(|s| s.borrow().clone());
         #[cfg(not(target_arch = "wasm32"))]
         let parts = SHARED.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        parts.map(|(device, queue)| Self { device, queue })
+        parts.map(|(device, queue, faults)| Self {
+            device,
+            queue,
+            faults,
+        })
     }
 
-    /// What the device shared with [`Gpu::share`] has reported.
+    /// What this device has reported since it was first shared.
+    pub fn faults(&self) -> DeviceFaults {
+        self.faults.clone()
+    }
+
+    /// What the device last shared with [`Gpu::share`] has reported; nothing if none was.
     pub fn shared_faults() -> DeviceFaults {
-        SHARED_FAULTS.clone()
+        Self::shared().map(|gpu| gpu.faults).unwrap_or_default()
     }
 }
 
-// One record across shares, so a clone an effect already holds stays current.
-static SHARED_FAULTS: LazyLock<DeviceFaults> = LazyLock::new(DeviceFaults::default);
+type GpuParts = (wgpu::Device, wgpu::Queue, DeviceFaults);
 
 // Browsers' wgpu objects stay on their thread.
 #[cfg(target_arch = "wasm32")]
 thread_local! {
-    static SHARED: std::cell::RefCell<Option<(wgpu::Device, wgpu::Queue)>> =
-        const { std::cell::RefCell::new(None) };
+    static SHARED: std::cell::RefCell<Option<GpuParts>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-static SHARED: std::sync::Mutex<Option<(wgpu::Device, wgpu::Queue)>> = std::sync::Mutex::new(None);
+static SHARED: std::sync::Mutex<Option<GpuParts>> = std::sync::Mutex::new(None);
 
 #[derive(Debug)]
 pub struct GpuError(String);

@@ -303,7 +303,7 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
             return Err(NoGpu::NoAdapter(format!("{} draws in software", info.name)));
         }
         // The host may have reported errors of its own before this.
-        let errors_before = vfx_core::Gpu::shared_faults().errors().0;
+        let errors_before = gpu.faults().errors().0;
         let dev = on_shared(gpu);
         return match (dev.lost(), dev.errors()) {
             (Some(e), _) => Err(NoGpu::Failed(e)),
@@ -423,7 +423,7 @@ fn on_shared(gpu: vfx_core::Gpu) -> GpuContext {
     #[cfg(target_arch = "wasm32")]
     let max_binding = max_binding.min(256 << 20);
     let info = gpu.device.adapter_info();
-    let faults = vfx_core::Gpu::shared_faults();
+    let faults = gpu.faults();
     let dev = GpuContext::build(gpu.device, gpu.queue, info, max_binding, faults, true);
     // The formats hosts offer, built here so the first offered render doesn't stall on it.
     for format in [
