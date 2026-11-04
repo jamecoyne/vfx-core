@@ -486,6 +486,15 @@ impl Effects {
         }
     }
 
+    /// The frame holding the last render's output.
+    #[cfg(target_arch = "wasm32")]
+    pub fn output_frame(&self) -> &Frame {
+        match &self.stage.run {
+            EffectRun::Gpu { .. } => &self.frames.output,
+            EffectRun::Cpu(stage) => stage.output(),
+        }
+    }
+
     /// The texture egui shows. Changes identity when the size changes.
     pub fn display_view(&self) -> &wgpu::TextureView {
         &self.frames.display_view

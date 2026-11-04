@@ -135,8 +135,7 @@ pub struct Actions {
     pub clear_layer: bool,
     /// The video's sound was switched on or off.
     pub sound: Option<bool>,
-    /// Record was pressed: starts recording, or stops and asks where to save.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Record was pressed: starts recording, or stops and saves.
     pub toggle_record: bool,
     /// Open a file picker for a video or image.
     pub import: bool,
@@ -169,10 +168,8 @@ pub struct PanelStatus<'a> {
     pub video: bool,
     pub sound_on: bool,
     /// Whether Record is on.
-    #[cfg(not(target_arch = "wasm32"))]
     pub recording: bool,
     /// How the last recording ended: saved, discarded or failed.
-    #[cfg(not(target_arch = "wasm32"))]
     pub record_result: Option<&'a str>,
     pub cameras: &'a [String],
     #[cfg(not(target_arch = "wasm32"))]
@@ -578,37 +575,40 @@ pub fn panel(
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         section(ui, "Expressions", false, |ui| {
-                ui.checkbox(&mut c.animate, "Animate")
-                    .on_hover_text("Advances the clock behind the time variable and test patterns");
-                #[cfg(not(target_arch = "wasm32"))]
-                if crate::face::HAS_TRACKER {
-                    let mut tracking = status.face_tracking;
-                    if ui
-                        .checkbox(&mut tracking, "Detect faces")
-                        .on_hover_text(
-                            "Finds a face in video or webcam frames for the face, eye, nose \
+            ui.checkbox(&mut c.animate, "Animate")
+                .on_hover_text("Advances the clock behind the time variable and test patterns");
+            #[cfg(not(target_arch = "wasm32"))]
+            if crate::face::HAS_TRACKER {
+                let mut tracking = status.face_tracking;
+                if ui
+                    .checkbox(&mut tracking, "Detect faces")
+                    .on_hover_text(
+                        "Finds a face in video or webcam frames for the face, eye, nose \
                              and mouth variables in expressions",
-                        )
-                        .changed()
-                    {
-                        actions.face_tracking = Some(tracking);
-                    }
+                    )
+                    .changed()
+                {
+                    actions.face_tracking = Some(tracking);
                 }
-                ui.separator();
-                modulation::variables_help(ui, variables);
-            });
+            }
+            ui.separator();
+            modulation::variables_help(ui, variables);
+        });
 
-        #[cfg(not(target_arch = "wasm32"))]
         section(ui, "Record", true, |ui| {
             let (text, hint) = if status.recording {
                 (
                     "Recording",
-                    "Click again to stop and choose where to save the MP4.",
+                    if cfg!(target_arch = "wasm32") {
+                        "Click again to stop and download the file."
+                    } else {
+                        "Click again to stop and choose where to save the MP4."
+                    },
                 )
             } else {
                 (
                     "Record",
-                    "Saves what the preview shows, with the effect, layers and expressions, to an MP4.",
+                    "Saves the effect's output, with its layers and expressions, to a video file.",
                 )
             };
             let mut button = egui::Button::new(RichText::new(text).strong()).min_size(egui::vec2(

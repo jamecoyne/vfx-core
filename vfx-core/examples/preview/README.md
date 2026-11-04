@@ -3,6 +3,13 @@
 The repository's preview: one effect at a time, on a test pattern, an image, a video file
 or a webcam. [docs/DEVELOPING.md](../../../docs/DEVELOPING.md#the-preview) describes it.
 
+## Record
+
+Record saves the effect's output as a video file, without the panel: an H.264 MP4 through ffmpeg
+on the desktop, at 30 fps from the render loop. In a browser it goes through `canvas.captureStream`
+and `MediaRecorder` to a download: H.264 in MP4 where the browser records that (Chrome 126 and
+later, Safari), otherwise WebM. There is no sound in the recording on either.
+
 ## Keys
 
 | Key | What |

@@ -10,10 +10,10 @@ use crate::effects::Effects;
 use crate::effects::{self, Output};
 use crate::modulation::{self, Expressions, VariableValues};
 use crate::stats;
-#[cfg(target_arch = "wasm32")]
-use crate::web_media;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{audio, face, script, video};
+#[cfg(target_arch = "wasm32")]
+use crate::{web_media, web_record};
 use vfx_core::Gpu;
 use winit::application::ApplicationHandler;
 use winit::event::ElementState;
@@ -49,8 +49,17 @@ struct Preview {
     #[cfg(not(target_arch = "wasm32"))]
     recording: Option<Recording>,
     /// How the last recording ended (saved, discarded or failed), shown in the Record section.
-    #[cfg(not(target_arch = "wasm32"))]
     record_result: Option<String>,
+    /// The output being recorded, while Record is on, and what a recording needs to open its
+    /// canvas.
+    #[cfg(target_arch = "wasm32")]
+    web_recording: Option<web_record::WebRecorder>,
+    #[cfg(target_arch = "wasm32")]
+    web_record_finished: web_record::Finished,
+    #[cfg(target_arch = "wasm32")]
+    instance: wgpu::Instance,
+    #[cfg(target_arch = "wasm32")]
+    adapter: wgpu::Adapter,
     exprs: Expressions,
     /// The expression variables for the frame on screen.
     variables: VariableValues,
@@ -281,8 +290,15 @@ impl Preview {
             layer: Layer::Off,
             #[cfg(not(target_arch = "wasm32"))]
             recording: None,
-            #[cfg(not(target_arch = "wasm32"))]
             record_result: None,
+            #[cfg(target_arch = "wasm32")]
+            web_recording: None,
+            #[cfg(target_arch = "wasm32")]
+            web_record_finished: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            instance,
+            #[cfg(target_arch = "wasm32")]
+            adapter,
             exprs: Expressions::default(),
             variables: modulation::variable_values(0.0, None, [0.0; 5], modulation::FACE_NONE),
             #[cfg(not(target_arch = "wasm32"))]
@@ -440,9 +456,54 @@ impl Preview {
         video.frame_time()
     }
 
+    /// Starts recording, or stops and saves when the browser has finished the file.
+    #[cfg(target_arch = "wasm32")]
+    fn toggle_web_record(&mut self) {
+        match self.web_recording.take() {
+            None => {
+                let size = self.effects.size();
+                match web_record::WebRecorder::start(&self.instance, &self.adapter, &self.gpu, size)
+                {
+                    Ok(recorder) => {
+                        self.web_recording = Some(recorder);
+                        self.record_result = None;
+                    }
+                    Err(e) => self.message = Some(format!("Couldn't start recording: {e}")),
+                }
+            }
+            Some(recorder) => {
+                self.record_result = Some("Finishing the file".into());
+                recorder.finish(self.web_record_finished.clone());
+            }
+        }
+    }
+
+    /// Draws a new picture into the recording. A frame of another size stops it, as on the
+    /// desktop, where the encoder takes one size.
+    #[cfg(target_arch = "wasm32")]
+    fn record_web_frame(&mut self) {
+        if let Some(finished) = self.web_record_finished.borrow_mut().take() {
+            self.record_result = Some(finished);
+        }
+        let Some(recorder) = &self.web_recording else {
+            return;
+        };
+        if recorder.size != self.effects.size() {
+            if let Some(recorder) = self.web_recording.take() {
+                recorder.discard();
+            }
+            self.record_result = Some("Recording stopped: the frame size changed".into());
+        } else if self.effects.last_outcome().new_picture {
+            recorder.draw(&self.gpu, self.effects.output_frame());
+        }
+    }
+
     /// The panel's source and transport actions, in the browser.
     #[cfg(target_arch = "wasm32")]
     fn handle_web_actions(&mut self, actions: &controls::Actions) {
+        if actions.toggle_record {
+            self.toggle_web_record();
+        }
         if actions.import {
             web_media::pick_file(&self.web_pending);
         }
@@ -557,6 +618,8 @@ impl Preview {
         self.effects.render(&self.gpu, c, &values, frame_time);
         #[cfg(not(target_arch = "wasm32"))]
         self.record_frame();
+        #[cfg(target_arch = "wasm32")]
+        self.record_web_frame();
     }
 
     /// Whether a video or camera is the source.
@@ -860,7 +923,8 @@ impl Preview {
             sound_on,
             #[cfg(not(target_arch = "wasm32"))]
             recording: self.recording.is_some(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(target_arch = "wasm32")]
+            recording: self.web_recording.is_some(),
             record_result: self.record_result.as_deref(),
             cameras,
             #[cfg(not(target_arch = "wasm32"))]
