@@ -98,6 +98,31 @@ fn argb(bytes: &[u8]) -> Pixels {
 }
 
 #[test]
+fn kept_target_render_matches_fresh() {
+    let Some(gpu) = shared() else {
+        eprintln!("no hardware GPU adapter: skipped");
+        return;
+    };
+    segcam_motion::gpu::status().expect("segcam draws on the shared device");
+    let params = values(&[
+        ("output", ParamValue::Int(3)),
+        ("background", ParamValue::Int(4)),
+        ("trail", ParamValue::Int(12)),
+        ("max_tiles", ParamValue::Int(30)),
+    ]);
+    let clip = vfx_host::contract::Clip {
+        width: W,
+        height: H,
+        frames: clip(16),
+        frame_rate: None,
+    };
+    let make = || vfx_core::Processor::Cpu(Box::new(SegcamMotion::with_gpu_min_coverage(0.0)));
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let drawn = vfx_host::contract::check_target(make, &clip, &params, gpu, format).unwrap();
+    assert!(drawn > 0, "no render drew into the target");
+}
+
+#[test]
 fn swarm_in_host_frame_matches_readback() {
     let Some(gpu) = shared() else {
         eprintln!("no hardware GPU adapter: skipped");
