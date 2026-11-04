@@ -547,6 +547,8 @@ struct ClipFrames<'a, C> {
     decoded_index: Option<usize>,
     /// Resolve is streaming renders, so earlier frames are taken as unchanged until it pauses.
     earlier_frames_unchanged: bool,
+    /// Resolve has dropped frames from this stream, which makes it playback, not an export.
+    frames_dropped: bool,
 }
 
 impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
@@ -583,6 +585,17 @@ impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
     fn fixed(&self) -> bool {
         self.earlier_frames_unchanged
     }
+
+    /// Playback that has fallen behind must not fall further behind to stay exact.
+    fn live(&self) -> bool {
+        self.frames_dropped
+    }
+
+    /// A frame Resolve dropped costs far more to fetch than one it decoded for playback, so
+    /// playback goes without it, as segcam 1.1 does when it can't keep up.
+    fn held(&self) -> usize {
+        if self.frames_dropped { 1 } else { usize::MAX }
+    }
 }
 
 /// Whether to declare temporal clip access. Resolve hands over earlier frames without it and
@@ -602,25 +615,60 @@ struct KeptEffect {
     last_render: std::sync::Mutex<Option<LastRender>>,
 }
 
-/// A frame rendered, when it finished, and whether it didn't follow on from the one before.
+/// A frame rendered, when it finished, and where it stood in its stream.
 #[derive(Clone, Copy)]
 struct LastRender {
     frame: i64,
     finished: std::time::Instant,
-    broke_stream: bool,
+    stream: StreamPosition,
 }
 
-fn follows_recent_render(last: Option<LastRender>, frame: i64) -> bool {
+/// Where a render stands among the renders before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct StreamPosition {
+    /// It follows the last render: a short step forward, soon after that one finished. How long a
+    /// render itself takes says nothing about this.
+    follows: bool,
+    /// It follows, and so did the last, so earlier frames are taken as unchanged. The render that
+    /// breaks a stream and the next check them: an export can still step back after it.
+    continues: bool,
+    /// How many renders in a row have continued.
+    run: u32,
+    /// The stream skipped a frame after running in order, which an export doesn't do past its
+    /// first few frames. It stays so until the stream breaks, since later frames build on what
+    /// went missing, and the renders that break it check everything again.
+    frames_dropped: bool,
+}
+
+/// Renders in order before a skipped frame counts as dropped.
+const RUN_BEFORE_DROPS: u32 = 8;
+
+/// The longest step forward that continues a stream. Playback falling behind steps up to 6 frames
+/// on an RTX 4070. A stop steps 35 or more, to the frame the playhead reached, and that frame stays
+/// on screen, so it has to be exact.
+const MAX_STREAM_STEP: i64 = 16;
+
+/// Where a render of `frame` starting at `now` stands.
+fn stream_position(
+    last: Option<LastRender>,
+    frame: i64,
+    now: std::time::Instant,
+) -> StreamPosition {
     const MAX_STREAM_GAP: std::time::Duration = std::time::Duration::from_secs(1);
-    last.is_some_and(|last| {
-        last.finished.elapsed() < MAX_STREAM_GAP && (1..=120).contains(&(frame - last.frame))
-    })
-}
-
-/// Whether a render of `frame` continues a stream, so earlier frames are taken as unchanged. The
-/// render that breaks a stream and the next check them: an export can still step back after it.
-fn continues_stream(last: Option<LastRender>, frame: i64) -> bool {
-    follows_recent_render(last, frame) && last.is_some_and(|last| !last.broke_stream)
+    let Some(last) = last else {
+        return StreamPosition::default();
+    };
+    let step = frame - last.frame;
+    let follows =
+        now.duration_since(last.finished) < MAX_STREAM_GAP && (1..=MAX_STREAM_STEP).contains(&step);
+    let continues = follows && last.stream.follows;
+    StreamPosition {
+        follows,
+        continues,
+        run: if continues { last.stream.run + 1 } else { 0 },
+        frames_dropped: continues
+            && (last.stream.frames_dropped || step > 1 && last.stream.run >= RUN_BEFORE_DROPS),
+    }
 }
 
 fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
@@ -693,8 +741,13 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
     if let Some(kept) = kept_for_instance(effect)? {
         let frame = in_args.get_double(PROP_TIME, 0)?.round() as i64;
         let last = *kept.last_render.lock().unwrap_or_else(|p| p.into_inner());
-        let earlier_frames_unchanged = host::is_resolve() && continues_stream(last, frame);
-        let rendered = render_cpu_effect(&kept.effect, effect, in_args, earlier_frames_unchanged);
+        let stream = stream_position(last, frame, std::time::Instant::now());
+        let host_stream = if host::is_resolve() {
+            stream
+        } else {
+            StreamPosition::default()
+        };
+        let rendered = render_cpu_effect(&kept.effect, effect, in_args, host_stream);
         // A report clones what the effect found, so it isn't asked for every frame.
         if last.is_none() || frame.rem_euclid(FRAMES_PER_REPORT) == 0 {
             let report = kept.effect.report();
@@ -711,19 +764,19 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         *kept.last_render.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastRender {
             frame,
             finished: std::time::Instant::now(),
-            broke_stream: !follows_recent_render(last, frame),
+            stream,
         });
         return rendered;
     }
     let fresh = vfx_host::CpuInstance::new(vfx_host::plugin().make, false).ok_or(STAT_FAILED)?;
-    render_cpu_effect(&fresh, effect, in_args, false)
+    render_cpu_effect(&fresh, effect, in_args, StreamPosition::default())
 }
 
 fn render_cpu_effect(
     cpu_effect: &vfx_host::CpuInstance,
     effect: ImageEffect,
     in_args: Props,
-    earlier_frames_unchanged: bool,
+    stream: StreamPosition,
 ) -> Result<(), OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
     let output = fetch_image(clip_handle(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?
@@ -762,7 +815,7 @@ fn render_cpu_effect(
         ctx: &ctx,
         output: &output.image,
         window,
-        earlier_frames_unchanged,
+        stream,
     };
     let error = if output.image.depth == Depth::Byte {
         render.at_depth::<u8>()
@@ -817,7 +870,7 @@ struct CpuRender<'a> {
     ctx: &'a Context,
     output: &'a Image,
     window: Rect,
-    earlier_frames_unchanged: bool,
+    stream: StreamPosition,
 }
 
 impl CpuRender<'_> {
@@ -834,7 +887,8 @@ impl CpuRender<'_> {
                 error: None,
                 decoded_pixels,
                 decoded_index: None,
-                earlier_frames_unchanged: self.earlier_frames_unchanged,
+                earlier_frames_unchanged: self.stream.continues,
+                frames_dropped: self.stream.frames_dropped,
             };
             let (w, h) = (canvas.width() as i32, canvas.height() as i32);
             output_pixels.clear();
@@ -857,20 +911,30 @@ impl CpuRender<'_> {
 mod tests {
     use super::*;
 
-    /// Which renders of `frames`, in this order, continue a stream.
-    fn streamed(frames: &[i64]) -> Vec<bool> {
+    /// Where renders of `frames`, in this order, stand, each taking `render_time`.
+    fn positions(frames: &[i64], render_time: std::time::Duration) -> Vec<StreamPosition> {
         let mut last = None;
+        let mut now = std::time::Instant::now();
         frames
             .iter()
             .map(|&frame| {
-                let streaming = continues_stream(last, frame);
+                let stream = stream_position(last, frame, now);
+                now += render_time;
                 last = Some(LastRender {
                     frame,
-                    finished: std::time::Instant::now(),
-                    broke_stream: !follows_recent_render(last, frame),
+                    finished: now,
+                    stream,
                 });
-                streaming
+                stream
             })
+            .collect()
+    }
+
+    /// Which renders of `frames`, in this order, continue a stream.
+    fn streamed(frames: &[i64]) -> Vec<bool> {
+        positions(frames, std::time::Duration::ZERO)
+            .iter()
+            .map(|p| p.continues)
             .collect()
     }
 
@@ -888,5 +952,45 @@ mod tests {
             false, false, false, false, false, false, true, true, false, false, false, true,
         ];
         assert_eq!(streamed(&frames), expected);
+    }
+
+    /// A render that takes long doesn't end its own stream, which would make the next read every
+    /// frame and take long too, for the rest of the playback.
+    #[test]
+    fn slow_render_continues_stream() {
+        let streams = positions(&[0, 1, 2, 3, 4], std::time::Duration::from_secs(8));
+        assert_eq!(
+            streams.iter().map(|p| p.continues).collect::<Vec<_>>(),
+            [false, false, true, true, true]
+        );
+    }
+
+    /// An export's skips at its start aren't dropped frames; playback's later on are, until the
+    /// stream breaks.
+    #[test]
+    fn only_skips_after_a_run_drop_frames() {
+        let dropped = |frames: &[i64]| {
+            positions(frames, std::time::Duration::ZERO)
+                .iter()
+                .map(|p| p.frames_dropped)
+                .collect::<Vec<_>>()
+        };
+        let export_start = [0, 0, 0, 2, 1, 3, 4, 5, 6];
+        assert!(!dropped(&export_start).contains(&true));
+        let run: Vec<i64> = (0..12).collect();
+        let playback = [&run[..], &[13, 14, 15, 2, 3, 4]].concat();
+        let want = (0..playback.len()).map(|i| (12..=14).contains(&i));
+        assert_eq!(dropped(&playback), want.collect::<Vec<_>>());
+    }
+
+    /// The jump to where the playhead stopped is checked, since that frame stays on screen.
+    #[test]
+    fn stop_jump_breaks_stream() {
+        let run: Vec<i64> = (0..12).collect();
+        let frames = [&run[..], &[13, 15, 15 + MAX_STREAM_STEP + 1]].concat();
+        let stop = *positions(&frames, std::time::Duration::ZERO)
+            .last()
+            .unwrap();
+        assert_eq!(stop, StreamPosition::default());
     }
 }
