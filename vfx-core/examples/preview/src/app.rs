@@ -1,5 +1,6 @@
 //! The preview window: input, the shown effect, the panel, recording.
 
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use web_time::Instant;
 
@@ -42,6 +43,11 @@ struct Preview {
     view: View,
     /// `h`: only the picture shows, for a live show.
     panel_hidden: bool,
+    /// The shared device's loss has been reported, so nothing draws any more.
+    device_lost_reported: bool,
+    /// Why a scripted run has to end with an error.
+    #[cfg(not(target_arch = "wasm32"))]
+    fatal: Option<String>,
     /// The effect's second input, when it's fed from a video, webcam or image.
     #[cfg(not(target_arch = "wasm32"))]
     layer: Layer,
@@ -286,6 +292,9 @@ impl Preview {
             controls: Controls::default(),
             view: View::default(),
             panel_hidden: false,
+            device_lost_reported: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            fatal: None,
             #[cfg(not(target_arch = "wasm32"))]
             layer: Layer::Off,
             #[cfg(not(target_arch = "wasm32"))]
@@ -829,7 +838,68 @@ impl Preview {
         }
     }
 
+    /// Whether the shared device is lost. Everything shown came through it, so nothing more can
+    /// draw and the picture would freeze with no word why: this says so once, where it can be
+    /// seen, stops the sound, keeps what a recording has so far, and ends a scripted run with an
+    /// error.
+    fn device_lost(&mut self) -> bool {
+        let Some(why) = self.gpu.faults().lost() else {
+            return false;
+        };
+        if !std::mem::replace(&mut self.device_lost_reported, true) {
+            let text = format!("The GPU was lost ({why}).");
+            #[cfg(target_arch = "wasm32")]
+            {
+                let mut message = format!("{text} Reload the page.");
+                if let Some(recorder) = self.web_recording.take() {
+                    recorder.finish(self.web_record_finished.clone());
+                    message += " The recording so far goes to your downloads.";
+                }
+                show_startup_message(&message);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let text = format!("{text} Restart the preview to carry on.");
+                self.window.set_title(&format!("VFX Preview: {text}"));
+                eprintln!("preview: {text}");
+                self.media = None;
+                self.layer = Layer::Off;
+                if self.meter.is_some() || self.quiet {
+                    self.fatal = Some(text);
+                    self.run_finished = true;
+                } else {
+                    rfd::MessageDialog::new()
+                        .set_title("VFX Preview")
+                        .set_description(text)
+                        .set_level(rfd::MessageLevel::Error)
+                        .show();
+                    if let Some(recording) = self.recording.take() {
+                        self.finish_recording(recording);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// A draw that survives what a lost device can panic on after its loss was recorded, such as
+    /// a staging buffer in egui, so the next draw can report it. Other panics go on as panics.
+    fn draw_guarded(&mut self) {
+        let drawn = catch_unwind(AssertUnwindSafe(|| self.draw()));
+        if let Err(panic) = drawn
+            && self.gpu.faults().lost().is_none()
+        {
+            resume_unwind(panic);
+        }
+    }
+
     fn draw(&mut self) {
+        if self.device_lost() {
+            // Nothing paces the loop now that nothing presents.
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            return;
+        }
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64();
         self.last_frame = now;
@@ -840,8 +910,9 @@ impl Preview {
         self.render_effects(dt);
         #[cfg(not(target_arch = "wasm32"))]
         if self.quiet {
-            // Nothing paces a hidden window, so wait for the GPU before the next frame.
-            let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            // Nothing paces a hidden window, so wait for the GPU before the next frame. A device
+            // lost now is reported on the next draw.
+            let _ = vfx_core::poll_device(&self.gpu.device, wgpu::PollType::wait_indefinitely());
         }
         let stats = {
             let rendered = self.effects.last_outcome();
@@ -1356,9 +1427,12 @@ impl ApplicationHandler<GpuSetup> for App {
                 preview.handle_key(&event.logical_key);
             }
             WindowEvent::RedrawRequested if !preview.is_quiet() => {
-                preview.draw();
+                preview.draw_guarded();
                 #[cfg(not(target_arch = "wasm32"))]
                 if preview.run_finished {
+                    if let Some(why) = preview.fatal.take() {
+                        self.failed = Some(why);
+                    }
                     event_loop.exit();
                     return;
                 }
@@ -1379,8 +1453,12 @@ impl ApplicationHandler<GpuSetup> for App {
         };
         #[cfg(not(target_arch = "wasm32"))]
         if preview.quiet {
-            preview.draw();
+            preview.draw_guarded();
             if preview.run_finished {
+                // The loop can draw once more after asking to exit, with nothing left to take.
+                if let Some(why) = preview.fatal.take() {
+                    self.failed = Some(why);
+                }
                 event_loop.exit();
             }
             return;
@@ -1432,7 +1510,11 @@ fn fail(why: &str) -> ! {
 pub fn run(entries: Vec<catalog::Entry>) {
     use winit::platform::web::EventLoopExtWebSys;
     catalog::set(entries);
-    console_error_panic_hook::set_once();
+    // A panic ends the page's loop, so the page has to say so or the picture just freezes.
+    std::panic::set_hook(Box::new(|info| {
+        console_error_panic_hook::hook(info);
+        show_startup_message(&format!("VFX Preview stopped: {info}. Reload the page."));
+    }));
     let event_loop = EventLoop::with_user_event().build().expect("event loop");
     let app = App::new(event_loop.create_proxy(), start_options());
     event_loop.spawn_app(app);

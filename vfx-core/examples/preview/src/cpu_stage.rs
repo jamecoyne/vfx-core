@@ -408,10 +408,10 @@ impl GpuFrameReader {
         time: f64,
         f: impl FnOnce(f64, &[u8], usize),
     ) {
-        let data = buffer
-            .slice(..)
-            .get_mapped_range()
-            .expect("readback is mapped");
+        // A device lost since the map skips the frame; the app reports it on its next draw.
+        let Ok(data) = buffer.slice(..).get_mapped_range() else {
+            return;
+        };
         f(time, &data, self.pitch as usize);
         drop(data);
         buffer.unmap();
@@ -439,13 +439,13 @@ impl GpuFrameReader {
             .map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.send(r);
             });
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed during readback");
-        rx.recv()
-            .expect("map callback dropped")
-            .expect("readback failed to map");
-        self.with_mapped_rows(&self.buffer, time, f);
+        // A device lost now skips the frame; the app reports it on its next draw.
+        if vfx_core::poll_device(&gpu.device, wgpu::PollType::wait_indefinitely()).is_err() {
+            return;
+        }
+        if let Ok(Ok(())) = rx.recv() {
+            self.with_mapped_rows(&self.buffer, time, f);
+        }
     }
 
     /// Starts reading the input back if it is a new frame, room permitting, and hands `f` the
@@ -697,6 +697,29 @@ mod tests {
             &in_ram.output().read_rgba8(&gpu),
             drawn.shown(),
             "the same picture",
+        );
+    }
+
+    /// A frame read from a lost device is skipped, on the main thread, with no panic.
+    #[test]
+    fn lost_device_skips_the_frame() {
+        let (_turn, gpu) = crate::test_gpu();
+        let _faults = vfx_core::DeviceFaults::watch(&gpu.device);
+        let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu(false)));
+        let effect = CpuInstance::new(make, true).expect("a CPU effect");
+        let mut stage = CpuStage::new(&gpu, effect, (32, 32));
+        let values = ParamValues::new(SegcamMotion::with_gpu(false).params());
+        let input = Frame::new(&gpu, 32, 32, crate::effects::FRAME_FORMAT);
+        input.write(&gpu, bytemuck::cast_slice(&vec![0.5f32; 32 * 32 * 4]));
+        stage.push_input(&gpu, Input::Gpu(&input), 0.0, &values, None);
+        assert_eq!(stage.history.len(), 1);
+
+        gpu.device.destroy();
+        stage.push_input(&gpu, Input::Gpu(&input), 1.0, &values, None);
+        assert_eq!(
+            stage.history.frame_number(),
+            0,
+            "the frame read back nothing"
         );
     }
 
