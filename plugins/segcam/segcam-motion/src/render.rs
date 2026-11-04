@@ -519,16 +519,20 @@ pub fn apply_matte<C: Channel>(
 pub fn cut_frame_tiles<C: Channel>(
     motion: &Segmentation,
     frame: Option<&View<C>>,
+    faces_frame: Option<&View<C>>,
     number: i64,
-    canvas_w: i32,
-    canvas_h: i32,
+    (canvas_w, canvas_h): (i32, i32),
     mirrored: bool,
     include_reused_faces: bool,
 ) -> Vec<Tile> {
     let make = |b: usize| {
         let blob = &motion.blobs[b];
         let title = format!("LO.FI.SCI.FI {}", blob_label(blob, number, b));
-        swarm::cut_tile(blob, frame, title, canvas_w, canvas_h, mirrored)
+        let source = match blob.kind {
+            SegmentKind::Motion | SegmentKind::ThresholdRegion => frame,
+            _ => faces_frame.or(frame),
+        };
+        swarm::cut_tile(blob, source, title, canvas_w, canvas_h, mirrored)
     };
     let count = if include_reused_faces {
         motion.blobs.len()

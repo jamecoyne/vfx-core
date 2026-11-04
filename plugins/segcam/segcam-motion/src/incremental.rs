@@ -87,6 +87,8 @@ pub struct IncrementalRenderer {
     /// `None` before the first render.
     drew_on_gpu: Option<bool>,
     faces_wanted: bool,
+    /// Face detection for live renders, which never wait for it.
+    live_faces: crate::faces::LiveFaces,
     readings: Vec<Reading>,
     /// Live renders act as if the face models were still loading.
     #[cfg(test)]
@@ -323,6 +325,7 @@ impl IncrementalRenderer {
             };
             (oldest..=number).filter(feeding).collect()
         };
+        let live = frames.live();
         for frame in frames_to_read {
             frames.with_frame((frame - first) as usize, &mut |image| {
                 let view = image.and_then(C::view);
@@ -365,6 +368,7 @@ impl IncrementalRenderer {
                         && frame == number
                         && self.displayed_analysis_frame(s, number, first) == number;
                 if wanted && !self.is_cached(frame, &key, s) {
+                    let mut detection = None;
                     let motion = match self.cached_motion(frame, &key) {
                         Some(motion) => motion.clone(),
                         None => {
@@ -403,8 +407,27 @@ impl IncrementalRenderer {
                                 {
                                     self.face_detection_calls += 1;
                                 }
-                                let found = crate::faces::find(view, s.faces, grid.count());
-                                motion.blobs.extend(found);
+                                if live {
+                                    // A live render takes the newest faces there are, and those
+                                    // already shown stay until newer ones arrive.
+                                    let cells = grid.count();
+                                    detection = self.live_faces.exchange(view, s.faces, cells);
+                                    if let Some(found) = &detection {
+                                        motion.blobs.extend_from_slice(&found.blobs);
+                                        self.live_faces.attached_to = Some(frame);
+                                    } else if let Some((at, (_, before))) = self
+                                        .live_faces
+                                        .attached_to
+                                        .and_then(|at| Some((at, self.motion.get(&at)?)))
+                                    {
+                                        motion.blobs.extend(reused_faces(before, at));
+                                    }
+                                } else {
+                                    // Any other render may be exported, so it has this frame's
+                                    // own faces, however long they take.
+                                    let found = crate::faces::find(view, s.faces, grid.count());
+                                    motion.blobs.extend(found);
+                                }
                             }
                             self.motion.insert(frame, (key, motion.clone()));
                             motion
@@ -414,17 +437,21 @@ impl IncrementalRenderer {
                         // A trail no longer than the step draws no earlier analysis, so
                         // reused faces need tiles here.
                         let include_reused_faces = trail_len <= s.analysis_step.every;
+                        let faces_frame = detection.as_ref().and_then(|d| d.frame::<C>());
                         let tiles = cut_frame_tiles(
                             &motion,
                             view.as_ref(),
+                            faces_frame.as_ref(),
                             frame,
-                            w,
-                            h,
+                            (w, h),
                             s.mirror,
                             include_reused_faces,
                         );
                         self.tiles.insert(frame, (key, s.mirror, tiles));
                         self.atlas_allocations.remove(&frame);
+                    }
+                    if let Some(found) = detection {
+                        self.live_faces.recycle(found);
                     }
                 }
                 if frame == number {
@@ -806,6 +833,7 @@ impl IncrementalRenderer {
         self.tiles.clear();
         self.atlas_allocations.clear();
         self.oldest_frame_in_atlas = None;
+        self.live_faces.forget();
         self.unfinished = false;
         if let Some(drawer) = &mut self.drawer {
             drawer.drop_unfinished_draw();
@@ -975,7 +1003,8 @@ fn frames_to_analyse(s: &RenderSettings, number: i64, first: i64) -> BTreeSet<i6
         .collect()
 }
 
-/// The faces in `motion`, frame `frame`'s, for the next analysis to reuse with their IDs.
+/// The faces in `motion`, frame `frame`'s, for the next analysis to reuse with their IDs, which
+/// faces it had reused already got from the frame that first found them.
 fn reused_faces(motion: &Segmentation, frame: i64) -> impl Iterator<Item = motion::Blob> + '_ {
     use motion::SegmentKind as Kind;
     motion
@@ -984,7 +1013,7 @@ fn reused_faces(motion: &Segmentation, frame: i64) -> impl Iterator<Item = motio
         .enumerate()
         .filter(|(_, b)| !matches!(b.kind, Kind::Motion | Kind::ThresholdRegion))
         .map(move |(i, b)| motion::Blob {
-            reused_from: Some((frame, i)),
+            reused_from: b.reused_from.or(Some((frame, i))),
             ..*b
         })
 }
@@ -1249,6 +1278,83 @@ mod tests {
                 "frame {n}"
             );
         }
+    }
+
+    /// A live render returns while detection can't run, here since the models are locked, and an
+    /// export would wait for them.
+    #[test]
+    fn live_render_does_not_wait_for_detection() {
+        wait_for_models();
+        let models = crate::faces::lock_models();
+        let (done, finished) = std::sync::mpsc::channel();
+        let renders = std::thread::spawn(move || {
+            let frames = crossing();
+            let mut state = IncrementalRenderer::default();
+            let mut history = vfx_core::cpu::History::<u8>::default();
+            history.resize(W, H);
+            let before = crate::previous_frames_needed(&with_faces(ALL_PARTS)) as usize;
+            for (n, frame) in frames.iter().enumerate() {
+                history.next(before, before).copy_from_slice(frame);
+                let count = history.len();
+                face_detection_calls_in(&mut state, &mut history, count, n as i64);
+            }
+            done.send(()).unwrap();
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(60)).is_ok(),
+            "a live render waited for the models"
+        );
+        drop(models);
+        renders.join().unwrap();
+    }
+
+    /// New face windows show the frame the face was found in, and motion windows the current one.
+    #[test]
+    fn new_face_windows_cut_from_detection_frame() {
+        let filled = |red| {
+            vec![
+                Argb::<u8> {
+                    alpha: 255,
+                    red,
+                    green: 0,
+                    blue: 0,
+                };
+                (W * H) as usize
+            ]
+        };
+        let (current, found_in) = (filled(50), filled(200));
+        let bounds = motion::NormRect {
+            x: 0.25,
+            y: 0.25,
+            w: 0.5,
+            h: 0.5,
+        };
+        let blob = |kind| motion::Blob {
+            bounds,
+            kind,
+            ..motion::Blob::default()
+        };
+        let motion = Segmentation {
+            blobs: vec![
+                blob(motion::SegmentKind::Motion),
+                blob(motion::SegmentKind::Face),
+            ],
+            ..Segmentation::default()
+        };
+        let tiles = cut_frame_tiles(
+            &motion,
+            Some(&View::from_pixels(&current, W, H)),
+            Some(&View::from_pixels(&found_in, W, H)),
+            0,
+            (W, H),
+            false,
+            false,
+        );
+        let reds: Vec<u8> = tiles
+            .iter()
+            .map(|t| bytemuck::cast_slice::<_, u8>(&t.pixels)[1])
+            .collect();
+        assert_eq!(reds, [50, 200]);
     }
 
     /// A render that may be exported doesn't draw without faces: it waits for the models.

@@ -157,6 +157,8 @@ mod live {
         spare_frame: Option<Arc<dyn Any + Send + Sync>>,
         /// The frame whose motion holds the newest faces, which analyses reuse until the next ones.
         pub attached_to: Option<i64>,
+        /// The parts last asked for.
+        parts: FaceParts,
     }
 
     impl LiveFaces {
@@ -168,6 +170,11 @@ mod live {
             parts: FaceParts,
             cells: usize,
         ) -> Option<Detection> {
+            if self.parts != parts {
+                // Faces found for other parts stop showing.
+                self.parts = parts;
+                self.attached_to = None;
+            }
             let mut finished = None;
             if self.requested {
                 finished = self.answer.lock().ok().and_then(|mut a| a.take());
@@ -227,6 +234,14 @@ mod live {
             self.attached_to = None;
         }
     }
+}
+
+/// Keeps the models from running while the guard lives.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub fn lock_models() -> std::sync::MutexGuard<'static, Option<segcam_face::Segmenter>> {
+    wait();
+    let models = models::MODELS.get().expect("the models have loaded");
+    models.lock().expect("the models' lock")
 }
 
 #[cfg(not(target_arch = "wasm32"))]

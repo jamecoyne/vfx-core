@@ -1,5 +1,5 @@
-//! A live host's renders while the face models load and after, against fresh renders once they
-//! are up. In a file of its own so its process starts with the models not loaded. Reads a portrait
+//! A live host's renders while the face models load, against renders with faces off, and the
+//! faces arriving once they are up. In a file of its own so its process starts with the models not loaded. Reads a portrait
 //! like `faces.rs`; passes with a note when `SEGCAM_FACE_PORTRAIT` isn't set.
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -45,7 +45,7 @@ fn render(
 }
 
 #[test]
-fn renders_during_and_after_load_match_fresh() {
+fn renders_match_faces_off_during_the_load_and_show_faces_after() {
     let Some(p) = portrait() else { return };
     let clip = drifting(&p);
     let all = ["face", "eyes", "mouth", "body"];
@@ -86,17 +86,15 @@ fn renders_during_and_after_load_match_fresh() {
         "the models were up before the first render: the test proves nothing"
     );
 
-    // Once the trail has moved past the renders of the load, they are fresh renders.
-    let mut differed = false;
-    for f in 0..TRAIL * 4 {
+    // Detection now runs beside the renders, so its results arrive within a little while.
+    let started = Instant::now();
+    loop {
+        assert!(started.elapsed() < LIMIT, "no faces after the load");
         next(&mut history, &swarm);
         let got = render(&mut kept, &mut history, &swarm);
         let off = render(&mut plain, &mut history, &without);
-        differed |= got != off;
-        if f > TRAIL {
-            let fresh = render(&mut SegcamMotion::default(), &mut history, &swarm);
-            assert!(got == fresh, "render {f} after the load");
+        if got != off {
+            break;
         }
     }
-    assert!(differed, "no faces after the load: the test proves nothing");
 }

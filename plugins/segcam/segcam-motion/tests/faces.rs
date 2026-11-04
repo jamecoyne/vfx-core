@@ -62,10 +62,78 @@ fn faces_keep_the_contract() {
     }
 }
 
-/// A live host keeps the effect and hands over frames forward from its own history, which
-/// reads only the frames the effect hasn't seen: each render still equals a fresh one.
+/// A host's own history of frames for a render that has to be exact: a live one takes faces when
+/// they arrive, which a fresh render can't match.
+struct ExactHistory<'a>(&'a mut History<u8>);
+
+impl FrameSource for ExactHistory<'_> {
+    fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+        self.0.with_frame(index, f);
+    }
+
+    fn fixed(&self) -> bool {
+        self.0.fixed()
+    }
+
+    fn held(&self) -> usize {
+        self.0.held()
+    }
+}
+
+/// A live render doesn't wait for faces: they arrive within a few renders of a slow device's time,
+/// and those shown stay on the renders between detections.
 #[test]
-fn faces_from_a_live_history_match_fresh_renders() {
+fn live_faces_arrive_and_stay() {
+    let Some(p) = portrait() else { return };
+    segcam_motion::faces::wait();
+    let clip = drifting(&p);
+    let params = faces_with(&[("output", ParamValue::Int(2))]);
+    let mut effect = SegcamMotion::default();
+    let mut history = History::<u8>::default();
+    history.resize(W, H);
+    let face_read = |effect: &SegcamMotion| {
+        effect
+            .report()
+            .readings
+            .iter()
+            .find(|r| r.name == "face")
+            .map(|r| r.value)
+    };
+    let mut seen = 0;
+    let started = std::time::Instant::now();
+    for f in 0.. {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(120),
+            "no faces after {f} renders"
+        );
+        let before = effect.frames_before(&params, None);
+        let pixels = &clip.frames[f % clip.frames.len()];
+        history.next(before, before).copy_from_slice(pixels);
+        let ctx = Context {
+            frame: history.frame_number(),
+            ..Context::at(f as f64 / 30.0)
+        };
+        let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+        let view = ViewMut::from_pixels(&mut out, W, H);
+        let count = history.len();
+        effect.render(&mut history, count, ImageMut::U8(view), &params, &ctx);
+        if seen > 0 {
+            assert_eq!(face_read(&effect), Some(1.0), "render {f}, faces went away");
+            seen += 1;
+        } else if face_read(&effect) == Some(1.0) {
+            seen = 1;
+        }
+        if seen == 20 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// A host keeps the effect and hands over frames forward from its own history, which reads only
+/// the frames the effect hasn't seen: each exact render still equals a fresh one.
+#[test]
+fn faces_from_a_kept_history_match_fresh_renders() {
     let Some(p) = portrait() else { return };
     segcam_motion::faces::wait();
     let clip = drifting(&p);
@@ -105,7 +173,8 @@ fn faces_from_a_live_history_match_fresh_renders() {
                 let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
                 let view = ViewMut::from_pixels(&mut out, W, H);
                 let count = history.len();
-                effect.render(&mut history, count, ImageMut::U8(view), params, &ctx);
+                let mut exact = ExactHistory(&mut history);
+                effect.render(&mut exact, count, ImageMut::U8(view), params, &ctx);
                 out
             };
             let got = render(&mut kept);
@@ -116,7 +185,8 @@ fn faces_from_a_live_history_match_fresh_renders() {
             let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
             let view = ViewMut::from_pixels(&mut out, W, H);
             let count = lean_history.len();
-            lean.render(&mut lean_history, count, ImageMut::U8(view), params, &ctx);
+            let mut exact = ExactHistory(&mut lean_history);
+            lean.render(&mut exact, count, ImageMut::U8(view), params, &ctx);
             assert!(got == out, "lean, frame {f} at {frame_rate:?}");
         }
     }
@@ -152,7 +222,8 @@ fn readings_match_model_output() {
     let view = ViewMut::from_pixels(&mut out, W, H);
     let count = history.len();
     let ctx = Context::at(0.0);
-    effect.render(&mut history, count, ImageMut::U8(view), &params, &ctx);
+    let mut exact = ExactHistory(&mut history);
+    effect.render(&mut exact, count, ImageMut::U8(view), &params, &ctx);
 
     let report = effect.report();
     assert_eq!(report.draw.as_deref(), Some("CPU"));
