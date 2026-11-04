@@ -71,6 +71,10 @@ pub struct IncrementalRenderer {
     /// create instances often. A frame's tiles enter the atlas on first GPU draw.
     drawer: Option<Box<Drawer>>,
     atlas_allocations: BTreeMap<i64, AtlasAllocation>,
+    /// A live render out of atlas stops drawing frames older than this.
+    oldest_frame_in_atlas: Option<i64>,
+    /// Whether the last render's source is live, so it must not stall to stay exact.
+    source_is_live: bool,
     gpu_wanted: bool,
     gpu_overlay: bool,
     /// Suppresses repeat logs of the same message.
@@ -217,6 +221,7 @@ impl IncrementalRenderer {
     ) {
         self.unfinished = false;
         self.drew_on_gpu = Some(false);
+        self.source_is_live = frames.live();
         if out.is_empty() {
             return;
         }
@@ -708,20 +713,27 @@ impl IncrementalRenderer {
             );
             return Ok(());
         }
-        // Only frames with a visible tile keep atlas allocations. A full atlas draws this render
-        // on the CPU; frames leaving the trail free space for the next.
+        // Only frames with a visible tile keep atlas allocations, newest first. A render that may
+        // be exported must be exact, so a full atlas draws it on the CPU and frames leaving the
+        // trail free space for the next. A CPU draw would stall a live render, so that one gives
+        // up its oldest windows instead, or waits a render for a growing atlas.
         let wanted: BTreeSet<i64> = visible.iter().map(|p| p.frame).collect();
         self.atlas_allocations.retain(|f, _| wanted.contains(f));
-        for f in wanted {
-            if self.atlas_allocations.contains_key(&f) {
+        for &f in wanted.iter().rev() {
+            if self.atlas_allocations.contains_key(&f)
+                || self.oldest_frame_in_atlas.is_some_and(|oldest| f < oldest)
+            {
                 continue;
             }
             let Some((_, _, tiles)) = self.tiles.get(&f) else {
                 continue;
             };
-            match drawer.upload_tiles(tiles, (w, h), &shadow)? {
-                Some(allocation) => self.atlas_allocations.insert(f, allocation),
-                None => {
+            loop {
+                if let Some(allocation) = drawer.upload_tiles(tiles, (w, h), &shadow)? {
+                    self.atlas_allocations.insert(f, allocation);
+                    break;
+                }
+                if !self.source_is_live {
                     draw_output(
                         out,
                         s,
@@ -732,11 +744,25 @@ impl IncrementalRenderer {
                     );
                     return Ok(());
                 }
-            };
+                if drawer.atlas_growing() {
+                    break;
+                }
+                if self.oldest_frame_in_atlas.is_none() {
+                    eprintln!("segcam Motion: the atlas is full; dropping the oldest windows");
+                }
+                let evicted = self.atlas_allocations.keys().next().copied();
+                let Some(oldest) = evicted.filter(|&oldest| oldest < f) else {
+                    self.oldest_frame_in_atlas = Some(f + 1);
+                    break;
+                };
+                self.atlas_allocations.remove(&oldest);
+                self.oldest_frame_in_atlas = Some(oldest + 1);
+            }
         }
-        let windows = visible
-            .iter()
-            .map(|p| (p.tile, self.atlas_allocations[&p.frame].slots[p.index]));
+        let windows = visible.iter().filter_map(|p| {
+            let allocation = self.atlas_allocations.get(&p.frame)?;
+            Some((p.tile, allocation.slots[p.index]))
+        });
         if into_target && let Some(offer) = self.target.as_mut() {
             drawer.draw_swarm_into(&offer.frame, windows, frame.as_ref(), number, s, &shadow)?;
             offer.drawn_into = true;
@@ -756,6 +782,7 @@ impl IncrementalRenderer {
         self.motion.clear();
         self.tiles.clear();
         self.atlas_allocations.clear();
+        self.oldest_frame_in_atlas = None;
         self.unfinished = false;
         if let Some(drawer) = &mut self.drawer {
             drawer.drop_unfinished_draw();
@@ -1492,6 +1519,49 @@ mod tests {
         assert_eq!(
             on_gpu.drawer().expect("a drawer").atlas_words().0,
             grown_words
+        );
+    }
+
+    /// A CPU draw stalls a live render, so one out of atlas keeps drawing on the GPU, with fewer
+    /// windows.
+    #[test]
+    fn live_full_atlas_drops_oldest_windows_on_gpu() {
+        let _lock = gpu_test_lock();
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut drawer = gpu::Drawer::new(dev.clone()).expect("a drawer on a working device");
+        // Room for a few frames' tiles, and no more.
+        drawer.small_atlas(1024);
+        drawer.set_max_binding_bytes((W * H * 4) as u64 * 6);
+        let mut state = IncrementalRenderer::default();
+        state.use_drawer(drawer);
+        state.set_gpu_min_coverage(0.0);
+        let s = RenderSettings {
+            mode: OutputMode::Swarm,
+            background_frames: 4,
+            trail_frames: 8,
+            max_tiles: 20,
+            ..RenderSettings::default()
+        };
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let mut history = vfx_core::cpu::History::<u8>::default();
+        history.resize(W, H);
+        let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+        for (n, frame) in frames.iter().enumerate() {
+            history.next(needed, 1).copy_from_slice(frame);
+            let count = history.len();
+            let view = &mut ViewMut::from_pixels(&mut out, W, H);
+            state.render_frame(&s, &mut history, count, n as i64, view);
+        }
+        assert!(
+            state.oldest_frame_in_atlas.is_some(),
+            "the atlas never filled"
+        );
+        assert_eq!(drawn(&state), frames.len() as u64, "a render left the GPU");
+        assert_eq!(faults(&state), 0);
+        assert!(
+            out.iter().any(|p| p.alpha == 255),
+            "the newest windows are gone"
         );
     }
 

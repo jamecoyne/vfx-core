@@ -916,6 +916,12 @@ impl Drawer {
         }
     }
 
+    /// Whether the atlas is waiting for the GPU to answer a request to grow (browsers).
+    pub(crate) fn atlas_growing(&self) -> bool {
+        let atlas = self.atlas.lock().unwrap_or_else(|e| e.into_inner());
+        atlas.pending_growth.is_some()
+    }
+
     /// A smaller atlas than usual, for a new drawer.
     #[cfg(test)]
     pub(crate) fn small_atlas(&mut self, words: u64) {
