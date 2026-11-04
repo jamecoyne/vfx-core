@@ -2,7 +2,7 @@
 use segcam_face::runtime::{self, Device, OrtFaceMesh, OrtPicoDet, OrtYuNet};
 use segcam_face::{
     BodyDetector, Detector, FACE_MESH_MODEL, FaceSegmenter, Image, PICODET_MODEL, Parts, Pixels,
-    YUNET_MODEL,
+    YUNET_MODEL, d3d12_device_lock,
 };
 
 /// Cargo copies DirectML.dll to target/<profile>, but tests run from its deps folder, where Windows
@@ -34,6 +34,8 @@ fn load_directml() {
 #[cfg(not(windows))]
 fn load_directml() {}
 
+/// Tests run on threads side by side and make and drop DirectML sessions, so each holds
+/// [`d3d12_device_lock`] from before its first session until after its last.
 fn devices() -> Vec<Device> {
     load_directml();
     #[allow(unused_mut)]
@@ -61,6 +63,7 @@ const ALL: Parts = Parts {
 
 #[test]
 fn a_flat_frame_has_no_faces_or_bodies() {
+    let _device_lock = d3d12_device_lock();
     let bytes = vec![90u8; 320 * 180 * 4];
     let floats = vec![0.35f32; 320 * 180 * 4];
     for device in devices() {
@@ -85,6 +88,7 @@ fn a_flat_frame_has_no_faces_or_bodies() {
 
 #[test]
 fn odd_frames_find_nothing_and_do_not_panic() {
+    let _device_lock = d3d12_device_lock();
     for device in devices() {
         let mut segmenter = FaceSegmenter::new(
             OrtYuNet::new(YUNET_MODEL, device).unwrap(),
@@ -107,6 +111,7 @@ fn odd_frames_find_nothing_and_do_not_panic() {
 
 #[test]
 fn the_fastest_device_loads_everything() {
+    let _device_lock = d3d12_device_lock();
     load_directml();
     let (mut segmenter, device) = runtime::fastest(true, true).expect("a device");
     assert!(
@@ -125,6 +130,7 @@ fn the_fastest_device_loads_everything() {
 
 #[test]
 fn the_best_segmenter_finds_nothing_in_a_flat_frame() {
+    let _device_lock = d3d12_device_lock();
     load_directml();
     let mut segmenter = segcam_face::Segmenter::best().expect("a segmenter");
     let data = vec![128u8; 320 * 180 * 4];

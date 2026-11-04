@@ -20,8 +20,10 @@ use std::sync::{Mutex, MutexGuard};
 pub use picodet::Body;
 pub use yunet::Face;
 
-/// Held while making or releasing a D3D12 device. One made on one thread while another releases
-/// one can deadlock (seen on NVIDIA, inside the driver and D3D12).
+/// Held while making or releasing a D3D12 device, including through a DirectML session, a
+/// [`runtime::fastest`] trial's losers or a [`Segmenter`]. One made on one thread while another
+/// releases one can deadlock (seen on NVIDIA, inside the driver and D3D12). Nothing in this crate
+/// takes it, so every caller does, for as long as it makes or drops them.
 pub fn d3d12_device_lock() -> MutexGuard<'static, ()> {
     static D3D12_DEVICE_LOCK: Mutex<()> = Mutex::new(());
     D3D12_DEVICE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
