@@ -342,8 +342,9 @@ pub trait FrameSource {
         false
     }
 
-    /// How many of the newest frames a [fixed](Self::fixed) source still has the pixels of.
-    /// Older ones come as `None`, and stay gone.
+    /// How many of the newest frames a [fixed](Self::fixed) source still has the pixels of, or
+    /// will fetch: older ones come as `None`, and stay gone for as long as it says so. An effect
+    /// that keeps work works those frames out again if the source later stops being fixed.
     fn held(&self) -> usize {
         usize::MAX
     }

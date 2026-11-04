@@ -4,8 +4,9 @@
 //! invalidates. Where they are immutable ([`FrameSource::fixed`]: a host's own frame history, as
 //! in Resolume and the preview, or Resolve while it streams), it reads only uncached frames and
 //! the current one, so an edit in Resolve appears when that frame renders or at the next check.
-//! Output depends only on pixels and settings, never on render order. The key includes the first
-//! background frame, so analysis computed near the start of the frames stays valid.
+//! Output depends only on pixels and settings, never on render order, except while a live source
+//! leaves frames out. The key includes the first background frame, so analysis computed near the
+//! start of the frames stays valid.
 //!
 //! Sources holding only their newest frames ([`FrameSource::held`]) cannot supply older frames
 //! again: their tiles are never recut, so new settings reach new windows only (as segcam 1.1),
@@ -305,6 +306,11 @@ impl IncrementalRenderer {
         } else {
             i64::MIN
         };
+        // A hash vouches for what a frame's pixels gave. Those of a frame out of the source's reach
+        // get released, so a source that hands it over again later has it worked out again.
+        if fixed && held != i64::MAX {
+            self.frame_hashes = self.frame_hashes.split_off(&oldest_held_frame);
+        }
         if swarm {
             self.pin_unreadable_frames(s, first, number, oldest_held_frame);
         }
@@ -381,10 +387,14 @@ impl IncrementalRenderer {
                                     ..Segmentation::default()
                                 },
                             };
-                            // The face source is analysed first, unless it is missing.
+                            // The face source is analysed first, unless it is missing or a
+                            // live source left it out, which leaves it no grid and no faces.
                             let source_motion = key
                                 .face_source
-                                .filter(|_| !missing.contains(&source_frame))
+                                .filter(|_| {
+                                    !missing.contains(&source_frame)
+                                        && self.grids.contains_key(&source_frame)
+                                })
                                 .and_then(|_| self.cached_motion(source_frame, &source_key));
                             if let Some(before) = source_motion {
                                 motion.blobs.extend(reused_faces(before, source_frame));
@@ -426,7 +436,10 @@ impl IncrementalRenderer {
             self.invalidate_frame(frame, invalidation_reach);
         }
         let retention_radius = background + trail_len + 2 * AnalysisStep::MAX_EVERY;
-        self.retain_frames(number - retention_radius..=number + retention_radius);
+        // Later frames are read when they come up. Keeping them from a seek would only compare
+        // their hashes then with pixels that needn't match: Resolve hands over different pixels for
+        // a frame in playback than for the same frame otherwise, which would clear the history.
+        self.retain_frames(number - retention_radius..=number);
         if swarm {
             self.release_undrawn_data(s, count, number, (w, h), oldest_held_frame);
         }
@@ -1059,24 +1072,114 @@ mod tests {
             .collect()
     }
 
-    fn render(
-        state: &mut IncrementalRenderer,
-        frames: &[Vec<Argb<u8>>],
-        n: usize,
-    ) -> Vec<Argb<u8>> {
-        let s = RenderSettings {
+    fn swarm_settings() -> RenderSettings {
+        RenderSettings {
             mode: OutputMode::Swarm,
             background_frames: 4,
             trail_frames: 8,
             max_tiles: 20,
             ..RenderSettings::default()
-        };
+        }
+    }
+
+    fn render(
+        state: &mut IncrementalRenderer,
+        frames: &[Vec<Argb<u8>>],
+        n: usize,
+    ) -> Vec<Argb<u8>> {
+        let s = swarm_settings();
         let needed = crate::previous_frames_needed(&s) as usize;
         let clip = &frames[n.saturating_sub(needed)..=n];
         let mut out = vec![Argb::default(); (W * H) as usize];
         let view = &mut ViewMut::from_pixels(&mut out, W, H);
         state.render_frame(&s, &mut Frames(clip), clip.len(), n as i64, view);
         out
+    }
+
+    /// Playback that has dropped frames: only the current frame can be read.
+    struct OnlyNewestFrame<'a> {
+        frames: &'a [Vec<Argb<u8>>],
+        reads: usize,
+    }
+
+    impl FrameSource for OnlyNewestFrame<'_> {
+        fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+            assert_eq!(index, self.frames.len() - 1, "an older frame was asked for");
+            self.reads += 1;
+            f(Some(Image::U8(View::from_pixels(
+                &self.frames[index],
+                W,
+                H,
+            ))));
+        }
+
+        fn live(&self) -> bool {
+            true
+        }
+
+        fn fixed(&self) -> bool {
+            true
+        }
+
+        fn held(&self) -> usize {
+            1
+        }
+    }
+
+    /// A stream that dropped frames reads only what it renders, and the first check after it
+    /// gives what a fresh effect gives, with nothing left over from those renders.
+    #[test]
+    fn render_after_dropped_frames_matches_fresh() {
+        let frames = crossing();
+        let s = swarm_settings();
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let mut kept = IncrementalRenderer::default();
+        for n in 0..6 {
+            render(&mut kept, &frames, n);
+        }
+        for n in [8, 10, 13] {
+            let clip = &frames[n - needed.min(n)..=n];
+            let mut source = OnlyNewestFrame {
+                frames: clip,
+                reads: 0,
+            };
+            let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+            let view = &mut ViewMut::from_pixels(&mut out, W, H);
+            kept.render_frame(&s, &mut source, clip.len(), n as i64, view);
+            assert_eq!(source.reads, 1, "frame {n}");
+        }
+        let fresh = render(&mut IncrementalRenderer::default(), &frames, 13);
+        assert!(render(&mut kept, &frames, 13) == fresh);
+    }
+
+    /// A frame whose faces would come from the one before looks for itself if that was dropped.
+    #[test]
+    fn dropped_face_source_leaves_frame_to_detect() {
+        wait_for_models();
+        let frames = crossing();
+        let s = with_faces(ALL_PARTS);
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let mut state = IncrementalRenderer::default();
+        for n in [4, 7, 9] {
+            let clip = &frames[n - needed.min(n)..=n];
+            let mut source = OnlyNewestFrame {
+                frames: clip,
+                reads: 0,
+            };
+            let calls = face_detection_calls_in(&mut state, &mut source, clip.len(), n as i64);
+            assert!(calls > 0, "frame {n} didn't look for faces");
+        }
+    }
+
+    /// Going back leaves nothing kept ahead of the frame rendered to be compared later.
+    #[test]
+    fn later_frames_are_not_kept() {
+        let frames = crossing();
+        let mut state = IncrementalRenderer::default();
+        render(&mut state, &frames, 10);
+        render(&mut state, &frames, 2);
+        assert!(state.frame_hashes.keys().all(|&frame| frame <= 2));
+        assert!(state.motion.keys().all(|&frame| frame <= 2));
     }
 
     const ALL_PARTS: FaceParts = FaceParts {
