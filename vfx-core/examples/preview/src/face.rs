@@ -57,7 +57,7 @@ impl Detector {
         })
     }
 
-    /// Taking the device lock waits out segcam's own load.
+    /// Moves to the device segcam chose, once. Taking the device lock waits out segcam's own load.
     fn use_chosen_device(&mut self) {
         let Some(chosen) = runtime::chosen_device().filter(|_| !self.device_tried) else {
             return;

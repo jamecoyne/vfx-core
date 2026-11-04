@@ -471,8 +471,14 @@ impl Preview {
         match self.web_recording.take() {
             None => {
                 let size = self.effects.size();
-                match web_record::WebRecorder::start(&self.instance, &self.adapter, &self.gpu, size)
-                {
+                let finished = self.web_record_finished.clone();
+                match web_record::WebRecorder::start(
+                    &self.instance,
+                    &self.adapter,
+                    &self.gpu,
+                    size,
+                    finished,
+                ) {
                     Ok(recorder) => {
                         self.web_recording = Some(recorder);
                         self.record_result = None;
@@ -482,7 +488,7 @@ impl Preview {
             }
             Some(recorder) => {
                 self.record_result = Some("Finishing the file".into());
-                recorder.finish(self.web_record_finished.clone());
+                recorder.finish();
             }
         }
     }
@@ -497,7 +503,9 @@ impl Preview {
         let Some(recorder) = &self.web_recording else {
             return;
         };
-        if recorder.size != self.effects.size() {
+        if recorder.ended() {
+            self.web_recording = None;
+        } else if recorder.size != self.effects.size() {
             if let Some(recorder) = self.web_recording.take() {
                 recorder.discard();
             }
@@ -852,7 +860,7 @@ impl Preview {
             {
                 let mut message = format!("{text} Reload the page.");
                 if let Some(recorder) = self.web_recording.take() {
-                    recorder.finish(self.web_record_finished.clone());
+                    recorder.finish();
                     message += " The recording so far goes to your downloads.";
                 }
                 show_startup_message(&message);

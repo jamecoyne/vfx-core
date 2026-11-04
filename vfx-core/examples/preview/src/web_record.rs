@@ -8,13 +8,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use js_sys::Array;
+use js_sys::{Array, Reflect};
 use vfx_core::{Frame, Gpu};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{
-    Blob, BlobEvent, BlobPropertyBag, HtmlAnchorElement, HtmlCanvasElement, MediaRecorder,
-    MediaRecorderOptions, Url,
+    Blob, BlobEvent, BlobPropertyBag, Event, HtmlAnchorElement, HtmlCanvasElement, MediaRecorder,
+    MediaRecorderOptions, RecordingState, Url,
 };
 
 use crate::effects::FullscreenPass;
@@ -34,6 +34,9 @@ const BITS_PER_SECOND: u32 = 16_000_000;
 
 /// How long a saved file's object URL stays valid, so the browser can finish taking it.
 const URL_LIFETIME_MS: i32 = 60_000;
+
+/// How long a recorder that reported an error gets to hand over its last data and stop.
+const AFTER_ERROR_MS: i32 = 250;
 
 const OPAQUE_COPY_WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -61,11 +64,22 @@ pub struct WebRecorder {
     surface: wgpu::Surface<'static>,
     pass: FullscreenPass,
     recorder: MediaRecorder,
-    chunks: Rc<RefCell<Vec<Blob>>>,
-    on_data: Closure<dyn FnMut(BlobEvent)>,
+    file: Rc<PendingFile>,
+    pub size: (u32, u32),
+}
+
+/// The file a recording becomes. The recorder's events hold this, so it outlives `WebRecorder`
+/// until the browser has handed over the last of the data.
+struct PendingFile {
+    /// Taken when the file is saved or dropped, so that happens once. It also keeps the recorder
+    /// alive for its last events, and taking it frees the event handlers that hold this.
+    recorder: RefCell<Option<MediaRecorder>>,
+    chunks: RefCell<Vec<Blob>>,
+    /// Why the recorder stopped by itself, if it reported that.
+    failure: RefCell<Option<String>>,
     mime_type: String,
     extension: &'static str,
-    pub size: (u32, u32),
+    finished: Finished,
 }
 
 fn error(e: JsValue) -> String {
@@ -78,6 +92,7 @@ impl WebRecorder {
         adapter: &wgpu::Adapter,
         gpu: &Gpu,
         size: (u32, u32),
+        finished: Finished,
     ) -> Result<Self, String> {
         let (mime_type, extension) = FORMATS
             .into_iter()
@@ -130,24 +145,40 @@ impl WebRecorder {
         let recorder =
             MediaRecorder::new_with_media_stream_and_media_recorder_options(&stream, &options)
                 .map_err(error)?;
-        let chunks: Rc<RefCell<Vec<Blob>>> = Rc::default();
-        let kept = chunks.clone();
-        let on_data = Closure::<dyn FnMut(BlobEvent)>::new(move |event: BlobEvent| {
-            if let Some(chunk) = event.data() {
-                kept.borrow_mut().push(chunk);
-            }
+        let file = Rc::new(PendingFile {
+            recorder: RefCell::new(Some(recorder.clone())),
+            chunks: RefCell::default(),
+            failure: RefCell::default(),
+            mime_type: mime_type.to_owned(),
+            extension,
+            finished,
         });
-        recorder.set_ondataavailable(Some(on_data.as_ref().unchecked_ref()));
+        let on_data = {
+            let file = file.clone();
+            Closure::<dyn FnMut(BlobEvent)>::new(move |event: BlobEvent| {
+                if let Some(chunk) = event.data() {
+                    file.chunks.borrow_mut().push(chunk);
+                }
+            })
+        };
+        recorder.set_ondataavailable(Some(on_data.into_js_value().unchecked_ref()));
+        let on_stop = {
+            let file = file.clone();
+            Closure::<dyn FnMut()>::new(move || file.save_once())
+        };
+        recorder.set_onstop(Some(on_stop.into_js_value().unchecked_ref()));
+        let on_error = {
+            let file = file.clone();
+            Closure::<dyn FnMut(Event)>::new(move |event: Event| file.recorder_failed(&event))
+        };
+        recorder.set_onerror(Some(on_error.into_js_value().unchecked_ref()));
         // Handed over a second at a time, so a long recording isn't one huge buffer to the end.
         recorder.start_with_time_slice(1000).map_err(error)?;
         Ok(Self {
             surface,
             pass,
             recorder,
-            chunks,
-            on_data,
-            mime_type: mime_type.to_owned(),
-            extension,
+            file,
             size,
         })
     }
@@ -174,26 +205,81 @@ impl WebRecorder {
         gpu.queue.present(frame);
     }
 
-    /// Stops, then saves the file once the browser has handed over the last of it.
-    pub fn finish(self, finished: Finished) {
-        let recorder = self.recorder.clone();
-        let on_stop = Closure::once_into_js(move || {
-            let outcome = self.save();
-            *finished.borrow_mut() = Some(match outcome {
-                Ok(name) => format!("Saved {name} to your downloads"),
-                Err(e) => format!("Couldn't save the recording: {e}"),
-            });
-        });
-        recorder.set_onstop(Some(on_stop.unchecked_ref()));
-        if let Err(e) = recorder.stop() {
-            web_sys::console::error_1(&e);
+    /// Stops, then saves the file once the browser has handed over the last of it. A recorder
+    /// that is already inactive fires no stop event, so that saves what there is now.
+    pub fn finish(self) {
+        if self.recorder.state() == RecordingState::Inactive || self.recorder.stop().is_err() {
+            self.file.save_once();
         }
     }
 
     /// Stops without saving, since the canvas size no longer matches.
     pub fn discard(self) {
+        self.file.recorder.borrow_mut().take();
         self.recorder.set_ondataavailable(None);
-        let _ = self.recorder.stop();
+        self.recorder.set_onstop(None);
+        self.recorder.set_onerror(None);
+        if self.recorder.state() != RecordingState::Inactive {
+            let _ = self.recorder.stop();
+        }
+    }
+
+    /// Whether the recording ended by itself and its file is dealt with.
+    pub fn ended(&self) -> bool {
+        self.file.recorder.borrow().is_none()
+    }
+}
+
+impl PendingFile {
+    /// Keeps why the recorder failed, then saves what it has. A browser should hand over the last
+    /// data and fire stop by itself, but the file can't depend on it.
+    fn recorder_failed(self: &Rc<Self>, event: &Event) {
+        let why = Reflect::get(event, &"error".into())
+            .and_then(|e| Reflect::get(&e, &"message".into()))
+            .ok()
+            .and_then(|message| message.as_string())
+            .unwrap_or_else(|| "the browser's recorder failed".to_owned());
+        *self.failure.borrow_mut() = Some(why);
+        if let Some(recorder) = &*self.recorder.borrow()
+            && recorder.state() != RecordingState::Inactive
+        {
+            let _ = recorder.stop();
+        }
+        let file = self.clone();
+        let save = Closure::once_into_js(move || file.save_once());
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                save.unchecked_ref(),
+                AFTER_ERROR_MS,
+            );
+        }
+    }
+
+    /// Saves the file and reports how that went, the first time it's called.
+    fn save_once(&self) {
+        let Some(recorder) = self.recorder.borrow_mut().take() else {
+            return;
+        };
+        recorder.set_ondataavailable(None);
+        recorder.set_onstop(None);
+        recorder.set_onerror(None);
+        let failure = self.failure.borrow_mut().take();
+        let outcome = if self.chunks.borrow().is_empty() {
+            match failure {
+                Some(why) => format!("Recording failed: {why}"),
+                None => "Nothing was recorded".to_owned(),
+            }
+        } else {
+            match (self.save(), failure) {
+                (Ok(name), None) => format!("Saved {name} to your downloads"),
+                (Ok(name), Some(why)) => {
+                    format!("Recording stopped: {why}. Saved {name} to your downloads")
+                }
+                (Err(e), _) => format!("Couldn't save the recording: {e}"),
+            }
+        };
+        self.chunks.borrow_mut().clear();
+        *self.finished.borrow_mut() = Some(outcome);
     }
 
     fn save(&self) -> Result<String, String> {
@@ -223,8 +309,6 @@ impl WebRecorder {
                 URL_LIFETIME_MS,
             )
             .map_err(error)?;
-        // Keeps the data callback alive up to here: the last chunk arrives just before stop.
-        let _ = &self.on_data;
         Ok(name)
     }
 }
