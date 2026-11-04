@@ -312,6 +312,9 @@ pub fn report_text(report: &Report) -> String {
     if let Some(faces) = &report.faces {
         text += &format!(", faces {faces}");
     }
+    if report.out_of_gpu_memory {
+        text += ", out of GPU memory";
+    }
     text
 }
 
@@ -371,6 +374,15 @@ fn machine_load(ui: &mut Ui, s: &Snapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_text_says_when_out_of_gpu_memory() {
+        let mut report = Report::default();
+        assert_eq!(report_text(&report), "");
+        report.draw = Some("GPU".to_owned());
+        report.out_of_gpu_memory = true;
+        assert_eq!(report_text(&report), ", draw GPU, out of GPU memory");
+    }
 
     #[test]
     fn device_error_reaches_the_fault_text() {

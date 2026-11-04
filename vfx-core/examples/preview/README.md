@@ -49,7 +49,8 @@ neither, and for a CPU effect drawing into the output frame the times stop at it
 which repeats the last frame when nothing new came in; `--frames N` stops after that many.
 `cpu` is the machine's, `app_cpu` this process's as a share of one core, and `gpu` is `n/a`
 where the OS doesn't report it. A `fault` key follows, and the bar starts with it in colour, once
-the shared device is lost or reports an error. Under `--quiet` loops are unpaced and each waits for the GPU,
+the shared device is lost or reports an error. `out_of_gpu_memory=true` follows once the effect
+has run out of GPU memory for what it keeps and draws less to keep its rate, and the bar says so too. Under `--quiet` loops are unpaced and each waits for the GPU,
 nothing is presented so `screen` is 0, and a test pattern (which changes every loop) shows
 the effect's throughput in `rendered`.
 
