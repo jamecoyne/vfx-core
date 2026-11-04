@@ -62,7 +62,7 @@ pub fn chosen_device() -> Option<Device> {
 /// `DIRECTML_MARGIN` of the CPU, with the mesh if `mesh` and bodies if `bodies`, or `None` if
 /// no device loads the detector. The first call times each device; later calls reuse its choice.
 pub fn fastest(mesh: bool, bodies: bool) -> Option<(OrtSegmenter, Device)> {
-    let (detector, face_mesh, device) = match CHOSEN.get() {
+    let (mut detector, face_mesh, device) = match CHOSEN.get() {
         Some(&device) => {
             let detector = OrtYuNet::new(YUNET_MODEL, device).ok()?;
             let face_mesh = mesh.then(|| OrtFaceMesh::new(FACE_MESH_MODEL, device).ok());
@@ -89,11 +89,17 @@ pub fn fastest(mesh: bool, bodies: bool) -> Option<(OrtSegmenter, Device)> {
             )
         }
     };
+    detector.score_threshold = SEGMENTER_FACE_SCORE;
     let bodies = bodies
         .then(|| OrtPicoDet::new(PICODET_MODEL, device).ok())
         .flatten();
     Some((FaceSegmenter::new(detector, face_mesh, bodies), device))
 }
+
+/// The lowest YuNet score that becomes a face window. YuNet's usual 0.6 finds half faces and far
+/// faces that Vision, and so segcam 1.1, leave out. This cut agrees best with Vision on which frames
+/// have a face; higher cuts lose faces Vision finds about as fast as they drop extra ones.
+const SEGMENTER_FACE_SCORE: f32 = 0.85;
 
 /// The face models loaded on one device, and how long they took there.
 pub struct Trial {
