@@ -661,8 +661,11 @@ impl Interop {
     pub unsafe fn present(&self, frame: &Frame) -> Result<(), InteropError> {
         let _queue = self.lock_queue();
         let gpu = &self.device.gpu;
-        // SAFETY: GL owns both images, and the queue lock is held.
-        unsafe { self.hand_images_to_vulkan()? };
+        // SAFETY: GL owns both images, the queue lock is held, and the context is current.
+        unsafe {
+            gl::clear_errors();
+            self.hand_images_to_vulkan()?;
+        }
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_texture(
             frame.texture.as_image_copy(),
@@ -692,6 +695,7 @@ impl Interop {
         // SAFETY: GL owns both images, the caller supplies valid host objects, and the queue lock
         // is held.
         unsafe {
+            gl::clear_errors();
             self.input_framebuffer.draw_into(host_fbo, || {
                 self.host_to_canvas.draw(
                     texture,

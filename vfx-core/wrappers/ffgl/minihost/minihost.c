@@ -665,6 +665,39 @@ static void case_sharing(void) {
     }
 }
 
+/* GL errors left on the context by the host or another plugin aren't the plugin's: it stays on the
+ * shared path, with the right pixels. An invalid target to glBindTexture is GL_INVALID_ENUM. */
+static void case_pending_gl_error(void) {
+    _putenv_s("VFX_FFGL_PATH", "ram");
+    void *ram = instantiate(63, 37);
+    _putenv_s("VFX_FFGL_PATH", "");
+    Frame f = frame(63, 37, 80, 48);
+    float *reference = malloc((size_t)f.w * f.h * 4 * sizeof(float));
+    CHECK(render(ram, &f), "forced RAM reference render");
+    memcpy(reference, f.out, (size_t)f.w * f.h * 4 * sizeof(float));
+    glBindTexture(0xFFFF, 0);
+    void *shared = instantiate(63, 37);
+    for (int i = 0; i < 3; i++) {
+        glBindTexture(0xFFFF, 0);
+        CHECK(render(shared, &f), "render %d with an error pending", i);
+        float worst = 0;
+        for (int k = 0; k < f.w * f.h * 4; k++) {
+            float diff = fabsf(reference[k] - f.out[k]);
+            if (diff > worst) worst = diff;
+        }
+        CHECK(worst < 1e-4f, "render %d differs from RAM: %g", i, worst);
+    }
+    free(reference);
+    free_frame(&f);
+    call(DEINSTANTIATE_GL, u(0), shared);
+    call(DEINSTANTIATE_GL, u(0), ram);
+    if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
+        CHECK(!logged_message("zero-copy path unavailable"), "a pending GL error stopped setup");
+        CHECK(!logged_message("shared GPU render failed"), "a pending GL error failed a render");
+        CHECK(logged_message("render path: GPU-native (Vulkan"), "the shared path did not run");
+    }
+}
+
 /* A frame whose GPU wait runs out, as on a GPU that hangs without being lost: the instance goes on
  * through RAM with the right pixels, and deleting it returns. */
 static void case_gpu_wait(void) {
@@ -709,6 +742,8 @@ static Case cases[] = {
 #ifdef _WIN32
     {"context", case_context},
     {"sharing", case_sharing},
+    /* Before gpu_wait, whose failed renders this one's log check would find. */
+    {"pending_gl_error", case_pending_gl_error},
     {"gpu_wait", case_gpu_wait},
 #endif
     {"info", case_info}, {"passthrough", case_passthrough}, {"brightness", case_brightness},
