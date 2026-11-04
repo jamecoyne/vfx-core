@@ -713,6 +713,10 @@ impl IncrementalRenderer {
         let shadow = swarm::shadow_kernel(m.scale);
         let pile = build_pile(&self.tiles, s, count, number, w, h);
         let mut visible: Vec<PileEntry> = pile.visible_entries().collect();
+        // Only a live render goes without windows, and a live stream can end with some left out.
+        if !self.source_is_live {
+            self.oldest_frame_in_atlas = None;
+        }
         if let Some(oldest) = self.oldest_frame_in_atlas {
             let dropping = visible.iter().any(|p| p.frame < oldest);
             visible.retain(|p| p.frame >= oldest);
@@ -1673,6 +1677,41 @@ mod tests {
             out.iter().any(|p| p.alpha == 255),
             "the newest windows are gone"
         );
+    }
+
+    /// What a live render left out for want of atlas space comes back in the first render that
+    /// may be exported.
+    #[test]
+    fn exact_render_after_full_atlas_has_every_window() {
+        let _lock = gpu_test_lock();
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut drawer = gpu::Drawer::new(dev.clone()).expect("a drawer on a working device");
+        drawer.small_atlas(1024);
+        drawer.set_max_binding_bytes((W * H * 4) as u64 * 6);
+        let mut state = IncrementalRenderer::default();
+        state.use_drawer(drawer);
+        state.set_gpu_min_coverage(0.0);
+        let s = swarm_settings();
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let mut history = vfx_core::cpu::History::<u8>::default();
+        history.resize(W, H);
+        let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+        for (n, frame) in frames.iter().enumerate() {
+            history.next(needed, 1).copy_from_slice(frame);
+            let count = history.len();
+            let view = &mut ViewMut::from_pixels(&mut out, W, H);
+            state.render_frame(&s, &mut history, count, n as i64, view);
+        }
+        assert!(
+            state.oldest_frame_in_atlas.is_some(),
+            "the atlas never filled"
+        );
+        let n = frames.len() - 1;
+        let after = render(&mut state, &frames, n);
+        let fresh = render(&mut IncrementalRenderer::default(), &frames, n);
+        assert!(within_a_level(&fresh, &after));
+        assert_eq!(state.oldest_frame_in_atlas, None);
     }
 
     /// An atlas too small for the trail draws the renders it can't hold on the CPU, and the

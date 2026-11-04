@@ -403,15 +403,6 @@ pub(crate) fn gpu_test_lock() -> MutexGuard<'static, ()> {
     GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Polls `device`. wgpu panics here on a lost device, which has to reach the fault paths as an
-/// error rather than unwind through the render.
-fn poll_device(device: &wgpu::Device, poll: wgpu::PollType) -> Result<(), String> {
-    catch_unwind(AssertUnwindSafe(|| device.poll(poll)))
-        .map_err(|_| "the device was lost during a poll".to_owned())?
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-
 /// Draws on a device a host shared ([`vfx_core::Gpu::share`]), binding as much as it allows.
 fn on_shared(gpu: vfx_core::Gpu) -> GpuContext {
     let limits = gpu.device.limits();
@@ -896,7 +887,7 @@ impl Drawer {
 
     /// Whether the device is lost, which it says when polled.
     pub fn lost(&self) -> bool {
-        let _ = poll_device(&self.dev.device, wgpu::PollType::Poll);
+        let _ = vfx_core::poll_device(&self.dev.device, wgpu::PollType::Poll);
         self.dev.lost().is_some()
     }
 
@@ -1494,12 +1485,12 @@ impl Drawer {
             timeout: Some(self.readback_timeout),
         };
         // Another instance's poll may be the one that calls back, a moment later.
-        let mapped = match poll_device(&self.dev.device, wait) {
-            Ok(()) => match rx.recv_timeout(self.readback_timeout) {
+        let mapped = match vfx_core::poll_device(&self.dev.device, wait) {
+            Ok(_) => match rx.recv_timeout(self.readback_timeout) {
                 Ok(result) => result.map_err(|e| e.to_string()),
                 Err(_) => Err("the readback never finished".into()),
             },
-            Err(e) => Err(e),
+            Err(e) => Err(e.to_string()),
         };
         if let Err(e) = mapped {
             // The map may still be pending on the buffer: the next render takes a new one.

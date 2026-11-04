@@ -233,9 +233,7 @@ impl Readback {
             timeout: Some(timeout),
         };
         // Another thread's poll may be the one that calls back, a moment later.
-        let mapped = gpu
-            .device
-            .poll(wait)
+        let mapped = crate::poll_device(&gpu.device, wait)
             .map_err(|e| e.to_string())
             .and_then(|_| rx.recv_timeout(timeout).map_err(|e| e.to_string()))
             .and_then(|mapped| mapped.map_err(|e| e.to_string()));

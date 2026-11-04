@@ -1,4 +1,5 @@
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 /// What a device reported through its error and loss callbacks. wgpu holds one of each per device
@@ -45,6 +46,33 @@ impl DeviceFaults {
     pub fn lost(&self) -> Option<String> {
         self.lost.lock().ok().and_then(|lost| lost.clone())
     }
+}
+
+/// Why [`poll_device`] failed.
+#[derive(Debug)]
+pub enum PollFailure {
+    DeviceLost,
+    Other(wgpu::PollError),
+}
+
+impl fmt::Display for PollFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceLost => write!(f, "the device was lost during a poll"),
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// [`wgpu::Device::poll`], for anything that has to go on after the device is lost: wgpu panics
+/// there rather than return an error.
+pub fn poll_device(
+    device: &wgpu::Device,
+    poll: wgpu::PollType,
+) -> Result<wgpu::PollStatus, PollFailure> {
+    catch_unwind(AssertUnwindSafe(|| device.poll(poll)))
+        .map_err(|_| PollFailure::DeviceLost)?
+        .map_err(PollFailure::Other)
 }
 
 /// The device and queue every effect renders with.
@@ -96,7 +124,7 @@ impl Gpu {
     /// `Gpu` again keeps its record. Sharing another replaces it for later readers, and a clone
     /// taken earlier goes on following its own device.
     pub fn share(&self) {
-        self.faults.install(&self.device);
+        self.watch_faults();
         let parts = Some(self.parts());
         #[cfg(target_arch = "wasm32")]
         SHARED.with(|s| *s.borrow_mut() = parts);
@@ -104,6 +132,12 @@ impl Gpu {
         {
             *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = parts;
         }
+    }
+
+    /// Takes over the device's error and loss callbacks, for a host that doesn't share it; read
+    /// them with [`Gpu::faults`].
+    pub fn watch_faults(&self) {
+        self.faults.install(&self.device);
     }
 
     fn parts(&self) -> GpuParts {
