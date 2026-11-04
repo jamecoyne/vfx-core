@@ -43,6 +43,17 @@ impl Default for Controls {
 }
 
 impl Controls {
+    /// Sets every effect's `mirror` toggle for a new source: on for a camera, which otherwise
+    /// reads backwards, and off for a file, as segcam 1.1 does. Every effect and not just the
+    /// shown one, so picking the effect after the camera gives the same result. The panel can
+    /// change it afterwards.
+    pub fn mirror_for_source(&mut self, camera: bool) {
+        for params in &mut self.params {
+            // Most effects have no such parameter.
+            let _ = params.set("mirror", ParamValue::Bool(camera));
+        }
+    }
+
     /// The shown effect's values.
     pub fn values(&self) -> &ParamValues {
         &self.params[self.effect]
@@ -568,6 +579,18 @@ pub fn panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_turns_mirror_on_and_file_turns_it_off() {
+        let mut c = Controls::default();
+        let segcam = &c.params[catalog::find("segcam Motion (Rust)").unwrap()];
+        assert!(!segcam.bool("mirror"));
+        c.mirror_for_source(true);
+        let segcam = catalog::find("segcam Motion (Rust)").unwrap();
+        assert!(c.params[segcam].bool("mirror"), "the effect isn't shown");
+        c.mirror_for_source(false);
+        assert!(!c.params[segcam].bool("mirror"));
+    }
 
     #[test]
     fn every_effect_has_its_own_values() {

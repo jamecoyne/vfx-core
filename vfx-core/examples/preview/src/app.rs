@@ -292,6 +292,9 @@ impl Preview {
                     .write_source(&self.gpu, &fit_still(&img.to_rgba8(), size));
             }),
         };
+        if loaded.is_ok() {
+            self.controls.mirror_for_source(false);
+        }
         self.message = loaded
             .err()
             .map(|e| format!("Couldn't open {}: {e}", path.display()));
@@ -313,6 +316,7 @@ impl Preview {
                 self.effects
                     .start_video(&self.gpu, name, video.info.size, video.info.fps);
                 let file = video.info.file();
+                self.controls.mirror_for_source(file.is_none());
                 self.media = Some(Media {
                     sound: self
                         .sound_on
@@ -337,6 +341,7 @@ impl Preview {
         if let Some(opened) = self.web_pending.borrow_mut().take() {
             match opened {
                 Ok(video) => {
+                    self.controls.mirror_for_source(video.is_camera());
                     self.web_video = Some(video);
                     self.message = None;
                 }
