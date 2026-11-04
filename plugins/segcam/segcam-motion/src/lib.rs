@@ -24,10 +24,10 @@ pub use incremental::IncrementalRenderer;
 
 vfx_plugin::export!(cpu: SegcamMotion);
 pub use motion::{
-    Blob, LumaGrid, Motion, MotionSettings, NormRect, SegmentKind, ThresholdSettings,
+    Blob, LumaGrid, MotionSettings, NormRect, SegmentKind, Segmentation, ThresholdSettings,
 };
 pub use pixel::{Argb, Channel, Color, View, ViewMut};
 pub use render::{
-    AnalysisStep, Detect, FaceParts, OutputMode, RenderSettings, SwarmBackground,
+    AnalysisStep, DetectionMode, FaceParts, OutputMode, RenderSettings, SwarmBackground,
     previous_frames_needed, render, segment_label,
 };

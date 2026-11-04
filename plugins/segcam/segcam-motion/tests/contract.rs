@@ -46,7 +46,7 @@ fn make() -> Processor {
 }
 
 fn make_gpu() -> Processor {
-    Processor::Cpu(Box::new(SegcamMotion::with_gpu_threshold(0.0)))
+    Processor::Cpu(Box::new(SegcamMotion::with_gpu_min_coverage(0.0)))
 }
 
 fn make_gpu_or_cpu() -> Processor {

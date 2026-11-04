@@ -29,7 +29,8 @@ use crate::font;
 use crate::motion::Blob;
 use crate::pixel::{Argb, Channel, View, ViewMut};
 use crate::render::{
-    PixelRect, RenderSettings, SwarmBackground, blob_label, text_height, text_width, to_pixels,
+    PixelRect, RenderSettings, SwarmBackground, blob_label, norm_rect_to_pixels, text_height,
+    text_width,
 };
 use crate::swarm::{ShadowKernel, SwarmMetrics, Tile, TitleBar, WindowPlan};
 
@@ -995,7 +996,10 @@ impl Drawer {
             .iter()
             .map(|t| WindowPlan::new(t, &m, shadow, whole))
             .collect();
-        let bars: Vec<_> = tiles.iter().map(|t| TitleBar::of(t, &m)).collect();
+        let bars: Vec<_> = tiles
+            .iter()
+            .map(|t| TitleBar::cached_or_new(t, &m))
+            .collect();
         // Slots hold offsets from the start of the pixels and of the tables until the atlas
         // has room for both.
         let mut pixel_words = 0;
@@ -1020,7 +1024,7 @@ impl Drawer {
         // Each window's shadow profiles, corner indices and mask edges, by column then by row.
         for (slot, plan) in slots.iter_mut().zip(&plans) {
             slot.plan = tables.len() as u32;
-            (slot.window_rect, slot.shadow_rect) = (plan.frame, plan.area);
+            (slot.window_rect, slot.shadow_rect) = (plan.window_rect, plan.shadow_rect);
             let mask = |v: &[f64]| v.iter().map(|&f| (f as f32).to_bits()).collect::<Vec<_>>();
             for (profile, corner, edge) in [
                 (&plan.profile_x, &plan.corner_x, &plan.mask_x),
@@ -1124,14 +1128,14 @@ impl Drawer {
         for (tile, slot) in windows {
             data.extend(rect_words(slot.window_rect));
             data.extend(rect_words(slot.shadow_rect));
-            data.extend(rect_words(tile.stored));
+            data.extend(rect_words(tile.clipped_rect));
             data.extend([slot.plan, slot.pixels, u32::from(slot.has_pixels), slot.bar]);
             data.extend([slot.bar_width as u32, 0, 0, 0]);
             widest = widest.max(slot.window_rect.w);
         }
         let count = data.len() / WINDOW_WORDS;
         let corner = data.len() as u32;
-        data.extend(shadow.corner.iter().map(|f| f.to_bits()));
+        data.extend(shadow.corner_table.iter().map(|f| f.to_bits()));
         let unit_table = append_unit_table(&mut data);
         // Where each column and row of a window samples its title bar, as the CPU works it out.
         let bar_h = chrome::TITLE_BAR_HEIGHT;
@@ -1181,8 +1185,8 @@ impl Drawer {
             unit_table,
             bar_x,
             bar_y,
-            corner_min_offset: shadow.lo,
-            corner_size: shadow.size,
+            corner_min_offset: shadow.corner_min_offset,
+            corner_size: shadow.corner_size,
             title_height: m.title_height,
             bar_h,
             scale: m.scale as f32,
@@ -1212,7 +1216,7 @@ impl Drawer {
         let mut items = Vec::with_capacity(blobs.len() * BLOB_WORDS);
         let mut glyphs = Vec::new();
         for (i, blob) in blobs.iter().enumerate() {
-            let r = to_pixels(&blob.bounds, w, h, s.mirror);
+            let r = norm_rect_to_pixels(&blob.bounds, w, h, s.mirror);
             let label = blob_label(blob, analysis, i);
             let pad = 2 * scale;
             let mut chip = PixelRect::new(

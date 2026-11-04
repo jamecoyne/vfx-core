@@ -129,8 +129,8 @@ fn a_swarm_drawn_into_a_host_frame_is_the_one_read_back() {
     ];
     let target = Frame::new(gpu, W as u32, H as u32, wgpu::TextureFormat::Rgba32Float);
     for (name, params) in &sets {
-        let mut read_back = SegcamMotion::with_gpu_threshold(0.0);
-        let mut drawn_into = SegcamMotion::with_gpu_threshold(0.0);
+        let mut read_back = SegcamMotion::with_gpu_min_coverage(0.0);
+        let mut drawn_into = SegcamMotion::with_gpu_min_coverage(0.0);
         let needed = read_back.frames_before(params, None);
         let mut want = vec![Argb::default(); (W * H) as usize];
         let mut out = want.clone();

@@ -6,7 +6,7 @@
 use segcam_motion::gpu::NoGpu;
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
-    AnalysisStep, Argb, Channel, Detect, IncrementalRenderer, OutputMode, RenderSettings,
+    AnalysisStep, Argb, Channel, DetectionMode, IncrementalRenderer, OutputMode, RenderSettings,
     SwarmBackground, View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, Image};
@@ -80,7 +80,7 @@ fn cases() -> Vec<(&'static str, RenderSettings)> {
         max_tiles: 30,
         ..RenderSettings::default()
     };
-    let threshold = Detect::Threshold;
+    let threshold = DetectionMode::Threshold;
     vec![
         ("overlay", RenderSettings::default()),
         (
@@ -112,7 +112,7 @@ fn cases() -> Vec<(&'static str, RenderSettings)> {
         (
             "threshold swarm straight",
             RenderSettings {
-                detect: threshold,
+                detection_mode: threshold,
                 straight_alpha: true,
                 ..swarm
             },
@@ -120,7 +120,7 @@ fn cases() -> Vec<(&'static str, RenderSettings)> {
         (
             "threshold swarm source mirror",
             RenderSettings {
-                detect: threshold,
+                detection_mode: threshold,
                 swarm_background: SwarmBackground::Source,
                 mirror: true,
                 ..swarm

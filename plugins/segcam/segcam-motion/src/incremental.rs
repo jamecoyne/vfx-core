@@ -21,11 +21,11 @@ use vfx_core::{Reading, Report};
 use vfx_plugin::vfx_host::by_rows;
 
 use crate::gpu::{self, AtlasAllocation, Drawer, Fault};
-use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
+use crate::motion::{self, LumaGrid, MotionSettings, Segmentation, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
-    AnalysisStep, Detect, FaceParts, OutputMode, Pile, PileEntry, PixelRect, RenderSettings,
-    downsample, draw_output, fill_rect, frame_tiles, history_frames,
+    AnalysisStep, DetectionMode, FaceParts, OutputMode, Pile, PileEntry, PixelRect, RenderSettings,
+    cut_frame_tiles, downsample, draw_output, fill_rect, history_frames,
 };
 use crate::swarm::{self, SwarmMetrics, Tile};
 
@@ -40,7 +40,7 @@ struct HistoryFormat {
 /// What a frame's segments depend on besides the grids.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DetectionSettings {
-    detect: Detect,
+    detection_mode: DetectionMode,
     motion: MotionSettings,
     background_frames: i32,
     every: i64,
@@ -65,7 +65,7 @@ pub struct IncrementalRenderer {
     grids: BTreeMap<i64, LumaGrid>,
     /// A hash of each frame's pixels, since edits upstream can leave the grid as it was.
     frame_hashes: BTreeMap<i64, u64>,
-    motion: BTreeMap<i64, (AnalysisKey, Motion)>,
+    motion: BTreeMap<i64, (AnalysisKey, Segmentation)>,
     /// Tiles by frame, with the basis and mirroring they were cut for.
     tiles: BTreeMap<i64, (AnalysisKey, bool, Vec<Tile>)>,
     /// Drawing on the GPU: a frame's tiles go into its atlas when a render first draws them
@@ -352,21 +352,21 @@ impl IncrementalRenderer {
                         None => {
                             let empty = LumaGrid::default();
                             let grid = self.grids.get(&frame).unwrap_or(&empty);
-                            let mut motion = match s.detect {
-                                Detect::Motion => {
+                            let mut motion = match s.detection_mode {
+                                DetectionMode::Motion => {
                                     let history = (key.background_start..frame)
                                         .filter(|k| k.rem_euclid(s.analysis_step.every) == 0)
                                         .map(|k| self.grids.get(&k).unwrap_or(&empty));
-                                    motion::detect(history, grid, &s.motion)
+                                    motion::detect_motion(history, grid, &s.motion)
                                 }
-                                Detect::Threshold => {
-                                    motion::threshold(grid, &s.threshold, &s.motion)
+                                DetectionMode::Threshold => {
+                                    motion::detect_threshold(grid, &s.threshold, &s.motion)
                                 }
-                                Detect::FacesOnly => Motion {
+                                DetectionMode::FacesOnly => Segmentation {
                                     mask: vec![0; grid.count()],
                                     width: grid.width,
                                     height: grid.height,
-                                    ..Motion::default()
+                                    ..Segmentation::default()
                                 },
                             };
                             // The frame it reuses was worked out first, unless it is missing.
@@ -392,7 +392,7 @@ impl IncrementalRenderer {
                         // A trail no longer than the step draws no earlier analysis, so
                         // reused faces need tiles here.
                         let include_reused_faces = trail_len <= s.analysis_step.every;
-                        let tiles = frame_tiles(
+                        let tiles = cut_frame_tiles(
                             &motion,
                             view.as_ref(),
                             frame,
@@ -434,7 +434,10 @@ impl IncrementalRenderer {
             .filter(|&f| f < oldest_held_frame)
         {
             let key = analysis_key(s, frame, first);
-            let motion = self.motion.entry(frame).or_insert((key, Motion::default()));
+            let motion = self
+                .motion
+                .entry(frame)
+                .or_insert((key, Segmentation::default()));
             motion.0 = key;
             let tiles = self
                 .tiles
@@ -458,17 +461,17 @@ impl IncrementalRenderer {
         if self.tiles.range(..oldest_held_frame).next().is_none() {
             return;
         }
-        let shown: BTreeSet<(i64, usize)> =
+        let visible: BTreeSet<(i64, usize)> =
             build_pile(&self.tiles, s, count, number, width, height)
-                .shown_entries()
+                .visible_entries()
                 .map(|p| (p.frame, p.index))
                 .collect();
         for (&frame, (_, _, tiles)) in self.tiles.range_mut(..oldest_held_frame) {
             for (index, tile) in tiles.iter_mut().enumerate() {
-                if !shown.contains(&(frame, index)) {
+                if !visible.contains(&(frame, index)) {
                     tile.hidden = true;
                     tile.pixels = Vec::new();
-                    tile.bar = None;
+                    tile.title_bar = None;
                 }
             }
         }
@@ -616,12 +619,12 @@ impl IncrementalRenderer {
     ) {
         let first = number - count as i64 + 1;
         let pile = build_pile(&self.tiles, s, count, number, out.width, out.height);
-        let empty = Motion::default();
+        let empty = Segmentation::default();
         let analysis_frame = self.displayed_analysis_frame(s, number, first);
         let motion = self
             .cached_motion(analysis_frame, &analysis_key(s, analysis_frame, first))
             .unwrap_or(&empty);
-        draw_output(out, s, frame, motion, analysis_frame, pile.shown());
+        draw_output(out, s, frame, motion, analysis_frame, pile.visible());
     }
 
     /// The frame whose analysis frame `number` shows: the last analysed, or its own where that
@@ -646,7 +649,7 @@ impl IncrementalRenderer {
         let first = number - count as i64 + 1;
         if let (OutputMode::Overlay, Some(view), true) = (s.mode, frame.as_ref(), self.gpu_overlay)
         {
-            let empty = Motion::default();
+            let empty = Segmentation::default();
             let analysis_frame = self.displayed_analysis_frame(s, number, first);
             let motion = self
                 .cached_motion(analysis_frame, &analysis_key(s, analysis_frame, first))
@@ -678,18 +681,25 @@ impl IncrementalRenderer {
         let m = SwarmMetrics::new(h);
         let shadow = swarm::shadow_kernel(m.scale);
         let pile = build_pile(&self.tiles, s, count, number, w, h);
-        let shown: Vec<PileEntry> = pile.shown_entries().collect();
-        let window_pixel_count = window_pixels(shown.iter().map(|p| p.tile), &m, &shadow, w, h);
-        let empty = Motion::default();
+        let visible: Vec<PileEntry> = pile.visible_entries().collect();
+        let window_pixel_count = window_pixels(visible.iter().map(|p| p.tile), &m, &shadow, w, h);
+        let empty = Segmentation::default();
         let motion =
             cached_motion(&self.motion, number, &analysis_key(s, number, first)).unwrap_or(&empty);
         if window_pixel_count * 1000 < canvas_pixels * min_coverage_permille {
-            draw_output(out, s, frame, motion, number, shown.iter().map(|p| p.tile));
+            draw_output(
+                out,
+                s,
+                frame,
+                motion,
+                number,
+                visible.iter().map(|p| p.tile),
+            );
             return Ok(());
         }
         // Only frames with a shown tile keep their place in the atlas. A full atlas draws this
         // render on the CPU; the frames the trail drops free it for the next.
-        let wanted: BTreeSet<i64> = shown.iter().map(|p| p.frame).collect();
+        let wanted: BTreeSet<i64> = visible.iter().map(|p| p.frame).collect();
         self.atlas_allocations.retain(|f, _| wanted.contains(f));
         for f in wanted {
             if self.atlas_allocations.contains_key(&f) {
@@ -701,12 +711,19 @@ impl IncrementalRenderer {
             match drawer.upload_tiles(tiles, (w, h), &shadow)? {
                 Some(allocation) => self.atlas_allocations.insert(f, allocation),
                 None => {
-                    draw_output(out, s, frame, motion, number, shown.iter().map(|p| p.tile));
+                    draw_output(
+                        out,
+                        s,
+                        frame,
+                        motion,
+                        number,
+                        visible.iter().map(|p| p.tile),
+                    );
                     return Ok(());
                 }
             };
         }
-        let windows = shown
+        let windows = visible
             .iter()
             .map(|p| (p.tile, self.atlas_allocations[&p.frame].slots[p.index]));
         #[cfg(not(target_arch = "wasm32"))]
@@ -742,7 +759,7 @@ impl IncrementalRenderer {
                 || cached_tiles(&self.tiles, frame, key, s.mirror).is_some())
     }
 
-    fn cached_motion(&self, frame: i64, key: &AnalysisKey) -> Option<&Motion> {
+    fn cached_motion(&self, frame: i64, key: &AnalysisKey) -> Option<&Segmentation> {
         cached_motion(&self.motion, frame, key)
     }
 
@@ -769,10 +786,10 @@ impl IncrementalRenderer {
 
 /// The motion kept for `frame`, if it was worked out for `key`.
 fn cached_motion<'a>(
-    kept: &'a BTreeMap<i64, (AnalysisKey, Motion)>,
+    kept: &'a BTreeMap<i64, (AnalysisKey, Segmentation)>,
     frame: i64,
     key: &AnalysisKey,
-) -> Option<&'a Motion> {
+) -> Option<&'a Segmentation> {
     kept.get(&frame).filter(|(b, _)| b == key).map(|(_, m)| m)
 }
 
@@ -823,7 +840,7 @@ fn window_pixels<'t>(
     let canvas = PixelRect::new(0, 0, width, height);
     tiles
         .map(|t| {
-            let f = swarm::tile_extent(t.video, m.title_height);
+            let f = swarm::window_rect(t.content_rect, m.title_height);
             let area = PixelRect::new(f.x - reach, f.y - reach, f.w + 2 * reach, f.h + 2 * reach);
             let r = crate::render::intersect(area, canvas);
             i64::from(r.w) * i64::from(r.h)
@@ -842,7 +859,7 @@ fn analysis_key(s: &RenderSettings, frame: i64, first: i64) -> AnalysisKey {
     };
     AnalysisKey {
         detection: DetectionSettings {
-            detect: s.detect,
+            detection_mode: s.detection_mode,
             motion: s.motion,
             background_frames: s.background_frames,
             every: s.analysis_step.every,
@@ -866,8 +883,8 @@ fn analysis_frames_used(s: &RenderSettings, number: i64, first: i64) -> impl Ite
             s.analysis_step.every,
         )
     } else {
-        let shown = s.analysis_step.analysis_frame(number, first);
-        (shown..=shown, 1)
+        let visible = s.analysis_step.analysis_frame(number, first);
+        (visible..=visible, 1)
     };
     frames.filter(move |f| f.rem_euclid(every) == 0)
 }
@@ -902,15 +919,15 @@ fn frames_to_analyse(s: &RenderSettings, number: i64, first: i64) -> BTreeSet<i6
 }
 
 /// The faces in `motion`, frame `frame`'s, as the next analysis reuses them: with their IDs.
-fn reused_faces(motion: &Motion, frame: i64) -> impl Iterator<Item = motion::Blob> + '_ {
+fn reused_faces(motion: &Segmentation, frame: i64) -> impl Iterator<Item = motion::Blob> + '_ {
     use motion::SegmentKind as Kind;
     motion
         .blobs
         .iter()
         .enumerate()
-        .filter(|(_, b)| !matches!(b.kind, Kind::Motion | Kind::Blob))
+        .filter(|(_, b)| !matches!(b.kind, Kind::Motion | Kind::ThresholdRegion))
         .map(move |(i, b)| motion::Blob {
-            reused: Some((frame, i)),
+            reused_from: Some((frame, i)),
             ..*b
         })
 }

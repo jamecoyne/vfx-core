@@ -7,11 +7,11 @@ use segcam_motion::motion::{self, LumaGrid};
 use segcam_motion::pixel::Depth;
 use segcam_motion::pixel::make_pixel;
 use segcam_motion::render::{PixelRect, blob_label, downsample, fit_text, text_width};
-use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, draw_window, make_tile};
+use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, cut_tile, draw_window};
 use segcam_motion::{
-    Argb, Blob, Channel, Color, Detect, FaceParts, IncrementalRenderer, MotionSettings, NormRect,
-    OutputMode, RenderSettings, SegmentKind, SwarmBackground, ThresholdSettings, View, ViewMut,
-    font, previous_frames_needed, render, segment_label,
+    Argb, Blob, Channel, Color, DetectionMode, FaceParts, IncrementalRenderer, MotionSettings,
+    NormRect, OutputMode, RenderSettings, SegmentKind, SwarmBackground, ThresholdSettings, View,
+    ViewMut, font, previous_frames_needed, render, segment_label,
 };
 use vfx_core::cpu::{FrameSource, Image as CpuImage};
 
@@ -116,7 +116,7 @@ fn blobs_for_moving_square<C: Channel>() -> Vec<Blob> {
         })
         .collect();
     let now = downsample(&frame_with_square::<C>(384, 216, 200, 60, 40).view(), 96);
-    motion::detect(&history, &now, &MotionSettings::default()).blobs
+    motion::detect_motion(&history, &now, &MotionSettings::default()).blobs
 }
 
 /// A square that sits for six frames, then jumps.
@@ -139,7 +139,7 @@ fn grid_keeps_aspect_and_orientation() {
 fn first_frame_is_only_a_reference() {
     let g = downsample(&frame_with_square::<u8>(W, H, 100, 50, 40).view(), 192);
     assert!(
-        motion::detect(&[], &g, &MotionSettings::default())
+        motion::detect_motion(&[], &g, &MotionSettings::default())
             .blobs
             .is_empty()
     );
@@ -152,7 +152,7 @@ fn still_frame_never_moves() {
         .collect();
     let now = history.last().unwrap();
     assert!(
-        motion::detect(&history, now, &MotionSettings::default())
+        motion::detect_motion(&history, now, &MotionSettings::default())
             .blobs
             .is_empty()
     );
@@ -164,7 +164,7 @@ fn jumping_square_is_found_where_it_lands_and_where_it_left() {
         .map(|_| downsample(&frame_with_square::<u8>(W, H, 40, 60, 48).view(), 192))
         .collect();
     let now = downsample(&frame_with_square::<u8>(W, H, 260, 120, 48).view(), 192);
-    let m = motion::detect(&history, &now, &MotionSettings::default());
+    let m = motion::detect_motion(&history, &now, &MotionSettings::default());
     assert_eq!(m.blobs.len(), 2);
     let centred = |b: &Blob, x: i32, y: i32| {
         let (cx, cy) = (b.bounds.x + b.bounds.w / 2.0, b.bounds.y + b.bounds.h / 2.0);
@@ -174,7 +174,9 @@ fn jumping_square_is_found_where_it_lands_and_where_it_left() {
     assert!(m.blobs.iter().any(|b| centred(b, 260, 120)), "new place");
     assert!(m.blobs.iter().any(|b| centred(b, 40, 60)), "old place");
     assert!(
-        m.blobs.windows(2).all(|p| p[0].pixels >= p[1].pixels),
+        m.blobs
+            .windows(2)
+            .all(|p| p[0].cell_count >= p[1].cell_count),
         "biggest first"
     );
 
@@ -184,13 +186,17 @@ fn jumping_square_is_found_where_it_lands_and_where_it_left() {
         sensitivity: 0.0,
         ..MotionSettings::default()
     };
-    assert_eq!(motion::detect(&history, &now, &dull).blobs.len(), 2);
+    assert_eq!(motion::detect_motion(&history, &now, &dull).blobs.len(), 2);
     // A min size bigger than the square drops both.
     let picky = MotionSettings {
         min_area_fraction: 0.2,
         ..MotionSettings::default()
     };
-    assert!(motion::detect(&history, &now, &picky).blobs.is_empty());
+    assert!(
+        motion::detect_motion(&history, &now, &picky)
+            .blobs
+            .is_empty()
+    );
 }
 
 #[test]
@@ -439,10 +445,10 @@ fn tile_enforces_its_minimum_size() {
             w: 0.01,
             h: 0.01,
         },
-        pixels: 1,
+        cell_count: 1,
         ..Blob::default()
     };
-    let tile = make_tile(
+    let tile = cut_tile(
         &tiny,
         Some(&frames[0].view()),
         "t".into(),
@@ -450,23 +456,23 @@ fn tile_enforces_its_minimum_size() {
         1080,
         false,
     );
-    assert_eq!((tile.video.w, tile.video.h), (120, 28));
+    assert_eq!((tile.content_rect.w, tile.content_rect.h), (120, 28));
 }
 
-fn window_tile(video: PixelRect) -> Tile {
+fn window_tile(content_rect: PixelRect) -> Tile {
     Tile {
         title: "LO.FI.SCI.FI motion#412.1".into(),
-        video,
-        stored: video,
+        content_rect,
+        clipped_rect: content_rect,
         pixels: vec![
             TilePixel {
                 alpha: 255,
                 ..TilePixel::default()
             };
-            (video.w * video.h) as usize
+            (content_rect.w * content_rect.h) as usize
         ],
         hidden: false,
-        bar: None,
+        title_bar: None,
     }
 }
 
@@ -528,10 +534,13 @@ fn window_chrome_matches_the_bake() {
 #[test]
 fn labels_and_font() {
     assert_eq!(segment_label(SegmentKind::Motion, 412, 0), "motion#412.1");
-    assert_eq!(segment_label(SegmentKind::Blob, 7, 1), "blob#7.2");
+    assert_eq!(
+        segment_label(SegmentKind::ThresholdRegion, 7, 1),
+        "blob#7.2"
+    );
     let face = Blob {
         kind: SegmentKind::Face,
-        reused: Some((6, 2)),
+        reused_from: Some((6, 2)),
         ..Blob::default()
     };
     assert_eq!(
@@ -549,7 +558,7 @@ fn labels_and_font() {
 
 fn threshold_settings(t: ThresholdSettings) -> RenderSettings {
     RenderSettings {
-        detect: Detect::Threshold,
+        detection_mode: DetectionMode::Threshold,
         threshold: t,
         ..RenderSettings::default()
     }
@@ -563,9 +572,9 @@ fn threshold_finds_bright_regions_in_a_single_frame() {
     // No background, and every frame analysed.
     assert_eq!(previous_frames_needed(&s), 0);
 
-    let found = motion::threshold(&grid, &s.threshold, &s.motion);
+    let found = motion::detect_threshold(&grid, &s.threshold, &s.motion);
     assert_eq!(found.blobs.len(), 1);
-    assert_eq!(found.blobs[0].kind, SegmentKind::Blob);
+    assert_eq!(found.blobs[0].kind, SegmentKind::ThresholdRegion);
     let b = found.blobs[0].bounds;
     assert!((b.x - 100.0 / f64::from(W)).abs() < 0.02 && (b.w - 48.0 / f64::from(W)).abs() < 0.02);
 
@@ -574,14 +583,17 @@ fn threshold_finds_bright_regions_in_a_single_frame() {
         invert: true,
         ..s.threshold
     };
-    assert!(motion::threshold(&grid, &inverted, &s.motion).blobs[0].pixels > found.blobs[0].pixels);
+    assert!(
+        motion::detect_threshold(&grid, &inverted, &s.motion).blobs[0].cell_count
+            > found.blobs[0].cell_count
+    );
     let white = i32::from(*grid.pixels.iter().max().unwrap());
     let at_white = ThresholdSettings {
         level: white,
         ..s.threshold
     };
     assert!(
-        motion::threshold(&grid, &at_white, &s.motion)
+        motion::detect_threshold(&grid, &at_white, &s.motion)
             .blobs
             .is_empty()
     );
@@ -591,7 +603,12 @@ fn threshold_finds_bright_regions_in_a_single_frame() {
         auto: true,
         invert: false,
     };
-    assert_eq!(motion::threshold(&grid, &auto, &s.motion).blobs.len(), 1);
+    assert_eq!(
+        motion::detect_threshold(&grid, &auto, &s.motion)
+            .blobs
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -667,9 +684,9 @@ fn faces_on_a_frame_without_people_change_nothing() {
         mouth: true,
         body: true,
     };
-    for detect in [Detect::Motion, Detect::FacesOnly] {
+    for detection_mode in [DetectionMode::Motion, DetectionMode::FacesOnly] {
         let s = RenderSettings {
-            detect,
+            detection_mode,
             ..RenderSettings::default()
         };
         let with = RenderSettings { faces: all, ..s };
@@ -922,6 +939,6 @@ fn oldest_grid_stays_out_of_mask() {
     for y in 40..60 {
         history[0].pixels[y * 192 + 90..y * 192 + 110].fill(240);
     }
-    let found = motion::detect(&history, &flat, &MotionSettings::default());
+    let found = motion::detect_motion(&history, &flat, &MotionSettings::default());
     assert!(found.blobs.is_empty());
 }

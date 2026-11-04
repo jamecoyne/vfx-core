@@ -8,7 +8,7 @@ use vfx_core::cpu::{FrameSource, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Report, Unit};
 
 use crate::{
-    AnalysisStep, Color, Detect, FaceParts, IncrementalRenderer, MotionSettings, OutputMode,
+    AnalysisStep, Color, DetectionMode, FaceParts, IncrementalRenderer, MotionSettings, OutputMode,
     RenderSettings, SwarmBackground, ThresholdSettings,
 };
 
@@ -90,14 +90,14 @@ pub const PARAMS: &[ParamSpec] = &[
 
 /// One frame's settings, analysing every frame. `premultiplied` says how the host's frames
 /// store colour.
-pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
+pub fn settings_from_params(p: &ParamValues, premultiplied: bool) -> RenderSettings {
     let [r, g, b, _] = p.color("box_color");
     RenderSettings {
-        mode: OutputMode::from_index(p.int("output") + 1).unwrap_or(OutputMode::Overlay),
-        detect: match p.int("detect") {
-            1 => Detect::Threshold,
-            2 => Detect::FacesOnly,
-            _ => Detect::Motion,
+        mode: OutputMode::from_choice(p.int("output")).unwrap_or(OutputMode::Overlay),
+        detection_mode: match p.int("detect") {
+            1 => DetectionMode::Threshold,
+            2 => DetectionMode::FacesOnly,
+            _ => DetectionMode::Motion,
         },
         faces: FaceParts {
             face: p.bool("face"),
@@ -138,7 +138,7 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
 /// segcam Motion. It keeps what it works out for each frame (see [`IncrementalRenderer`]), so a host
 /// that keeps the instance works out only what changed since the last render.
 pub struct SegcamMotion {
-    state: IncrementalRenderer,
+    renderer: IncrementalRenderer,
 }
 
 impl Default for SegcamMotion {
@@ -151,16 +151,16 @@ impl Default for SegcamMotion {
 impl SegcamMotion {
     /// With `gpu` false, always on the CPU.
     pub fn with_gpu(gpu: bool) -> Self {
-        let mut state = IncrementalRenderer::default();
-        state.use_gpu(gpu);
-        Self { state }
+        let mut renderer = IncrementalRenderer::default();
+        renderer.use_gpu(gpu);
+        Self { renderer }
     }
 
     /// On the GPU from `share` of the canvas in window pixels (see
     /// [`IncrementalRenderer::set_gpu_min_coverage`]); 0 draws every swarm render there.
-    pub fn with_gpu_threshold(share: f64) -> Self {
+    pub fn with_gpu_min_coverage(min_coverage: f64) -> Self {
         let mut effect = Self::with_gpu(true);
-        effect.state.set_gpu_min_coverage(share);
+        effect.renderer.set_gpu_min_coverage(min_coverage);
         effect
     }
 }
@@ -175,14 +175,14 @@ impl CpuEffect for SegcamMotion {
     }
 
     fn clear_history(&mut self) -> bool {
-        self.state.clear_history();
+        self.renderer.clear_history();
         true
     }
 
     fn frames_before(&self, params: &ParamValues, frame_rate: Option<f64>) -> usize {
         let s = RenderSettings {
-            analysis_step: AnalysisStep::at(frame_rate),
-            ..settings(params, false)
+            analysis_step: AnalysisStep::for_frame_rate(frame_rate),
+            ..settings_from_params(params, false)
         };
         crate::previous_frames_needed(&s) as usize
     }
@@ -193,7 +193,7 @@ impl CpuEffect for SegcamMotion {
     }
 
     fn values_known(&self, params: &ParamValues) {
-        if settings(params, false).faces.any() {
+        if settings_from_params(params, false).faces.any() {
             crate::faces::start();
         }
     }
@@ -207,14 +207,14 @@ impl CpuEffect for SegcamMotion {
         ctx: &Context,
     ) {
         let s = RenderSettings {
-            analysis_step: AnalysisStep::at(ctx.frame_rate),
-            ..settings(params, ctx.premultiplied)
+            analysis_step: AnalysisStep::for_frame_rate(ctx.frame_rate),
+            ..settings_from_params(params, ctx.premultiplied)
         };
-        let (state, n) = (&mut self.state, ctx.frame);
+        let (renderer, n) = (&mut self.renderer, ctx.frame);
         match output {
-            ImageMut::U8(mut out) => state.render_frame(&s, frames, count, n, &mut out),
-            ImageMut::U16(mut out) => state.render_frame(&s, frames, count, n, &mut out),
-            ImageMut::F32(mut out) => state.render_frame(&s, frames, count, n, &mut out),
+            ImageMut::U8(mut out) => renderer.render_frame(&s, frames, count, n, &mut out),
+            ImageMut::U16(mut out) => renderer.render_frame(&s, frames, count, n, &mut out),
+            ImageMut::F32(mut out) => renderer.render_frame(&s, frames, count, n, &mut out),
         }
     }
 
@@ -230,17 +230,17 @@ impl CpuEffect for SegcamMotion {
         params: &ParamValues,
         ctx: &Context,
     ) -> bool {
-        self.state.offer_target(target);
+        self.renderer.offer_target(target);
         self.render(frames, count, output, params, ctx);
-        self.state.took_target()
+        self.renderer.took_target()
     }
 
     fn unfinished(&self) -> bool {
-        self.state.unfinished()
+        self.renderer.unfinished()
     }
 
     fn report(&self) -> Report {
-        self.state.report()
+        self.renderer.report()
     }
 }
 
@@ -252,9 +252,9 @@ mod tests {
 
     #[test]
     fn controls_start_as_1_1() {
-        let mut s = settings(&ParamValues::new(PARAMS), false);
-        let core = RenderSettings {
-            detect: Detect::FacesOnly,
+        let mut s = settings_from_params(&ParamValues::new(PARAMS), false);
+        let expected = RenderSettings {
+            detection_mode: DetectionMode::FacesOnly,
             faces: FaceParts {
                 eyes: true,
                 mouth: true,
@@ -264,9 +264,9 @@ mod tests {
             ..RenderSettings::default()
         };
         // Parameters are f32, so 86.4% arrives as 0.86400002: the same threshold.
-        assert_eq!(s.motion.threshold(), core.motion.threshold());
-        s.motion.sensitivity = core.motion.sensitivity;
-        assert_eq!(s, core);
+        assert_eq!(s.motion.threshold(), expected.motion.threshold());
+        s.motion.sensitivity = expected.motion.sensitivity;
+        assert_eq!(s, expected);
     }
 
     #[test]

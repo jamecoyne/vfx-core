@@ -36,7 +36,7 @@ pub enum SegmentKind {
     #[default]
     Motion,
     /// A region the threshold stage found.
-    Blob,
+    ThresholdRegion,
     Face,
     Body,
     EyeLeft,
@@ -48,7 +48,7 @@ impl SegmentKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Motion => "motion",
-            Self::Blob => "blob",
+            Self::ThresholdRegion => "blob",
             Self::Face => "face",
             Self::Body => "body",
             Self::EyeLeft => "eye.L",
@@ -62,19 +62,25 @@ impl SegmentKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Blob {
     pub bounds: NormRect,
-    pub pixels: i32,
+    pub cell_count: i32,
     pub kind: SegmentKind,
     /// A face reused from an earlier frame keeps its ID: that frame and its index there.
-    pub reused: Option<(i64, usize)>,
+    pub reused_from: Option<(i64, usize)>,
     /// On a face: the box the model found, which `bounds` sizes for drawing.
-    pub detected: Option<NormRect>,
+    pub detected_bounds: Option<NormRect>,
     /// On a face from YuNet: its eyes, nose and mouth corners, normalized like `bounds`.
     pub landmarks: Option<[(f32, f32); 5]>,
 }
 
 /// 8-connected labelling. `mask` is 1 for foreground, 0 for background. Returns the largest
 /// components, biggest first, as normalized boxes (top-left origin, y down).
-pub fn label(mask: &[u8], width: i32, height: i32, min_pixels: i32, max_count: i32) -> Vec<Blob> {
+pub fn label_components(
+    mask: &[u8],
+    width: i32,
+    height: i32,
+    min_cells: i32,
+    max_count: i32,
+) -> Vec<Blob> {
     let mut blobs = Vec::new();
     if width <= 0 || height <= 0 || mask.len() < (width * height) as usize {
         return blobs;
@@ -120,7 +126,7 @@ pub fn label(mask: &[u8], width: i32, height: i32, min_pixels: i32, max_count: i
             }
         }
 
-        if count < min_pixels {
+        if count < min_cells {
             continue;
         }
         // Cell edges, not centres: a one-cell blob still has real extent.
@@ -131,16 +137,16 @@ pub fn label(mask: &[u8], width: i32, height: i32, min_pixels: i32, max_count: i
                 w: f64::from(max_x - min_x + 1) / f64::from(width),
                 h: f64::from(max_y - min_y + 1) / f64::from(height),
             },
-            pixels: count,
+            cell_count: count,
             kind: SegmentKind::Motion,
-            reused: None,
-            detected: None,
+            reused_from: None,
+            detected_bounds: None,
             landmarks: None,
         });
     }
 
     // Stable, so equal-sized blobs keep scan order and a render is the same every time.
-    blobs.sort_by_key(|b| std::cmp::Reverse(b.pixels));
+    blobs.sort_by_key(|b| std::cmp::Reverse(b.cell_count));
     blobs.truncate(max_count.max(0) as usize);
     blobs
 }
@@ -233,15 +239,19 @@ impl Default for ThresholdSettings {
 
 /// The regions of one grid past the threshold, as segcam finds them: no background and no
 /// morphology, and a cell exactly at the level never counts, in either direction.
-pub fn threshold(grid: &LumaGrid, t: &ThresholdSettings, settings: &MotionSettings) -> Motion {
+pub fn detect_threshold(
+    grid: &LumaGrid,
+    t: &ThresholdSettings,
+    settings: &MotionSettings,
+) -> Segmentation {
     let count = grid.count();
     let (w, h) = (grid.width, grid.height);
     if count == 0 || grid.pixels.len() < count {
-        return Motion {
+        return Segmentation {
             mask: vec![0; count],
             width: w,
             height: h,
-            ..Motion::default()
+            ..Segmentation::default()
         };
     }
     let cells = &grid.pixels[..count];
@@ -250,12 +260,12 @@ pub fn threshold(grid: &LumaGrid, t: &ThresholdSettings, settings: &MotionSettin
         .iter()
         .map(|&v| u8::from(if t.invert { v < level } else { v > level }))
         .collect();
-    let min_pixels = 4.max((settings.min_area_fraction * count as f64) as i32);
-    let mut blobs = label(&mask, w, h, min_pixels, settings.max_segments);
+    let min_cells = 4.max((settings.min_area_fraction * count as f64) as i32);
+    let mut blobs = label_components(&mask, w, h, min_cells, settings.max_segments);
     for blob in &mut blobs {
-        blob.kind = SegmentKind::Blob;
+        blob.kind = SegmentKind::ThresholdRegion;
     }
-    Motion {
+    Segmentation {
         blobs,
         mask,
         width: w,
@@ -297,7 +307,7 @@ pub fn otsu(values: &[u8]) -> i32 {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Motion {
+pub struct Segmentation {
     pub blobs: Vec<Blob>,
     /// The cleaned mask the blobs were labelled from; grid-sized.
     pub mask: Vec<u8>,
@@ -313,13 +323,13 @@ pub struct Motion {
 ///
 /// Grids that are not the current grid's shape are skipped. With no usable history there is
 /// nothing to compare against and nothing moves: segcam's "first frame is only a reference".
-pub fn detect<'a>(
+pub fn detect_motion<'a>(
     history: impl IntoIterator<Item = &'a LumaGrid>,
     current: &LumaGrid,
     settings: &MotionSettings,
-) -> Motion {
+) -> Segmentation {
     let count = current.count();
-    let mut result = Motion {
+    let mut result = Segmentation {
         blobs: Vec::new(),
         mask: vec![0; count],
         width: current.width,
@@ -347,11 +357,11 @@ pub fn detect<'a>(
         return result; // nothing to compare against yet
     }
 
-    let tau = settings.threshold().max(1) as f32;
+    let threshold = settings.threshold().max(1) as f32;
     let mask: Vec<u8> = current.pixels[..count]
         .iter()
         .zip(&background)
-        .map(|(&p, &b)| u8::from((f32::from(p) - b).abs() > tau))
+        .map(|(&p, &b)| u8::from((f32::from(p) - b).abs() > threshold))
         .collect();
 
     // One erode kills sensor speckle, two dilates glue an object back together
@@ -359,8 +369,8 @@ pub fn detect<'a>(
     let (w, h) = (current.width, current.height);
     let mask = dilate(&dilate(&erode(&mask, w, h), w, h), w, h);
 
-    let min_pixels = 4.max((settings.min_area_fraction * count as f64) as i32);
-    result.blobs = label(&mask, w, h, min_pixels, settings.max_segments);
+    let min_cells = 4.max((settings.min_area_fraction * count as f64) as i32);
+    result.blobs = label_components(&mask, w, h, min_cells, settings.max_segments);
     result.mask = mask;
     result
 }

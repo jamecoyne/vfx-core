@@ -16,8 +16,8 @@ use std::process::ExitCode;
 
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
-    AnalysisStep, Argb, Detect, IncrementalRenderer, OutputMode, RenderSettings, SwarmBackground,
-    View, ViewMut,
+    AnalysisStep, Argb, DetectionMode, IncrementalRenderer, OutputMode, RenderSettings,
+    SwarmBackground, View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, Image};
 
@@ -83,10 +83,10 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
                 }
             }
             "--detect" => {
-                s.detect = match value()? {
-                    "motion" => Detect::Motion,
-                    "threshold" => Detect::Threshold,
-                    "faces" => Detect::FacesOnly,
+                s.detection_mode = match value()? {
+                    "motion" => DetectionMode::Motion,
+                    "threshold" => DetectionMode::Threshold,
+                    "faces" => DetectionMode::FacesOnly,
                     _ => return None,
                 }
             }
@@ -116,12 +116,12 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
                 s = match value()? {
                     "1.1" => RenderSettings {
                         analysis_step: s.analysis_step,
-                        ..RenderSettings::look_1_1(None)
+                        ..RenderSettings::segcam_1_1_preset(None)
                     },
                     _ => return None,
                 }
             }
-            "--fps" => s.analysis_step = AnalysisStep::at(Some(value()?.parse().ok()?)),
+            "--fps" => s.analysis_step = AnalysisStep::for_frame_rate(Some(value()?.parse().ok()?)),
             "--max-tiles" => s.max_tiles = value()?.parse().ok()?,
             "--straight-alpha" => s.straight_alpha = true,
             "--mirror" => s.mirror = true,

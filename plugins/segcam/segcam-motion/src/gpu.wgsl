@@ -210,7 +210,7 @@ fn overlay(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------------------------------
-// The swarm: each window in pile order, as `draw_window_with` draws it.
+// The swarm: each window in pile order, as `draw_prepared_window` draws it.
 
 fn corner_loss(i: i32, j: i32) -> f32 {
     let n = g.corner_size;
@@ -292,9 +292,9 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
     let vx = x - stored.x;
     let vy = y - stored.y;
     let in_stored = vx >= 0 && vx < stored.w && vy >= 0 && vy < stored.h;
-    var cov = g.inner_coverage;
+    var coverage = g.inner_coverage;
     if !(dx == 0.0 && dy == 0.0) {
-        cov = clamp(g.radius + 0.5 - sqrt(dx * dx + dy * dy), 0.0, 1.0);
+        coverage = clamp(g.radius + 0.5 - sqrt(dx * dx + dy * dy), 0.0, 1.0);
     }
     var tile_color = vec3<f32>(0.0);
     if pixels && in_stored {
@@ -303,7 +303,7 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
     }
     // At 8 bits a frozen tile's pixel under the whole mask is the tile's own level.
     if g.depth == 0u && !has(LIVE) && pixels && ly > g.title_height && ly < frame_r.h
-        && lx >= 0 && lx < frame_r.w && in_stored && cov == 1.0 {
+        && lx >= 0 && lx < frame_r.w && in_stored && coverage == 1.0 {
         *px = vec4<f32>(1.0, tile_color);
         return true;
     }
@@ -330,8 +330,8 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
                 c = c * g.edge_shade;
             }
         }
-        p = lerp(p, c, cov);
-        a += cov * (1.0 - a);
+        p = lerp(p, c, coverage);
+        a += coverage * (1.0 - a);
     }
     if has(STRAIGHT) && a > 0.0 && a < 1.0 {
         p = p / a;
