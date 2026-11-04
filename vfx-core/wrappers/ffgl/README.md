@@ -13,7 +13,7 @@ On macOS this builds a universal `VfxPreview.bundle` (named by the crate's
 `target/vfx-plugin/VfxPreview.dll` and copies it into the same folders under the user's
 Documents, when they exist. `cargo vfx build --hosts ffgl` only builds. Restart Resolume,
 then find the effect (**VFX Preview**) in the Effects browser. The plugin needs a 64-bit
-FFGL host with OpenGL 4.1. It passes the mini host on Windows; Resolume there is untested.
+FFGL host with OpenGL 4.1.
 
 ## Controls
 
@@ -66,27 +66,6 @@ values, to `vfx-ffgl-timing.log` in the temp directory. For output kept on the G
 is the copy into the output image and the handoff to GL, waiting for the effect's GPU work.
 It waits for the host's GL work around each frame, so leave it off outside measurements.
 
-Measured on an Apple M5 with blur radius 8 and the vignette on:
-
-| | 720p | 1080p |
-|---|---|---|
-| GPU-native (IOSurface) | 3.3 ms | 6.4 ms |
-| Through RAM | 11.2 ms | 24.0 ms |
-
-On Windows with an AMD Radeon RX 5700 XT 50th Anniversary (driver
-26.10.1.261008), the release mini host measured the same effect settings over 30
-frames after a warm-up frame. These are medians of three alternating baseline
-(`1cdef96`, RAM) and shared-image runs:
-
-| | 720p | 1080p |
-|---|---|---|
-| Through RAM (before) | 23.7 ms | 49.7 ms |
-| GPU-native (shared Vulkan images) | 2.8 ms | 3.7 ms |
-
-The earlier CPU conversion path measured 48.6 / 97.8 ms in alternating runs on the
-same machine. GPU sharing brings both sizes below the 16.7 ms budget for 60 fps.
-The earlier RAM measurement was 28.1 / 48.7 ms; RAM timings vary between runs.
-
 ## Testing without Resolume
 
 ```bash
@@ -118,6 +97,5 @@ sharing extensions to exercise automatic RAM fallback.
 
 ## Not yet
 
-- Resolume on Windows has not been tested. Both Windows paths pass the mini host on
-  the RX 5700 XT; other drivers and multi-GPU hosts are untested.
+- Drivers and multi GPU hosts other than those in `plugins/segcam/BENCHMARK.md`.
 - A thumbnail for Resolume's effect browser, and beat-synced parameters.
