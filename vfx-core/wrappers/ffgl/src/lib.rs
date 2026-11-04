@@ -577,9 +577,13 @@ unsafe fn process_cpu(
     if on_gpu {
         let presented = (instance.interop.current())
             .zip(instance.gpu_output_frame.as_ref())
-            // SAFETY: the context is current with the host's framebuffer bound, and the effect drew
-            // `frame` on the interop's device.
-            .map(|(interop, frame)| unsafe { interop.present(frame) });
+            .map(|(interop, frame)| {
+                // SAFETY: the context is current with the host's framebuffer bound, and the effect
+                // drew `frame` on the interop's device.
+                catch_unwind(AssertUnwindSafe(|| unsafe { interop.present(frame) })).unwrap_or_else(
+                    |_| Err(shared::InteropError::Failed("the render panicked".into())),
+                )
+            });
         if let Some(Err(e)) = presented {
             // This frame exists only on the GPU, so the input stands in for it. The next ones go
             // through RAM.

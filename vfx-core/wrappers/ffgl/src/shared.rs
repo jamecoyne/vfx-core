@@ -7,6 +7,7 @@
 //! the output image ([`Interop::present`]).
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,8 @@ pub enum InteropError {
     /// The GPU didn't finish in time. Vulkan may still own the images and its work may still be
     /// running, so GL must not wait on the semaphore and nothing may be deleted until it is idle.
     Hung,
+    /// The device is lost: nothing on it runs any more, and it stays lost for the process.
+    Lost(String),
 }
 
 impl From<String> for InteropError {
@@ -52,6 +55,7 @@ impl std::fmt::Display for InteropError {
         match self {
             Self::Unsupported(message) | Self::Failed(message) => f.write_str(message),
             Self::Hung => f.write_str("the GPU did not finish in time"),
+            Self::Lost(reason) => write!(f, "device lost: {reason}"),
         }
     }
 }
@@ -617,29 +621,41 @@ impl Interop {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Waits for everything submitted to the queue.
-    fn wait_for_gpu(&self, timeout: Duration) -> Result<(), InteropError> {
-        let wait = wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(timeout),
-        };
-        match self.device.gpu.device.poll(wait) {
-            // A lost device can finish a wait without doing the work, so GL mustn't wait on the
-            // semaphore it would have signalled.
-            Ok(_) => match Gpu::shared_faults().lost() {
-                Some(reason) => Err(InteropError::Failed(format!("device lost: {reason}"))),
-                None => Ok(()),
+    /// Polls the device. wgpu panics when a poll finds the device lost, so the unwind is caught
+    /// here and comes back as [`InteropError::Lost`].
+    fn poll(&self, poll_type: wgpu::PollType) -> Result<wgpu::PollStatus, InteropError> {
+        let polled = catch_unwind(AssertUnwindSafe(|| self.device.gpu.device.poll(poll_type)));
+        match polled {
+            Ok(Ok(status)) => match self.device.gpu.faults().lost() {
+                Some(reason) => Err(InteropError::Lost(reason)),
+                None => Ok(status),
             },
-            Err(wgpu::PollError::Timeout) => Err(InteropError::Hung),
-            Err(e) => Err(InteropError::Failed(e.to_string())),
+            Ok(Err(wgpu::PollError::Timeout)) => Err(InteropError::Hung),
+            Ok(Err(e)) => Err(InteropError::Failed(e.to_string())),
+            Err(panic) => {
+                let reason = (panic.downcast_ref::<String>().cloned())
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "the poll panicked".into());
+                Err(InteropError::Lost(reason))
+            }
         }
     }
 
-    /// Whether everything submitted to the queue has finished. Doesn't wait.
+    /// Waits for everything submitted to the queue. A lost device can finish a wait without doing
+    /// the work, so on an error GL mustn't wait on the semaphore it would have signalled.
+    fn wait_for_gpu(&self, timeout: Duration) -> Result<(), InteropError> {
+        self.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(timeout),
+        })
+        .map(|_| ())
+    }
+
+    /// Whether nothing submitted to the queue is still running. Doesn't wait.
     fn gpu_is_idle(&self) -> bool {
         matches!(
-            self.device.gpu.device.poll(wgpu::PollType::Poll),
-            Ok(wgpu::PollStatus::QueueEmpty)
+            self.poll(wgpu::PollType::Poll),
+            Ok(wgpu::PollStatus::QueueEmpty) | Err(InteropError::Lost(_))
         )
     }
 
@@ -929,17 +945,17 @@ impl Interop {
     }
 
     /// Deletes the interop, or leaks it if the GPU is still using it: a leak ends with the process,
-    /// and a wait here would freeze the host.
+    /// and a wait here would freeze the host. A lost device is using nothing.
     ///
     /// # Safety
     /// The context that made the interop must be current.
     unsafe fn delete(self) {
-        let finished = {
+        let waited = {
             let _queue = self.lock_queue();
-            self.wait_for_gpu(SETUP_GPU_WAIT).is_ok()
+            self.wait_for_gpu(SETUP_GPU_WAIT)
         };
-        if finished {
-            // SAFETY: the caller has the context current and Vulkan has finished.
+        if matches!(waited, Ok(()) | Err(InteropError::Lost(_))) {
+            // SAFETY: the caller has the context current and Vulkan has finished or is lost.
             unsafe { self.delete_objects() };
         } else {
             LOG.note("warning: leaking shared images the GPU never finished with");
@@ -1002,10 +1018,12 @@ impl InteropSlot {
                 .no_setup_before
                 .is_none_or(|time| Instant::now() >= time);
         if self.current.is_none() && may_try {
+            // A setup that panics on a lost device would otherwise fail every frame from here on.
             // SAFETY: the context is current.
-            match unsafe { Interop::new(size) } {
-                Ok(interop) => self.current = Some(interop),
-                Err(e) => self.record_setup_error(e),
+            match catch_unwind(|| unsafe { Interop::new(size) }) {
+                Ok(Ok(interop)) => self.current = Some(interop),
+                Ok(Err(e)) => self.record_setup_error(e),
+                Err(_) => self.record_setup_error(InteropError::Failed("setup panicked".into())),
             }
         }
         self.current.as_ref()
@@ -1017,7 +1035,9 @@ impl InteropSlot {
         ));
         match error {
             // A setup that hung has leaked its images, so another try could leak more.
-            InteropError::Unsupported(_) | InteropError::Hung => self.disabled = true,
+            InteropError::Unsupported(_) | InteropError::Hung | InteropError::Lost(_) => {
+                self.disabled = true;
+            }
             InteropError::Failed(_) => {
                 self.no_setup_before = Some(Instant::now() + RETRY_AFTER);
             }
@@ -1035,7 +1055,9 @@ impl InteropSlot {
                 self.hung = self.current.take();
                 self.no_setup_before = Some(Instant::now() + RETRY_AFTER);
             }
-            InteropError::Unsupported(_) | InteropError::Failed(_) => self.disabled = true,
+            InteropError::Unsupported(_) | InteropError::Failed(_) | InteropError::Lost(_) => {
+                self.disabled = true;
+            }
         }
     }
 
