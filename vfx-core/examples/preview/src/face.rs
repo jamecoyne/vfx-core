@@ -18,7 +18,7 @@ use ort::value::Tensor;
 #[cfg(all(not(target_os = "macos"), feature = "tracker"))]
 use segcam_face::runtime::{self, Device, OrtYuNet};
 #[cfg(all(not(target_os = "macos"), feature = "tracker"))]
-use segcam_face::{Detector as _, Image, Pixels, YUNET_MODEL, device_turn};
+use segcam_face::{Detector as _, Image, Pixels, YUNET_MODEL, d3d12_device_lock};
 use vfx_core::cpu::Argb;
 
 #[cfg(target_os = "macos")]
@@ -59,7 +59,7 @@ impl Detector {
         })
     }
 
-    /// The turn waits out segcam's own load.
+    /// Taking the device lock waits out segcam's own load.
     fn use_chosen_device(&mut self) {
         let Some(chosen) = runtime::chosen_device().filter(|_| !self.device_tried) else {
             return;
@@ -68,7 +68,7 @@ impl Detector {
         if chosen == self.device {
             return;
         }
-        let _turn = device_turn();
+        let _device_lock = d3d12_device_lock();
         match OrtYuNet::new(YUNET_MODEL, chosen) {
             Ok(yunet) => {
                 self.yunet = Some(yunet);
@@ -114,9 +114,9 @@ impl Detector {
 
 #[cfg(all(not(target_os = "macos"), feature = "tracker"))]
 impl Drop for Detector {
-    /// A session on DirectML releases a D3D12 device, which takes its turn too.
+    /// A session on DirectML releases a D3D12 device, so it holds the device lock.
     fn drop(&mut self) {
-        let _turn = device_turn();
+        let _device_lock = d3d12_device_lock();
         self.yunet = None;
     }
 }

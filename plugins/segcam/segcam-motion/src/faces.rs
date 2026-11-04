@@ -49,7 +49,7 @@ mod models {
 
     /// A panic in a broken runtime counts as no models, so [`wait`] and [`ready`] still get an answer.
     fn load() {
-        let _turn = segcam_face::device_turn();
+        let _device_lock = segcam_face::d3d12_device_lock();
         let started = Instant::now();
         let segmenter = catch_unwind(AssertUnwindSafe(load_warmed_segmenter)).unwrap_or(None);
         match &segmenter {
