@@ -1308,6 +1308,45 @@ mod tests {
         renders.join().unwrap();
     }
 
+    /// A live source whose numbering restarts drops what detection found in the frames before.
+    #[test]
+    fn live_restart_drops_found_faces() {
+        wait_for_models();
+        let frames = crossing();
+        let mut state = IncrementalRenderer::default();
+        let before = crate::previous_frames_needed(&with_faces(ALL_PARTS)) as usize;
+        let mut history = vfx_core::cpu::History::<u8>::default();
+        history.resize(W, H);
+        let started = std::time::Instant::now();
+        let mut n = 0;
+        while state.live_faces.attached_to.is_none() {
+            assert!(started.elapsed() < Duration::from_secs(120), "no detection");
+            history
+                .next(before, before)
+                .copy_from_slice(&frames[n as usize % frames.len()]);
+            let count = history.len();
+            face_detection_calls_in(&mut state, &mut history, count, n);
+            n += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Two renders in, so the lower number is certain whichever frame the detection landed on.
+        for _ in 0..2 {
+            history
+                .next(before, before)
+                .copy_from_slice(&frames[n as usize % frames.len()]);
+            let count = history.len();
+            face_detection_calls_in(&mut state, &mut history, count, n);
+            n += 1;
+        }
+
+        let mut restarted = vfx_core::cpu::History::<u8>::default();
+        restarted.resize(W, H);
+        restarted.next(before, before).copy_from_slice(&frames[0]);
+        let count = restarted.len();
+        face_detection_calls_in(&mut state, &mut restarted, count, 0);
+        assert_eq!(state.live_faces.attached_to, None);
+    }
+
     /// New face windows show the frame the face was found in, and motion windows the current one.
     #[test]
     fn new_face_windows_cut_from_detection_frame() {
