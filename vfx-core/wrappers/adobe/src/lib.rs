@@ -326,8 +326,8 @@ fn region(values: &ParamValues, scale: [f32; 2]) -> Region {
 // ---------------------------------------------------------------------------------------
 // GPU effects
 
-/// Called once per GPU After Effects might render on. We only take Metal devices. If
-/// opening one fails, we don't advertise GPU support for it, so After Effects stays on
+/// Called once per GPU After Effects might render on. Only Metal devices are taken. If
+/// opening one fails, GPU support isn't advertised for it, so After Effects stays on
 /// the CPU path for that device.
 #[cfg(target_os = "macos")]
 fn gpu_device_setup(
@@ -494,7 +494,7 @@ fn gpu_pre_render(
     // Never return more than was asked for, so no RETURNS_EXTRA_PIXELS handling is needed.
     extra.set_result_rect(intersect(result, request.rect.into()));
     extra.set_max_result_rect(max);
-    // GPU-native render is possible on any Metal device we opened in GPU device setup.
+    // GPU-native render is possible on any Metal device opened in GPU device setup.
     // After Effects only offers Metal here if that setup advertised support.
     if cfg!(target_os = "macos") && extra.what_gpu() == ae::GpuFramework::Metal {
         extra.set_gpu_render_possible(true);
