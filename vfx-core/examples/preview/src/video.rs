@@ -20,12 +20,12 @@ use vfx_core::cpu::{Argb, Channel};
 const MAX_QUEUED: usize = 2;
 
 /// File extensions treated as video when dropped on the window.
-const EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv"];
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv"];
 
 pub fn is_video(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// Where frames come from.
@@ -34,12 +34,12 @@ pub enum Input {
     File(PathBuf),
     /// A camera by the name `cameras` lists, in a mode it supports (`None` leaves ffmpeg's
     /// default).
-    Camera(String, Option<Mode>),
+    Camera(String, Option<CameraMode>),
 }
 
 /// A frame size and rate a camera can deliver.
 #[derive(Clone, Copy)]
-pub struct Mode {
+pub struct CameraMode {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -48,18 +48,18 @@ pub struct Mode {
 /// The camera modes to try, in order. ffmpeg's default is often a different shape than the
 /// camera's usual feed (a portrait size for a landscape camera, which stretches the image),
 /// and each camera takes only some sizes and rates.
-const CAMERA_MODES: [Option<Mode>; 4] = [
-    Some(Mode {
+const CAMERA_MODES: [Option<CameraMode>; 4] = [
+    Some(CameraMode {
         width: 1280,
         height: 720,
         fps: 30,
     }),
-    Some(Mode {
+    Some(CameraMode {
         width: 640,
         height: 480,
         fps: 30,
     }),
-    Some(Mode {
+    Some(CameraMode {
         width: 1920,
         height: 1080,
         fps: 60,
@@ -268,7 +268,7 @@ impl Info {
         Err("no frame rate the camera supports worked".into())
     }
 
-    fn frame_pixels(&self) -> usize {
+    fn pixel_count(&self) -> usize {
         (self.size.0 * self.size.1) as usize
     }
 
@@ -334,28 +334,28 @@ enum Pace {
 /// started at the beginning of a file with an exact frame count keeps looping instead.
 pub struct Video {
     pub info: Info,
-    shared: Arc<Mutex<Playback>>,
+    state: Arc<Mutex<DecoderState>>,
 }
 
-struct Decoded {
+struct DecodedFrame {
     pixels: Vec<Argb<u8>>,
     time: f64,
 }
 
-struct Playback {
+struct DecoderState {
     /// Bumped on every seek, so old reader threads know to stop.
     generation: u64,
     child: Option<Child>,
     /// Oldest first, at most [`MAX_QUEUED`].
-    queue: VecDeque<Decoded>,
+    queue: VecDeque<DecodedFrame>,
     /// Buffers to decode into again, so a frame allocates nothing.
-    spare: Vec<Vec<Argb<u8>>>,
+    free_buffers: Vec<Vec<Argb<u8>>>,
     /// The time of the frame last taken, or where the last seek landed.
     position: f64,
     /// Where the current decode started, in seconds.
     start: f64,
     /// Frames the current decode has delivered in this pass of the file.
-    frames: u64,
+    frames_in_pass: u64,
     /// Frames that arrived since the last [`Video::take_arrived_count`], dropped ones too.
     arrived: u64,
     /// A frame of a later pass was taken since the last [`Video::take_looped`].
@@ -369,26 +369,26 @@ impl Video {
     /// Starts playing `input`, scaled to fit `max_side`.
     pub fn open(input: Input, max_side: u32) -> Result<Self, String> {
         let info = Info::probe(input, max_side)?;
-        Self::start(info)
+        Self::start_playing(info)
     }
 
     /// Starts playing `input` fitted into `size` (see [`Info::fitted`]).
     pub fn open_fitted(input: Input, size: (u32, u32)) -> Result<Self, String> {
         let info = Info::probe(input, size.0.max(size.1))?.fitted(size);
-        Self::start(info)
+        Self::start_playing(info)
     }
 
-    fn start(info: Info) -> Result<Self, String> {
+    fn start_playing(info: Info) -> Result<Self, String> {
         let video = Self {
             info,
-            shared: Arc::new(Mutex::new(Playback {
+            state: Arc::new(Mutex::new(DecoderState {
                 generation: 0,
                 child: None,
                 queue: VecDeque::new(),
-                spare: Vec::new(),
+                free_buffers: Vec::new(),
                 position: 0.0,
                 start: 0.0,
-                frames: 0,
+                frames_in_pass: 0,
                 arrived: 0,
                 looped: false,
                 playing: true,
@@ -414,7 +414,7 @@ impl Video {
             Pace::OneFrame
         };
 
-        let mut s = self.shared.lock().unwrap();
+        let mut s = self.state.lock().unwrap();
         if let Some(mut old) = s.child.take() {
             let _ = old.kill();
             let _ = old.wait();
@@ -429,20 +429,23 @@ impl Video {
         s.child = Some(child);
         s.position = position;
         s.start = position;
-        s.frames = 0;
+        s.frames_in_pass = 0;
         s.looped = false;
         s.playing = play || camera;
         s.ended = false;
         while let Some(old) = s.queue.pop_front() {
-            s.spare.push(old.pixels);
+            s.free_buffers.push(old.pixels);
         }
 
         let generation = s.generation;
-        let shared = Arc::clone(&self.shared);
-        let size = self.info.frame_pixels();
+        let state = Arc::clone(&self.state);
+        let size = self.info.pixel_count();
         let (fps, duration) = (self.info.fps, self.info.duration);
         let looping_pass = self.info.looping_pass(position, pace);
-        let mut pixels = s.spare.pop().unwrap_or_else(|| bytemuck::zeroed_vec(size));
+        let mut pixels = s
+            .free_buffers
+            .pop()
+            .unwrap_or_else(|| bytemuck::zeroed_vec(size));
         let mut first_frame_at = None;
         let mut frames_read = 0u32;
         std::thread::spawn(move || {
@@ -460,26 +463,26 @@ impl Video {
                     std::thread::sleep(due.saturating_duration_since(now));
                     frames_read += 1;
                 }
-                let mut s = shared.lock().unwrap();
+                let mut s = state.lock().unwrap();
                 if s.generation != generation {
                     return;
                 }
-                let time = (s.start + s.frames as f64 / fps).min(duration);
-                s.frames += 1;
-                if looping_pass == Some(s.frames) {
-                    s.frames = 0;
+                let time = (s.start + s.frames_in_pass as f64 / fps).min(duration);
+                s.frames_in_pass += 1;
+                if looping_pass == Some(s.frames_in_pass) {
+                    s.frames_in_pass = 0;
                 }
                 s.arrived += 1;
                 let next = if s.queue.len() == MAX_QUEUED {
                     s.queue.pop_front().map(|oldest| oldest.pixels)
                 } else {
-                    s.spare.pop()
+                    s.free_buffers.pop()
                 };
                 let next = next.unwrap_or_else(|| bytemuck::zeroed_vec(size));
                 let pixels = std::mem::replace(&mut pixels, next);
-                s.queue.push_back(Decoded { pixels, time });
+                s.queue.push_back(DecodedFrame { pixels, time });
             }
-            let mut s = shared.lock().unwrap();
+            let mut s = state.lock().unwrap();
             if s.generation == generation && s.playing {
                 s.ended = true;
             }
@@ -488,13 +491,13 @@ impl Video {
     }
 
     /// Swaps the oldest waiting frame into `pixels`, recycling the old buffer; returns its time.
-    pub fn take_frame(&self, pixels: &mut Vec<Argb<u8>>) -> Option<f64> {
-        let mut s = self.shared.lock().unwrap();
+    pub fn take_oldest(&self, pixels: &mut Vec<Argb<u8>>) -> Option<f64> {
+        let mut s = self.state.lock().unwrap();
         let frame = s.queue.pop_front()?;
         let old = std::mem::replace(pixels, frame.pixels);
         // A buffer from another video, of another size, would put the pipe out of step.
-        if old.len() == self.info.frame_pixels() {
-            s.spare.push(old);
+        if old.len() == self.info.pixel_count() {
+            s.free_buffers.push(old);
         }
         // Compared here, not where the reader wraps: that frame may be dropped from the queue.
         s.looped |= frame.time < s.position;
@@ -505,44 +508,44 @@ impl Video {
     /// Whether playback went back to the start of the file inside its process since the last
     /// call. A seek clears it.
     pub fn take_looped(&self) -> bool {
-        std::mem::take(&mut self.shared.lock().unwrap().looped)
+        std::mem::take(&mut self.state.lock().unwrap().looped)
     }
 
-    /// As [`Video::take_frame`], skipping to the newest waiting frame.
+    /// As [`Video::take_oldest`], skipping to the newest waiting frame.
     pub fn take_newest(&self, pixels: &mut Vec<Argb<u8>>) -> Option<f64> {
         {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.state.lock().unwrap();
             while s.queue.len() > 1 {
                 let old = s.queue.pop_front().expect("more than one");
-                s.spare.push(old.pixels);
+                s.free_buffers.push(old.pixels);
             }
         }
-        self.take_frame(pixels)
+        self.take_oldest(pixels)
     }
 
     pub fn take_arrived_count(&self) -> u64 {
-        std::mem::take(&mut self.shared.lock().unwrap().arrived)
+        std::mem::take(&mut self.state.lock().unwrap().arrived)
     }
 
     /// Where playback is in the file (or how long a camera has run), in seconds.
     pub fn position(&self) -> f64 {
-        self.shared.lock().unwrap().position
+        self.state.lock().unwrap().position
     }
 
     pub fn playing(&self) -> bool {
-        self.shared.lock().unwrap().playing
+        self.state.lock().unwrap().playing
     }
 
     /// Whether a playing process has ended and its last frame was taken.
     pub fn ended(&self) -> bool {
-        let s = self.shared.lock().unwrap();
+        let s = self.state.lock().unwrap();
         s.ended && s.queue.is_empty()
     }
 }
 
 impl Drop for Video {
     fn drop(&mut self) {
-        let mut s = self.shared.lock().unwrap();
+        let mut s = self.state.lock().unwrap();
         s.generation += 1;
         if let Some(mut child) = s.child.take() {
             let _ = child.kill();
@@ -592,7 +595,7 @@ const RECORD_FPS: u32 = 30;
 pub struct Encoder {
     child: Child,
     stdin: Option<ChildStdin>,
-    raw: Vec<Argb<u8>>,
+    argb_scratch: Vec<Argb<u8>>,
 }
 
 impl Encoder {
@@ -615,7 +618,7 @@ impl Encoder {
         Ok(Self {
             child,
             stdin,
-            raw: Vec::new(),
+            argb_scratch: Vec::new(),
         })
     }
 
@@ -628,16 +631,16 @@ impl Encoder {
     }
 
     pub fn write_float(&mut self, pixels: &[f32]) -> Result<(), String> {
-        let mut raw = std::mem::take(&mut self.raw);
-        raw.clear();
-        raw.extend(pixels.as_chunks::<4>().0.iter().map(|&[r, g, b, a]| Argb {
+        let mut argb_scratch = std::mem::take(&mut self.argb_scratch);
+        argb_scratch.clear();
+        argb_scratch.extend(pixels.as_chunks::<4>().0.iter().map(|&[r, g, b, a]| Argb {
             alpha: u8::from_unit(a),
             red: u8::from_unit(r),
             green: u8::from_unit(g),
             blue: u8::from_unit(b),
         }));
-        let written = self.write(&raw);
-        self.raw = raw;
+        let written = self.write(&argb_scratch);
+        self.argb_scratch = argb_scratch;
         written
     }
 
@@ -664,9 +667,9 @@ impl Drop for Encoder {
 
 /// Plays a file's sound through ffplay (no window), from `start` seconds. None
 /// for cameras.
-pub struct Sound(Child);
+pub struct SoundPlayer(Child);
 
-impl Sound {
+impl SoundPlayer {
     pub fn play(info: &Info, start: f64) -> Option<Self> {
         let path = info.file()?;
         Command::new("ffplay")
@@ -682,7 +685,7 @@ impl Sound {
     }
 }
 
-impl Drop for Sound {
+impl Drop for SoundPlayer {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -729,7 +732,7 @@ mod tests {
         video.seek(2.0, false).unwrap();
         assert!(!video.playing());
         wait_for("the paused frame", || {
-            video.take_frame(&mut pixels).is_some()
+            video.take_oldest(&mut pixels).is_some()
         });
         std::thread::sleep(Duration::from_millis(300));
         assert!(
@@ -742,7 +745,7 @@ mod tests {
         // Playing on from 2 s reaches the end of the 3 s clip in about a second.
         video.seek(2.0, true).unwrap();
         wait_for("the end", || {
-            video.take_frame(&mut pixels);
+            video.take_oldest(&mut pixels);
             video.ended()
         });
         assert!(video.position() > 2.8, "{}", video.position());
@@ -756,19 +759,19 @@ mod tests {
         let video = Video::open(Input::File(test_clip("loop-test")), 1920).unwrap();
         assert_eq!(video.info.frames_per_pass, Some(75));
         let child = |video: &Video| {
-            let s = video.shared.lock().unwrap();
+            let s = video.state.lock().unwrap();
             (s.generation, s.child.as_ref().unwrap().id())
         };
         let process = child(&video);
 
         let mut pixels = Vec::new();
         wait_for("the first frame", || {
-            video.take_frame(&mut pixels).is_some()
+            video.take_oldest(&mut pixels).is_some()
         });
         assert_eq!(video.position(), 0.0);
         let first_pass = pixels.clone();
         wait_for("the next pass", || {
-            video.take_frame(&mut pixels);
+            video.take_oldest(&mut pixels);
             video.take_looped()
         });
         assert_eq!(video.position(), 0.0);
@@ -787,13 +790,13 @@ mod tests {
         video.seek(2.5, true).unwrap();
         let mut pixels = Vec::new();
         wait_for("the end", || {
-            video.take_frame(&mut pixels);
+            video.take_oldest(&mut pixels);
             video.ended()
         });
         assert!(!video.take_looped());
         video.seek(0.0, true).unwrap();
         wait_for("the next pass", || {
-            video.take_frame(&mut pixels);
+            video.take_oldest(&mut pixels);
             video.take_looped()
         });
         assert!(!video.ended());
@@ -833,10 +836,10 @@ mod tests {
         assert!(arrived <= 13, "{arrived} frames in 0.4 s at 25 fps");
 
         let mut pixels = Vec::new();
-        let first = video.take_frame(&mut pixels).expect("a waiting frame");
+        let first = video.take_oldest(&mut pixels).expect("a waiting frame");
         assert!(first > 0.2, "{first} is an old frame");
         assert_eq!(video.position(), first);
-        let second = video.take_frame(&mut pixels).expect("a second one");
+        let second = video.take_oldest(&mut pixels).expect("a second one");
         assert_eq!(video.position(), second);
         assert!(
             (second - first - 1.0 / 25.0).abs() < 1e-3,
@@ -852,11 +855,11 @@ mod tests {
         let small = Video::open(Input::File(clip), 80).unwrap();
         let mut pixels = Vec::new();
         for video in [&large, &small, &large, &small] {
-            let size = video.info.frame_pixels();
+            let size = video.info.pixel_count();
             wait_for("a frame", || video.take_newest(&mut pixels).is_some());
             assert_eq!(pixels.len(), size);
-            let spare = &video.shared.lock().unwrap().spare;
-            assert!(spare.iter().all(|buffer| buffer.len() == size));
+            let free_buffers = &video.state.lock().unwrap().free_buffers;
+            assert!(free_buffers.iter().all(|buffer| buffer.len() == size));
         }
     }
 
@@ -877,9 +880,9 @@ mod tests {
                 .unwrap()
                 .stdout;
 
-            let video = Video::start(info).unwrap();
+            let video = Video::start_playing(info).unwrap();
             let mut pixels = Vec::new();
-            wait_for("a frame", || video.take_frame(&mut pixels).is_some());
+            wait_for("a frame", || video.take_oldest(&mut pixels).is_some());
             assert_eq!(pixels.len() * 4, plain.len());
             for (p, rgba) in pixels.iter().zip(plain.as_chunks::<4>().0) {
                 assert_eq!([p.red, p.green, p.blue, p.alpha], *rgba);

@@ -562,7 +562,7 @@ impl Effects {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn take_video_frame(&mut self, video: &Video) -> Option<&[Argb<u8>]> {
         let frame = self.video.as_mut()?;
-        frame.time = video.take_frame(&mut frame.pixels)?;
+        frame.time = video.take_oldest(&mut frame.pixels)?;
         frame.on_gpu = false;
         Some(&frame.pixels)
     }

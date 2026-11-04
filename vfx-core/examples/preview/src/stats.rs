@@ -47,7 +47,7 @@ impl Counts {
 
 /// Where the frames come from.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
-pub enum SourceRate {
+pub enum SourceKind {
     /// A test pattern, new every loop.
     #[default]
     Pattern,
@@ -59,12 +59,12 @@ pub enum SourceRate {
 
 /// The effect and source of the moment, which the loop knows and the bar names.
 #[derive(Clone, Copy)]
-pub struct What {
+pub struct ShownEffect {
     pub effect: &'static str,
     /// The effect as `--effect` names it.
     pub slug: &'static str,
     pub on_cpu: bool,
-    pub source: SourceRate,
+    pub source: SourceKind,
     /// The effect output's size, in pixels.
     pub size: (u32, u32),
 }
@@ -74,7 +74,7 @@ pub struct What {
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct Snapshot {
     pub counts: Counts,
-    pub what: What,
+    pub shown: ShownEffect,
     pub report: Report,
     /// Over the last second: frames in, renders and new frames a second, and a render's mean
     /// and longest time in ms (a CPU effect's).
@@ -98,11 +98,11 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             counts: Counts::default(),
-            what: What {
+            shown: ShownEffect {
                 effect: "",
                 slug: "",
                 on_cpu: false,
-                source: SourceRate::default(),
+                source: SourceKind::default(),
                 size: (0, 0),
             },
             report: Report::default(),
@@ -124,7 +124,7 @@ pub struct Sampler {
     last: Option<Instant>,
     last_counts: Counts,
     /// The longest render since the last sample.
-    worst: Duration,
+    longest_render: Duration,
     snapshot: Snapshot,
     #[cfg(not(target_arch = "wasm32"))]
     load: MachineLoad,
@@ -206,7 +206,7 @@ impl Sampler {
         Self {
             last: None,
             last_counts: Counts::default(),
-            worst: Duration::ZERO,
+            longest_render: Duration::ZERO,
             snapshot: Snapshot::default(),
             #[cfg(not(target_arch = "wasm32"))]
             load: MachineLoad::start(),
@@ -220,28 +220,28 @@ impl Sampler {
         &mut self,
         counts: Counts,
         render: Option<Duration>,
-        what: What,
+        shown: ShownEffect,
         report: &Report,
     ) -> Snapshot {
         if let Some(render) = render {
-            self.worst = self.worst.max(render);
+            self.longest_render = self.longest_render.max(render);
         }
         let second_passed = self.last.is_none_or(|t| t.elapsed() >= INTERVAL);
-        if second_passed || what.slug != self.snapshot.what.slug {
+        if second_passed || shown.slug != self.snapshot.shown.slug {
             self.snapshot.report.clone_from(report);
             self.snapshot.report.readings.clear(); // the bar has no use for them
         }
         if second_passed {
             if let Some(last) = self.last {
                 let seconds = last.elapsed().as_secs_f32();
-                let done = counts.since(self.last_counts);
-                self.snapshot.source = done.arrived as f32 / seconds;
-                self.snapshot.rendered = done.rendered as f32 / seconds;
-                self.snapshot.screen = done.screen as f32 / seconds;
-                self.snapshot.render_ms = done.render_ms().map(|ms| ms as f32);
-                self.snapshot.worst_ms =
-                    (!self.worst.is_zero()).then_some(self.worst.as_secs_f32() * 1000.0);
-                self.worst = Duration::ZERO;
+                let delta = counts.since(self.last_counts);
+                self.snapshot.source = delta.arrived as f32 / seconds;
+                self.snapshot.rendered = delta.rendered as f32 / seconds;
+                self.snapshot.screen = delta.screen as f32 / seconds;
+                self.snapshot.render_ms = delta.render_ms().map(|ms| ms as f32);
+                self.snapshot.worst_ms = (!self.longest_render.is_zero())
+                    .then_some(self.longest_render.as_secs_f32() * 1000.0);
+                self.longest_render = Duration::ZERO;
             }
             self.last = Some(Instant::now());
             self.last_counts = counts;
@@ -249,7 +249,7 @@ impl Sampler {
             self.load.read_into(&mut self.snapshot);
         }
         self.snapshot.counts = counts;
-        self.snapshot.what = what;
+        self.snapshot.shown = shown;
         self.snapshot.last_render = render;
         self.snapshot.clone()
     }
@@ -270,10 +270,10 @@ fn gpu_percent() -> Option<f32> {
 
 /// The source slot's text.
 pub fn source_text(s: &Snapshot) -> String {
-    match s.what.source {
-        SourceRate::Pattern => "source pattern".to_owned(),
-        SourceRate::Still => "source still".to_owned(),
-        SourceRate::Video => format!("source {:.0} fps", s.source),
+    match s.shown.source {
+        SourceKind::Pattern => "source pattern".to_owned(),
+        SourceKind::Still => "source still".to_owned(),
+        SourceKind::Video => format!("source {:.0} fps", s.source),
     }
 }
 
@@ -292,10 +292,10 @@ pub fn report_text(report: &Report) -> String {
 /// The effect slot's text: which effect, where it runs, and its renders a second with
 /// their cost when it has one.
 pub fn effect_text(s: &Snapshot) -> String {
-    let where_ = if s.what.on_cpu { "CPU" } else { "GPU" };
+    let device = if s.shown.on_cpu { "CPU" } else { "GPU" };
     let mut text = format!(
-        "{} on {where_}{}: rendered {:.0} fps",
-        s.what.effect,
+        "{} on {device}{}: rendered {:.0} fps",
+        s.shown.effect,
         report_text(&s.report),
         s.rendered
     );
@@ -308,7 +308,7 @@ pub fn effect_text(s: &Snapshot) -> String {
 /// Draws the bar, source to screen, then the machine.
 pub fn bar(ui: &mut Ui, s: &Snapshot) {
     ui.horizontal_wrapped(|ui| {
-        ui.monospace(format!("{} × {}", s.what.size.0, s.what.size.1));
+        ui.monospace(format!("{} × {}", s.shown.size.0, s.shown.size.1));
         ui.separator();
         ui.monospace(source_text(s));
         ui.separator();

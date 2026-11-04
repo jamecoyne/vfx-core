@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 
-const RATE: f32 = 22_050.0;
+const SAMPLE_RATE: f32 = 22_050.0;
 const FFT_SIZE: usize = 1024;
 /// Loudness mapped to 0–1 between these (dBFS).
 const FLOOR_DB: f32 = -60.0;
@@ -19,17 +19,17 @@ const BANDS: [(f32, f32); 4] = [
     (20.0, 250.0),
     (250.0, 1000.0),
     (1000.0, 4000.0),
-    (4000.0, RATE / 2.0),
+    (4000.0, SAMPLE_RATE / 2.0),
 ];
 
 /// Level, then the four bands, each roughly 0–1.
 pub type Levels = [f32; 5];
 
-pub struct Audio {
+pub struct AudioAnalysis {
     samples: Arc<OnceLock<Vec<f32>>>,
 }
 
-impl Audio {
+impl AudioAnalysis {
     /// Starts decoding `path`'s first audio track. Until it's done (or if the file has
     /// no sound) every level reads 0.
     pub fn load(path: &Path) -> Self {
@@ -69,7 +69,7 @@ impl Audio {
         let Some(samples) = self.samples.get().filter(|s| !s.is_empty()) else {
             return [0.0; 5];
         };
-        let centre = (time * RATE as f64) as isize;
+        let centre = (time * SAMPLE_RATE as f64) as isize;
         let start = centre - FFT_SIZE as isize / 2;
         let mut re = [0.0f32; FFT_SIZE];
         let mut im = [0.0f32; FFT_SIZE];
@@ -90,8 +90,8 @@ impl Audio {
         fft(&mut re, &mut im);
 
         let mut levels = [0.0; 5];
-        levels[0] = to_unit((square_sum / FFT_SIZE as f32).sqrt());
-        let hz_per_bin = RATE / FFT_SIZE as f32;
+        levels[0] = amplitude_to_unit((square_sum / FFT_SIZE as f32).sqrt());
+        let hz_per_bin = SAMPLE_RATE / FFT_SIZE as f32;
         for (band, (lo, hi)) in BANDS.iter().enumerate() {
             let bins =
                 (lo / hz_per_bin).ceil() as usize..=((hi / hz_per_bin) as usize).min(FFT_SIZE / 2);
@@ -103,14 +103,14 @@ impl Audio {
                     a * a
                 })
                 .sum();
-            levels[band + 1] = to_unit((power / count).sqrt());
+            levels[band + 1] = amplitude_to_unit((power / count).sqrt());
         }
         levels
     }
 }
 
 /// An amplitude as 0–1 on a decibel scale from FLOOR_DB to 0 dBFS.
-fn to_unit(amplitude: f32) -> f32 {
+fn amplitude_to_unit(amplitude: f32) -> f32 {
     let db = 20.0 * amplitude.max(1e-9).log10();
     ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
 }
@@ -153,22 +153,22 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
 mod tests {
     use super::*;
 
-    fn audio_of(samples: Vec<f32>) -> Audio {
+    fn audio_of(samples: Vec<f32>) -> AudioAnalysis {
         let lock = OnceLock::new();
         let _ = lock.set(samples);
-        Audio {
+        AudioAnalysis {
             samples: Arc::new(lock),
         }
     }
 
     fn sine(hz: f32) -> Vec<f32> {
         (0..22_050)
-            .map(|i| (std::f32::consts::TAU * hz * i as f32 / RATE).sin())
+            .map(|i| (std::f32::consts::TAU * hz * i as f32 / SAMPLE_RATE).sin())
             .collect()
     }
 
     #[test]
-    fn a_tone_lands_in_its_band() {
+    fn tone_lands_in_its_band() {
         let bass = audio_of(sine(100.0)).levels(0.5);
         assert!(bass[1] > 0.8, "{bass:?}");
         assert!(bass[4] < 0.3, "{bass:?}");

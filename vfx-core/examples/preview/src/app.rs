@@ -4,11 +4,11 @@ use std::sync::Arc;
 use web_time::Instant;
 
 use crate::catalog;
-use crate::controls::{self, Controls, Status};
+use crate::controls::{self, Controls, PanelStatus};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::effects::Output;
 use crate::effects::{self, Effects};
-use crate::modulation::{self, Expressions, Sources};
+use crate::modulation::{self, Expressions, VariableValues};
 use crate::stats;
 #[cfg(target_arch = "wasm32")]
 use crate::web_media;
@@ -51,7 +51,7 @@ struct Preview {
     record_result: Option<String>,
     exprs: Expressions,
     /// The expression variables for the frame on screen.
-    sources: Sources,
+    variables: VariableValues,
     #[cfg(not(target_arch = "wasm32"))]
     media: Option<Media>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -61,7 +61,7 @@ struct Preview {
     tracker: Option<face::Tracker>,
     /// Held while no face is found.
     #[cfg(not(target_arch = "wasm32"))]
-    face_values: modulation::Face,
+    face_values: modulation::FaceValues,
     report: vfx_core::Report,
     /// Cameras found at startup.
     #[cfg(not(target_arch = "wasm32"))]
@@ -96,8 +96,8 @@ struct Preview {
 struct Media {
     video: video::Video,
     /// The file's sound, analysed for expressions; None for webcams.
-    audio: Option<audio::Audio>,
-    sound: Option<video::Sound>,
+    audio: Option<audio::AudioAnalysis>,
+    sound: Option<video::SoundPlayer>,
     /// While the position slider is being dragged.
     scrub: Option<Scrub>,
 }
@@ -120,7 +120,7 @@ impl Media {
         self.sound = None;
         self.video.seek(position, play)?;
         if play && sound_on {
-            self.sound = video::Sound::play(&self.video.info, self.video.position());
+            self.sound = video::SoundPlayer::play(&self.video.info, self.video.position());
         }
         Ok(())
     }
@@ -217,7 +217,7 @@ impl Preview {
             #[cfg(not(target_arch = "wasm32"))]
             record_result: None,
             exprs: Expressions::default(),
-            sources: modulation::sources(0.0, None, [0.0; 5], modulation::FACE_NONE),
+            variables: modulation::variable_values(0.0, None, [0.0; 5], modulation::FACE_NONE),
             #[cfg(not(target_arch = "wasm32"))]
             media: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -313,9 +313,9 @@ impl Preview {
                 self.media = Some(Media {
                     sound: self
                         .sound_on
-                        .then(|| video::Sound::play(&video.info, 0.0))
+                        .then(|| video::SoundPlayer::play(&video.info, 0.0))
                         .flatten(),
-                    audio: file.map(audio::Audio::load),
+                    audio: file.map(audio::AudioAnalysis::load),
                     video,
                     scrub: None,
                 });
@@ -342,7 +342,8 @@ impl Preview {
             }
         }
         let Some(video) = &mut self.web_video else {
-            self.sources = modulation::sources(self.time, None, [0.0; 5], modulation::FACE_NONE);
+            self.variables =
+                modulation::variable_values(self.time, None, [0.0; 5], modulation::FACE_NONE);
             return self.time;
         };
         // Until the browser knows its size the previous source stays up.
@@ -363,7 +364,7 @@ impl Preview {
             }
         }
         let video = self.web_video.as_ref().expect("checked above");
-        self.sources = modulation::sources(
+        self.variables = modulation::variable_values(
             self.time,
             Some((video.position(), video.duration())),
             [0.0; 5],
@@ -457,12 +458,12 @@ impl Preview {
             if media.video.take_looped() {
                 media.sound = None;
                 if self.sound_on {
-                    media.sound = video::Sound::play(&media.video.info, 0.0);
+                    media.sound = video::SoundPlayer::play(&media.video.info, 0.0);
                 }
             }
             let position = media.video.position();
             frame_time = position;
-            self.sources = modulation::sources(
+            self.variables = modulation::variable_values(
                 self.time,
                 Some((position, media.video.info.duration)),
                 media
@@ -476,13 +477,13 @@ impl Preview {
             let face = self.face_values;
             #[cfg(target_arch = "wasm32")]
             let face = modulation::FACE_NONE;
-            self.sources = modulation::sources(self.time, None, [0.0; 5], face);
+            self.variables = modulation::variable_values(self.time, None, [0.0; 5], face);
         }
 
         let c = &self.controls;
         let values = self
             .exprs
-            .apply(c.effect, c.values(), &self.sources, dt as f32);
+            .apply(c.effect, c.values(), &self.variables, dt as f32);
         self.effects.render(&self.gpu, c, &values, frame_time);
         #[cfg(not(target_arch = "wasm32"))]
         self.record_frame();
@@ -657,7 +658,7 @@ impl Preview {
             self.sound_on = on;
             if let Some(media) = &mut self.media {
                 media.sound = (on && media.video.playing())
-                    .then(|| video::Sound::play(&media.video.info, media.video.position()))
+                    .then(|| video::SoundPlayer::play(&media.video.info, media.video.position()))
                     .flatten();
             }
         }
@@ -722,13 +723,13 @@ impl Preview {
             self.counts.render_time += rendered.render_time.unwrap_or_default();
             self.unshown |= rendered.new_picture;
             let source = if self.has_video() {
-                stats::SourceRate::Video
+                stats::SourceKind::Video
             } else if self.effects.image_name().is_some() {
-                stats::SourceRate::Still
+                stats::SourceKind::Still
             } else {
-                stats::SourceRate::Pattern
+                stats::SourceKind::Pattern
             };
-            let what = stats::What {
+            let shown = stats::ShownEffect {
                 effect: self.effects.name(),
                 slug: self.effects.slug(),
                 on_cpu: self.effects.on_cpu(),
@@ -736,7 +737,7 @@ impl Preview {
                 size: self.effects.size(),
             };
             self.stats
-                .sample(self.counts, rendered.render_time, what, &self.report)
+                .sample(self.counts, rendered.render_time, shown, &self.report)
         };
         #[cfg(not(target_arch = "wasm32"))]
         self.count_frame(&stats);
@@ -789,7 +790,7 @@ impl Preview {
         let record_result = self.record_result.as_deref();
         #[cfg(target_arch = "wasm32")]
         let record_result: Option<&str> = None;
-        let status = Status {
+        let status = PanelStatus {
             image: self.effects.image_name(),
             message: self.message.as_deref(),
             video,
@@ -805,7 +806,7 @@ impl Preview {
         let controls = &mut self.controls;
         let view = &mut self.view;
         let exprs = &mut self.exprs;
-        let sources = &self.sources;
+        let variables = &self.variables;
         let mut actions = controls::Actions::default();
         let mut output = self.egui.run_ui(input, |ui| {
             // Added first, so it runs the window's full width under the controls.
@@ -816,13 +817,13 @@ impl Preview {
                 .resizable(false)
                 .exact_size(320.0)
                 .show(ui, |ui| {
-                    actions = controls::panel(ui, controls, exprs, sources, &status)
+                    actions = controls::panel(ui, controls, exprs, variables, &status)
                 });
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(18)))
                 .show(ui, |ui| show_image(ui, image, image_size, controls, view));
         });
-        if actions.clear_image {
+        if actions.use_pattern {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 self.media = None;
@@ -1243,7 +1244,7 @@ pub fn run(entries: Vec<catalog::Entry>) -> Result<(), Box<dyn std::error::Error
             if start.help {
                 script::USAGE.to_owned()
             } else {
-                script::list()
+                script::effects_listing()
             }
         );
         return Ok(());
@@ -1338,9 +1339,11 @@ impl Preview {
         }
         match &start.input {
             None => {}
-            Some(script::Source::Pattern(name)) => self.controls.pattern = script::pattern(name)?,
+            Some(script::Source::Pattern(name)) => {
+                self.controls.pattern = script::pattern_index(name)?
+            }
             Some(script::Source::Camera(name)) => {
-                let camera = script::camera(&self.cameras, name)?;
+                let camera = script::camera_name(&self.cameras, name)?;
                 self.open_input(video::Input::Camera(camera, None), start.size);
             }
             Some(script::Source::File(path)) => self.open(path, start.size),
@@ -1349,7 +1352,7 @@ impl Preview {
             return Err(message);
         }
         if let Some(mode) = &start.mode {
-            let (name, value) = script::mode(self.controls.specs(), mode)?;
+            let (name, value) = script::mode_param(self.controls.specs(), mode)?;
             self.set_param(name, value)?;
         }
         for (name, text) in &start.params {
@@ -1360,7 +1363,7 @@ impl Preview {
                 .find(|s| s.name == name)
                 .copied()
                 .ok_or_else(|| format!("--param {name}: no such parameter; --list shows them"))?;
-            self.set_param(name, script::value(&spec, text)?)?;
+            self.set_param(name, script::parse_value(&spec, text)?)?;
         }
         if start.detect_faces {
             self.tracker = Some(face::Tracker::start()?);

@@ -6,7 +6,7 @@ use vfx_core::{ParamKind, ParamSpec, ParamValue, ParamValues};
 
 use crate::catalog;
 use crate::effects::PATTERNS;
-use crate::modulation::{self, Expressions, Sources, Target};
+use crate::modulation::{self, Expressions, Target, VariableValues};
 
 #[derive(Clone)]
 pub struct Controls {
@@ -89,10 +89,10 @@ impl Controls {
 /// What the panel reports back to the app.
 #[derive(Default)]
 pub struct Actions {
-    pub clear_image: bool,
+    pub use_pattern: bool,
     /// Open a file picker for a layer's video or image.
     pub import_layer: bool,
-    /// Feed the layer from this index of `Status::cameras`.
+    /// Feed the layer from this index of `PanelStatus::cameras`.
     pub start_layer_camera: Option<usize>,
     /// Go back to a test pattern (or none) for the layer.
     pub clear_layer: bool,
@@ -104,7 +104,7 @@ pub struct Actions {
     pub toggle_record: bool,
     /// Open a file picker for a video or image.
     pub import: bool,
-    /// Start the camera at this index of `Status::cameras`.
+    /// Start the camera at this index of `PanelStatus::cameras`.
     pub start_camera: Option<usize>,
     pub refresh_cameras: bool,
     /// Face tracking was switched on or off.
@@ -124,7 +124,7 @@ pub struct Playback {
 }
 
 /// Status shown at the top of the panel.
-pub struct Status<'a> {
+pub struct PanelStatus<'a> {
     pub image: Option<&'a str>,
     pub message: Option<&'a str>,
     /// The source is a video file (so it can play sound and be rendered).
@@ -145,7 +145,7 @@ pub struct Status<'a> {
 }
 
 /// Seconds as m:ss.s.
-fn clock(seconds: f64) -> String {
+fn format_clock(seconds: f64) -> String {
     let seconds = seconds.max(0.0);
     format!("{}:{:04.1}", (seconds / 60.0) as u32, seconds % 60.0)
 }
@@ -160,8 +160,8 @@ fn transport(ui: &mut Ui, playback: &Playback, actions: &mut Actions) {
         ui.label(
             RichText::new(format!(
                 "{} / {}",
-                clock(playback.position),
-                clock(playback.duration)
+                format_clock(playback.position),
+                format_clock(playback.duration)
             ))
             .monospace(),
         );
@@ -179,7 +179,7 @@ fn transport(ui: &mut Ui, playback: &Playback, actions: &mut Actions) {
 }
 
 /// A boxed section across the sidebar's width, with a heading that opens and closes it.
-fn boxed(ui: &mut Ui, title: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
+fn section(ui: &mut Ui, title: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
         // No vertical line down the open section's left edge.
@@ -191,7 +191,7 @@ fn boxed(ui: &mut Ui, title: &str, default_open: bool, body: impl FnOnce(&mut Ui
     ui.add_space(4.0);
 }
 
-fn choice(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) -> bool {
+fn choice_menu(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) -> bool {
     let before = *value;
     egui::ComboBox::from_id_salt(id)
         .width(ui.available_width())
@@ -231,9 +231,9 @@ fn param(
     match (spec.kind, value) {
         (ParamKind::Float { min, max, .. }, ParamValue::Float(mut v)) => {
             let target = Target::new(effect, spec.name);
-            modulation::header(ui, exprs, target, &label);
+            modulation::param_header(ui, exprs, target, &label);
             if exprs.is_on(target) {
-                modulation::field(ui, exprs, target);
+                modulation::expression_field(ui, exprs, target);
             } else if full_slider(ui, egui::Slider::new(&mut v, min..=max).fixed_decimals(2))
                 .changed()
             {
@@ -242,21 +242,21 @@ fn param(
         }
         (ParamKind::Int { options, .. }, ParamValue::Int(v)) if !options.is_empty() => {
             let target = Target::new(effect, spec.name);
-            modulation::header(ui, exprs, target, &label);
+            modulation::param_header(ui, exprs, target, &label);
             if exprs.is_on(target) {
-                modulation::field(ui, exprs, target);
+                modulation::expression_field(ui, exprs, target);
             } else {
                 let mut i = v.clamp(0, options.len() as i32 - 1) as usize;
-                if choice(ui, spec.name, &mut i, options) {
+                if choice_menu(ui, spec.name, &mut i, options) {
                     set(ParamValue::Int(i as i32));
                 }
             }
         }
         (ParamKind::Int { min, max, .. }, ParamValue::Int(mut v)) => {
             let target = Target::new(effect, spec.name);
-            modulation::header(ui, exprs, target, &label);
+            modulation::param_header(ui, exprs, target, &label);
             if exprs.is_on(target) {
-                modulation::field(ui, exprs, target);
+                modulation::expression_field(ui, exprs, target);
             } else if full_slider(ui, egui::Slider::new(&mut v, min..=max)).changed() {
                 set(ParamValue::Int(v));
             }
@@ -275,9 +275,9 @@ fn param(
         (ParamKind::Point { .. }, ParamValue::Point(mut p)) => {
             for (axis, name) in ["x", "y"].into_iter().enumerate() {
                 let target = Target::axis(effect, spec.name, axis);
-                modulation::header(ui, exprs, target, &format!("{label} {name}"));
+                modulation::param_header(ui, exprs, target, &format!("{label} {name}"));
                 if exprs.is_on(target) {
-                    modulation::field(ui, exprs, target);
+                    modulation::expression_field(ui, exprs, target);
                 } else if full_slider(
                     ui,
                     egui::Slider::new(&mut p[axis], 0.0..=1.0).fixed_decimals(2),
@@ -333,7 +333,7 @@ fn refresh_button(ui: &mut Ui) -> egui::Response {
 
 /// The input box: one menu of test patterns, a video or image, and webcams, then the
 /// controls for whichever is running.
-fn input_box(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actions) {
+fn input_box(ui: &mut Ui, c: &mut Controls, status: &PanelStatus, actions: &mut Actions) {
     ui.horizontal(|ui| {
         let shown = match status.image {
             Some(name) => name.to_string(),
@@ -349,7 +349,7 @@ fn input_box(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actio
                 if let Some(i) = pattern_items(ui, |i| status.image.is_none() && c.pattern == i) {
                     c.pattern = i;
                     if status.image.is_some() {
-                        actions.clear_image = true;
+                        actions.use_pattern = true;
                     }
                 }
                 source_items(ui, status, &mut actions.import, &mut actions.start_camera);
@@ -393,7 +393,7 @@ fn pattern_items(ui: &mut Ui, current: impl Fn(usize) -> bool) -> Option<usize> 
 
 /// The video-or-image and webcam rows of the source menus. A click sets `import` or
 /// `camera` for the caller to act on.
-fn source_items(ui: &mut Ui, status: &Status, import: &mut bool, camera: &mut Option<usize>) {
+fn source_items(ui: &mut Ui, status: &PanelStatus, import: &mut bool, camera: &mut Option<usize>) {
     // The browser build opens videos only (web_media.rs).
     let open = if cfg!(target_arch = "wasm32") {
         "Video…"
@@ -417,7 +417,7 @@ fn source_items(ui: &mut Ui, status: &Status, import: &mut bool, camera: &mut Op
 }
 
 /// The layer menu: None, a test pattern, or a video, image or webcam (when one is fed).
-fn layer_menu(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actions) {
+fn layer_menu(ui: &mut Ui, c: &mut Controls, status: &PanelStatus, actions: &mut Actions) {
     let shown = match (status.layer_name, c.layers[c.effect]) {
         (Some(name), _) => name.to_string(),
         (None, Some(pattern)) => PATTERNS[pattern].to_string(),
@@ -457,13 +457,13 @@ fn layer_menu(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Acti
 fn effect_box(
     ui: &mut Ui,
     c: &mut Controls,
-    status: &Status,
+    status: &PanelStatus,
     exprs: &mut Expressions,
     actions: &mut Actions,
 ) {
     let entries = catalog::entries();
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-    actions.effect_changed = choice(ui, "effect", &mut c.effect, &names);
+    actions.effect_changed = choice_menu(ui, "effect", &mut c.effect, &names);
     ui.label(RichText::new(&entries[c.effect].about).weak());
     if status.layers > 0 {
         ui.label("Layer");
@@ -501,8 +501,8 @@ pub fn panel(
     ui: &mut Ui,
     c: &mut Controls,
     exprs: &mut Expressions,
-    sources: &Sources,
-    status: &Status,
+    variables: &VariableValues,
+    status: &PanelStatus,
 ) -> Actions {
     let mut actions = Actions::default();
     ui.add_space(4.0);
@@ -512,18 +512,18 @@ pub fn panel(
     }
     ui.separator();
 
-    boxed(ui, "Input", true, |ui| {
+    section(ui, "Input", true, |ui| {
         input_box(ui, c, status, &mut actions)
     });
     ui.add_space(4.0);
 
-    boxed(ui, "Effect", true, |ui| {
+    section(ui, "Effect", true, |ui| {
         effect_box(ui, c, status, exprs, &mut actions)
     });
     ui.add_space(4.0);
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        boxed(ui, "Expressions", false, |ui| {
+        section(ui, "Expressions", false, |ui| {
                 ui.checkbox(&mut c.animate, "Animate")
                     .on_hover_text("Advances the clock behind the time variable and test patterns");
                 #[cfg(not(target_arch = "wasm32"))]
@@ -541,11 +541,11 @@ pub fn panel(
                     }
                 }
                 ui.separator();
-                modulation::help(ui, sources);
+                modulation::variables_help(ui, variables);
             });
 
         #[cfg(not(target_arch = "wasm32"))]
-        boxed(ui, "Record", true, |ui| {
+        section(ui, "Record", true, |ui| {
             let (text, hint) = if status.recording {
                 (
                     "Recording",
