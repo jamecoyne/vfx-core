@@ -20,6 +20,8 @@ const INTERVAL: Duration = Duration::from_secs(1);
 pub struct Counts {
     /// Renders the effect finished.
     pub rendered: u64,
+    /// Those whose picture was drawn on the GPU rather than uploaded from RAM.
+    pub drawn: u64,
     /// The time those renders took, for a CPU effect.
     pub render_time: Duration,
     /// Pictures presented in the window that differ from the one before.
@@ -32,6 +34,7 @@ impl Counts {
     pub fn since(self, earlier: Self) -> Self {
         Self {
             rendered: self.rendered - earlier.rendered,
+            drawn: self.drawn - earlier.drawn,
             render_time: self.render_time - earlier.render_time,
             screen: self.screen - earlier.screen,
             arrived: self.arrived - earlier.arrived,

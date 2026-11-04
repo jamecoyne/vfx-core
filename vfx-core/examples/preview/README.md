@@ -31,8 +31,8 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 when `--frames` or `--seconds` ends the run:
 
 ```text
-stats t=18.4 effect=segcam-motion on=cpu source=59.9 rendered=39.4 rendered_ms=8.9 worst_ms=23.5 screen=19.7 size=1920x1080 cpu=29.2 app_cpu=239.9 mem_mb=1932 gpu=n/a
-done frames=905 seconds=20.00 effect=segcam-motion on=cpu source=59.9 rendered=37.2 rendered_ms=10.0 worst_ms=2661.5 screen=18.6
+stats t=18.4 effect=segcam-motion on=cpu source=59.9 rendered=39.4 rendered_ms=8.9 worst_ms=23.5 drawn=0.0 screen=19.7 size=1920x1080 cpu=29.2 app_cpu=239.9 mem_mb=1932 gpu=n/a
+done frames=905 seconds=20.00 effect=segcam-motion on=cpu source=59.9 rendered=37.2 rendered_ms=10.0 worst_ms=2661.5 drawn=0.0 screen=18.6
 ```
 
 The keys follow the frames: `source` is the rate they arrive from the decoder, whether they
@@ -40,7 +40,7 @@ are taken or dropped (or `pattern` and `still`), `rendered` the renders the effe
 `screen` the new frames presented in the window each second. A picture in RAM counts only if
 it differs from the last one. A picture drawn on the GPU (a GPU effect, or segcam's Swarm drawn
 into the output frame) counts if its frame or parameters changed, and the bar then says
-`screen 60 fps drawn`.
+`screen 60 fps drawn`. `drawn` is how many of the renders a second were drawn on the GPU.
 `on` says whether the
 effect renders on the CPU or in GPU passes; it can't see what a CPU effect does inside its
 render. For a CPU effect `rendered_ms` and `worst_ms` are a render's mean and longest time

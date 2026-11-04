@@ -360,7 +360,11 @@ fn counts_text(seconds: f64, worst: Duration, shown: &ShownEffect, delta: Counts
             worst.as_secs_f64() * 1000.0
         );
     }
-    text += &format!(" screen={:.1}", delta.screen as f64 / seconds);
+    text += &format!(
+        " drawn={:.1} screen={:.1}",
+        delta.drawn as f64 / seconds,
+        delta.screen as f64 / seconds
+    );
     text
 }
 
@@ -518,6 +522,7 @@ mod tests {
         };
         let delta = Counts {
             rendered: 60,
+            drawn: 0,
             render_time: Duration::from_millis(600),
             screen: 30,
             arrived: 59,
@@ -525,7 +530,7 @@ mod tests {
         assert_eq!(
             stats_line(1.0, 1.0, Duration::from_millis(20), &s, delta),
             "stats t=1.0 effect=segcam-motion on=cpu source=59.0 rendered=60.0 rendered_ms=10.0 \
-             worst_ms=20.0 screen=30.0 size=1920x1080 cpu=0.0 app_cpu=0.0 mem_mb=0 gpu=n/a"
+             worst_ms=20.0 drawn=0.0 screen=30.0 size=1920x1080 cpu=0.0 app_cpu=0.0 mem_mb=0 gpu=n/a"
         );
         let s = Snapshot {
             shown: ShownEffect {
@@ -540,14 +545,15 @@ mod tests {
         };
         let delta = Counts {
             rendered: 120,
+            drawn: 120,
             render_time: Duration::ZERO,
             screen: 120,
             arrived: 0,
         };
         assert_eq!(
             stats_line(2.0, 1.0, Duration::ZERO, &s, delta),
-            "stats t=2.0 effect=gaussian-blur on=gpu source=pattern rendered=120.0 screen=120.0 \
-             size=0x0 cpu=0.0 app_cpu=0.0 mem_mb=0 gpu=n/a"
+            "stats t=2.0 effect=gaussian-blur on=gpu source=pattern rendered=120.0 drawn=120.0 \
+             screen=120.0 size=0x0 cpu=0.0 app_cpu=0.0 mem_mb=0 gpu=n/a"
         );
     }
 

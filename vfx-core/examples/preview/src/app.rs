@@ -766,6 +766,7 @@ impl Preview {
         let stats = {
             let rendered = self.effects.last_outcome();
             self.counts.rendered += u64::from(rendered.finished);
+            self.counts.drawn += u64::from(rendered.finished && self.effects.output_drawn_on_gpu());
             self.counts.render_time += rendered.render_time.unwrap_or_default();
             self.picture_awaiting_present |= rendered.new_picture;
             let source = if self.has_video() {
