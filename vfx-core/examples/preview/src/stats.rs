@@ -15,6 +15,10 @@ use web_time::Instant;
 
 const INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long the bar keeps saying an effect ran out of GPU memory. The effect's flag flips within
+/// a frame or two while it drops windows, and a word flashing once a second reads as a fault.
+const OUT_OF_MEMORY_HOLD: Duration = Duration::from_secs(5);
+
 /// Running totals of what the preview did.
 #[derive(Clone, Copy, Default)]
 pub struct Counts {
@@ -135,6 +139,8 @@ pub struct Sampler {
     last_counts: Counts,
     /// The longest render since the last sample.
     longest_render: Duration,
+    /// When the effect last said it was out of GPU memory.
+    out_of_memory_at: Option<Instant>,
     snapshot: Snapshot,
     #[cfg(not(target_arch = "wasm32"))]
     load: MachineLoad,
@@ -217,6 +223,7 @@ impl Sampler {
             last: None,
             last_counts: Counts::default(),
             longest_render: Duration::ZERO,
+            out_of_memory_at: None,
             snapshot: Snapshot::default(),
             #[cfg(not(target_arch = "wasm32"))]
             load: MachineLoad::start(),
@@ -241,6 +248,13 @@ impl Sampler {
             self.snapshot.report.clone_from(report);
             self.snapshot.report.readings.clear(); // the bar has no use for them
         }
+        // Looked at every call, since the flag can last less than the bar's second.
+        if report.out_of_gpu_memory {
+            self.out_of_memory_at = Some(Instant::now());
+        }
+        self.snapshot.report.out_of_gpu_memory = self
+            .out_of_memory_at
+            .is_some_and(|at| at.elapsed() < OUT_OF_MEMORY_HOLD);
         if second_passed {
             if let Some(last) = self.last {
                 let seconds = last.elapsed().as_secs_f32();
@@ -374,6 +388,30 @@ fn machine_load(ui: &mut Ui, s: &Snapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_memory_stays_on_the_bar_after_the_flag_clears() {
+        let mut sampler = Sampler::new();
+        let shown = ShownEffect {
+            effect: "",
+            slug: "",
+            on_cpu: true,
+            source: SourceKind::Video,
+            size: (1, 1),
+            screen_counts_drawn: false,
+        };
+        let mut report = Report::default();
+        let quiet = sampler.sample(Counts::default(), None, shown, &report);
+        assert!(!quiet.report.out_of_gpu_memory);
+        report.out_of_gpu_memory = true;
+        sampler.sample(Counts::default(), None, shown, &report);
+        report.out_of_gpu_memory = false;
+        let held = sampler.sample(Counts::default(), None, shown, &report);
+        assert!(held.report.out_of_gpu_memory);
+        sampler.out_of_memory_at = Instant::now().checked_sub(OUT_OF_MEMORY_HOLD);
+        let later = sampler.sample(Counts::default(), None, shown, &report);
+        assert!(!later.report.out_of_gpu_memory);
+    }
 
     #[test]
     fn report_text_says_when_out_of_gpu_memory() {
