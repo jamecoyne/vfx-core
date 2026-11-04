@@ -21,7 +21,8 @@ Recent changes for agents (newest first; prune entries once they are old):
   (`vfx-core/src/effects`). A target crate (`vfx-core/wrappers/`) only translates parameters
   and moves pixels, for any effect; what two targets share belongs in
   `vfx-core/wrappers/common`. Nothing in `vfx-core/` depends on `plugins/` except the
-  preview's list of effects.
+  preview's list of effects and, on Windows and Linux, its face tracker (segcam-face's detector,
+  the `tracker` feature).
 - Read the README in each target or effect (`vfx-core/wrappers/ffgl/`,
   `vfx-core/wrappers/adobe/ae-tests/`, `plugins/segcam/segcam-motion/`) before changing it, and run its harness afterwards. The After
   Effects harnesses test the *installed* plugins, so `cargo vfx package` and reinstall

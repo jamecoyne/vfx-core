@@ -12,7 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 
 use vfx_core::cpu::{FrameSource, ImageMut};
-use vfx_core::{Context, CpuEffect, ParamValues, Processor, Target};
+use vfx_core::{Context, CpuEffect, ParamValues, Processor, Report, Target};
 
 /// A CPU effect as a host instance holds it.
 pub struct CpuInstance {
@@ -117,6 +117,14 @@ impl CpuInstance {
     /// Whether the last render is still waiting on the GPU (see [`CpuEffect::unfinished`]).
     pub fn unfinished(&self) -> bool {
         self.kept.is_some() && self.with(|e| e.unfinished())
+    }
+
+    /// The kept effect's [`CpuEffect::report`]; an effect that isn't kept has none.
+    pub fn report(&self) -> Report {
+        match &self.kept {
+            Some(_) => self.with(|e| e.report()),
+            None => Report::default(),
+        }
     }
 
     /// Drops what the kept effect worked out.

@@ -430,11 +430,18 @@ impl Effects {
     }
 
     /// Whether the shown effect renders on the CPU (a `CpuEffect`) rather than in a chain
-    /// of GPU passes. What it does inside its render, segcam's face models on DirectML say,
-    /// the preview can't see.
+    /// of GPU passes.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn on_cpu(&self) -> bool {
         matches!(self.stage.run, Run::Cpu(_))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn report(&self) -> vfx_core::Report {
+        match &self.stage.run {
+            Run::Cpu(stage) => stage.report(),
+            _ => vfx_core::Report::default(),
+        }
     }
 
     fn set_size(&mut self, gpu: &Gpu, size: (u32, u32)) {

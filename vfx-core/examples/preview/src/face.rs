@@ -2,35 +2,151 @@
 //! as positions from 0 to 1 across the frame (origin top left, like the vignette
 //! centre).
 //!
-//! Uses OpenCV's YuNet detector (models/face_detection_yunet_2023mar.onnx, MIT
-//! licence) through ONNX Runtime, on the CPU. It finds the face box and five points,
-//! not a full face mesh, so there's no mouth-open or blink.
+//! OpenCV's YuNet (MIT licence): a face box and five points, no mesh, so no mouth-open or blink.
+//! macOS runs it here on the CPU through ONNX Runtime; elsewhere it is segcam-face's.
 
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
+use std::sync::{Arc, Condvar, Mutex};
 
+#[cfg(target_os = "macos")]
 use ort::environment::Environment;
+#[cfg(target_os = "macos")]
 use ort::session::Session;
+#[cfg(target_os = "macos")]
 use ort::value::Tensor;
+#[cfg(all(not(target_os = "macos"), feature = "tracker"))]
+use segcam_face::runtime::{self, Device, OrtYuNet};
+#[cfg(all(not(target_os = "macos"), feature = "tracker"))]
+use segcam_face::{Detector as _, Image, Pixels, YUNET_MODEL, device_turn};
 use vfx_core::cpu::Argb;
 
+#[cfg(target_os = "macos")]
 const MODEL: &[u8] = include_bytes!("../models/face_detection_yunet_2023mar.onnx");
 /// The model's fixed input size.
+#[cfg(target_os = "macos")]
 const SIDE: usize = 640;
+#[cfg(target_os = "macos")]
 const MIN_SCORE: f32 = 0.6;
 
 /// In the order of the face variables in `modulation::VARIABLES`.
 pub type Values = modulation::Face;
 use crate::modulation::{self, FACE_NONE as NONE};
 
+/// Without a tracker, faces come only from effects' reports.
+pub const HAS_TRACKER: bool = cfg!(any(target_os = "macos", feature = "tracker"));
+
+/// segcam-face's YuNet, on the CPU until segcam has chosen a device, then on that device: the
+/// tracker never runs the trial itself.
+#[cfg(all(not(target_os = "macos"), feature = "tracker"))]
+pub struct Detector {
+    /// Only `None` while dropping.
+    yunet: Option<OrtYuNet>,
+    device: Device,
+    device_tried: bool,
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "tracker"))]
+impl Detector {
+    /// On the CPU, so no D3D12 device is made on the caller's thread.
+    pub fn new() -> Result<Self, String> {
+        let yunet = OrtYuNet::new(YUNET_MODEL, Device::Cpu)
+            .map_err(|e| format!("couldn't load the face model: {e}"))?;
+        Ok(Self {
+            yunet: Some(yunet),
+            device: Device::Cpu,
+            device_tried: false,
+        })
+    }
+
+    /// The turn waits out segcam's own load.
+    fn use_chosen_device(&mut self) {
+        let Some(chosen) = runtime::chosen_device().filter(|_| !self.device_tried) else {
+            return;
+        };
+        self.device_tried = true;
+        if chosen == self.device {
+            return;
+        }
+        let _turn = device_turn();
+        match OrtYuNet::new(YUNET_MODEL, chosen) {
+            Ok(yunet) => {
+                self.yunet = Some(yunet);
+                self.device = chosen;
+            }
+            Err(e) => eprintln!("preview: face tracker stays on the CPU: {e}"),
+        }
+    }
+
+    pub fn detect(&mut self, pixels: &[Argb<u8>], size: (u32, u32)) -> Option<Values> {
+        self.use_chosen_device();
+        let (width, height) = (size.0 as usize, size.1 as usize);
+        let image = Image {
+            pixels: Pixels::Argb8(bytemuck::cast_slice(pixels)),
+            width,
+            height,
+            stride: width,
+        };
+        let faces = self.yunet.as_mut()?.detect(&image);
+        let face = faces.first()?;
+        let r = face.rect;
+        let [a, b, nose, mouth_a, mouth_b] = face.landmarks;
+        let (left, right) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+        Some(
+            [
+                1.0,
+                r.x + r.w / 2.0,
+                r.y + r.h / 2.0,
+                r.w,
+                left.0,
+                left.1,
+                right.0,
+                right.1,
+                nose.0,
+                nose.1,
+                (mouth_a.0 + mouth_b.0) / 2.0,
+                (mouth_a.1 + mouth_b.1) / 2.0,
+            ]
+            .map(|v| v as f32),
+        )
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "tracker"))]
+impl Drop for Detector {
+    /// A session on DirectML releases a D3D12 device, which takes its turn too.
+    fn drop(&mut self) {
+        let _turn = device_turn();
+        self.yunet = None;
+    }
+}
+
+#[cfg(not(any(target_os = "macos", feature = "tracker")))]
+pub struct Detector;
+
+#[cfg(not(any(target_os = "macos", feature = "tracker")))]
+impl Detector {
+    pub fn new() -> Result<Self, String> {
+        Err("this build has no face tracker".to_owned())
+    }
+
+    pub fn detect(&mut self, _pixels: &[Argb<u8>], _size: (u32, u32)) -> Option<Values> {
+        None
+    }
+}
+
 /// ONNX Runtime allows one environment per process, so the live tracker and an
 /// export's detector share this one.
+#[cfg(target_os = "macos")]
 static ENVIRONMENT: OnceLock<Result<Environment, String>> = OnceLock::new();
 
+#[cfg(target_os = "macos")]
 pub struct Detector {
     session: Session,
     input: Vec<f32>,
 }
 
+#[cfg(target_os = "macos")]
 impl Detector {
     pub fn new() -> Result<Self, String> {
         let err = |e: ort::Error| format!("couldn't load the face model: {e}");
@@ -200,6 +316,14 @@ impl Tracker {
     pub fn values(&self) -> Values {
         self.shared.0.lock().unwrap().values
     }
+
+    /// While an effect's report reads the faces: its positions with `face` at 0, so the variables
+    /// carry on from there when the report stops.
+    pub fn hold_positions(&self, values: Values) {
+        let mut s = self.shared.0.lock().unwrap();
+        s.values = values;
+        s.values[0] = 0.0;
+    }
 }
 
 impl Drop for Tracker {
@@ -210,7 +334,7 @@ impl Drop for Tracker {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", feature = "tracker")))]
 mod tests {
     use super::*;
 
@@ -229,6 +353,42 @@ mod tests {
                 .detect(&pixels, (320, 240))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn held_tracker_reports_no_face() {
+        let tracker = Tracker::start().unwrap();
+        tracker.hold_positions([1.0; 12]);
+        let values = tracker.values();
+        assert_eq!(values[0], 0.0);
+        assert_eq!(values[1..], [1.0; 11]);
+    }
+
+    /// In a process of its own: DirectML can deadlock in the driver with another test's wgpu
+    /// device being released.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn tracker_environment_in_own_process() {
+        let test = "face::tests::tracker_shares_environment";
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--ignored"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    #[ignore = "run by tracker_environment_in_own_process"]
+    fn tracker_shares_environment() {
+        let flat = vec![Argb::default(); 320 * 240];
+        let mut tracker = Detector::new().unwrap();
+        let (_, device) = runtime::fastest(true, true).expect("segcam's models");
+        tracker.detect(&flat, (320, 240));
+        assert_eq!(tracker.device, device);
+        let mut second_tracker = Detector::new().unwrap();
+        second_tracker.detect(&flat, (320, 240));
+        assert_eq!(second_tracker.device, device);
     }
 
     /// Finds the face in a photo given by FACE_TEST_IMAGE (one clear face).

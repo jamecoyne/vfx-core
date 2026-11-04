@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
 use sysinfo::{Pid, ProcessesToUpdate, System};
+use vfx_core::Report;
 
 const INTERVAL: Duration = Duration::from_secs(1);
 
@@ -65,10 +66,11 @@ pub struct What {
 }
 
 /// What the bar shows.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Snapshot {
     pub counts: Counts,
     pub what: What,
+    pub report: Report,
     /// Over the last second: frames in, renders and new frames a second, and a render's mean
     /// and longest time in ms (a CPU effect's).
     pub source: f32,
@@ -98,6 +100,7 @@ impl Default for Snapshot {
                 source: SourceRate::default(),
                 size: (0, 0),
             },
+            report: Report::default(),
             source: 0.0,
             rendered: 0.0,
             screen: 0.0,
@@ -182,11 +185,22 @@ impl Sampler {
     /// The latest numbers, with `counts` as the render loop keeps them and `render` the
     /// time of the render this loop finished, if any. The rates, CPU and memory are only
     /// worked out again once a second.
-    pub fn sample(&mut self, counts: Counts, render: Option<Duration>, what: What) -> Snapshot {
+    pub fn sample(
+        &mut self,
+        counts: Counts,
+        render: Option<Duration>,
+        what: What,
+        report: &Report,
+    ) -> Snapshot {
         if let Some(render) = render {
             self.worst = self.worst.max(render);
         }
-        if self.last.is_none_or(|t| t.elapsed() >= INTERVAL) {
+        let second_passed = self.last.is_none_or(|t| t.elapsed() >= INTERVAL);
+        if second_passed || what.slug != self.snapshot.what.slug {
+            self.snapshot.report.clone_from(report);
+            self.snapshot.report.readings.clear(); // the bar has no use for them
+        }
+        if second_passed {
             if let Some(last) = self.last {
                 let seconds = last.elapsed().as_secs_f32();
                 let done = counts.since(self.last_counts);
@@ -212,7 +226,7 @@ impl Sampler {
         self.snapshot.counts = counts;
         self.snapshot.what = what;
         self.snapshot.last_render = render;
-        self.snapshot
+        self.snapshot.clone()
     }
 }
 
@@ -238,13 +252,27 @@ pub fn source_text(s: &Snapshot) -> String {
     }
 }
 
+/// ", draw GPU (RTX 4070), faces DirectML 0".
+pub fn report_text(report: &Report) -> String {
+    let mut text = String::new();
+    if let Some(draw) = &report.draw {
+        text += &format!(", draw {draw}");
+    }
+    if let Some(faces) = &report.faces {
+        text += &format!(", faces {faces}");
+    }
+    text
+}
+
 /// The effect slot's text: which effect, where it runs, and its renders a second with
 /// their cost when it has one.
 pub fn effect_text(s: &Snapshot) -> String {
     let where_ = if s.what.on_cpu { "CPU" } else { "GPU" };
     let mut text = format!(
-        "{} on {where_}: rendered {:.0} fps",
-        s.what.effect, s.rendered
+        "{} on {where_}{}: rendered {:.0} fps",
+        s.what.effect,
+        report_text(&s.report),
+        s.rendered
     );
     if let (Some(ms), Some(worst)) = (s.render_ms, s.worst_ms) {
         text += &format!(", {ms:.0} ms, worst {worst:.0} ms");

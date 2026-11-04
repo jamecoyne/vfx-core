@@ -3457,6 +3457,7 @@ dependencies = [
  "ort",
  "pollster 1.0.1",
  "rfd",
+ "segcam-face",
  "segcam-motion",
  "sysinfo",
  "vfx-build",

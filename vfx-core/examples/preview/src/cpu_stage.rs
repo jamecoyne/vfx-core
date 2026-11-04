@@ -185,6 +185,11 @@ impl CpuStage {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn report(&self) -> vfx_core::Report {
+        self.effect.report()
+    }
+
     pub fn render(
         &mut self,
         gpu: &Gpu,

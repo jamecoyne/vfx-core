@@ -5,7 +5,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 use vfx_core::Target;
 use vfx_core::cpu::{FrameSource, ImageMut};
-use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Unit};
+use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Report, Unit};
 
 use crate::{
     Cadence, Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode, RenderSettings,
@@ -234,6 +234,10 @@ impl CpuEffect for SegcamMotion {
 
     fn unfinished(&self) -> bool {
         self.state.unfinished()
+    }
+
+    fn report(&self) -> Report {
+        self.state.report()
     }
 }
 

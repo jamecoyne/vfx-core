@@ -17,6 +17,7 @@ use std::ops::RangeInclusive;
 use vfx_core::cpu::FrameSource;
 #[cfg(not(target_arch = "wasm32"))]
 use vfx_core::wgpu;
+use vfx_core::{Reading, Report};
 use vfx_plugin::vfx_host::by_rows;
 
 use crate::gpu::{self, Cut, Drawer, Fault};
@@ -81,7 +82,10 @@ pub struct Incremental {
     window_share: f64,
     /// The last render's draw hasn't come back from the GPU yet (browsers).
     unfinished: bool,
-    drew_on_gpu: bool,
+    /// `None` before the first render.
+    drew_on_gpu: Option<bool>,
+    faces_wanted: bool,
+    readings: Vec<Reading>,
     /// Live renders act as if the face models were still loading.
     #[cfg(test)]
     models_held: bool,
@@ -162,7 +166,7 @@ impl Incremental {
 
     /// Whether the GPU drew the last render's output.
     pub fn drew_on_gpu(&self) -> bool {
-        self.drew_on_gpu
+        self.drew_on_gpu == Some(true)
     }
 
     /// Draws with `drawer` from now on.
@@ -236,7 +240,7 @@ impl Incremental {
         out: &mut ViewMut<C>,
     ) {
         self.unfinished = false;
-        self.drew_on_gpu = false;
+        self.drew_on_gpu = Some(false);
         if out.is_empty() {
             return;
         }
@@ -520,12 +524,38 @@ impl Incremental {
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
     ) {
-        self.drew_on_gpu = false;
+        self.drew_on_gpu = Some(false);
+        self.update_face_readings(s, number, number - count as i64 + 1);
         if let Err(fault) = self.try_draw(s, count, number, frame, out) {
-            self.drew_on_gpu = false;
+            self.drew_on_gpu = Some(false);
             self.fall_back(&fault);
             self.draw_cpu(s, count, number, frame, out);
         }
+    }
+
+    fn update_face_readings(&mut self, s: &RenderSettings, number: i64, first: i64) {
+        self.faces_wanted = s.faces.any();
+        self.readings = if s.faces.face {
+            let shows = self.shows(s, number, first);
+            let motion = self.motion(shows, &basis(s, shows, first));
+            let models_loaded = crate::faces::runs_on().is_some();
+            crate::faces::readings(models_loaded, motion.map_or(&[], |m| &m.blobs))
+        } else {
+            Vec::new()
+        };
+    }
+
+    pub fn report(&self) -> Report {
+        let mut report = Report::default();
+        report.draw = self.drew_on_gpu.map(|on_gpu| match &self.gpu {
+            Some(drawer) if on_gpu => format!("GPU ({})", drawer.adapter().name),
+            _ => "CPU".to_owned(),
+        });
+        report.faces = crate::faces::runs_on()
+            .filter(|_| self.faces_wanted)
+            .map(str::to_owned);
+        report.readings = self.readings.clone();
+        report
     }
 
     fn try_draw<C: Channel>(
@@ -613,7 +643,7 @@ impl Incremental {
                 .motion(shows, &basis(s, shows, first))
                 .unwrap_or(&empty);
             gpu.draw_overlay(out, view, &motion.blobs, number, shows, s)?;
-            self.drew_on_gpu = true;
+            self.drew_on_gpu = Some(true);
             return Ok(());
         }
         if s.mode != OutputMode::Swarm {
@@ -674,11 +704,11 @@ impl Incremental {
         if into && let Some(offer) = self.target.as_mut() {
             gpu.draw_swarm_into(&offer.frame, windows, frame.as_ref(), number, s, &shadow)?;
             offer.taken = true;
-            self.drew_on_gpu = true;
+            self.drew_on_gpu = Some(true);
             return Ok(());
         }
         gpu.draw_swarm(out, windows, frame.as_ref(), number, s, &shadow)?;
-        self.drew_on_gpu = true;
+        self.drew_on_gpu = Some(true);
         Ok(())
     }
 
@@ -1111,6 +1141,8 @@ mod tests {
         for n in 0..frames.len() {
             if n == 7 {
                 assert!(drawn(&on_gpu) > 0, "drawing on the GPU before the loss");
+                let draw = on_gpu.report().draw.expect("a render");
+                assert_eq!(draw, format!("GPU ({})", dev.info.name));
                 dev.device.destroy();
             }
             let (a, b) = (
@@ -1119,6 +1151,8 @@ mod tests {
             );
             assert!(n < 7 || a == b, "frame {n} isn't the CPU's after the loss");
         }
+        assert_eq!(cpu.report().draw.as_deref(), Some("CPU"));
+        assert_eq!(on_gpu.report().draw.as_deref(), Some("CPU"));
         assert!(dev.lost().is_some(), "the loss went unnoticed");
         assert!(on_gpu.gpu().is_none(), "the instance is still on the GPU");
         assert!(!on_gpu.gpu_wanted, "the instance still looks for a GPU");

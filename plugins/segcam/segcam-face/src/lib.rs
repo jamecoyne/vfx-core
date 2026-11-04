@@ -15,8 +15,17 @@ pub mod runtime;
 pub mod vision;
 pub mod yunet;
 
+use std::sync::{Mutex, MutexGuard};
+
 pub use picodet::Body;
 pub use yunet::Face;
+
+/// Held while making or releasing a D3D12 device. One made on one thread while another releases
+/// one can deadlock (seen on NVIDIA, inside the driver and D3D12).
+pub fn device_turn() -> MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The bundled YuNet model, `face_detection_yunet_2023mar.onnx`.
 #[cfg(feature = "onnx")]
@@ -35,6 +44,7 @@ pub const PICODET_MODEL: &[u8] = include_bytes!("../models/picodet.onnx");
 pub enum Pixels<'a> {
     Rgba8(&'a [u8]),
     Bgra8(&'a [u8]),
+    Argb8(&'a [u8]),
     /// RGBA from 0 to 1.
     RgbaF32(&'a [f32]),
 }
@@ -52,7 +62,7 @@ impl Image<'_> {
     /// Whether the size is non-zero and the pixels cover it.
     pub fn is_usable(&self) -> bool {
         let channels = match self.pixels {
-            Pixels::Rgba8(data) | Pixels::Bgra8(data) => data.len(),
+            Pixels::Rgba8(data) | Pixels::Bgra8(data) | Pixels::Argb8(data) => data.len(),
             Pixels::RgbaF32(data) => data.len(),
         };
         self.width > 0
@@ -68,6 +78,7 @@ impl Image<'_> {
         match self.pixels {
             Pixels::Rgba8(d) => [d[i], d[i + 1], d[i + 2]].map(f32::from),
             Pixels::Bgra8(d) => [d[i + 2], d[i + 1], d[i]].map(f32::from),
+            Pixels::Argb8(d) => [d[i + 1], d[i + 2], d[i + 3]].map(f32::from),
             Pixels::RgbaF32(d) => [d[i], d[i + 1], d[i + 2]].map(|v| v.clamp(0.0, 1.0) * 255.0),
         }
     }
@@ -125,6 +136,10 @@ pub struct Segment {
     pub number: u64,
     pub rect: Rect,
     pub score: f32,
+    /// On a face, the box the model found, before it was sized to match segcam 1.1.
+    pub detected: Option<Rect>,
+    /// On a face, YuNet's five points (see [`Face::landmarks`]). Vision gives none.
+    pub landmarks: Option<[(f64, f64); 5]>,
 }
 
 /// Which segments to find.
@@ -291,6 +306,10 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
                 h: r.h,
             };
             self.push(Kind::Face, square.clamped(), face.score);
+            if let Some(pushed) = self.segments.last_mut() {
+                pushed.detected = Some(r);
+                pushed.landmarks = Some(face.landmarks);
+            }
         }
         let outline = if parts.eyes || parts.mouth {
             self.mesh.as_mut().and_then(|m| m.landmarks(image, face))
@@ -339,6 +358,8 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
             number: self.next_number,
             rect,
             score,
+            detected: None,
+            landmarks: None,
         });
     }
 }
