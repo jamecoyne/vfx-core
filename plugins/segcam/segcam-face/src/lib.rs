@@ -45,6 +45,10 @@ pub enum Pixels<'a> {
     Rgba8(&'a [u8]),
     Bgra8(&'a [u8]),
     Argb8(&'a [u8]),
+    /// ARGB at After Effects' 16 bits, where white is 32768.
+    Argb16(&'a [u16]),
+    /// ARGB from 0 to 1.
+    ArgbF32(&'a [f32]),
     /// RGBA from 0 to 1.
     RgbaF32(&'a [f32]),
 }
@@ -63,7 +67,8 @@ impl Image<'_> {
     pub fn is_usable(&self) -> bool {
         let channels = match self.pixels {
             Pixels::Rgba8(data) | Pixels::Bgra8(data) | Pixels::Argb8(data) => data.len(),
-            Pixels::RgbaF32(data) => data.len(),
+            Pixels::Argb16(data) => data.len(),
+            Pixels::ArgbF32(data) | Pixels::RgbaF32(data) => data.len(),
         };
         self.width > 0
             && self.height > 0
@@ -74,11 +79,15 @@ impl Image<'_> {
     /// Red, green and blue from 0 to 255 at a pixel inside a usable image.
     #[inline]
     pub fn rgb(&self, x: usize, y: usize) -> [f32; 3] {
+        // The models were fitted to 8-bit input, so deep ARGB rounds to what an 8-bit frame holds.
+        let byte = |unit: f32| (unit.clamp(0.0, 1.0) * 255.0 + 0.5).floor();
         let i = (y * self.stride + x) * 4;
         match self.pixels {
             Pixels::Rgba8(d) => [d[i], d[i + 1], d[i + 2]].map(f32::from),
             Pixels::Bgra8(d) => [d[i + 2], d[i + 1], d[i]].map(f32::from),
             Pixels::Argb8(d) => [d[i + 1], d[i + 2], d[i + 3]].map(f32::from),
+            Pixels::Argb16(d) => [d[i + 1], d[i + 2], d[i + 3]].map(|v| byte(f32::from(v) / 32768.0)),
+            Pixels::ArgbF32(d) => [d[i + 1], d[i + 2], d[i + 3]].map(byte),
             Pixels::RgbaF32(d) => [d[i], d[i + 1], d[i + 2]].map(|v| v.clamp(0.0, 1.0) * 255.0),
         }
     }
@@ -387,4 +396,39 @@ fn part(centre: (f64, f64), w: f64, h: f64) -> Rect {
         h,
     }
     .clamped()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgb(pixels: Pixels) -> [f32; 3] {
+        let image = Image {
+            pixels,
+            width: 1,
+            height: 1,
+            stride: 1,
+        };
+        image.rgb(0, 0)
+    }
+
+    #[test]
+    fn deep_argb_reads_as_the_8_bit_value() {
+        assert_eq!(rgb(Pixels::Argb8(&[255, 10, 128, 255])), [10.0, 128.0, 255.0]);
+        let white = 32768.0;
+        let from_8_bit = |v: f32| (v / 255.0 * white) as u16;
+        assert_eq!(
+            rgb(Pixels::Argb16(&[
+                32768,
+                from_8_bit(10.0),
+                from_8_bit(128.0),
+                40000
+            ])),
+            [10.0, 128.0, 255.0]
+        );
+        assert_eq!(
+            rgb(Pixels::ArgbF32(&[1.0, 10.0 / 255.0, 128.0 / 255.0, 1.5])),
+            [10.0, 128.0, 255.0]
+        );
+    }
 }

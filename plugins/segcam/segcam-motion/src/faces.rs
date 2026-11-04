@@ -4,6 +4,8 @@
 use vfx_core::Reading;
 
 use crate::motion::{Blob, SegmentKind};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::pixel::Argb;
 use crate::pixel::{Channel, View};
 use crate::render::FaceParts;
 
@@ -95,6 +97,140 @@ mod models {
     }
 }
 
+/// Detection for one instance's live renders, on the one worker thread instances share, so a render
+/// never waits for the models or for another instance's detection. A slow device lowers the rate
+/// of face detections instead of the rate of renders, as in segcam-port's `FaceWorker`.
+#[cfg(not(target_arch = "wasm32"))]
+mod live {
+    use std::any::Any;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::mpsc::{Sender, channel};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use crate::motion::Blob;
+    use crate::pixel::{Argb, Channel, View};
+    use crate::render::FaceParts;
+
+    type Job = Box<dyn FnOnce() + Send>;
+
+    /// The queue of the worker thread, started by the first request. Each instance has at most one
+    /// request queued, so instances take turns and the queue stays short.
+    fn worker() -> Option<&'static Sender<Job>> {
+        static WORKER: OnceLock<Option<Sender<Job>>> = OnceLock::new();
+        WORKER
+            .get_or_init(|| {
+                let (sender, jobs) = channel::<Job>();
+                std::thread::Builder::new()
+                    .name("segcam face detection".into())
+                    .spawn(move || jobs.into_iter().for_each(|job| job()))
+                    .ok()?;
+                Some(sender)
+            })
+            .as_ref()
+    }
+
+    /// The faces found in one frame, and that frame's pixels, which their windows are cut from: a
+    /// box found a few frames ago doesn't fit the current frame's picture of a moving face.
+    pub struct Detection {
+        pub blobs: Vec<Blob>,
+        parts: FaceParts,
+        frame: Arc<dyn Any + Send + Sync>,
+        width: i32,
+        height: i32,
+    }
+
+    impl Detection {
+        /// The frame it was found in, if that was at depth `C`.
+        pub fn frame<C: Channel>(&self) -> Option<View<'_, C>> {
+            let pixels = self.frame.downcast_ref::<Vec<Argb<C>>>()?;
+            Some(View::from_pixels(pixels, self.width, self.height))
+        }
+    }
+
+    #[derive(Default)]
+    pub struct LiveFaces {
+        /// Where the worker leaves the answer to this instance's request. A request whose answer
+        /// nobody can read any more, after [`LiveFaces::forget`], is skipped.
+        answer: Arc<Mutex<Option<Detection>>>,
+        requested: bool,
+        /// The last frame copied for a request, whose allocation the next copy reuses.
+        spare_frame: Option<Arc<dyn Any + Send + Sync>>,
+        /// The frame whose motion holds the newest faces, which analyses reuse until the next ones.
+        pub attached_to: Option<i64>,
+    }
+
+    impl LiveFaces {
+        /// The detection finished since the last call, if any, for these `parts`. Unless one is
+        /// still running, also asks for a detection in `frame`. `cells` is as in [`super::find`].
+        pub fn exchange<C: Channel>(
+            &mut self,
+            frame: &View<C>,
+            parts: FaceParts,
+            cells: usize,
+        ) -> Option<Detection> {
+            let mut finished = None;
+            if self.requested {
+                finished = self.answer.lock().ok().and_then(|mut a| a.take());
+                self.requested = finished.is_none();
+            }
+            if !self.requested {
+                self.request(frame, parts, cells);
+            }
+            finished.filter(|detection| detection.parts == parts)
+        }
+
+        fn request<C: Channel>(&mut self, frame: &View<C>, parts: FaceParts, cells: usize) {
+            let Some(worker) = worker() else { return };
+            let mut pixels: Vec<Argb<C>> = self
+                .spare_frame
+                .take()
+                .and_then(|spare| spare.downcast::<Vec<Argb<C>>>().ok())
+                .and_then(|spare| Arc::try_unwrap(spare).ok())
+                .unwrap_or_default();
+            pixels.clear();
+            for y in 0..frame.height {
+                pixels.extend_from_slice(frame.row(y));
+            }
+            let (width, height) = (frame.width, frame.height);
+            let answer = Arc::clone(&self.answer);
+            let job = move || {
+                if Arc::strong_count(&answer) == 1 {
+                    return;
+                }
+                // A broken runtime can panic; that is no faces, not an answer that never comes.
+                let blobs = catch_unwind(AssertUnwindSafe(|| {
+                    super::find_in(&pixels, width, height, parts, cells)
+                }))
+                .unwrap_or_default();
+                if let Ok(mut answer) = answer.lock() {
+                    *answer = Some(Detection {
+                        blobs,
+                        parts,
+                        frame: Arc::new(pixels),
+                        width,
+                        height,
+                    });
+                }
+            };
+            self.requested = worker.send(Box::new(job)).is_ok();
+        }
+
+        /// Takes back a detection's frame once its windows are cut.
+        pub fn recycle(&mut self, detection: Detection) {
+            self.spare_frame = Some(detection.frame);
+        }
+
+        /// Drops what was found so far and what is being looked for: the frames changed.
+        pub fn forget(&mut self) {
+            self.answer = Arc::default();
+            self.requested = false;
+            self.attached_to = None;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use live::{Detection, LiveFaces};
 #[cfg(not(target_arch = "wasm32"))]
 pub use models::{ready, runs_on, start, wait};
 
@@ -114,39 +250,41 @@ pub fn wait() {}
 /// render checks [`ready`] first and draws without faces until then.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn find<C: Channel>(frame: &View<C>, parts: FaceParts, cells: usize) -> Vec<Blob> {
-    use segcam_face::{Image, Kind, Parts, Pixels};
-
-    use crate::motion::{NormRect, SegmentKind};
-
     if !parts.any() {
         return Vec::new();
     }
     wait();
-    let (w, h) = (frame.width.max(0) as usize, frame.height.max(0) as usize);
-    let byte = |c: C| (c.to_unit().clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-    // A whole frame takes a few ms on one thread, so bands of rows go to a few threads.
-    let mut rgba = vec![0u8; w * h * 4];
-    let threads = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(6);
-    let band_rows = h.div_ceil(threads).max(1);
-    std::thread::scope(|scope| {
-        for (b, band) in rgba.chunks_mut((band_rows * w * 4).max(1)).enumerate() {
-            scope.spawn(move || {
-                for (r, row) in band.chunks_exact_mut((w * 4).max(1)).enumerate() {
-                    let y = (b * band_rows + r) as i32;
-                    for (out, p) in row.as_chunks_mut::<4>().0.iter_mut().zip(frame.row(y)) {
-                        *out = [byte(p.red), byte(p.green), byte(p.blue), 255];
-                    }
-                }
-            });
-        }
-    });
+    // The models read rows of one slice, and a host's rows may have gaps between them.
+    let mut pixels = Vec::with_capacity((frame.width.max(0) * frame.height.max(0)) as usize);
+    for y in 0..frame.height {
+        pixels.extend_from_slice(frame.row(y));
+    }
+    find_in(&pixels, frame.width, frame.height, parts, cells)
+}
+
+/// [`find`] in a frame of tightly packed rows, once the models have loaded. The models sample the
+/// pixels at their own sizes, so the frame isn't converted first.
+#[cfg(not(target_arch = "wasm32"))]
+fn find_in<C: Channel>(
+    pixels: &[Argb<C>],
+    width: i32,
+    height: i32,
+    parts: FaceParts,
+    cells: usize,
+) -> Vec<Blob> {
+    use segcam_face::{Image, Kind, Parts, Pixels};
+
+    use crate::motion::{NormRect, SegmentKind};
+
     let image = Image {
-        pixels: Pixels::Rgba8(&rgba),
-        width: w,
-        height: h,
-        stride: w,
+        pixels: match size_of::<C>() {
+            1 => Pixels::Argb8(bytemuck::cast_slice(pixels)),
+            2 => Pixels::Argb16(bytemuck::cast_slice(pixels)),
+            _ => Pixels::ArgbF32(bytemuck::cast_slice(pixels)),
+        },
+        width: width.max(0) as usize,
+        height: height.max(0) as usize,
+        stride: width.max(0) as usize,
     };
     let Some(Ok(mut slot)) = models::MODELS.get().map(|m| m.lock()) else {
         return Vec::new();
@@ -195,6 +333,41 @@ pub fn find<C: Channel>(frame: &View<C>, parts: FaceParts, cells: usize) -> Vec<
 #[cfg(target_arch = "wasm32")]
 pub fn find<C: Channel>(_frame: &View<C>, _parts: FaceParts, _cells: usize) -> Vec<Blob> {
     Vec::new()
+}
+
+/// No face models in the web build, so nothing is ever found.
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+pub struct LiveFaces {
+    pub attached_to: Option<i64>,
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct Detection {
+    pub blobs: Vec<Blob>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Detection {
+    pub fn frame<C: Channel>(&self) -> Option<View<'_, C>> {
+        None
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl LiveFaces {
+    pub fn exchange<C: Channel>(
+        &mut self,
+        _frame: &View<C>,
+        _parts: FaceParts,
+        _cells: usize,
+    ) -> Option<Detection> {
+        None
+    }
+
+    pub fn recycle(&mut self, _detection: Detection) {}
+
+    pub fn forget(&mut self) {}
 }
 
 #[cfg(target_arch = "wasm32")]
