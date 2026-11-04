@@ -11,7 +11,7 @@ pub mod ffi;
 pub mod host;
 pub mod image;
 
-mod cpu;
+mod cpu_pixels;
 mod params;
 
 use std::ffi::{CStr, c_char, c_void};
@@ -23,7 +23,7 @@ use vfx_core::{Context, ParamSpec, ParamValues, Processor, Region};
 use vfx_host::{Kind, diag, pipeline};
 
 use ffi::*;
-use host::{Props, check, suites};
+use host::{Props, check_status, suites};
 use image::{Depth, Image, Rect};
 
 /// For the export macro.
@@ -102,7 +102,7 @@ fn dispatch(
 ) -> Result<OfxStatus, OfxStatus> {
     let cpu = vfx_host::plugin().kind == Kind::Cpu;
     Ok(if action == ACTION_LOAD {
-        if host::load() {
+        if host::fetch_suites() {
             STAT_OK
         } else {
             STAT_ERR_MISSING_HOST_FEATURE
@@ -151,14 +151,14 @@ fn dispatch(
 fn effect_props(effect: ImageEffect) -> Result<Props, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a descriptor or instance handle from the host.
-    check(unsafe { (suites().effect.getPropertySet)(effect, &mut props) })?;
+    check_status(unsafe { (suites().effect.getPropertySet)(effect, &mut props) })?;
     Ok(Props(props))
 }
 
 /// For properties a host may not know (OpenFX grew over versions, and hosts return
 /// kOfxStatErrUnknown for names they don't recognise). Failing describe over one of
 /// these would hide the plugin, so note it and carry on.
-pub(crate) fn optional(name: &CStr, result: Result<(), OfxStatus>) {
+pub(crate) fn note_if_rejected(name: &CStr, result: Result<(), OfxStatus>) {
     if let Err(status) = result {
         LOG.note(&format!(
             "host rejected optional property {name:?} (status {status})"
@@ -176,41 +176,45 @@ fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
         PROP_SUPPORTED_PIXEL_DEPTHS,
         &[DEPTH_BYTE, DEPTH_SHORT, DEPTH_FLOAT],
     )?;
-    optional(
+    note_if_rejected(
         PROP_GROUPING,
         p.set_string(PROP_GROUPING, plugin.info.category),
     );
     // DaVinci Resolve 21 rejects this one with kOfxStatErrUnknown.
-    optional(
+    note_if_rejected(
         PROP_PLUGIN_DESCRIPTION,
         p.set_string(PROP_PLUGIN_DESCRIPTION, plugin.info.description),
     );
     // GPU effects scale pixel distances themselves; CPU effects see whole frames.
-    optional(
+    note_if_rejected(
         PROP_SUPPORTS_MULTI_RESOLUTION,
         p.set_int(PROP_SUPPORTS_MULTI_RESOLUTION, 0, i32::from(!cpu)),
     );
-    optional(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
-    optional(
+    note_if_rejected(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
+    note_if_rejected(
         PROP_TEMPORAL_CLIP_ACCESS,
-        p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, i32::from(temporal(cpu))),
+        p.set_int(
+            PROP_TEMPORAL_CLIP_ACCESS,
+            0,
+            i32::from(declares_temporal_access(cpu)),
+        ),
     );
-    optional(
+    note_if_rejected(
         PROP_MULTIPLE_CLIP_DEPTHS,
         p.set_int(PROP_MULTIPLE_CLIP_DEPTHS, 0, 0),
     );
     // Each render makes or leases its own instance, so concurrent renders are safe. An effect
     // that keeps state has one per instance, so its renders take turns.
-    let safety = if keeps_state() {
+    let safety = if effect_keeps_state() {
         RENDER_INSTANCE_SAFE
     } else {
         RENDER_FULLY_SAFE
     };
-    optional(
+    note_if_rejected(
         PROP_RENDER_THREAD_SAFETY,
         p.set_str(PROP_RENDER_THREAD_SAFETY, 0, safety),
     );
-    optional(
+    note_if_rejected(
         PROP_HOST_FRAME_THREADING,
         p.set_int(PROP_HOST_FRAME_THREADING, 0, 0),
     );
@@ -220,20 +224,20 @@ fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
 fn define_clip(
     effect: ImageEffect,
     name: &CStr,
-    optional: bool,
-    temporal: bool,
+    is_optional: bool,
+    is_temporal: bool,
 ) -> Result<(), OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a descriptor handle in the describe-in-context action.
-    check(unsafe { (suites().effect.clipDefine)(effect, name.as_ptr(), &mut props) })?;
+    check_status(unsafe { (suites().effect.clipDefine)(effect, name.as_ptr(), &mut props) })?;
     let p = Props(props);
     p.set_str(PROP_SUPPORTED_COMPONENTS, 0, COMPONENT_RGBA)?;
-    self::optional(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
-    if optional {
+    note_if_rejected(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
+    if is_optional {
         p.set_int(CLIP_PROP_OPTIONAL, 0, 1)?;
     }
-    if temporal {
-        self::optional(
+    if is_temporal {
+        note_if_rejected(
             PROP_TEMPORAL_CLIP_ACCESS,
             p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, 1),
         );
@@ -255,7 +259,7 @@ fn describe_in_context(effect: ImageEffect, in_args: Props) -> Result<(), OfxSta
         effect,
         CLIP_SOURCE,
         false,
-        temporal(plugin.kind == Kind::Cpu),
+        declares_temporal_access(plugin.kind == Kind::Cpu),
     )?;
     if layer {
         define_clip(effect, CLIP_LAYER, true, false)?;
@@ -263,11 +267,11 @@ fn describe_in_context(effect: ImageEffect, in_args: Props) -> Result<(), OfxSta
     define_clip(effect, CLIP_OUTPUT, false, false)?;
     let mut set = ptr::null_mut();
     // SAFETY: a descriptor handle.
-    check(unsafe { (suites().effect.getParamSet)(effect, &mut set) })?;
+    check_status(unsafe { (suites().effect.getParamSet)(effect, &mut set) })?;
     params::define(set, plugin.params(), layer)
 }
 
-fn clip(effect: ImageEffect, name: &CStr) -> Option<Clip> {
+fn clip_handle(effect: ImageEffect, name: &CStr) -> Option<Clip> {
     let mut clip = ptr::null_mut();
     // SAFETY: an instance handle; fails for clips this context doesn't define.
     let status = unsafe {
@@ -279,7 +283,7 @@ fn clip(effect: ImageEffect, name: &CStr) -> Option<Clip> {
 fn clip_props(clip: Clip) -> Result<Props, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a clip handle from clipGetHandle.
-    check(unsafe { (suites().effect.clipGetPropertySet)(clip, &mut props) })?;
+    check_status(unsafe { (suites().effect.clipGetPropertySet)(clip, &mut props) })?;
     Ok(Props(props))
 }
 
@@ -290,13 +294,13 @@ fn clip_connected(clip: Clip) -> bool {
         != 0
 }
 
-fn values(effect: ImageEffect, time: OfxTime) -> Result<ParamValues, OfxStatus> {
+fn param_values(effect: ImageEffect, time: OfxTime) -> Result<ParamValues, OfxStatus> {
     params::Reader::new(effect, time)?.values(vfx_host::plugin().params())
 }
 
 /// The GPU effect's region at `scale` (1 in canonical coordinates). CPU effects use the
 /// whole frame.
-fn region(values: &ParamValues, scale: [f64; 2]) -> Region {
+fn gpu_effect_region(values: &ParamValues, scale: [f64; 2]) -> Region {
     match (vfx_host::plugin().make)() {
         Processor::Gpu(e) => e.region(values, [scale[0] as f32, scale[1] as f32]),
         Processor::Cpu(_) => Region::default(),
@@ -304,10 +308,10 @@ fn region(values: &ParamValues, scale: [f64; 2]) -> Region {
 }
 
 fn source_rod(effect: ImageEffect, time: OfxTime) -> Result<[f64; 4], OfxStatus> {
-    let source = clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
+    let source = clip_handle(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
     let mut rod = [0.0f64; 4];
     // SAFETY: a clip handle and a four-double rectangle.
-    check(unsafe { (suites().effect.clipGetRegionOfDefinition)(source, time, &mut rod) })?;
+    check_status(unsafe { (suites().effect.clipGetRegionOfDefinition)(source, time, &mut rod) })?;
     Ok(rod)
 }
 
@@ -315,7 +319,7 @@ fn source_rod(effect: ImageEffect, time: OfxTime) -> Result<[f64; 4], OfxStatus>
 fn frames_needed(effect: ImageEffect, in_args: Props, out_args: Props) -> Result<(), OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
     let before = match (vfx_host::plugin().make)() {
-        Processor::Cpu(e) => e.frames_before(&values(effect, time)?, frame_rate(effect)?),
+        Processor::Cpu(e) => e.frames_before(&param_values(effect, time)?, frame_rate(effect)?),
         Processor::Gpu(_) => 0,
     };
     out_args.set_doubles(CLIP_FRAME_RANGE_SOURCE, &[time - before as f64, time])
@@ -328,7 +332,7 @@ fn region_of_definition(
     out_args: Props,
 ) -> Result<OfxStatus, OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
-    let r = region(&values(effect, time)?, [1.0, 1.0]);
+    let r = gpu_effect_region(&param_values(effect, time)?, [1.0, 1.0]);
     if !r.grows {
         return Ok(STAT_REPLY_DEFAULT);
     }
@@ -351,32 +355,32 @@ fn regions_of_interest(
     if vfx_host::plugin().kind == Kind::Cpu {
         return out_args.set_doubles(CLIP_ROI_SOURCE, &source_rod(effect, time)?);
     }
-    let [rx, ry] = region(&values(effect, time)?, [1.0, 1.0])
+    let [rx, ry] = gpu_effect_region(&param_values(effect, time)?, [1.0, 1.0])
         .reach
         .map(f64::from);
     let r = in_args.get_rect_d(PROP_ROI)?;
     let roi = [r[0] - rx, r[1] - ry, r[2] + rx, r[3] + ry];
     out_args.set_doubles(CLIP_ROI_SOURCE, &roi)?;
-    if clip(effect, CLIP_LAYER).is_some() {
+    if clip_handle(effect, CLIP_LAYER).is_some() {
         out_args.set_doubles(CLIP_ROI_LAYER, &roi)?;
     }
     Ok(())
 }
 
 /// A fetched image, released when dropped.
-struct Fetched {
+struct FetchedImage {
     props: Props,
     image: Image,
 }
 
-impl Drop for Fetched {
+impl Drop for FetchedImage {
     fn drop(&mut self) {
         // SAFETY: an image handle from clipGetImage, released once.
         unsafe { (suites().effect.clipReleaseImage)(self.props.0) };
     }
 }
 
-fn fetch(clip: Clip, time: OfxTime) -> Result<Option<Fetched>, OfxStatus> {
+fn fetch_image(clip: Clip, time: OfxTime) -> Result<Option<FetchedImage>, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a clip handle; a null region asks for the whole image.
     let status = unsafe { (suites().effect.clipGetImage)(clip, time, ptr::null(), &mut props) };
@@ -385,7 +389,7 @@ fn fetch(clip: Clip, time: OfxTime) -> Result<Option<Fetched>, OfxStatus> {
     }
     let p = Props(props);
     // Release the image even if describing it fails.
-    let mut fetched = Fetched {
+    let mut fetched = FetchedImage {
         props: p,
         image: Image {
             data: ptr::null_mut(),
@@ -458,24 +462,25 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         in_args.get_double(PROP_RENDER_SCALE, 0)?,
         in_args.get_double(PROP_RENDER_SCALE, 1)?,
     ];
-    let output = fetch(clip(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?.ok_or(STAT_FAILED)?;
-    let source = fetch(clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?, time)?;
-    let layer = match clip(effect, CLIP_LAYER) {
-        Some(c) if clip_connected(c) => fetch(c, time)?,
+    let output = fetch_image(clip_handle(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?
+        .ok_or(STAT_FAILED)?;
+    let source = fetch_image(clip_handle(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?, time)?;
+    let layer = match clip_handle(effect, CLIP_LAYER) {
+        Some(c) if clip_connected(c) => fetch_image(c, time)?,
         _ => None,
     };
-    let mut values = values(effect, time)?;
+    let mut values = param_values(effect, time)?;
 
     let window = window.intersect(&output.image.bounds);
     if window.is_empty() {
         return Ok(());
     }
     // Render a canvas that also covers the pixels the effect reads around the window.
-    let r = region(&values, scale);
-    let reach = window.grow(r.reach[0], r.reach[1]);
+    let r = gpu_effect_region(&values, scale);
+    let read_area = window.grow(r.reach[0], r.reach[1]);
     let canvas = match &source {
-        Some(s) if !r.grows => reach.intersect(&s.image.bounds).union(&window),
-        _ => reach,
+        Some(s) if !r.grows => read_area.intersect(&s.image.bounds).union(&window),
+        _ => read_area,
     };
     map_points(&mut values, plugin.params(), scale, canvas);
     // SAFETY: images come from the host and are described by their own properties.
@@ -505,7 +510,9 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         layer: layer_pixels.as_deref(),
     };
     let depth = output.image.depth;
-    LOG.note(&format!("render path: CPU (frames through RAM), {depth:?}"));
+    LOG.note(&format!(
+        "render path: GPU effect, frames through RAM, {depth:?}"
+    ));
     let result = match vfx_host::gpu(&LOG) {
         Some(gpu) => {
             catch_unwind(AssertUnwindSafe(|| pipeline::run(gpu, &job))).unwrap_or_else(|_| {
@@ -522,41 +529,41 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
 
 /// Hands a CPU effect the source frames it reads, oldest first, each fetched and
 /// converted when asked for and released straight after.
-struct Source<'a, C> {
+struct ClipFrames<'a, C> {
     clip: Clip,
     /// The clip's first frame; earlier ones don't exist.
-    start: f64,
+    clip_start_time: f64,
     /// The time of frame 0.
-    first: f64,
+    first_frame_time: f64,
     canvas: Rect,
     error: Option<OfxStatus>,
     /// Where each frame is decoded.
-    frame: &'a mut Vec<Argb<C>>,
-    /// The frame `frame` holds, which isn't fetched again if asked for again.
-    decoded: Option<usize>,
+    decoded_pixels: &'a mut Vec<Argb<C>>,
+    /// The frame `decoded_pixels` holds, which isn't fetched again if asked for again.
+    decoded_index: Option<usize>,
     /// Resolve is streaming renders, so earlier frames are taken as unchanged until it pauses.
-    fixed: bool,
+    earlier_frames_unchanged: bool,
 }
 
-impl<C: CpuDepth> FrameSource for Source<'_, C> {
+impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<vfx_core::cpu::Image<'_>>)) {
-        let time = self.first + index as f64;
-        if time < self.start {
+        let time = self.first_frame_time + index as f64;
+        if time < self.clip_start_time {
             f(None);
             return;
         }
         let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
-        if self.decoded == Some(index) {
-            f(Some(C::image(View::from_pixels(self.frame, w, h))));
+        if self.decoded_index == Some(index) {
+            f(Some(C::image(View::from_pixels(self.decoded_pixels, w, h))));
             return;
         }
-        self.decoded = None;
-        match fetch(self.clip, time) {
+        self.decoded_index = None;
+        match fetch_image(self.clip, time) {
             Ok(Some(frame)) => {
                 // SAFETY: the fetched image stays alive through the closure.
-                unsafe { cpu::decode_into(&frame.image, self.canvas, self.frame) };
-                self.decoded = Some(index);
-                f(Some(C::image(View::from_pixels(self.frame, w, h))));
+                unsafe { cpu_pixels::decode_into(&frame.image, self.canvas, self.decoded_pixels) };
+                self.decoded_index = Some(index);
+                f(Some(C::image(View::from_pixels(self.decoded_pixels, w, h))));
             }
             Ok(None) => {
                 self.error.get_or_insert(STAT_FAILED);
@@ -570,44 +577,46 @@ impl<C: CpuDepth> FrameSource for Source<'_, C> {
     }
 
     fn fixed(&self) -> bool {
-        self.fixed
+        self.earlier_frames_unchanged
     }
 }
 
 /// Whether to declare temporal clip access. Resolve hands over earlier frames without it and
 /// plays back far slower with it.
-fn temporal(cpu: bool) -> bool {
+fn declares_temporal_access(cpu: bool) -> bool {
     cpu && !host::is_resolve()
 }
 
-fn keeps_state() -> bool {
+fn effect_keeps_state() -> bool {
     vfx_host::CpuInstance::new(vfx_host::plugin().make, true).is_some_and(|i| i.is_kept())
 }
 
 /// An instance's CPU effect, kept between renders under the shared policy
 /// ([`vfx_host::CpuInstance`]) when the effect keeps state, and its last render.
-struct Kept {
+struct KeptEffect {
     effect: vfx_host::CpuInstance,
-    last: std::sync::Mutex<Option<Rendered>>,
+    last_render: std::sync::Mutex<Option<LastRender>>,
 }
 
 /// A frame rendered, when it finished, and whether it didn't follow on from the one before.
 #[derive(Clone, Copy)]
-struct Rendered {
+struct LastRender {
     frame: i64,
-    ended: std::time::Instant,
+    finished: std::time::Instant,
     broke_stream: bool,
 }
 
-fn steps_forward_soon(last: Option<Rendered>, frame: i64) -> bool {
-    const GAP: std::time::Duration = std::time::Duration::from_secs(1);
-    last.is_some_and(|last| last.ended.elapsed() < GAP && (1..=120).contains(&(frame - last.frame)))
+fn follows_recent_render(last: Option<LastRender>, frame: i64) -> bool {
+    const MAX_STREAM_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+    last.is_some_and(|last| {
+        last.finished.elapsed() < MAX_STREAM_GAP && (1..=120).contains(&(frame - last.frame))
+    })
 }
 
 /// Whether a render of `frame` continues a stream, so earlier frames are taken as unchanged. The
 /// render that breaks a stream and the next check them: an export can still step back after it.
-fn streaming(last: Option<Rendered>, frame: i64) -> bool {
-    steps_forward_soon(last, frame) && last.is_some_and(|last| !last.broke_stream)
+fn continues_stream(last: Option<LastRender>, frame: i64) -> bool {
+    follows_recent_render(last, frame) && last.is_some_and(|last| !last.broke_stream)
 }
 
 fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
@@ -617,15 +626,15 @@ fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     if !instance.is_kept() {
         return Ok(());
     }
-    if let Ok(values) = values(effect, 0.0) {
+    if let Ok(values) = param_values(effect, 0.0) {
         instance.values_known(&values);
     }
-    let kept: *mut Kept = Box::into_raw(Box::new(Kept {
+    let kept: *mut KeptEffect = Box::into_raw(Box::new(KeptEffect {
         effect: instance,
-        last: std::sync::Mutex::new(None),
+        last_render: std::sync::Mutex::new(None),
     }));
     // SAFETY: an instance handle; the pointer is freed in destroy-instance.
-    check(unsafe {
+    check_status(unsafe {
         (suites().prop.propSetPointer)(
             effect_props(effect)?.0,
             PROP_INSTANCE_DATA.as_ptr(),
@@ -642,21 +651,21 @@ fn destroy_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
         .unwrap_or(ptr::null_mut());
     if !kept.is_null() {
         // SAFETY: an instance handle; the pointer is cleared before what it points at is freed.
-        check(unsafe {
+        check_status(unsafe {
             (suites().prop.propSetPointer)(props.0, PROP_INSTANCE_DATA.as_ptr(), 0, ptr::null_mut())
         })?;
         // SAFETY: the Box from create-instance, freed once.
-        drop(unsafe { Box::from_raw(kept.cast::<Kept>()) });
+        drop(unsafe { Box::from_raw(kept.cast::<KeptEffect>()) });
     }
     Ok(())
 }
 
-fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a Kept>, OfxStatus> {
+fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a KeptEffect>, OfxStatus> {
     let kept = effect_props(effect)?
         .get_pointer(PROP_INSTANCE_DATA)
         .unwrap_or(ptr::null_mut());
     // SAFETY: set from a Box in create-instance and freed only in destroy-instance.
-    Ok(unsafe { kept.cast::<Kept>().as_ref() })
+    Ok(unsafe { kept.cast::<KeptEffect>().as_ref() })
 }
 
 /// Ends the stream, so the next render checks earlier frames. Hosts send this for single frames
@@ -668,7 +677,7 @@ fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> 
         && last > first
         && let Some(kept) = kept_for_instance(effect)?
     {
-        *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *kept.last_render.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
     Ok(())
 }
@@ -676,36 +685,37 @@ fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> 
 fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
     if let Some(kept) = kept_for_instance(effect)? {
         let frame = in_args.get_double(PROP_TIME, 0)?.round() as i64;
-        let last = *kept.last.lock().unwrap_or_else(|p| p.into_inner());
-        let fixed = host::is_resolve() && streaming(last, frame);
-        let rendered = render_cpu_with(&kept.effect, effect, in_args, fixed);
-        *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Rendered {
+        let last = *kept.last_render.lock().unwrap_or_else(|p| p.into_inner());
+        let earlier_frames_unchanged = host::is_resolve() && continues_stream(last, frame);
+        let rendered = render_cpu_effect(&kept.effect, effect, in_args, earlier_frames_unchanged);
+        *kept.last_render.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastRender {
             frame,
-            ended: std::time::Instant::now(),
-            broke_stream: !steps_forward_soon(last, frame),
+            finished: std::time::Instant::now(),
+            broke_stream: !follows_recent_render(last, frame),
         });
         return rendered;
     }
     let fresh = vfx_host::CpuInstance::new(vfx_host::plugin().make, false).ok_or(STAT_FAILED)?;
-    render_cpu_with(&fresh, effect, in_args, false)
+    render_cpu_effect(&fresh, effect, in_args, false)
 }
 
-fn render_cpu_with(
+fn render_cpu_effect(
     cpu_effect: &vfx_host::CpuInstance,
     effect: ImageEffect,
     in_args: Props,
-    fixed: bool,
+    earlier_frames_unchanged: bool,
 ) -> Result<(), OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
-    let output = fetch(clip(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?.ok_or(STAT_FAILED)?;
-    let source = clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
+    let output = fetch_image(clip_handle(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?
+        .ok_or(STAT_FAILED)?;
+    let source = clip_handle(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
     let source_props = clip_props(source)?;
-    let start = source_props.get_double(PROP_FRAME_RANGE, 0)?;
-    let values = values(effect, time)?;
+    let clip_start_time = source_props.get_double(PROP_FRAME_RANGE, 0)?;
+    let values = param_values(effect, time)?;
     // Frames go back to the clip's first: earlier ones aren't missing, there are none.
     let rate = frame_rate(effect)?;
-    let count =
-        (cpu_effect.frames_before(&values, rate) + 1).min((time - start).max(0.0) as usize + 1);
+    let frame_count = (cpu_effect.frames_before(&values, rate) + 1)
+        .min((time - clip_start_time).max(0.0) as usize + 1);
     let ctx = Context {
         time: seconds(effect, time)?,
         frame: time.round() as i64,
@@ -717,116 +727,110 @@ fn render_cpu_with(
     let window = in_args
         .get_rect_i(PROP_RENDER_WINDOW)?
         .intersect(&output.image.bounds);
-    let canvas = output.image.bounds;
-    let first = time - (count - 1) as f64;
     LOG.note(&format!(
-        "render path: CPU effect, {:?} frames, {count} read",
+        "render path: CPU effect, {:?} frames, {frame_count} read",
         output.image.depth
     ));
+    let render = CpuRender {
+        effect: cpu_effect,
+        source,
+        clip_start_time,
+        first_frame_time: time - (frame_count - 1) as f64,
+        frame_count,
+        canvas: output.image.bounds,
+        values: &values,
+        ctx: &ctx,
+        output: &output.image,
+        window,
+        earlier_frames_unchanged,
+    };
     let error = if output.image.depth == Depth::Byte {
-        draw::<u8>(
-            cpu_effect,
-            source,
-            start,
-            first,
-            count,
-            canvas,
-            &values,
-            &ctx,
-            &output.image,
-            window,
-            fixed,
-        )
+        render.at_depth::<u8>()
     } else {
-        draw::<f32>(
-            cpu_effect,
-            source,
-            start,
-            first,
-            count,
-            canvas,
-            &values,
-            &ctx,
-            &output.image,
-            window,
-            fixed,
-        )
+        render.at_depth::<f32>()
     };
     error.map_or(Ok(()), Err)
 }
 
 /// Buffers kept on each rendering thread, so a render allocates no frame-sized memory. A render
 /// takes them out while it runs, so one nested inside it on the same thread starts empty.
-trait Scratch: CpuDepth {
+trait ScratchBuffers: CpuDepth {
     fn with_scratch<R>(f: impl FnOnce(&mut Vec<Argb<Self>>, &mut Vec<Argb<Self>>) -> R) -> R;
 }
 
 thread_local! {
-    static BYTES: std::cell::RefCell<[Vec<Argb<u8>>; 2]> = const {
+    static SCRATCH_U8: std::cell::RefCell<[Vec<Argb<u8>>; 2]> = const {
         std::cell::RefCell::new([Vec::new(), Vec::new()])
     };
-    static FLOATS: std::cell::RefCell<[Vec<Argb<f32>>; 2]> = const {
+    static SCRATCH_F32: std::cell::RefCell<[Vec<Argb<f32>>; 2]> = const {
         std::cell::RefCell::new([Vec::new(), Vec::new()])
     };
 }
 
-impl Scratch for u8 {
+impl ScratchBuffers for u8 {
     fn with_scratch<R>(f: impl FnOnce(&mut Vec<Argb<u8>>, &mut Vec<Argb<u8>>) -> R) -> R {
-        let [mut a, mut b] = BYTES.take();
+        let [mut a, mut b] = SCRATCH_U8.take();
         let result = f(&mut a, &mut b);
-        BYTES.set([a, b]);
+        SCRATCH_U8.set([a, b]);
         result
     }
 }
 
-impl Scratch for f32 {
+impl ScratchBuffers for f32 {
     fn with_scratch<R>(f: impl FnOnce(&mut Vec<Argb<f32>>, &mut Vec<Argb<f32>>) -> R) -> R {
-        let [mut a, mut b] = FLOATS.take();
+        let [mut a, mut b] = SCRATCH_F32.take();
         let result = f(&mut a, &mut b);
-        FLOATS.set([a, b]);
+        SCRATCH_F32.set([a, b]);
         result
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw<C: Scratch>(
-    effect: &vfx_host::CpuInstance,
-    clip: Clip,
-    start: f64,
-    first: f64,
-    count: usize,
+/// One render of a CPU effect, whichever depth it runs at.
+struct CpuRender<'a> {
+    effect: &'a vfx_host::CpuInstance,
+    source: Clip,
+    clip_start_time: f64,
+    first_frame_time: f64,
+    frame_count: usize,
     canvas: Rect,
-    values: &ParamValues,
-    ctx: &Context,
-    output: &Image,
+    values: &'a ParamValues,
+    ctx: &'a Context,
+    output: &'a Image,
     window: Rect,
-    fixed: bool,
-) -> Option<OfxStatus> {
-    C::with_scratch(|frame, pixels| {
-        let mut frames = Source::<C> {
-            clip,
-            start,
-            first,
-            canvas,
-            error: None,
-            frame,
-            decoded: None,
-            fixed,
-        };
-        let (w, h) = (canvas.width() as i32, canvas.height() as i32);
-        pixels.clear();
-        pixels.resize(canvas.width() * canvas.height(), Argb::default());
-        let view = C::image_mut(ViewMut::from_pixels(pixels, w, h));
-        if effect
-            .render(&mut frames, count, view, values, ctx)
-            .is_err()
-        {
-            return Some(STAT_FAILED);
-        }
-        // SAFETY: the render window is clipped to the output and canvas bounds.
-        unsafe { cpu::encode(pixels, canvas, output, window) };
-        frames.error
-    })
+    earlier_frames_unchanged: bool,
+}
+
+impl CpuRender<'_> {
+    /// Renders at `C` and writes the window to the host's output. The error is the render's or
+    /// the first failed frame fetch's.
+    fn at_depth<C: ScratchBuffers>(&self) -> Option<OfxStatus> {
+        let canvas = self.canvas;
+        C::with_scratch(|decoded_pixels, output_pixels| {
+            let mut frames = ClipFrames::<C> {
+                clip: self.source,
+                clip_start_time: self.clip_start_time,
+                first_frame_time: self.first_frame_time,
+                canvas,
+                error: None,
+                decoded_pixels,
+                decoded_index: None,
+                earlier_frames_unchanged: self.earlier_frames_unchanged,
+            };
+            let (w, h) = (canvas.width() as i32, canvas.height() as i32);
+            output_pixels.clear();
+            output_pixels.resize(canvas.width() * canvas.height(), Argb::default());
+            let view = C::image_mut(ViewMut::from_pixels(output_pixels, w, h));
+            let rendered =
+                self.effect
+                    .render(&mut frames, self.frame_count, view, self.values, self.ctx);
+            if rendered.is_err() {
+                return Some(STAT_FAILED);
+            }
+            // SAFETY: the render window is clipped to the output and canvas bounds.
+            unsafe { cpu_pixels::encode(output_pixels, canvas, self.output, self.window) };
+            frames.error
+        })
+    }
 }
 
 #[cfg(test)]
@@ -839,11 +843,11 @@ mod tests {
         frames
             .iter()
             .map(|&frame| {
-                let streaming = streaming(last, frame);
-                last = Some(Rendered {
+                let streaming = continues_stream(last, frame);
+                last = Some(LastRender {
                     frame,
-                    ended: std::time::Instant::now(),
-                    broke_stream: !steps_forward_soon(last, frame),
+                    finished: std::time::Instant::now(),
+                    broke_stream: !follows_recent_render(last, frame),
                 });
                 streaming
             })
@@ -851,8 +855,8 @@ mod tests {
     }
 
     #[test]
-    fn forward_steps_stream_and_anything_else_checks_again() {
-        // How Resolve 21 starts a Deliver, then playback skipping, a seek back and a jump.
+    fn only_forward_steps_continue_stream() {
+        // How Resolve 21 starts an export, then playback skipping, a seek back and a jump.
         let frames = [0, 0, 0, 2, 1, 3, 4, 7, 5, 200, 201, 202];
         let expected = [
             false, false, false, false, false, false, true, true, false, false, false, true,

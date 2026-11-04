@@ -67,7 +67,7 @@ pub enum Depth {
 }
 
 impl Depth {
-    fn bytes_per_channel(self) -> usize {
+    pub fn bytes_per_channel(self) -> usize {
         match self {
             Depth::Byte => 1,
             Depth::Short => 2,

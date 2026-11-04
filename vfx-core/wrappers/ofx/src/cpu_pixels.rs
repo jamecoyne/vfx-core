@@ -6,29 +6,24 @@ use vfx_host::by_rows;
 
 use crate::image::{Depth, Image, Rect};
 
-fn channel_bytes(depth: Depth) -> usize {
-    match depth {
-        Depth::Byte => 1,
-        Depth::Short => 2,
-        Depth::Float => 4,
-    }
-}
-unsafe fn address(image: &Image, x: i32, y: i32) -> *mut u8 {
+unsafe fn pixel_address(image: &Image, x: i32, y: i32) -> *mut u8 {
     // SAFETY: caller supplies coordinates inside the host image.
     unsafe {
         image.data.offset(
             (y - image.bounds.y1) as isize * image.row_bytes
-                + (x - image.bounds.x1) as isize * (4 * channel_bytes(image.depth)) as isize,
+                + (x - image.bounds.x1) as isize * (4 * image.depth.bytes_per_channel()) as isize,
         )
     }
 }
 /// A host image shared by the threads converting its rows; each writes rows of its own.
-struct Shared<'a>(&'a Image);
+/// Closures must call [`Self::image`]: naming the field would capture the `&Image`, which isn't
+/// `Sync`, in place of this wrapper.
+struct SharedRows<'a>(&'a Image);
 
 // SAFETY: threads read the image, and write only disjoint rows of it.
-unsafe impl Sync for Shared<'_> {}
+unsafe impl Sync for SharedRows<'_> {}
 
-impl Shared<'_> {
+impl SharedRows<'_> {
     fn image(&self) -> &Image {
         self.0
     }
@@ -43,14 +38,14 @@ impl Shared<'_> {
     reason = "an Image describes host memory it doesn't own; rows are handed out one per thread"
 )]
 unsafe fn row_bytes(image: &Image, x: i32, y: i32, pixels: usize) -> &mut [u8] {
-    let len = pixels * 4 * channel_bytes(image.depth);
+    let len = pixels * 4 * image.depth.bytes_per_channel();
     // SAFETY: the caller confines the row to the host image and uses it alone.
-    unsafe { std::slice::from_raw_parts_mut(address(image, x, y), len) }
+    unsafe { std::slice::from_raw_parts_mut(pixel_address(image, x, y), len) }
 }
 
 /// One host row's bytes (`depth`, RGBA, native byte order) into `row`, through `byte` for
 /// 8-bit channels.
-fn decode_row<C: Channel>(src: &[u8], depth: Depth, row: &mut [Argb<C>], byte: &[C; 256]) {
+fn decode_row<C: Channel>(src: &[u8], depth: Depth, row: &mut [Argb<C>], byte_lut: &[C; 256]) {
     let argb = |[r, g, b, a]: [C; 4]| Argb {
         alpha: a,
         red: r,
@@ -60,7 +55,7 @@ fn decode_row<C: Channel>(src: &[u8], depth: Depth, row: &mut [Argb<C>], byte: &
     match depth {
         Depth::Byte => {
             for (px, c) in row.iter_mut().zip(src.as_chunks::<4>().0) {
-                *px = argb(c.map(|v| byte[usize::from(v)]));
+                *px = argb(c.map(|v| byte_lut[usize::from(v)]));
             }
         }
         Depth::Short => {
@@ -128,8 +123,8 @@ pub unsafe fn decode_into<C: Channel>(image: &Image, canvas: Rect, out: &mut Vec
     let r = canvas.intersect(&image.bounds);
     out.clear();
     out.resize(canvas.width() * canvas.height(), Argb::default());
-    let byte: [C; 256] = std::array::from_fn(|v| C::from_unit(v as f32 / 255.0));
-    let shared = Shared(image);
+    let byte_lut: [C; 256] = std::array::from_fn(|v| C::from_unit(v as f32 / 255.0));
+    let shared = SharedRows(image);
     let skip = (r.x1 - canvas.x1).max(0) as usize;
     by_rows(out, canvas.width(), |row, pixels| {
         let y = canvas.y2 - 1 - row as i32;
@@ -139,7 +134,7 @@ pub unsafe fn decode_into<C: Channel>(image: &Image, canvas: Rect, out: &mut Vec
             // SAFETY: the intersection confines the row to the host image, read by this
             // thread alone.
             let src = unsafe { row_bytes(image, r.x1, y, pixels.len()) };
-            decode_row(src, image.depth, pixels, &byte);
+            decode_row(src, image.depth, pixels, &byte_lut);
         }
     });
 }
@@ -149,7 +144,7 @@ pub unsafe fn decode_into<C: Channel>(image: &Image, canvas: Rect, out: &mut Vec
 /// # Safety
 /// `image` must describe a live host image, and `window` lie inside both it and `canvas`.
 pub unsafe fn encode<C: Channel>(pixels: &[Argb<C>], canvas: Rect, image: &Image, window: Rect) {
-    let shared = Shared(image);
+    let shared = SharedRows(image);
     let skip = (window.x1 - canvas.x1) as usize;
     let mut rows: Vec<i32> = (window.y1..window.y2).collect();
     by_rows(&mut rows, 1, |_, y| {
@@ -177,7 +172,7 @@ mod tests {
         for y in r.y1..r.y2 {
             for x in r.x1..r.x2 {
                 // SAFETY: intersection confines the pointer and four channels to the host image.
-                let p = unsafe { address(image, x, y) };
+                let p = unsafe { pixel_address(image, x, y) };
                 let read = |i| unsafe {
                     match image.depth {
                         Depth::Byte => C::from_unit(f32::from(*p.add(i)) / 255.0),
@@ -213,7 +208,7 @@ mod tests {
                 let v = pixels
                     [(canvas.y2 - 1 - y) as usize * canvas.width() + (x - canvas.x1) as usize];
                 // SAFETY: caller confines the window to both canvas and output bounds.
-                let p = unsafe { address(image, x, y) };
+                let p = unsafe { pixel_address(image, x, y) };
                 for (i, c) in [v.red, v.green, v.blue, v.alpha].into_iter().enumerate() {
                     let c = c.to_unit();
                     // SAFETY: each write addresses one channel of the host pixel, possibly unaligned.
@@ -234,14 +229,14 @@ mod tests {
 
     /// The conversions themselves, on bytes alone.
     #[test]
-    fn rows_convert_without_a_host() {
-        let byte: [f32; 256] = std::array::from_fn(|v| v as f32 / 255.0);
+    fn short_and_float_rows_round_trip() {
+        let byte_lut: [f32; 256] = std::array::from_fn(|v| v as f32 / 255.0);
         let mut row = [Argb::<f32>::default(); 2];
         let shorts: Vec<u8> = [0u16, 65535, 32768, 65535, 65535, 0, 0, 13107]
             .iter()
             .flat_map(|v| v.to_ne_bytes())
             .collect();
-        decode_row(&shorts, Depth::Short, &mut row, &byte);
+        decode_row(&shorts, Depth::Short, &mut row, &byte_lut);
         assert_eq!((row[0].red, row[0].green, row[0].alpha), (0.0, 1.0, 1.0));
         assert_eq!((row[1].red, row[1].alpha), (1.0, 0.2));
         let mut back = vec![0u8; shorts.len()];
@@ -250,7 +245,7 @@ mod tests {
         let mut floats = vec![0u8; 32];
         encode_row(&row, Depth::Float, &mut floats);
         let mut again = [Argb::<f32>::default(); 2];
-        decode_row(&floats, Depth::Float, &mut again, &byte);
+        decode_row(&floats, Depth::Float, &mut again, &byte_lut);
         assert_eq!(again, row);
     }
 
@@ -259,7 +254,7 @@ mod tests {
     fn row_conversions_match_the_per_pixel_ones() {
         let (w, h) = (37usize, 5usize);
         for depth in [Depth::Byte, Depth::Short, Depth::Float] {
-            let bytes = 4 * channel_bytes(depth);
+            let bytes = 4 * depth.bytes_per_channel();
             let mut host: Vec<u8> = (0..w * h * bytes).map(|i| (i * 7919 % 256) as u8).collect();
             if depth == Depth::Float {
                 for (i, c) in host.as_chunks_mut::<4>().0.iter_mut().enumerate() {
