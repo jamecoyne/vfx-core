@@ -9,10 +9,11 @@ use crate::controls::{self, Controls, Status};
 use crate::effects::Output;
 use crate::effects::{self, Effects};
 use crate::modulation::{self, Expressions, Sources};
+use crate::stats;
 #[cfg(target_arch = "wasm32")]
 use crate::web_media;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{audio, face, script, stats, video};
+use crate::{audio, face, script, video};
 use vfx_core::Gpu;
 use winit::application::ApplicationHandler;
 #[cfg(not(target_arch = "wasm32"))]
@@ -61,7 +62,6 @@ struct Preview {
     /// Held while no face is found.
     #[cfg(not(target_arch = "wasm32"))]
     face_values: modulation::Face,
-    #[cfg(not(target_arch = "wasm32"))]
     report: vfx_core::Report,
     /// Cameras found at startup.
     #[cfg(not(target_arch = "wasm32"))]
@@ -72,13 +72,10 @@ struct Preview {
     /// A file pick or camera request the browser hasn't answered yet.
     #[cfg(target_arch = "wasm32")]
     web_pending: web_media::Pending,
-    /// Samples the bottom bar's CPU, memory and GPU numbers.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Samples the bottom bar's numbers.
     stats: stats::Sampler,
-    #[cfg(not(target_arch = "wasm32"))]
     counts: stats::Counts,
     /// A new picture is waiting for the next present.
-    #[cfg(not(target_arch = "wasm32"))]
     unshown: bool,
     /// Counts frames for `--stats`, `--frames` and `--seconds`.
     #[cfg(not(target_arch = "wasm32"))]
@@ -229,7 +226,6 @@ impl Preview {
             tracker: None,
             #[cfg(not(target_arch = "wasm32"))]
             face_values: modulation::FACE_NONE,
-            #[cfg(not(target_arch = "wasm32"))]
             report: vfx_core::Report::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cameras: video::cameras(),
@@ -237,11 +233,8 @@ impl Preview {
             web_video: None,
             #[cfg(target_arch = "wasm32")]
             web_pending: Default::default(),
-            #[cfg(not(target_arch = "wasm32"))]
             stats: stats::Sampler::new(),
-            #[cfg(not(target_arch = "wasm32"))]
             counts: stats::Counts::default(),
-            #[cfg(not(target_arch = "wasm32"))]
             unshown: false,
             #[cfg(not(target_arch = "wasm32"))]
             meter: None,
@@ -362,10 +355,11 @@ impl Preview {
                 self.refresh_image();
             }
             let video = self.web_video.as_mut().expect("checked above");
-            if let Some(frame) = self.effects.source_frame()
-                && let Err(e) = video.upload(&self.gpu, frame)
-            {
-                self.message = Some(format!("Couldn't read the video: {e}"));
+            if let Some(frame) = self.effects.source_frame() {
+                match video.upload(&self.gpu, frame) {
+                    Ok(copied) => self.counts.arrived += u64::from(copied),
+                    Err(e) => self.message = Some(format!("Couldn't read the video: {e}")),
+                }
             }
         }
         let video = self.web_video.as_ref().expect("checked above");
@@ -408,6 +402,10 @@ impl Preview {
         let mut frame_time = self.time;
         #[cfg(target_arch = "wasm32")]
         let frame_time = self.feed_web_video();
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.report = self.effects.report();
+        }
         // The face variables: from the effect's report where it gives them, else the tracker's.
         #[cfg(not(target_arch = "wasm32"))]
         let tracker_needed = {
@@ -488,6 +486,14 @@ impl Preview {
         self.effects.render(&self.gpu, c, &values, frame_time);
         #[cfg(not(target_arch = "wasm32"))]
         self.record_frame();
+    }
+
+    /// Whether a video or camera is the source.
+    fn has_video(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.media.is_some();
+        #[cfg(target_arch = "wasm32")]
+        return self.web_video.is_some();
     }
 
     fn is_quiet(&self) -> bool {
@@ -710,16 +716,17 @@ impl Preview {
             // Nothing paces a hidden window, so wait for the GPU before the next frame.
             let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
         }
-        #[cfg(not(target_arch = "wasm32"))]
         let stats = {
             let rendered = self.effects.rendered();
             self.counts.rendered += u64::from(rendered.finished);
             self.counts.render_time += rendered.render_time.unwrap_or_default();
             self.unshown |= rendered.new_picture;
-            let source = match &self.media {
-                Some(_) => stats::SourceRate::Video,
-                None if self.effects.image_name().is_some() => stats::SourceRate::Still,
-                None => stats::SourceRate::Pattern,
+            let source = if self.has_video() {
+                stats::SourceRate::Video
+            } else if self.effects.image_name().is_some() {
+                stats::SourceRate::Still
+            } else {
+                stats::SourceRate::Pattern
             };
             let what = stats::What {
                 effect: self.effects.name(),
@@ -802,7 +809,6 @@ impl Preview {
         let mut actions = controls::Actions::default();
         let mut output = self.egui.run_ui(input, |ui| {
             // Added first, so it runs the window's full width under the controls.
-            #[cfg(not(target_arch = "wasm32"))]
             egui::Panel::bottom("status")
                 .resizable(false)
                 .show(ui, |ui| stats::bar(ui, &stats));
@@ -898,11 +904,8 @@ impl Preview {
         self.gpu.queue.submit(commands);
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.counts.screen += u64::from(self.unshown);
-            self.unshown = false;
-        }
+        self.counts.screen += u64::from(self.unshown);
+        self.unshown = false;
     }
 }
 

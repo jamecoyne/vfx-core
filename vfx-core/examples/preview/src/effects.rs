@@ -326,7 +326,6 @@ impl Stage {
 
 /// What the last [`Effects::render`] did, for the stats.
 #[derive(Clone, Copy, Default)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct Rendered {
     pub finished: bool,
     pub new_picture: bool,
@@ -412,25 +411,21 @@ impl Effects {
     }
 
     /// The shown effect's name.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn name(&self) -> &'static str {
         &catalog::entries()[self.stage.effect].name
     }
 
     /// The shown effect as `--effect` names it.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn slug(&self) -> &'static str {
         &catalog::entries()[self.stage.effect].slug
     }
 
     /// Whether the shown effect renders on the CPU (a `CpuEffect`) rather than in a chain
     /// of GPU passes.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn on_cpu(&self) -> bool {
         matches!(self.stage.run, Run::Cpu(_))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn report(&self) -> vfx_core::Report {
         match &self.stage.run {
             Run::Cpu(stage) => stage.report(),
@@ -588,7 +583,6 @@ impl Effects {
     }
 
     /// What the last render did.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn rendered(&self) -> Rendered {
         self.rendered
     }

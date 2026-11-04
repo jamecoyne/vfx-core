@@ -198,7 +198,6 @@ impl CpuStage {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn report(&self) -> vfx_core::Report {
         self.effect.report()
     }

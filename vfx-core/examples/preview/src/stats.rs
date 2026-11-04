@@ -1,13 +1,17 @@
 //! The bottom bar: frames in from the source, the effect's renders and what they cost, new
-//! frames out to the screen, then this process's and the whole machine's CPU, memory and
-//! GPU load. Sampled about once a second, so the bar costs no frames.
+//! frames out to the screen, then, on the desktop, this process's and the whole machine's CPU,
+//! memory and GPU load, which browsers don't report. Sampled about once a second, so the bar
+//! costs no frames.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use egui::{RichText, Ui};
+use egui::Ui;
+#[cfg(not(target_arch = "wasm32"))]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use vfx_core::Report;
+use web_time::Instant;
 
 const INTERVAL: Duration = Duration::from_secs(1);
 
@@ -65,8 +69,9 @@ pub struct What {
     pub size: (u32, u32),
 }
 
-/// What the bar shows.
+/// What the bar shows, and on the desktop what `--stats` prints.
 #[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct Snapshot {
     pub counts: Counts,
     pub what: What,
@@ -121,6 +126,13 @@ pub struct Sampler {
     /// The longest render since the last sample.
     worst: Duration,
     snapshot: Snapshot,
+    #[cfg(not(target_arch = "wasm32"))]
+    load: MachineLoad,
+}
+
+/// The process's and machine's load, read on threads of their own.
+#[cfg(not(target_arch = "wasm32"))]
+struct MachineLoad {
     /// Written by the GPU thread (macOS only).
     gpu: Arc<Mutex<Option<f32>>>,
     /// Written by the usage thread. None until its first reading, and for good if the OS
@@ -129,14 +141,16 @@ pub struct Sampler {
 }
 
 /// This process's CPU and memory in MB, when the OS lists it, and the whole machine's CPU.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
 struct Usage {
     process: Option<(f32, u64)>,
     system_cpu: f32,
 }
 
-impl Sampler {
-    pub fn new() -> Self {
+#[cfg(not(target_arch = "wasm32"))]
+impl MachineLoad {
+    fn start() -> Self {
         let gpu = Arc::new(Mutex::new(None));
         #[cfg(target_os = "macos")]
         {
@@ -172,13 +186,30 @@ impl Sampler {
                 std::thread::sleep(INTERVAL);
             }
         });
+        Self { gpu, usage }
+    }
+
+    fn read_into(&self, snapshot: &mut Snapshot) {
+        if let Some(usage) = *self.usage.lock().unwrap() {
+            if let Some((cpu, memory_mb)) = usage.process {
+                snapshot.cpu = cpu;
+                snapshot.memory_mb = memory_mb;
+            }
+            snapshot.system_cpu = usage.system_cpu;
+        }
+        snapshot.gpu = *self.gpu.lock().unwrap();
+    }
+}
+
+impl Sampler {
+    pub fn new() -> Self {
         Self {
             last: None,
             last_counts: Counts::default(),
             worst: Duration::ZERO,
             snapshot: Snapshot::default(),
-            gpu,
-            usage,
+            #[cfg(not(target_arch = "wasm32"))]
+            load: MachineLoad::start(),
         }
     }
 
@@ -214,14 +245,8 @@ impl Sampler {
             }
             self.last = Some(Instant::now());
             self.last_counts = counts;
-            if let Some(usage) = *self.usage.lock().unwrap() {
-                if let Some((cpu, memory_mb)) = usage.process {
-                    self.snapshot.cpu = cpu;
-                    self.snapshot.memory_mb = memory_mb;
-                }
-                self.snapshot.system_cpu = usage.system_cpu;
-            }
-            self.snapshot.gpu = *self.gpu.lock().unwrap();
+            #[cfg(not(target_arch = "wasm32"))]
+            self.load.read_into(&mut self.snapshot);
         }
         self.snapshot.counts = counts;
         self.snapshot.what = what;
@@ -290,14 +315,20 @@ pub fn bar(ui: &mut Ui, s: &Snapshot) {
         ui.monospace(effect_text(s));
         ui.separator();
         ui.monospace(format!("screen {:.0} fps", s.screen));
-        ui.separator();
-        ui.monospace(format!("CPU {:.0}% (app {:.0}%)", s.system_cpu, s.cpu));
-        ui.separator();
-        ui.monospace(format!("Memory {} MB", s.memory_mb));
-        ui.separator();
-        match s.gpu {
-            Some(gpu) => ui.monospace(format!("GPU {gpu:.0}%")),
-            None => ui.label(RichText::new("GPU n/a").monospace().weak()),
-        };
+        #[cfg(not(target_arch = "wasm32"))]
+        machine_load(ui, s);
     });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn machine_load(ui: &mut Ui, s: &Snapshot) {
+    ui.separator();
+    ui.monospace(format!("CPU {:.0}% (app {:.0}%)", s.system_cpu, s.cpu));
+    ui.separator();
+    ui.monospace(format!("Memory {} MB", s.memory_mb));
+    ui.separator();
+    match s.gpu {
+        Some(gpu) => ui.monospace(format!("GPU {gpu:.0}%")),
+        None => ui.label(egui::RichText::new("GPU n/a").monospace().weak()),
+    };
 }
