@@ -624,7 +624,12 @@ impl Interop {
             timeout: Some(timeout),
         };
         match self.device.gpu.device.poll(wait) {
-            Ok(_) => Ok(()),
+            // A lost device can finish a wait without doing the work, so GL mustn't wait on the
+            // semaphore it would have signalled.
+            Ok(_) => match Gpu::shared_faults().lost() {
+                Some(reason) => Err(InteropError::Failed(format!("device lost: {reason}"))),
+                None => Ok(()),
+            },
             Err(wgpu::PollError::Timeout) => Err(InteropError::Hung),
             Err(e) => Err(InteropError::Failed(e.to_string())),
         }
@@ -968,6 +973,13 @@ impl InteropSlot {
     /// # Safety
     /// The host's GL context must be current.
     pub unsafe fn ready(&mut self, size: (u32, u32)) -> Option<&Interop> {
+        // Every instance shares the device for the life of the process, so a lost one stays lost.
+        if !self.disabled
+            && let Some(reason) = Gpu::shared_faults().lost()
+        {
+            LOG.note(&format!("warning: GPU device lost, using RAM: {reason}"));
+            self.disabled = true;
+        }
         if let Some(hung) = self.hung.take() {
             if hung.gpu_is_idle() {
                 // SAFETY: the context is current and the GPU has finished.
