@@ -522,6 +522,16 @@ impl ShadowKernel {
         }
     }
 
+    /// `window` grown by how far the shadow reaches.
+    pub fn shadow_rect(&self, window: PixelRect) -> PixelRect {
+        PixelRect::new(
+            window.x - self.reach,
+            window.y - self.reach,
+            window.w + 2 * self.reach,
+            window.h + 2 * self.reach,
+        )
+    }
+
     /// Where a pixel centre `o` in from a corner (negative: outside) falls in the corner table.
     fn corner_index(&self, o: f64) -> i32 {
         o.floor() as i32 - self.corner_min_offset
@@ -629,16 +639,8 @@ impl WindowPlan {
     pub fn new(tile: &Tile, m: &SwarmMetrics, shadow: &ShadowKernel, canvas: PixelRect) -> Self {
         let window = window_rect(tile.content_rect, m.title_height);
         let radius = f64::from(chrome::CORNER_RADIUS) * m.scale;
-        let (sigma, offset_y, reach) = (shadow.sigma, shadow.offset_y, shadow.reach);
-        let shadow_rect = intersect(
-            PixelRect::new(
-                window.x - reach,
-                window.y - reach,
-                window.w + 2 * reach,
-                window.h + 2 * reach,
-            ),
-            canvas,
-        );
+        let (sigma, offset_y) = (shadow.sigma, shadow.offset_y);
+        let shadow_rect = intersect(shadow.shadow_rect(window), canvas);
         let (fx0, fy0) = (f64::from(window.x), f64::from(window.y));
         let (fw, fh) = (f64::from(window.w), f64::from(window.h));
         let mid_x = fx0 + fw / 2.0;

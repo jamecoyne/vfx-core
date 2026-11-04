@@ -116,6 +116,14 @@ const GPU_MIN_COVERAGE_8_BIT: f64 = 0.0;
 #[cfg(target_arch = "wasm32")]
 const GPU_MIN_COVERAGE_DEEPER: f64 = 0.0;
 
+/// What a frame without a cached analysis draws from.
+static NO_SEGMENTS: Segmentation = Segmentation {
+    blobs: Vec::new(),
+    mask: Vec::new(),
+    width: 0,
+    height: 0,
+};
+
 impl IncrementalRenderer {
     /// Draws Swarm on the GPU where there is one, or always on the CPU. Off by default, so the
     /// library's renders are the CPU's; the plugin and the CLI turn it on.
@@ -545,11 +553,9 @@ impl IncrementalRenderer {
     fn update_face_readings(&mut self, s: &RenderSettings, number: i64, first: i64) {
         self.faces_wanted = s.faces.any();
         self.readings = if s.faces.face {
-            let analysis_frame = self.displayed_analysis_frame(s, number, first);
-            let motion =
-                self.cached_motion(analysis_frame, &analysis_key(s, analysis_frame, first));
+            let (_, motion) = self.displayed_analysis(s, number, first);
             let models_loaded = crate::faces::runs_on().is_some();
-            crate::faces::readings(models_loaded, motion.map_or(&[], |m| &m.blobs))
+            crate::faces::readings(models_loaded, &motion.blobs)
         } else {
             Vec::new()
         };
@@ -617,11 +623,7 @@ impl IncrementalRenderer {
     ) {
         let first = number - count as i64 + 1;
         let pile = build_pile(&self.tiles, s, count, number, out.width, out.height);
-        let empty = Segmentation::default();
-        let analysis_frame = self.displayed_analysis_frame(s, number, first);
-        let motion = self
-            .cached_motion(analysis_frame, &analysis_key(s, analysis_frame, first))
-            .unwrap_or(&empty);
+        let (analysis_frame, motion) = self.displayed_analysis(s, number, first);
         draw_output(out, s, frame, motion, analysis_frame, pile.visible());
     }
 
@@ -633,6 +635,20 @@ impl IncrementalRenderer {
             Some(_) => analysis,
             None => number,
         }
+    }
+
+    /// [`Self::displayed_analysis_frame`] and that frame's analysis; empty if it isn't cached.
+    fn displayed_analysis(
+        &self,
+        s: &RenderSettings,
+        number: i64,
+        first: i64,
+    ) -> (i64, &Segmentation) {
+        let frame = self.displayed_analysis_frame(s, number, first);
+        let motion = self
+            .cached_motion(frame, &analysis_key(s, frame, first))
+            .unwrap_or(&NO_SEGMENTS);
+        (frame, motion)
     }
 
     fn draw_gpu<C: Channel>(
@@ -647,11 +663,7 @@ impl IncrementalRenderer {
         let first = number - count as i64 + 1;
         if let (OutputMode::Overlay, Some(view), true) = (s.mode, frame.as_ref(), self.gpu_overlay)
         {
-            let empty = Segmentation::default();
-            let analysis_frame = self.displayed_analysis_frame(s, number, first);
-            let motion = self
-                .cached_motion(analysis_frame, &analysis_key(s, analysis_frame, first))
-                .unwrap_or(&empty);
+            let (analysis_frame, motion) = self.displayed_analysis(s, number, first);
             drawer.draw_overlay(out, view, &motion.blobs, number, analysis_frame, s)?;
             self.drew_on_gpu = Some(true);
             return Ok(());
@@ -679,9 +691,8 @@ impl IncrementalRenderer {
         let pile = build_pile(&self.tiles, s, count, number, w, h);
         let visible: Vec<PileEntry> = pile.visible_entries().collect();
         let window_pixel_count = window_pixels(visible.iter().map(|p| p.tile), &m, &shadow, w, h);
-        let empty = Segmentation::default();
-        let motion =
-            cached_motion(&self.motion, number, &analysis_key(s, number, first)).unwrap_or(&empty);
+        let motion = cached_motion(&self.motion, number, &analysis_key(s, number, first))
+            .unwrap_or(&NO_SEGMENTS);
         if window_pixel_count * 1000 < canvas_pixels * min_coverage_permille {
             draw_output(
                 out,
@@ -831,13 +842,11 @@ fn window_pixels<'t>(
     width: i32,
     height: i32,
 ) -> i64 {
-    let reach = shadow.reach;
     let canvas = PixelRect::new(0, 0, width, height);
     tiles
         .map(|t| {
-            let f = swarm::window_rect(t.content_rect, m.title_height);
-            let area = PixelRect::new(f.x - reach, f.y - reach, f.w + 2 * reach, f.h + 2 * reach);
-            let r = crate::render::intersect(area, canvas);
+            let window = swarm::window_rect(t.content_rect, m.title_height);
+            let r = crate::render::intersect(shadow.shadow_rect(window), canvas);
             i64::from(r.w) * i64::from(r.h)
         })
         .sum()

@@ -399,6 +399,41 @@ pub fn copy_scaled<C: Channel>(src: &View<C>, dst: &mut ViewMut<C>, mirrored: bo
 // ---------------------------------------------------------------------------------------
 // The overlay and the mattes
 
+/// The overlay's measures at a canvas height, shared by the CPU and GPU paths.
+pub(crate) struct OverlayLayout {
+    pub line: i32,
+    pub text_scale: i32,
+}
+
+impl OverlayLayout {
+    pub fn new(canvas_height: i32) -> Self {
+        Self {
+            line: 2.max((f64::from(canvas_height) / 540.0).round() as i32),
+            text_scale: 1.max((f64::from(canvas_height) / 600.0).round() as i32),
+        }
+    }
+
+    /// The gap between an ID chip's edge and its text.
+    pub fn chip_padding(&self) -> i32 {
+        2 * self.text_scale
+    }
+
+    /// The ID chip of box `r`: on the box's top edge, outside it; inside if the box is at the top.
+    pub fn chip(&self, r: PixelRect, label: &str) -> PixelRect {
+        let (scale, pad) = (self.text_scale, self.chip_padding());
+        let mut chip = PixelRect::new(
+            r.x,
+            r.y - text_height(scale) - 2 * pad,
+            text_width(label, scale) + 2 * pad,
+            text_height(scale) + 2 * pad,
+        );
+        if chip.y < 0 {
+            chip.y = r.y;
+        }
+        chip
+    }
+}
+
 pub fn draw_overlay<C: Channel>(
     out: &mut ViewMut<C>,
     blobs: &[Blob],
@@ -407,31 +442,22 @@ pub fn draw_overlay<C: Channel>(
 ) {
     let box_color = make_pixel::<C>(s.box_color, 1.0);
     let black = make_pixel::<C>(Color::default(), 1.0);
-    let line = 2.max((f64::from(out.height) / 540.0).round() as i32);
-    let scale = 1.max((f64::from(out.height) / 600.0).round() as i32);
+    let layout = OverlayLayout::new(out.height);
+    let pad = layout.chip_padding();
 
     for (i, blob) in blobs.iter().enumerate() {
         let r = norm_rect_to_pixels(&blob.bounds, out.width, out.height, s.mirror);
         if s.boxes {
-            stroke_rect(out, r, line, box_color);
+            stroke_rect(out, r, layout.line, box_color);
         }
         if !s.labels {
             continue;
         }
 
-        // The ID chip sits on the box's top edge, outside it; inside if the box is at the top.
         let label = blob_label(blob, frame, i);
-        let pad = 2 * scale;
-        let mut chip = PixelRect::new(
-            r.x,
-            r.y - text_height(scale) - 2 * pad,
-            text_width(&label, scale) + 2 * pad,
-            text_height(scale) + 2 * pad,
-        );
-        if chip.y < 0 {
-            chip.y = r.y;
-        }
+        let chip = layout.chip(r, &label);
         fill_rect(out, chip, box_color);
+        let scale = layout.text_scale;
         draw_text(out, chip.x + pad, chip.y + pad, &label, scale, black);
     }
 }

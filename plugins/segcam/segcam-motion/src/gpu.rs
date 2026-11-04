@@ -29,8 +29,7 @@ use crate::font;
 use crate::motion::Blob;
 use crate::pixel::{Argb, Channel, View, ViewMut};
 use crate::render::{
-    PixelRect, RenderSettings, SwarmBackground, blob_label, norm_rect_to_pixels, text_height,
-    text_width,
+    OverlayLayout, PixelRect, RenderSettings, SwarmBackground, blob_label, norm_rect_to_pixels,
 };
 use crate::swarm::{ShadowKernel, SwarmMetrics, Tile, TitleBar, WindowPlan};
 
@@ -1212,23 +1211,14 @@ impl Drawer {
         s: &RenderSettings,
     ) -> Result<(), Fault> {
         let (w, h) = (out.width, out.height);
-        let line = 2.max((f64::from(h) / 540.0).round() as i32);
-        let scale = 1.max((f64::from(h) / 600.0).round() as i32);
+        let layout = OverlayLayout::new(h);
+        let pad = layout.chip_padding();
         let mut items = Vec::with_capacity(blobs.len() * BLOB_WORDS);
         let mut glyphs = Vec::new();
         for (i, blob) in blobs.iter().enumerate() {
             let r = norm_rect_to_pixels(&blob.bounds, w, h, s.mirror);
             let label = blob_label(blob, analysis, i);
-            let pad = 2 * scale;
-            let mut chip = PixelRect::new(
-                r.x,
-                r.y - text_height(scale) - 2 * pad,
-                text_width(&label, scale) + 2 * pad,
-                text_height(scale) + 2 * pad,
-            );
-            if chip.y < 0 {
-                chip.y = r.y;
-            }
+            let chip = layout.chip(r, &label);
             items.extend(rect_words(r));
             items.extend(rect_words(chip));
             items.extend([(chip.x + pad) as u32, (chip.y + pad) as u32]);
@@ -1263,8 +1253,8 @@ impl Drawer {
             frame_h: frame.height,
             count: blobs.len() as u32,
             unit_table,
-            line,
-            text_scale: scale,
+            line: layout.line,
+            text_scale: layout.text_scale,
             box_color: [1.0, c.r, c.g, c.b],
             ..Globals::default()
         };

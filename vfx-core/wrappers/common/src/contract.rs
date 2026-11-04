@@ -1,7 +1,7 @@
 //! The contract for a stateful CPU effect: every render equals a fresh effect's render of the
-//! same frames. Hosts rely on it (see [`crate::kept`]);
-//! an effect crate checks itself with [`check`] in its tests, on a clip that moves. A render
-//! left [unfinished](CpuEffect::unfinished) counts only once the same frame renders again and
+//! same frames. Hosts rely on it (see [`crate::kept`]); an effect crate checks itself with
+//! [`check`] in its tests, on a clip that moves. A render left
+//! [unfinished](CpuEffect::unfinished) counts only once the same frame renders again and
 //! finishes, as a host must show it.
 
 use vfx_core::cpu::{Argb, FrameSource, Image, ImageMut, View, ViewMut};
