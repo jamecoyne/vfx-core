@@ -269,10 +269,21 @@ impl IncrementalRenderer {
         let oldest =
             (to_analyse.first().map_or(number, |&f| f.min(number)) - background).max(first);
         // A fixed source's earlier frames never change, so only the current frame is hashed: a
-        // different hash means the source restarted.
+        // different hash means the source restarted. A live source numbers each frame once, so
+        // its frames aren't hashed at all, an entry only marks a frame read, and a lower number
+        // means it restarted.
         let fixed = frames.fixed();
+        let numbers_identify_frames = fixed && frames.live();
         let mut current_hash = None;
-        if fixed {
+        if numbers_identify_frames {
+            if self
+                .frame_hashes
+                .last_key_value()
+                .is_some_and(|(&newest, _)| number < newest)
+            {
+                self.clear_history();
+            }
+        } else if fixed {
             frames.with_frame((number - first) as usize, &mut |image| {
                 current_hash = image.and_then(C::view).map(|v| frame_hash(&v));
             });
@@ -313,7 +324,9 @@ impl IncrementalRenderer {
                     Some(v) => {
                         // Revalidating existing hashes reads every frame, so hash in parallel.
                         let hash = current_hash.filter(|_| frame == number).unwrap_or_else(|| {
-                            if self.frame_hashes.contains_key(&frame) {
+                            if numbers_identify_frames {
+                                0
+                            } else if self.frame_hashes.contains_key(&frame) {
                                 frame_hash_parallel(v)
                             } else {
                                 frame_hash(v)

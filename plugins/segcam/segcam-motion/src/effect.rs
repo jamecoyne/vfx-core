@@ -324,6 +324,68 @@ mod tests {
         );
     }
 
+    /// A clip loop or new source: the history starts over and the same numbers hold other pixels.
+    #[test]
+    fn history_restart_after_clear_matches_fresh_effect() {
+        let (w, h) = (160, 90);
+        let frame_with_square = |frame: &mut [Argb<u8>], x0: i32| {
+            for (i, p) in frame.iter_mut().enumerate() {
+                let (x, y) = (i as i32 % w, i as i32 / w);
+                let v = if (x0..x0 + 24).contains(&x) && (20..44).contains(&y) {
+                    250
+                } else {
+                    80
+                };
+                *p = Argb {
+                    alpha: 255,
+                    red: v,
+                    green: v,
+                    blue: v,
+                };
+            }
+        };
+        let mut params = ParamValues::new(PARAMS);
+        for (name, value) in [
+            ("output", vfx_core::ParamValue::Int(3)),
+            ("detect", vfx_core::ParamValue::Int(0)),
+            ("eyes", vfx_core::ParamValue::Bool(false)),
+            ("mouth", vfx_core::ParamValue::Bool(false)),
+        ] {
+            params.set(name, value).expect("a segcam parameter");
+        }
+        let play = |effect: &mut SegcamMotion, history: &mut History<u8>, xs: &[i32]| {
+            let mut out = vec![Argb::<u8>::default(); (w * h) as usize];
+            for &x in xs {
+                let before = effect.frames_before(&params, None);
+                let frame = history.next(before, effect.frames_held(&params, None));
+                frame_with_square(frame, x);
+                let ctx = Context {
+                    frame: history.frame_number(),
+                    ..Context::at(0.0)
+                };
+                let count = history.len();
+                let view = ViewMut::from_pixels(&mut out, w, h);
+                effect.render(history, count, ImageMut::U8(view), &params, &ctx);
+            }
+            out
+        };
+        let other_clip: Vec<i32> = (0..8).map(|f| 120 - f * 12).collect();
+        let mut kept = SegcamMotion::with_gpu(false);
+        let mut history = History::<u8>::default();
+        history.resize(w, h);
+        play(&mut kept, &mut history, &[10, 22, 34, 46, 58, 70, 82, 94]);
+        history.clear();
+        assert!(kept.clear_history());
+        let got = play(&mut kept, &mut history, &other_clip);
+
+        let mut fresh = SegcamMotion::with_gpu(false);
+        let mut history = History::<u8>::default();
+        history.resize(w, h);
+        let want = play(&mut fresh, &mut history, &other_clip);
+        assert!(got == want, "a kept effect kept something across the clear");
+        assert!(want.iter().any(|p| p.alpha == 255), "no windows drawn");
+    }
+
     /// Driven the way a streaming host drives it: one frame at a time, kept in a history.
     #[test]
     fn history_driven_matte_keeps_moving_square() {

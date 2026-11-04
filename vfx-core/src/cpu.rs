@@ -326,7 +326,8 @@ pub trait FrameSource {
 
     /// Whether frames arrive from a live stream, so an effect should draw what it has rather than
     /// hold up the output: true for [`History`], false where a render may be exported and has to
-    /// be exact whatever it costs.
+    /// be exact whatever it costs. A live source that is also [fixed](Self::fixed) numbers each
+    /// frame once, and starts over only from a lower number.
     fn live(&self) -> bool {
         false
     }
