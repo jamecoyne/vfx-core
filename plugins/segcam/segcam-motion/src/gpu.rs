@@ -246,9 +246,11 @@ fn open_shared_device() {
     static START: Once = Once::new();
     START.call_once(|| {
         let load = || {
-            #[cfg(not(target_arch = "wasm32"))]
-            let _turn = segcam_face::device_turn();
             let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+            // Wrapping a host's device creates none, so it needn't wait behind the face trial.
+            #[cfg(not(target_arch = "wasm32"))]
+            let _turn = (!choice.is_empty() || vfx_core::Gpu::shared().is_none())
+                .then(segcam_face::device_turn);
             open_and_publish(&DEVICE, || open(&choice));
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -296,6 +298,10 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
     if choice.is_empty()
         && let Some(gpu) = vfx_core::Gpu::shared()
     {
+        let info = gpu.device.adapter_info();
+        if info.device_type == wgpu::DeviceType::Cpu {
+            return Err(NoGpu::NoAdapter(format!("{} draws in software", info.name)));
+        }
         // The host may have reported errors of its own before this.
         let errors_before = vfx_core::Gpu::shared_faults().errors().0;
         let dev = on_shared(gpu);
@@ -395,6 +401,15 @@ fn test_device(adapter: wgpu::Adapter, limits: wgpu::Limits) -> Result<GpuContex
 pub(crate) fn gpu_test_lock() -> MutexGuard<'static, ()> {
     static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
     GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Polls `device`. wgpu panics here on a lost device, which has to reach the fault paths as an
+/// error rather than unwind through the render.
+fn poll_device(device: &wgpu::Device, poll: wgpu::PollType) -> Result<(), String> {
+    catch_unwind(AssertUnwindSafe(|| device.poll(poll)))
+        .map_err(|_| "the device was lost during a poll".to_owned())?
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Draws on a device a host shared ([`vfx_core::Gpu::share`]), binding as much as it allows.
@@ -881,7 +896,7 @@ impl Drawer {
 
     /// Whether the device is lost, which it says when polled.
     pub fn lost(&self) -> bool {
-        let _ = self.dev.device.poll(wgpu::PollType::Poll);
+        let _ = poll_device(&self.dev.device, wgpu::PollType::Poll);
         self.dev.lost().is_some()
     }
 
@@ -1479,12 +1494,12 @@ impl Drawer {
             timeout: Some(self.readback_timeout),
         };
         // Another instance's poll may be the one that calls back, a moment later.
-        let mapped = match self.dev.device.poll(wait) {
-            Ok(_) => match rx.recv_timeout(self.readback_timeout) {
+        let mapped = match poll_device(&self.dev.device, wait) {
+            Ok(()) => match rx.recv_timeout(self.readback_timeout) {
                 Ok(result) => result.map_err(|e| e.to_string()),
                 Err(_) => Err("the readback never finished".into()),
             },
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(e),
         };
         if let Err(e) = mapped {
             // The map may still be pending on the buffer: the next render takes a new one.
