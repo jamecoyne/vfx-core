@@ -1,13 +1,13 @@
 //! segcam Motion's Overlay and Swarm drawn on the GPU with wgpu, frames through host memory.
 //! Detection, tile layout, cutting tiles, title bars and window plans stay on the CPU; a tile
 //! goes into an atlas kept for the trail when a render first draws it on the GPU. Each output
-//! pixel replays what the CPU path does to it (`gpu.wgsl`), so the two agree within a level. The CPU
-//! path stays the reference and the fallback; Overlay draws there unless asked
-//! ([`crate::IncrementalRenderer::gpu_overlay`]). The device opens in the background, and renders draw
-//! on the CPU until it is ready. A render the GPU fails is drawn on the CPU and the next one
-//! tries the GPU again, or after a few close together, one a while later; a lost device is
-//! given up by every instance. In browsers it draws on the device the host shares, and a draw
-//! comes back at the next render of the same frame.
+//! pixel replays what the CPU path does to it (`gpu.wgsl`), so the two agree within a level. The
+//! CPU path stays the reference and the fallback; Overlay draws there unless asked
+//! ([`crate::IncrementalRenderer::gpu_overlay`]). The device opens in the background, and renders
+//! draw on the CPU until it is ready. A render the GPU fails is drawn on the CPU and the next one
+//! retries the GPU, or after `MAX_RECENT_FAULTS`, retries after `FAULT_COOLDOWN`; a lost device
+//! is disabled for every instance. In browsers it draws on the device the host shares, and a draw
+//! is read back at the next render of the same frame.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
@@ -34,7 +34,8 @@ use crate::render::{
 };
 use crate::swarm::{ShadowKernel, SwarmMetrics, Tile, TitleBar, WindowPlan};
 
-/// The device every instance draws with, made on first use, and its pipelines.
+/// The device every instance draws with, created on first use, its pipelines, and its loss and
+/// error state.
 pub struct GpuContext {
     pub(crate) device: wgpu::Device,
     queue: wgpu::Queue,
@@ -48,7 +49,7 @@ pub struct GpuContext {
     /// How many errors the device has reported and the last one. A render that sees the count
     /// move falls back; the device stays.
     errors: Errors,
-    /// An atlas made ahead for the first instance, so its first render needn't.
+    /// An atlas built ahead for the first drawer, so its first render doesn't allocate one.
     preallocated_atlas: Mutex<Option<Atlas>>,
     /// What writes the swarm into a host's frame, per frame format, made on first use.
     #[cfg(not(target_arch = "wasm32"))]
@@ -172,17 +173,17 @@ pub struct Fault(pub String);
 /// How long a render waits for its draw before drawing on the CPU instead.
 const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The wait on a software adapter, which draws on the CPU's cores beside the host's own work
-/// and can be slow without hanging.
+/// The timeout on a software adapter, which shares the CPU's cores with the host's work and can
+/// be slow without hanging.
 const SOFTWARE_READBACK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Faults within the last [`FAULT_HISTORY_RENDERS`] renders tried on the GPU after which renders stay off it
-/// for [`FAULT_COOLDOWN`].
+/// Faults within the last [`FAULT_HISTORY_RENDERS`] renders tried on the GPU that start a cooldown
+/// of [`FAULT_COOLDOWN`].
 pub(crate) const MAX_RECENT_FAULTS: u32 = 3;
 const FAULT_HISTORY_RENDERS: u32 = 10;
 
-/// Long next to a render's wait, so a GPU that hangs without being lost leaves a show on the
-/// CPU at its own speed, with a try now and then.
+/// Long relative to the readback timeout, so a hung but not lost GPU degrades to CPU speed rather
+/// than stalling every render, with a periodic retry.
 const FAULT_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Whether to draw on the GPU where there is one: yes, unless `SEGCAM_GPU=0`.
@@ -264,8 +265,8 @@ fn open_shared_device() {
     });
 }
 
-/// Opens the device with `open` and gives the answer to `opened`. A broken driver can panic
-/// wgpu; that is a failed GPU, not an answer that never comes.
+/// Opens the device with `open` and publishes the result to `opened`. A driver panic counts as a
+/// failed GPU, so waiters aren't left blocked.
 fn open_and_publish(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<GpuContext, NoGpu>) {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let dev = Arc::new(open()?);
@@ -292,7 +293,7 @@ fn open_and_publish(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<Gpu
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
     // A host that shows frames from the GPU shares the device they're on (FFGL), so the swarm
-    // can draw its output there. It doesn't watch the device, so this does, as on its own.
+    // can draw its output there. The host doesn't track its errors, so this does.
     // An adapter asked for by name still gets a device of its own.
     if choice.is_empty()
         && let Some(gpu) = vfx_core::Gpu::shared()
@@ -569,7 +570,7 @@ pub struct Slot {
     shadow_rect: PixelRect,
 }
 
-/// One frame's tiles in the atlas; dropping it gives the space back.
+/// One frame's tiles in the atlas; dropping it frees the space.
 pub struct AtlasAllocation {
     atlas: Arc<Mutex<Atlas>>,
     start: u64,
@@ -774,11 +775,11 @@ impl GrowableBuffer {
     }
 }
 
-/// One instance's buffers.
+/// Per effect instance GPU state: buffers, atlas, timeouts, fault history.
 pub struct Drawer {
     dev: Arc<GpuContext>,
     globals: wgpu::Buffer,
-    /// The canvas width for an unpack into a host's frame.
+    /// Holds the canvas width for an unpack into a host's frame.
     #[cfg(not(target_arch = "wasm32"))]
     unpack_uniform: wgpu::Buffer,
     frame_buffer: GrowableBuffer,
@@ -786,12 +787,12 @@ pub struct Drawer {
     readback_buffer: GrowableBuffer,
     table_buffer: GrowableBuffer,
     atlas: Arc<Mutex<Atlas>>,
-    /// The most a buffer may take: what the device binds.
+    /// Largest buffer the device binds.
     max_binding_bytes: u64,
-    /// How long a render waits for its draw; browsers don't.
+    /// How long a render waits for its draw; browsers never wait.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     readback_timeout: Duration,
-    /// The device's error count as this render began.
+    /// The device's error count when this render began.
     errors_at_render_start: u64,
     /// Which frame the frame buffer holds, this render.
     uploaded_frame: Option<i64>,
@@ -799,21 +800,22 @@ pub struct Drawer {
     pub drawn: u64,
     /// Renders the GPU failed, drawn on the CPU instead.
     pub faults: u64,
-    /// The last [`FAULT_HISTORY_RENDERS`] renders tried on the GPU, newest in the lowest bit, set for a fault.
+    /// The last [`FAULT_HISTORY_RENDERS`] renders tried on the GPU, newest in the lowest bit, set
+    /// for a fault.
     recent_faults: u16,
-    /// When the last of [`MAX_RECENT_FAULTS`] faults in the window sent renders to the CPU.
+    /// When [`MAX_RECENT_FAULTS`] faults in the history started the cooldown.
     cooldown_started: Option<Instant>,
     cooldown: Duration,
-    /// This render's draw is still on its way back; the next render of it takes it (browsers).
+    /// This render's draw isn't read back yet; the next render of the same draw reads it (browsers).
     pub unfinished: bool,
     #[cfg(target_arch = "wasm32")]
     in_flight: Option<InFlightDraw>,
-    /// Draws replaced in a row before they came back, as when a parameter moves every frame.
+    /// In-flight draws replaced in a row, as when a parameter moves every frame.
     #[cfg(target_arch = "wasm32")]
     superseded_draws: u32,
 }
 
-/// A draw submitted without waiting: what it drew, its readback and how the map went.
+/// A submitted draw awaiting readback: its cache key, readback buffer and map state.
 #[cfg(target_arch = "wasm32")]
 struct InFlightDraw {
     key: u64,
@@ -826,12 +828,12 @@ const PENDING: u8 = 0;
 #[cfg(target_arch = "wasm32")]
 const MAPPED: u8 = 1;
 
-/// After this many draws replaced in a row, one render draws on the CPU.
+/// After this many in-flight draws replaced in a row, one render draws on the CPU.
 #[cfg(target_arch = "wasm32")]
 const MAX_SUPERSEDED_DRAWS: u32 = 3;
 
 impl Drawer {
-    /// On `dev`, unless it is lost.
+    /// A drawer on `dev`; `None` if the device is lost.
     pub fn new(dev: Arc<GpuContext>) -> Option<Self> {
         dev.lost().is_none().then_some(())?;
         use wgpu::BufferUsages as U;
@@ -899,8 +901,7 @@ impl Drawer {
         self.dev.lost().is_some()
     }
 
-    /// Counts a render the GPU failed. After [`MAX_RECENT_FAULTS`] within the window, renders stay off it
-    /// for a while.
+    /// Counts a render the GPU failed. [`MAX_RECENT_FAULTS`] within the history start a cooldown.
     pub(crate) fn record_fault(&mut self) {
         self.faults += 1;
         self.record_outcome(true);
@@ -914,7 +915,7 @@ impl Drawer {
             (self.recent_faults << 1 | u16::from(fault)) & ((1 << FAULT_HISTORY_RENDERS) - 1);
     }
 
-    /// Whether renders stay off the GPU after too many faults.
+    /// Whether renders stay off the GPU after too many recent faults.
     pub fn in_fault_cooldown(&self) -> bool {
         self.cooldown_started
             .is_some_and(|since| since.elapsed() < self.cooldown)
@@ -928,8 +929,8 @@ impl Drawer {
         self.errors_at_render_start = self.dev.errors().0;
     }
 
-    /// Abandons a draw still on its way back: it shows frames that were just forgotten, and a
-    /// later render of a reused frame number could otherwise match its key.
+    /// Abandons an in-flight draw: its frames were just cleared, and a later render of a reused
+    /// frame number could otherwise match its key.
     pub(crate) fn drop_unfinished_draw(&mut self) {
         self.unfinished = false;
         #[cfg(target_arch = "wasm32")]
@@ -1069,7 +1070,7 @@ impl Drawer {
         Ok(Some(allocation))
     }
 
-    /// Draws the swarm of `windows` (shown tiles, oldest first) into `out`. `frame` is frame
+    /// Draws the swarm of `windows` (visible tiles, oldest first) into `out`. `frame` is frame
     /// `number`, for the source backdrop and live windows; `shadow` the kernel at the canvas's
     /// scale.
     pub fn draw_swarm<'t, C: Channel>(
@@ -1137,7 +1138,7 @@ impl Drawer {
         let corner = data.len() as u32;
         data.extend(shadow.corner_table.iter().map(|f| f.to_bits()));
         let unit_table = append_unit_table(&mut data);
-        // Where each column and row of a window samples its title bar, as the CPU works it out.
+        // Where each column and row of a window samples its title bar, as the CPU computes it.
         let bar_h = chrome::TITLE_BAR_HEIGHT;
         let place = |f: f64| {
             [
@@ -1372,7 +1373,7 @@ impl Drawer {
     }
 
     /// Submits a draw over the whole of a `width` by `height` output of `bytes`, copied into the
-    /// staging buffer it returns.
+    /// readback buffer it returns.
     fn submit(
         &mut self,
         pipeline: &wgpu::ComputePipeline,
@@ -1600,7 +1601,7 @@ impl Drawer {
         Ok(())
     }
 
-    /// Reads a draw that came back into `out`.
+    /// Copies a finished in-flight draw into `out`.
     #[cfg(target_arch = "wasm32")]
     fn read_in_flight_draw<C: Channel>(
         &mut self,

@@ -1,5 +1,5 @@
-//! The contract a CPU effect that keeps state signs: whatever it keeps, every render gives
-//! what a fresh effect renders from the same frames. Hosts rely on it (see [`crate::kept`]);
+//! The contract for a stateful CPU effect: every render equals a fresh effect's render of the
+//! same frames. Hosts rely on it (see [`crate::kept`]);
 //! an effect crate checks itself with [`check`] in its tests, on a clip that moves. A render
 //! left [unfinished](CpuEffect::unfinished) counts only once the same frame renders again and
 //! finishes, as a host must show it.

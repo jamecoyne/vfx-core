@@ -121,7 +121,7 @@ pub trait CpuEffect: Send {
         self.frames_before(params, frame_rate)
     }
 
-    /// Whether the effect keeps what it worked out between renders. Hosts that can keep one
+    /// Whether the effect keeps computed state between renders. Hosts that can keep one
     /// effect per instance then do (OpenFX, FFGL, the preview); After Effects never does. What
     /// it keeps must not change any frame, even when earlier frames change upstream or a host
     /// can't hand one over: `vfx_host::contract::check` tests an effect for that.

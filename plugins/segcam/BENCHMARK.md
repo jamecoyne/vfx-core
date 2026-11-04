@@ -97,6 +97,16 @@ From the FFGL timing log (`VFX_FFGL_TIMING=1`): the medians of its 300-frame bat
 first, which holds the face models' load, so the first 40 frames aren't split out. Times run
 from the readback to the frame shown; fps is frames over the run.
 
+## GPU thresholds
+
+`GPU_MIN_COVERAGE_8_BIT` (0.5) and `GPU_MIN_COVERAGE_DEEPER` (1.5) in `src/incremental.rs` sit a
+little above where CPU and GPU drawing cross. On an RTX 4070 at 1080p the CPU took about 2.7 ms per
+canvas of window pixels at 8 bit and 2.2 ms in float; the GPU took about 1.2 ms and 3.6 ms whatever
+the windows.
+
+`tests/gpu.rs` allows 1 pixel in 10,000, at least 4, off by over half a level. The 1080p clip's
+cases measured at most 8 of 2,073,600 on an RTX 4070.
+
 ## When
 
 Every release candidate gets the whole table on each contributor's machine, named in the table,

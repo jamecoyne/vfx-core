@@ -9,7 +9,7 @@ static int reads;
 static OfxHost host;
 /* Resolve turns temporal clip access off, and is the host earlier frames are trusted in. */
 static int as_resolve;
-/* The plugin keeps what it worked out between renders, so it may read frames in any order and
+/* The plugin keeps what it computed between renders, so it may read frames in any order and
    hold the current frame while it reads another. */
 static OfxPropertySetHandle temporal(OfxImageClipHandle c, OfxTime t) {
     if (!strcmp(c->name, "Output")) return output_props;

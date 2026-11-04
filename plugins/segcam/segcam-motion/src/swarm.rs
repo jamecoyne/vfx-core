@@ -466,7 +466,8 @@ pub struct ShadowKernel {
     pub offset_y: f64,
     /// How far the shadow is drawn past the frame.
     pub reach: i32,
-    /// The corner table covers offsets `corner_min_offset..corner_min_offset + corner_size` from a corner.
+    /// The corner table covers offsets `corner_min_offset..corner_min_offset + corner_size` from
+    /// a corner.
     pub(crate) corner_min_offset: i32,
     pub(crate) corner_size: i32,
     pub(crate) corner_table: Vec<f32>,
@@ -617,8 +618,8 @@ pub struct WindowPlan {
     /// Indices into the shadow's corner table, by column and row of `shadow_rect`.
     pub(crate) corner_x: Vec<i32>,
     pub(crate) corner_y: Vec<i32>,
-    /// How far each column and row of `shadow_rect` lies outside the mask's straight edges, read only
-    /// inside the frame.
+    /// How far each column and row of `shadow_rect` lies outside the mask's straight edges, read
+    /// only inside the window.
     pub(crate) mask_x: Vec<f64>,
     pub(crate) mask_y: Vec<f64>,
     radius: f64,
@@ -857,8 +858,8 @@ pub fn draw_prepared_window<C: Channel>(
     }
 }
 
-/// The shadow kernel at `scale`. Its corner table takes a while to make, and a host draws at
-/// a few canvas sizes in turn (its viewer's and its output's), so the last few are kept.
+/// The shadow kernel at `scale`. Building the corner table is slow, and hosts alternate between a
+/// few canvas sizes (viewer and output), so the last `CACHE_SIZE` kernels are cached.
 pub fn shadow_kernel(scale: f64) -> std::sync::Arc<ShadowKernel> {
     const CACHE_SIZE: usize = 4;
     static KERNEL_CACHE: std::sync::Mutex<Vec<(f64, std::sync::Arc<ShadowKernel>)>> =
@@ -875,7 +876,7 @@ pub fn shadow_kernel(scale: f64) -> std::sync::Arc<ShadowKernel> {
     kernel
 }
 
-/// Clears the canvas, then draws each shown tile oldest first as segcam's window. Bands of
+/// Clears the canvas, then draws each visible tile oldest first as segcam's window. Bands of
 /// rows are drawn on a few threads, each band drawing every window in order. With `live`,
 /// windows show that frame (mirrored with `mirrored`) where they sit.
 pub fn draw_swarm<'t, C: Channel>(

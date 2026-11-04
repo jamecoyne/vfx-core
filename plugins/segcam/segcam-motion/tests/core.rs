@@ -882,9 +882,9 @@ fn fixed_source_reads_only_new_frames() {
     }
 }
 
-/// The start of a clip isn't a missing frame. With the defaults a render reads 76 frames, and
-/// each of the first 76, whose background runs past the start, is worked out once: every
-/// render after the first reads only its own frame, and matches a cold render.
+/// The start of a clip isn't a missing frame. Each frame whose background runs past the start,
+/// the first `previous_frames_needed` + 1 of them, is analysed once: every render after the
+/// first reads only its own frame, and matches a cold render.
 #[test]
 fn clip_start_frames_are_analysed_once() {
     let swarm = RenderSettings {

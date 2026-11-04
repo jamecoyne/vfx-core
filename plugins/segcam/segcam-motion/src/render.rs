@@ -1,7 +1,5 @@
-//! Everything between "here are some frames" and "here is the output picture", generic over
-//! the channel type so one implementation serves After Effects' 8, 16 and 32 bpc worlds and
-//! the command-line tool alike. Rows run top to bottom. Pixels are premultiplied unless
-//! [`RenderSettings::straight_alpha`] says otherwise; After Effects' effect worlds are straight.
+//! CPU rendering, generic over channel type so one implementation serves all host depths. Rows
+//! run top to bottom. Pixels are premultiplied unless [`RenderSettings::straight_alpha`].
 
 use std::collections::VecDeque;
 
@@ -491,7 +489,7 @@ pub fn apply_matte<C: Channel>(
 
 /// The tiles a frame's blobs become, biggest first, titled with their labels. Reused faces,
 /// which come last, already have windows from their own frame, so they get tiles only if
-/// `reused` asks for them.
+/// `include_reused_faces` asks for them.
 pub fn cut_frame_tiles<C: Channel>(
     motion: &Segmentation,
     frame: Option<&View<C>>,
@@ -542,7 +540,7 @@ pub fn cut_frame_tiles<C: Channel>(
     tiles.into_inner().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A kept tile in a [`Pile`], and where it is kept: its frame and its index in that frame.
+/// A cached tile in a [`Pile`], with its frame and its index in that frame's tiles.
 #[derive(Clone, Copy)]
 pub struct PileEntry<'a> {
     pub tile: &'a Tile,
@@ -550,6 +548,7 @@ pub struct PileEntry<'a> {
     pub index: usize,
 }
 
+/// An entry of a [`Pile`], with what it adds to the pile's byte budget.
 struct PiledTile<'a> {
     entry: PileEntry<'a>,
     /// A newer tile covers it whole, so it isn't drawn.
@@ -624,7 +623,7 @@ impl<'a> Pile<'a> {
 }
 
 /// Draws the output for the current frame from its motion and, for the swarm, the pile's
-/// shown tiles.
+/// visible tiles.
 pub fn draw_output<'t, C: Channel>(
     out: &mut ViewMut<C>,
     s: &RenderSettings,

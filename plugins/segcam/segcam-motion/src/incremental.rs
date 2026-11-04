@@ -1,16 +1,15 @@
-//! segcam Motion worked out incrementally: each frame's grid, motion and tiles are kept, with
-//! a hash of the pixels they came from. Where earlier frames can change upstream (OpenFX), a
-//! render reads every frame it depends on and works out again only what a changed frame feeds.
-//! Where they are taken as unchanged ([`FrameSource::fixed`]: a host's own history of frames, as
-//! in Resolume and the preview, or Resolve while it streams), it reads only the frames it hasn't
-//! worked out, and the current one, so an edit in Resolve shows when that frame renders
-//! or at the next check. Results come from each frame and the settings
-//! alone, so render order doesn't change the output. Motion whose background is cut short by
-//! the start of the frames, as at the start of a clip, is kept with the frame it starts at.
+//! Incremental segcam Motion render. Caches each frame's luma grid, analysis and tiles, keyed
+//! by a hash of its pixels and an `AnalysisKey`. Where earlier frames can change upstream
+//! (OpenFX), a render reads every frame it depends on and recomputes only what a changed hash
+//! invalidates. Where they are immutable ([`FrameSource::fixed`]: a host's own frame history, as
+//! in Resolume and the preview, or Resolve while it streams), it reads only uncached frames and
+//! the current one, so an edit in Resolve appears when that frame renders or at the next check.
+//! Output depends only on pixels and settings, never on render order. The key includes the first
+//! background frame, so analysis computed near the start of the frames stays valid.
 //!
-//! A host that holds only its newest frames ([`FrameSource::held`]) can't hand the others over
-//! again. What was cut from them stays as it was cut, so new settings reach new windows only,
-//! as in segcam 1.1, and tiles the pile has stopped drawing drop their pixels.
+//! Sources holding only their newest frames ([`FrameSource::held`]) cannot supply older frames
+//! again: their tiles are never recut, so new settings reach new windows only (as segcam 1.1),
+//! and tiles the pile no longer draws release their pixels.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
@@ -29,6 +28,7 @@ use crate::render::{
 };
 use crate::swarm::{self, SwarmMetrics, Tile};
 
+/// What every cached frame shares; a change clears the whole history.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HistoryFormat {
     width: i32,
@@ -37,7 +37,7 @@ struct HistoryFormat {
     grid_width: i32,
 }
 
-/// What a frame's segments depend on besides the grids.
+/// Settings a frame's segments depend on, besides the grids.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DetectionSettings {
     detection_mode: DetectionMode,
@@ -48,13 +48,13 @@ struct DetectionSettings {
     faces: FaceParts,
 }
 
-/// What a frame's motion and tiles were worked out from besides its own pixels.
+/// Cache key of a frame's analysis and tiles, besides its pixel hash.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct AnalysisKey {
     detection: DetectionSettings,
-    /// The first frame of its background: later than usual near the start of the frames.
+    /// First background frame: later than usual near the start of the frames.
     background_start: i64,
-    /// For a frame that reuses the faces of an earlier analysis: that frame and its `from`,
+    /// For a frame reusing an earlier analysis's faces: that frame and its `background_start`,
     /// since the faces keep the IDs they had there.
     face_source: Option<(i64, i64)>,
 }
@@ -63,23 +63,22 @@ struct AnalysisKey {
 pub struct IncrementalRenderer {
     history_format: Option<HistoryFormat>,
     grids: BTreeMap<i64, LumaGrid>,
-    /// A hash of each frame's pixels, since edits upstream can leave the grid as it was.
+    /// Hash of each frame's pixels: an upstream edit can leave the luma grid unchanged.
     frame_hashes: BTreeMap<i64, u64>,
     motion: BTreeMap<i64, (AnalysisKey, Segmentation)>,
-    /// Tiles by frame, with the basis and mirroring they were cut for.
+    /// Tiles by frame, with the key and mirroring they were cut for.
     tiles: BTreeMap<i64, (AnalysisKey, bool, Vec<Tile>)>,
-    /// Drawing on the GPU: a frame's tiles go into its atlas when a render first draws them
-    /// there. The drawer is made by the first render that draws on the GPU once the device is
-    /// open, as hosts make instances often.
+    /// Created on the first GPU render after the device opens, not per instance, because hosts
+    /// create instances often. A frame's tiles enter the atlas on first GPU draw.
     drawer: Option<Box<Drawer>>,
     atlas_allocations: BTreeMap<i64, AtlasAllocation>,
     gpu_wanted: bool,
     gpu_overlay: bool,
-    /// The last fault told of, so a fault that repeats every render is told of once.
+    /// Suppresses repeat logs of the same message.
     last_reported_fault: Option<String>,
-    /// From what share of the canvas in window pixels the swarm draws on the GPU.
+    /// See [`Self::set_gpu_min_coverage`].
     gpu_min_coverage: Option<f64>,
-    /// The last render's draw hasn't come back from the GPU yet (browsers).
+    /// The last render's draw hasn't been read back from the GPU yet (browsers).
     unfinished: bool,
     /// `None` before the first render.
     drew_on_gpu: Option<bool>,
@@ -88,7 +87,7 @@ pub struct IncrementalRenderer {
     /// Live renders act as if the face models were still loading.
     #[cfg(test)]
     simulate_models_loading: bool,
-    /// How many times faces were looked for.
+    /// Face detection calls so far.
     #[cfg(test)]
     face_detection_calls: u32,
     /// A host's GPU frame the render may draw into instead of its output.
@@ -105,15 +104,13 @@ struct TargetOffer {
     drawn_into: bool,
 }
 
-/// Below these shares of the canvas in window pixels (each window with its shadow, overlaps
-/// counted, as the CPU draws them) the CPU draws the swarm faster than the GPU's copy back. On an
-/// RTX 4070 at 1080p the CPU took about 2.7 ms a canvas at 8 bits and 2.2 ms in float, the GPU
-/// about 1.2 and 3.6 ms whatever the windows; these sit a little above where they cross.
+/// Below these coverages, CPU drawing beats the GPU's readback cost. Coverage is window pixels
+/// over canvas pixels, counted per window with shadow, overlaps included. See BENCHMARK.md.
 #[cfg(not(target_arch = "wasm32"))]
 const GPU_MIN_COVERAGE_8_BIT: f64 = 0.5;
 #[cfg(not(target_arch = "wasm32"))]
 const GPU_MIN_COVERAGE_DEEPER: f64 = 1.5;
-// Browsers draw on the CPU on one thread: the GPU draws every swarm there.
+// The browser CPU path runs on one thread, so the GPU draws every swarm there.
 #[cfg(target_arch = "wasm32")]
 const GPU_MIN_COVERAGE_8_BIT: f64 = 0.0;
 #[cfg(target_arch = "wasm32")]
@@ -134,13 +131,14 @@ impl IncrementalRenderer {
         self.drawer.as_deref()
     }
 
-    /// From what share of the canvas in window pixels the swarm draws on the GPU; 0 draws every
-    /// render there. By default, what was measured to be faster at the canvas's depth.
+    /// Minimum window coverage for drawing on the GPU; 0 always draws there. Defaults depend on
+    /// canvas depth.
     pub fn set_gpu_min_coverage(&mut self, min_coverage: f64) {
         self.gpu_min_coverage = Some(min_coverage);
     }
 
-    /// Whether the last render is still waiting on the GPU (see [`vfx_core::CpuEffect::unfinished`]).
+    /// Whether the last render is still waiting on the GPU (see
+    /// [`vfx_core::CpuEffect::unfinished`]).
     pub fn unfinished(&self) -> bool {
         self.unfinished
     }
@@ -169,7 +167,8 @@ impl IncrementalRenderer {
     }
 
     /// Offers the next render `target` to draw into instead of its output, which a swarm drawn
-    /// on the GPU of the same device takes; [`IncrementalRenderer::took_target`] says whether it did.
+    /// on the GPU of the same device takes; [`IncrementalRenderer::took_target`] says whether it
+    /// did.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn offer_target(&mut self, target: vfx_core::Target<'_>) {
         let f = target.frame;
@@ -209,9 +208,9 @@ impl IncrementalRenderer {
         size_of::<C>() == 1 && fits
     }
 
-    /// Renders the last of `count` frames, frame `number`, into `out`. Reads the frames the
-    /// render depends on (only those it lacks, from a fixed source) once each, oldest first,
-    /// and works out again only what changed.
+    /// Renders the last of `count` frames, frame `number`, into `out`. Reads each frame the
+    /// render depends on once, oldest first (from a fixed source, only uncached ones), and
+    /// recomputes only what changed.
     pub fn render_frame<C: Depth>(
         &mut self,
         s: &RenderSettings,
@@ -225,8 +224,8 @@ impl IncrementalRenderer {
         if out.is_empty() {
             return;
         }
-        // A live render can't wait for the face models, so it draws as with faces off until they
-        // are up. Any other render may be exported, so finding faces waits for them.
+        // Live renders can't block on model load, so they render without faces until ready.
+        // Non-live renders may be exported and must block.
         let without_faces = RenderSettings {
             faces: FaceParts::default(),
             ..*s
@@ -262,20 +261,19 @@ impl IncrementalRenderer {
         }
         let swarm = s.mode == OutputMode::Swarm;
         let background = i64::from(history_frames(s));
-        // What a changed frame feeds: the frames it is background to, and with faces the
-        // analysis after.
+        // Frames using this one as background and, with faces, the next analysis.
         let invalidation_reach = background.max(i64::from(s.faces.any()) * s.analysis_step.every);
         let trail_len = trail_frame_count(s);
         let first = number - count as i64 + 1;
         let to_analyse = frames_to_analyse(s, number, first);
 
         // Frames the host didn't hand over count as empty, as in a cold render, but nothing
-        // worked out from one is kept, so it is read again next time.
+        // computed from one is cached, so it is read again next time.
         let mut missing = BTreeSet::new();
         let oldest =
             (to_analyse.first().map_or(number, |&f| f.min(number)) - background).max(first);
-        // A fixed source's earlier frames are as they were, so only the current frame is
-        // checked: a different one means the source started over.
+        // A fixed source's earlier frames never change, so only the current frame is hashed: a
+        // different hash means the source restarted.
         let fixed = frames.fixed();
         let mut current_hash = None;
         if fixed {
@@ -288,7 +286,7 @@ impl IncrementalRenderer {
                 self.clear_history();
             }
         }
-        // The frames before this one whose pixels the source no longer has.
+        // Frames older than `oldest_held_frame` can't be read from this source again.
         let held = i64::try_from(frames.held()).unwrap_or(i64::MAX);
         let oldest_held_frame = if fixed {
             number.saturating_sub(held) + 1
@@ -301,7 +299,7 @@ impl IncrementalRenderer {
         let frames_to_read = if fixed {
             self.frames_to_read(s, first, number, oldest_held_frame)
         } else {
-            // Frames between analyses feed nothing.
+            // Frames between analyses are no analysis's input.
             let feeding = |f: &i64| {
                 f.rem_euclid(s.analysis_step.every) == 0 || *f == number || to_analyse.contains(f)
             };
@@ -317,7 +315,7 @@ impl IncrementalRenderer {
                     }
                     Some(_) if fixed && self.frame_hashes.contains_key(&frame) => {}
                     Some(v) => {
-                        // After a pause every frame has a kept hash to check: those go on threads.
+                        // Revalidating existing hashes reads every frame, so hash in parallel.
                         let hash = current_hash.filter(|_| frame == number).unwrap_or_else(|| {
                             if self.frame_hashes.contains_key(&frame) {
                                 frame_hash_parallel(v)
@@ -327,8 +325,8 @@ impl IncrementalRenderer {
                         });
                         if self.frame_hashes.get(&frame) != Some(&hash) {
                             // A fixed source's frame read for the first time can't have
-                            // changed what later frames worked out from it; elsewhere a
-                            // frame that wasn't kept may have.
+                            // changed what later frames computed from it; in other sources
+                            // an uncached frame may have.
                             if !fixed {
                                 self.invalidate_frame(frame, invalidation_reach);
                             }
@@ -340,8 +338,8 @@ impl IncrementalRenderer {
                 let source_frame = face_source_frame(s, frame, first);
                 let source_key = analysis_key(s, source_frame, first);
                 let key = analysis_key(s, frame, first);
-                // Outside the swarm a missing analysis isn't worked out: the frame showing it
-                // works out its own instead.
+                // Outside the swarm a missing analysis frame isn't analysed: the frame
+                // displaying it analyses itself instead.
                 let wanted = to_analyse.contains(&frame) && (swarm || view.is_some())
                     || !swarm
                         && frame == number
@@ -369,7 +367,7 @@ impl IncrementalRenderer {
                                     ..Segmentation::default()
                                 },
                             };
-                            // The frame it reuses was worked out first, unless it is missing.
+                            // The face source is analysed first, unless it is missing.
                             let source_motion = key
                                 .face_source
                                 .filter(|_| !missing.contains(&source_frame))
@@ -420,8 +418,8 @@ impl IncrementalRenderer {
         }
     }
 
-    /// The frames before `oldest_held_frame` can't be cut again, so what they gave stays, whatever the
-    /// settings are now; those that gave nothing yet stay empty.
+    /// Frames before `oldest_held_frame` can't be re-cut. Re-key their cached results to the
+    /// current settings so they stay valid; frames with no result stay empty.
     fn pin_unreadable_frames(
         &mut self,
         s: &RenderSettings,
@@ -447,9 +445,9 @@ impl IncrementalRenderer {
         }
     }
 
-    /// Drops what no later render reads from the frames before `oldest_held_frame`: a tile the pile no longer
-    /// draws never comes back, as what buried it or pushed it out stays newer than it, and only
-    /// the frame a render shows has its mask read.
+    /// Releases data for unreadable frames that no later render reads. Invariant: a tile hidden
+    /// by a newer one or evicted never becomes visible again, because the newer entries stay
+    /// newer. Only the displayed frame's mask is read.
     fn release_undrawn_data(
         &mut self,
         s: &RenderSettings,
@@ -493,9 +491,9 @@ impl IncrementalRenderer {
         crate::faces::ready()
     }
 
-    /// The frames from `first` a render of `number` has to read: those whose motion or tiles
-    /// aren't kept, the analyses before them whose grids aren't, and `number`, which it draws
-    /// and, outside the swarm, may have to analyse. None from before `oldest_held_frame`.
+    /// The frames from `first` a render of `number` must read: those without cached motion or
+    /// tiles, the analyses before them without grids, and `number`, which it draws and, outside
+    /// the swarm, may analyse. None before `oldest_held_frame`.
     fn frames_to_read(
         &self,
         s: &RenderSettings,
@@ -525,9 +523,9 @@ impl IncrementalRenderer {
         wanted
     }
 
-    /// Draws frame `number`, the last of `count`, from what is kept. `frame` is its pixels,
-    /// which every output but the swarm draws over. A render the GPU fails is drawn on the
-    /// CPU from the same kept state.
+    /// Draws frame `number`, the last of `count`, from the cache. `frame` is its pixels, which
+    /// every output but the swarm draws over. A render the GPU fails is drawn on the CPU from the
+    /// same cached state.
     pub fn draw<C: Channel>(
         &mut self,
         s: &RenderSettings,
@@ -589,8 +587,8 @@ impl IncrementalRenderer {
         drawn
     }
 
-    /// The GPU failed this render. A lost device is given up for good by this instance; after
-    /// anything else the next render tries the GPU again, unless it failed a few lately.
+    /// Device loss disables the GPU for this instance. Any other fault retries on the next
+    /// render, unless [`gpu::MAX_RECENT_FAULTS`] is reached (cooldown).
     fn fall_back(&mut self, fault: &Fault) {
         if self.last_reported_fault.as_ref() != Some(&fault.0) {
             eprintln!(
@@ -627,8 +625,8 @@ impl IncrementalRenderer {
         draw_output(out, s, frame, motion, analysis_frame, pile.visible());
     }
 
-    /// The frame whose analysis frame `number` shows: the last analysed, or its own where that
-    /// one is missing.
+    /// The frame whose analysis frame `number` displays: the last analysed, or `number` itself
+    /// when that analysis is missing.
     fn displayed_analysis_frame(&self, s: &RenderSettings, number: i64, first: i64) -> i64 {
         let analysis = s.analysis_step.analysis_frame(number, first);
         match self.cached_motion(analysis, &analysis_key(s, analysis, first)) {
@@ -662,10 +660,8 @@ impl IncrementalRenderer {
             self.draw_cpu(s, count, number, frame, out);
             return Ok(());
         }
-        // The swarm draws where its windows draw faster: the choice depends on this render's
-        // windows alone, so a kept render draws what a cold one does. The shares below were
-        // set by the cost of the copy back, which a host's frame to draw into takes away, so
-        // then the GPU draws every swarm.
+        // Choose by this render's windows alone, so cached and cold renders match. The thresholds
+        // reflect readback cost, so drawing directly into a host frame always uses the GPU.
         let (w, h) = (out.width, out.height);
         let canvas_pixels = i64::from(w) * i64::from(h);
         let default = if size_of::<C>() == 1 {
@@ -697,8 +693,8 @@ impl IncrementalRenderer {
             );
             return Ok(());
         }
-        // Only frames with a shown tile keep their place in the atlas. A full atlas draws this
-        // render on the CPU; the frames the trail drops free it for the next.
+        // Only frames with a visible tile keep atlas allocations. A full atlas draws this render
+        // on the CPU; frames leaving the trail free space for the next.
         let wanted: BTreeSet<i64> = visible.iter().map(|p| p.frame).collect();
         self.atlas_allocations.retain(|f, _| wanted.contains(f));
         for f in wanted {
@@ -738,8 +734,8 @@ impl IncrementalRenderer {
         Ok(())
     }
 
-    /// Forgets every frame. Dropping the cuts returns their atlas space; the drawer stays, with
-    /// its buffers, its atlas at the size it grew to, and its record of GPU faults and refusals.
+    /// Clears every frame. Dropping the allocations frees their atlas space; the drawer keeps its
+    /// buffers, its atlas at the size it grew to, and its fault and refusal history.
     pub fn clear_history(&mut self) {
         self.grids.clear();
         self.frame_hashes.clear();
@@ -752,7 +748,7 @@ impl IncrementalRenderer {
         }
     }
 
-    /// Whether `frame` has its motion and, for the swarm, its tiles.
+    /// Whether `frame` has cached motion and, for the swarm, tiles.
     fn is_cached(&self, frame: i64, key: &AnalysisKey, s: &RenderSettings) -> bool {
         self.cached_motion(frame, key).is_some()
             && (s.mode != OutputMode::Swarm
@@ -763,8 +759,7 @@ impl IncrementalRenderer {
         cached_motion(&self.motion, frame, key)
     }
 
-    /// Drops what was kept for `frame`, and the motion and tiles of the frames whose
-    /// background it is part of.
+    /// Drops `frame`'s cached data, and the motion and tiles of the `dependents` frames after it.
     fn invalidate_frame(&mut self, frame: i64, dependents: i64) {
         self.grids.remove(&frame);
         self.frame_hashes.remove(&frame);
@@ -784,7 +779,7 @@ impl IncrementalRenderer {
     }
 }
 
-/// The motion kept for `frame`, if it was worked out for `key`.
+/// The cached motion of `frame`, if computed for `key`.
 fn cached_motion<'a>(
     kept: &'a BTreeMap<i64, (AnalysisKey, Segmentation)>,
     frame: i64,
@@ -793,7 +788,7 @@ fn cached_motion<'a>(
     kept.get(&frame).filter(|(b, _)| b == key).map(|(_, m)| m)
 }
 
-/// The tiles kept for `frame`, if they were cut for `key` and `mirror`.
+/// The cached tiles of `frame`, if cut for `key` and `mirror`.
 fn cached_tiles<'a>(
     kept: &'a BTreeMap<i64, (AnalysisKey, bool, Vec<Tile>)>,
     frame: i64,
@@ -848,7 +843,7 @@ fn window_pixels<'t>(
         .sum()
 }
 
-/// What `frame` is worked out from in a render whose frames start at `first`.
+/// The cache key of `frame` in a render whose frames start at `first`.
 fn analysis_key(s: &RenderSettings, frame: i64, first: i64) -> AnalysisKey {
     // The background's analyses end at the last one before the frame, on it or not.
     let every = s.analysis_step.every;
@@ -889,7 +884,7 @@ fn analysis_frames_used(s: &RenderSettings, number: i64, first: i64) -> impl Ite
     frames.filter(move |f| f.rem_euclid(every) == 0)
 }
 
-/// How many frames up to the current one are drawn from: the trail for the swarm.
+/// Frames drawn from, current included: the trail for the swarm, otherwise 1.
 fn trail_frame_count(s: &RenderSettings) -> i64 {
     if s.mode == OutputMode::Swarm {
         i64::from(s.trail_frames.max(1))
@@ -910,7 +905,7 @@ fn face_source_frame(s: &RenderSettings, frame: i64, first: i64) -> i64 {
     }
 }
 
-/// The frames whose motion a render of `number` works out: those it uses, and the frames whose
+/// The frames whose motion a render of `number` computes: those it uses, and the frames whose
 /// faces they reuse.
 fn frames_to_analyse(s: &RenderSettings, number: i64, first: i64) -> BTreeSet<i64> {
     analysis_frames_used(s, number, first)
@@ -918,7 +913,7 @@ fn frames_to_analyse(s: &RenderSettings, number: i64, first: i64) -> BTreeSet<i6
         .collect()
 }
 
-/// The faces in `motion`, frame `frame`'s, as the next analysis reuses them: with their IDs.
+/// The faces in `motion`, frame `frame`'s, for the next analysis to reuse with their IDs.
 fn reused_faces(motion: &Segmentation, frame: i64) -> impl Iterator<Item = motion::Blob> + '_ {
     use motion::SegmentKind as Kind;
     motion
@@ -963,7 +958,7 @@ fn frame_hash<C: Channel>(view: &View<C>) -> u64 {
     fold_hash((0..view.height).map(|y| row_hash(view.row(y))))
 }
 
-/// [`frame_hash`] on the threads hosts convert rows on.
+/// [`frame_hash`] on the host worker threads.
 fn frame_hash_parallel<C: Channel>(view: &View<C>) -> u64 {
     let mut rows = vec![0u64; view.height as usize];
     by_rows(&mut rows, 1, |y, hash| {
@@ -1195,7 +1190,7 @@ mod tests {
         );
     }
 
-    /// Prints from both paths are compared when a host stops streaming.
+    /// Hashes from both paths are compared when a host stops streaming.
     #[test]
     fn parallel_frame_hash_matches_serial() {
         // An odd width leaves a row's last pixel out of the words of 8-bit frames.
@@ -1290,7 +1285,7 @@ mod tests {
             on_gpu.drawer().is_none(),
             "the instance is still on the GPU"
         );
-        assert!(dev.lost().is_none(), "the device was given up");
+        assert!(dev.lost().is_none(), "the device was lost");
     }
 
     /// A render the GPU can't take, here a canvas larger than the device binds, is drawn on
@@ -1328,7 +1323,7 @@ mod tests {
         }
         assert_eq!(faults(&on_gpu), 1);
         assert!(on_gpu.drawer().is_some(), "the instance left the GPU");
-        assert!(dev.lost().is_none(), "the device was given up");
+        assert!(dev.lost().is_none(), "the device was lost");
     }
 
     /// A draw that isn't back in time is drawn on the CPU, and the next render is back on
@@ -1368,12 +1363,12 @@ mod tests {
         }
         assert!(faults(&on_gpu) <= 1);
         assert!(on_gpu.drawer().is_some(), "the instance left the GPU");
-        assert!(dev.lost().is_none(), "the device was given up");
+        assert!(dev.lost().is_none(), "the device was lost");
     }
 
-    /// A GPU that fails every other render rests too: after a few faults among its last
-    /// renders, the renders are the CPU's byte for byte and don't touch the GPU, and once the
-    /// rest is over the GPU draws again.
+    /// A GPU failing every other render enters cooldown too: after `MAX_RECENT_FAULTS` faults
+    /// in the history, renders match the CPU byte for byte without touching the GPU, and the GPU
+    /// draws again when the cooldown ends.
     #[test]
     fn repeated_gpu_faults_cool_down_then_recover() {
         let _lock = gpu_test_lock();
@@ -1381,7 +1376,7 @@ mod tests {
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
         let mut on_gpu = on_device(&dev);
-        // Frames 0, 2 and 4 fault; from 5 the instance rests, until the test ends it at 8.
+        // Frames 0, 2 and 4 fault; the cooldown runs from 5 until the test ends it at 8.
         let cooldown_frames = 5..8;
         for n in 0..frames.len() {
             let drawer = on_gpu.drawer.as_mut().expect("on the GPU");
@@ -1403,15 +1398,15 @@ mod tests {
             assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
             assert_eq!(in_cooldown, cooldown_frames.contains(&n), "frame {n}");
             if in_cooldown {
-                assert_eq!(a, b, "resting frame {n} isn't the CPU's");
-                assert_eq!(drawn(&on_gpu), before, "resting frame {n} drew on the GPU");
-                assert_eq!(faults(&on_gpu), faulted, "resting frame {n} tried the GPU");
+                assert_eq!(a, b, "cooldown frame {n} isn't the CPU's");
+                assert_eq!(drawn(&on_gpu), before, "cooldown frame {n} drew on the GPU");
+                assert_eq!(faults(&on_gpu), faulted, "cooldown frame {n} tried the GPU");
             } else if !failing {
                 assert_eq!(drawn(&on_gpu), before + 1, "frame {n} wasn't on the GPU");
             }
         }
         assert_eq!(faults(&on_gpu), u64::from(gpu::MAX_RECENT_FAULTS));
-        assert!(dev.lost().is_none(), "the device was given up");
+        assert!(dev.lost().is_none(), "the device was lost");
     }
 
     /// A host holding only the current frame: tiles the pile stopped drawing keep no pixels.
@@ -1519,7 +1514,7 @@ mod tests {
         );
         assert_eq!(faults(&on_gpu), 0, "a full atlas is not a fault");
         assert!(on_gpu.drawer().is_some(), "the instance left the GPU");
-        assert!(dev.lost().is_none(), "the device was given up");
+        assert!(dev.lost().is_none(), "the device was lost");
     }
 
     #[test]
@@ -1562,6 +1557,6 @@ mod tests {
             "a refusal reached the device's errors"
         );
         assert!(on_gpu.drawer().is_some(), "the instance left the GPU");
-        assert!(dev.lost().is_none(), "the device was given up");
+        assert!(dev.lost().is_none(), "the device was lost");
     }
 }

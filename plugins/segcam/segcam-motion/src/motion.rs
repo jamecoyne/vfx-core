@@ -306,6 +306,7 @@ pub fn otsu(values: &[u8]) -> i32 {
     best_level
 }
 
+/// A frame's segments and the mask they came from. Threshold and faces only results use it too.
 #[derive(Clone, Debug, Default)]
 pub struct Segmentation {
     pub blobs: Vec<Blob>,
@@ -354,7 +355,7 @@ pub fn detect_motion<'a>(
         }
     }
     if background.is_empty() {
-        return result; // nothing to compare against yet
+        return result;
     }
 
     let threshold = settings.threshold().max(1) as f32;

@@ -11,8 +11,7 @@ use segcam_motion::{
 };
 use vfx_core::cpu::{FrameSource, Image};
 
-/// Most pixels a frame may have off by over half a level: 1 in 10,000, and at least 4. The
-/// 1080p clip's cases measured at most 8 of 2,073,600 on an RTX 4070.
+/// Most pixels a frame may have off by over half a level: 1 in 10,000, and at least 4.
 fn cap(pixels: usize) -> usize {
     (pixels / 10_000).max(4)
 }

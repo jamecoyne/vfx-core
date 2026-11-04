@@ -135,8 +135,8 @@ pub fn settings_from_params(p: &ParamValues, premultiplied: bool) -> RenderSetti
     }
 }
 
-/// segcam Motion. It keeps what it works out for each frame (see [`IncrementalRenderer`]), so a host
-/// that keeps the instance works out only what changed since the last render.
+/// segcam Motion. Caches per-frame analysis (see [`IncrementalRenderer`]), so a kept instance
+/// recomputes only what changed.
 pub struct SegcamMotion {
     renderer: IncrementalRenderer,
 }
@@ -156,8 +156,8 @@ impl SegcamMotion {
         Self { renderer }
     }
 
-    /// On the GPU from `share` of the canvas in window pixels (see
-    /// [`IncrementalRenderer::set_gpu_min_coverage`]); 0 draws every swarm render there.
+    /// On the GPU from `min_coverage` (see [`IncrementalRenderer::set_gpu_min_coverage`]); 0 draws
+    /// every swarm render there.
     pub fn with_gpu_min_coverage(min_coverage: f64) -> Self {
         let mut effect = Self::with_gpu(true);
         effect.renderer.set_gpu_min_coverage(min_coverage);
@@ -187,7 +187,7 @@ impl CpuEffect for SegcamMotion {
         crate::previous_frames_needed(&s) as usize
     }
 
-    /// None: earlier frames live on as the grids, segments and tiles kept from them.
+    /// Returns 0: cached grids, segments and tiles replace held frames.
     fn frames_held(&self, _params: &ParamValues, _frame_rate: Option<f64>) -> usize {
         0
     }
