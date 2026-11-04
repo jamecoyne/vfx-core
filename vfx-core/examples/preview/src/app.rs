@@ -91,6 +91,42 @@ struct Preview {
     message: Option<String>,
 }
 
+/// The adapter `--gpu` names: `high` or nothing for the high performance one, `low` for the low
+/// power one, anything else the first that can show the window and has that in its name.
+async fn pick_adapter(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+    choice: Option<&str>,
+) -> Result<wgpu::Adapter, String> {
+    let power_preference = match choice {
+        None | Some("high") => wgpu::PowerPreference::HighPerformance,
+        Some("low") => wgpu::PowerPreference::LowPower,
+        Some(name) => {
+            let wanted = name.to_lowercase();
+            let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+            let names: Vec<String> = adapters.iter().map(|a| a.get_info().name).collect();
+            return adapters
+                .into_iter()
+                .find(|a| {
+                    a.get_info().name.to_lowercase().contains(&wanted)
+                        && a.is_surface_supported(surface)
+                })
+                .ok_or_else(|| {
+                    format!("--gpu {name}: none found; there are {}", names.join(", "))
+                });
+        }
+    };
+    instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference,
+            compatible_surface: Some(surface),
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .map_err(|e| format!("no GPU adapter: {e}"))
+}
+
 /// A video file or webcam and everything that goes with it.
 #[cfg(not(target_arch = "wasm32"))]
 struct Media {
@@ -143,26 +179,44 @@ impl Media {
 impl Preview {
     /// Opens the GPU for `window` and builds everything else. Async because browsers
     /// can't block on the GPU; the native build blocks on it with pollster.
-    async fn new(window: Arc<Window>, instance: wgpu::Instance) -> Result<Self, String> {
+    async fn new(
+        window: Arc<Window>,
+        instance: wgpu::Instance,
+        gpu_choice: Option<String>,
+    ) -> Result<Self, String> {
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| format!("couldn't create a surface: {e}"))?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
-            .await
-            .map_err(|e| format!("no GPU adapter: {e}"))?;
+        let adapter = pick_adapter(&instance, &surface, gpu_choice.as_deref()).await?;
+        #[cfg(target_arch = "wasm32")]
+        let required_limits = wgpu::Limits::default();
+        // Effects draw on this device, and segcam's atlas grows with the trail: as much of a
+        // binding as the adapter allows, or the atlas stops at wgpu's default.
+        #[cfg(not(target_arch = "wasm32"))]
+        let required_limits = {
+            let supported = adapter.limits();
+            eprintln!(
+                "preview: drawing on {} ({:?})",
+                adapter.get_info().name,
+                adapter.get_info().backend
+            );
+            wgpu::Limits {
+                max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
+                max_buffer_size: supported.max_buffer_size,
+                ..wgpu::Limits::default()
+            }
+        };
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits,
+                ..wgpu::DeviceDescriptor::default()
+            })
             .await
             .map_err(|e| format!("couldn't open the GPU: {e}"))?;
         let gpu = Gpu::from_parts(device, queue);
-        // CPU effects can't open a device of their own in browsers.
-        #[cfg(target_arch = "wasm32")]
+        // Before any effect exists: a CPU effect that opens a device in its first render finds
+        // this one, so its frames stay on the device that shows them. Browsers can't open a
+        // second device at all.
         gpu.share();
 
         let size = window.inner_size();
@@ -1046,6 +1100,13 @@ fn new_wgpu_instance(event_loop: &ActiveEventLoop) -> wgpu::Instance {
     {
         descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
     }
+    // The D3D12 validation layer changes what DirectML finds in the same process, so it is on
+    // only with WGPU_VALIDATION=1. Face models run beside this device.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        descriptor.flags =
+            (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION).with_env();
+    }
     wgpu::Instance::new(descriptor)
 }
 
@@ -1059,6 +1120,7 @@ type StartOptions = script::Options;
 #[derive(Default)]
 struct StartOptions {
     effect: Option<String>,
+    gpu: Option<String>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1071,7 +1133,7 @@ fn start_options() -> StartOptions {
         .split('&')
         .find_map(|pair| pair.strip_prefix("effect="))
         .map(str::to_owned);
-    StartOptions { effect }
+    StartOptions { effect, gpu: None }
 }
 
 /// Shows a message in the page (web) or on stderr (native).
@@ -1101,7 +1163,11 @@ impl ApplicationHandler<GpuSetup> for App {
                 return;
             }
         };
-        let setup = Preview::new(window, new_wgpu_instance(event_loop));
+        let setup = Preview::new(
+            window,
+            new_wgpu_instance(event_loop),
+            self.start.gpu.clone(),
+        );
         let proxy = self.proxy.clone();
         let finish = move |result: Result<Preview, String>| {
             let _ = proxy.send_event(match result {
@@ -1141,14 +1207,17 @@ impl ApplicationHandler<GpuSetup> for App {
                 preview.window.request_redraw();
                 self.preview = Some(*preview);
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            GpuSetup::Failed(e) => {
+                self.failed = Some(e);
+                event_loop.exit();
+            }
+            #[cfg(target_arch = "wasm32")]
             GpuSetup::Failed(e) => {
                 show_startup_message(&format!(
                     "VFX Preview needs WebGPU, which this browser didn't provide ({e}). \
                      Try a current Chrome, Edge or Safari."
                 ));
-                #[cfg(not(target_arch = "wasm32"))]
-                event_loop.exit();
-                #[cfg(target_arch = "wasm32")]
                 let _ = event_loop;
             }
         }

@@ -21,6 +21,7 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 | `--param NAME=VALUE` | a parameter by its `name`; repeatable. A number, `true` or `false`, an option's name or index, `r,g,b,a`, or `x,y` |
 | `--input SOURCE` | `pattern[:NAME\|N]`, `camera[:NAME\|N]` (part of a webcam's name), or a video or image path |
 | `--size WxH` | the frame size; videos, webcams and stills are fitted into it |
+| `--gpu GPU` | `high`, `low`, or part of an adapter's name; the default is `high`. Effects draw on this device too |
 | `--stats` | the stats bar on stdout, once a second |
 | `--frames N`, `--seconds N` | exit after that many frames or seconds |
 | `--quiet` | keep the window hidden and render only the effect |

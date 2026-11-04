@@ -21,6 +21,7 @@ vfx-preview [FLAGS] [FILE]
                        option's name or index, r,g,b,a for colours, x,y for points
   --input SOURCE       pattern[:NAME|N], camera[:NAME|N], or a video or image path
   --size WxH           the frame size (patterns, and videos, webcams and stills fitted into it)
+  --gpu GPU            high, low, or part of an adapter's name (default high)
   --detect-faces       tick the Expressions panel's Detect faces
   --stats              print the stats bar to stdout once a second
   --frames N           exit after N frames
@@ -39,6 +40,7 @@ pub struct Options {
     pub params: Vec<(String, String)>,
     pub input: Option<Source>,
     pub size: Option<(u32, u32)>,
+    pub gpu: Option<String>,
     pub detect_faces: bool,
     pub stats: bool,
     pub stop: Option<StopAfter>,
@@ -69,6 +71,7 @@ impl Options {
         self.mode.is_some()
             || !self.params.is_empty()
             || self.size.is_some()
+            || self.gpu.is_some()
             || self.detect_faces
             || self.stats
             || self.stop.is_some()
@@ -101,6 +104,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String
             }
             "--input" => options.input = Some(parse_source(&value()?)),
             "--size" => options.size = Some(parse_size(&value()?)?),
+            "--gpu" => options.gpu = Some(value()?),
             "--detect-faces" => options.detect_faces = true,
             "--stats" => options.stats = true,
             "--frames" => {
@@ -409,6 +413,8 @@ mod tests {
             "pattern:checker",
             "--size",
             "640x360",
+            "--gpu",
+            "low",
             "--detect-faces",
             "--stats",
             "--seconds",
@@ -421,6 +427,7 @@ mod tests {
         assert_eq!(o.params, [("grid".to_owned(), "96".to_owned())]);
         assert_eq!(o.input, Some(Source::Pattern("checker".into())));
         assert_eq!(o.size, Some((640, 360)));
+        assert_eq!(o.gpu.as_deref(), Some("low"));
         assert_eq!(o.stop, Some(StopAfter::Seconds(5.0)));
         assert!(o.stats && o.quiet && o.scripted());
         assert_eq!(
