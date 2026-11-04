@@ -487,6 +487,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn device_names_parse() {
+        assert_eq!(device_named("CPU"), Some(Device::Cpu));
+        assert_eq!(device_named("fast"), None);
+        #[cfg(windows)]
+        assert_eq!(device_named("1"), Some(Device::DirectMl(1)));
+    }
+
     #[cfg(windows)]
     #[test]
     fn directml_close_behind_cpu_is_picked() {

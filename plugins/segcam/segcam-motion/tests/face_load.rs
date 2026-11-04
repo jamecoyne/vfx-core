@@ -86,7 +86,7 @@ fn renders_match_faces_off_during_the_load_and_show_faces_after() {
         "the models were up before the first render: the test proves nothing"
     );
 
-    // Detection now runs beside the renders, so its results arrive within a little while.
+    // Detection runs beside the renders, so faces arrive some renders after the load.
     let started = Instant::now();
     loop {
         assert!(started.elapsed() < LIMIT, "no faces after the load");
