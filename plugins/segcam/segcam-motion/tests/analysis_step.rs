@@ -7,7 +7,7 @@ use motion_only::motion_only;
 use segcam_motion::motion::{self, LumaGrid};
 use segcam_motion::render::{copy_scaled, downsample, draw_overlay};
 use segcam_motion::{
-    Argb, Cadence, Detect, OutputMode, RenderSettings, SegcamMotion, SwarmBackground, View,
+    AnalysisStep, Argb, Detect, OutputMode, RenderSettings, SegcamMotion, SwarmBackground, View,
     ViewMut, previous_frames_needed, render,
 };
 use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
@@ -62,30 +62,30 @@ fn cold(s: &RenderSettings, frames: &[Frame], number: usize) -> Frame {
 
 #[test]
 fn step_at_each_frame_rate() {
-    let stride = |rate| Cadence::at(rate).stride;
-    assert_eq!(stride(None), 1);
+    let every = |rate| AnalysisStep::at(rate).every;
+    assert_eq!(every(None), 1);
     for rate in [
         23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 72.0,
     ] {
-        assert_eq!(stride(Some(rate)), 1, "{rate}");
+        assert_eq!(every(Some(rate)), 1, "{rate}");
     }
     for rate in [89.9, 90.0, 96.0, 100.0, 119.88, 120.0, 149.9] {
         let want = if rate < 90.0 { 1 } else { 2 };
-        assert_eq!(stride(Some(rate)), want, "{rate}");
+        assert_eq!(every(Some(rate)), want, "{rate}");
     }
     for rate in [150.0, 180.0, 209.9] {
-        assert_eq!(stride(Some(rate)), 3, "{rate}");
+        assert_eq!(every(Some(rate)), 3, "{rate}");
     }
-    assert_eq!(stride(Some(210.0)), Cadence::MAX_STRIDE);
-    assert_eq!(stride(Some(240.0)), Cadence::MAX_STRIDE);
-    assert_eq!(stride(Some(480.0)), Cadence::MAX_STRIDE);
-    assert_eq!(stride(Some(0.0)), 1);
+    assert_eq!(every(Some(210.0)), AnalysisStep::MAX_EVERY);
+    assert_eq!(every(Some(240.0)), AnalysisStep::MAX_EVERY);
+    assert_eq!(every(Some(480.0)), AnalysisStep::MAX_EVERY);
+    assert_eq!(every(Some(0.0)), 1);
 
-    let at_120 = Cadence::at(Some(120.0));
-    assert_eq!(at_120.analysis(10, 0), 10);
-    assert_eq!(at_120.analysis(11, 0), 10);
+    let at_120 = AnalysisStep::at(Some(120.0));
+    assert_eq!(at_120.analysis_frame(10, 0), 10);
+    assert_eq!(at_120.analysis_frame(11, 0), 10);
     // A clip starting on an odd frame analyses its first.
-    assert_eq!(at_120.analysis(11, 11), 11);
+    assert_eq!(at_120.analysis_frame(11, 11), 11);
 }
 
 /// Between analyses no window spawns, so the swarm holds still.
@@ -99,7 +99,7 @@ fn the_swarm_holds_between_analyses() {
         ..RenderSettings::default()
     };
     let at_120 = RenderSettings {
-        cadence: Cadence::at(Some(120.0)),
+        analysis_step: AnalysisStep::at(Some(120.0)),
         ..s
     };
     for n in [10, 16, 22] {
@@ -132,14 +132,14 @@ fn the_oldest_trail_frame_waits_for_its_analysis() {
         swarm_background: SwarmBackground::Black,
         ..RenderSettings::default()
     };
-    let trail = |trail_frames, cadence| RenderSettings {
+    let trail = |trail_frames, analysis_step| RenderSettings {
         trail_frames,
-        cadence,
+        analysis_step,
         ..s
     };
-    let at_120 = Cadence::at(Some(120.0));
+    let at_120 = AnalysisStep::at(Some(120.0));
     assert!(as_host(&trail(11, at_120), &frames, n) == as_host(&trail(10, at_120), &frames, n));
-    let every = Cadence::EVERY_FRAME;
+    let every = AnalysisStep::EVERY_FRAME;
     assert!(as_host(&trail(11, every), &frames, n) != as_host(&trail(10, every), &frames, n));
 }
 
@@ -150,7 +150,7 @@ fn overlay_shows_the_last_analysis() {
     let frames = crossing(24);
     let s = RenderSettings {
         background_frames: 6,
-        cadence: Cadence::at(Some(119.88)),
+        analysis_step: AnalysisStep::at(Some(119.88)),
         ..RenderSettings::default()
     };
     let grids: Vec<LumaGrid> = frames
@@ -191,9 +191,9 @@ impl FrameSource for Gappy<'_> {
 fn a_missing_analysis_is_stood_in_for() {
     let frames = crossing(24);
     let n = 15;
-    let at = |cadence| RenderSettings {
+    let at = |analysis_step| RenderSettings {
         background_frames: 6,
-        cadence,
+        analysis_step,
         ..RenderSettings::default()
     };
     let without_analysis = |s: &RenderSettings| {
@@ -206,7 +206,7 @@ fn a_missing_analysis_is_stood_in_for() {
         render(s, &mut source, n + 1, n as i64, view);
         out
     };
-    let at_120 = at(Cadence::at(Some(120.0)));
+    let at_120 = at(AnalysisStep::at(Some(120.0)));
     let stood_in = without_analysis(&at_120);
     let grids: Vec<LumaGrid> = frames
         .iter()
@@ -241,7 +241,7 @@ fn background_counts_analyses() {
         ..RenderSettings::default()
     };
     let doubled = RenderSettings {
-        cadence: Cadence::at(Some(120.0)),
+        analysis_step: AnalysisStep::at(Some(120.0)),
         ..s
     };
     for n in [8, 12, 16] {
@@ -287,7 +287,7 @@ fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]
 /// A seek back starts the frame count over, so the analyses fall on the new frames as they
 /// would for a fresh effect.
 #[test]
-fn a_seek_back_starts_the_cadence_again() {
+fn seek_back_restarts_count() {
     let frames = crossing(30);
     let mut effect = SegcamMotion::default();
     let mut history = History::default();

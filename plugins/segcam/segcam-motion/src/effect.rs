@@ -8,8 +8,8 @@ use vfx_core::cpu::{FrameSource, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Report, Unit};
 
 use crate::{
-    Cadence, Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode, RenderSettings,
-    SwarmBackground, ThresholdSettings,
+    AnalysisStep, Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode,
+    RenderSettings, SwarmBackground, ThresholdSettings,
 };
 
 /// The controls, with segcam's units (percentages are 0-100), ranges and defaults: those of
@@ -131,7 +131,7 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
             _ => SwarmBackground::Transparent,
         },
         live_windows: p.bool("live_windows"),
-        cadence: Cadence::EVERY_FRAME,
+        analysis_step: AnalysisStep::EVERY_FRAME,
     }
 }
 
@@ -176,7 +176,7 @@ impl CpuEffect for SegcamMotion {
 
     fn frames_before(&self, params: &ParamValues, frame_rate: Option<f64>) -> usize {
         let s = RenderSettings {
-            cadence: Cadence::at(frame_rate),
+            analysis_step: AnalysisStep::at(frame_rate),
             ..settings(params, false)
         };
         crate::previous_frames_needed(&s) as usize
@@ -202,7 +202,7 @@ impl CpuEffect for SegcamMotion {
         ctx: &Context,
     ) {
         let s = RenderSettings {
-            cadence: Cadence::at(ctx.frame_rate),
+            analysis_step: AnalysisStep::at(ctx.frame_rate),
             ..settings(params, ctx.premultiplied)
         };
         let (state, n) = (&mut self.state, ctx.frame);

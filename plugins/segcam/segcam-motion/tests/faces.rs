@@ -9,7 +9,7 @@ mod portrait;
 
 use portrait::{H, W, drifting, frame, portrait};
 use segcam_motion::{
-    Argb, Cadence, Detect, FaceParts, OutputMode, RenderSettings, SegcamMotion, View, ViewMut,
+    AnalysisStep, Argb, Detect, FaceParts, OutputMode, RenderSettings, SegcamMotion, View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamValue, ParamValues, Processor};
@@ -190,12 +190,16 @@ impl FrameSource for Frames<'_> {
 
 /// Faces only, as a box matte: the frame shows through the face boxes alone.
 fn boxes_at(frames: Vec<Option<&[Argb<u8>]>>, number: i64) -> Vec<Argb<u8>> {
-    boxes_every(Cadence::EVERY_FRAME, frames, number)
+    boxes_every(AnalysisStep::EVERY_FRAME, frames, number)
 }
 
-fn boxes_every(cadence: Cadence, frames: Vec<Option<&[Argb<u8>]>>, number: i64) -> Vec<Argb<u8>> {
+fn boxes_every(
+    analysis_step: AnalysisStep,
+    frames: Vec<Option<&[Argb<u8>]>>,
+    number: i64,
+) -> Vec<Argb<u8>> {
     let s = RenderSettings {
-        cadence,
+        analysis_step,
         mode: OutputMode::BoxMatte,
         detect: Detect::FacesOnly,
         faces: FaceParts {
@@ -239,7 +243,7 @@ fn at_120_fps_faces_run_on_every_2nd_analysis() {
     let Some(p) = portrait() else { return };
     let (left, right) = (frame(&p, 90, 80, None), frame(&p, 230, 80, None));
     let shown = |out: &[Argb<u8>], x: i32| out[(80 * W + x) as usize].alpha == 255;
-    let every_2nd = Cadence { stride: 2 };
+    let every_2nd = AnalysisStep { every: 2 };
     let (l, r) = (Some(left.as_slice()), Some(right.as_slice()));
 
     let own = boxes_every(every_2nd, vec![l, l, r], 8);

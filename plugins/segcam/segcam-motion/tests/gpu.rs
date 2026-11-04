@@ -6,8 +6,8 @@
 use segcam_motion::gpu::NoGpu;
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
-    Argb, Cadence, Channel, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View,
-    ViewMut,
+    AnalysisStep, Argb, Channel, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground,
+    View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, Image};
 
@@ -129,14 +129,14 @@ fn cases() -> Vec<(&'static str, RenderSettings)> {
         (
             "swarm every 2nd",
             RenderSettings {
-                cadence: Cadence { stride: 2 },
+                analysis_step: AnalysisStep { every: 2 },
                 ..swarm
             },
         ),
         (
             "overlay every 2nd",
             RenderSettings {
-                cadence: Cadence { stride: 2 },
+                analysis_step: AnalysisStep { every: 2 },
                 ..RenderSettings::default()
             },
         ),

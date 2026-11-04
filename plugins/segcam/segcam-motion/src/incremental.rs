@@ -24,8 +24,8 @@ use crate::gpu::{self, Cut, Drawer, Fault};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
-    Cadence, Detect, FaceParts, OutputMode, Pile, PiledTile, PixelRect, RenderSettings, downsample,
-    draw_output, fill_rect, frame_tiles, history_frames,
+    AnalysisStep, Detect, FaceParts, OutputMode, Pile, PiledTile, PixelRect, RenderSettings,
+    downsample, draw_output, fill_rect, frame_tiles, history_frames,
 };
 use crate::swarm::{self, SwarmMetrics, Tile};
 
@@ -43,7 +43,7 @@ struct Detection {
     detect: Detect,
     motion: MotionSettings,
     background_frames: i32,
-    stride: i64,
+    every: i64,
     threshold: ThresholdSettings,
     faces: FaceParts,
 }
@@ -283,7 +283,7 @@ impl Incremental {
         let background = i64::from(history_frames(s));
         // What a changed frame feeds: the frames it is background to, and with faces the
         // analysis after.
-        let feeds = background.max(i64::from(s.faces.any()) * s.cadence.stride);
+        let frames_fed = background.max(i64::from(s.faces.any()) * s.analysis_step.every);
         let targets = targets(s);
         let first = number - count as i64 + 1;
         let used = worked_out(s, number, first);
@@ -318,8 +318,9 @@ impl Incremental {
             self.lacking(s, first, number, gone)
         } else {
             // Frames between analyses feed nothing.
-            let feeding =
-                |f: &i64| f.rem_euclid(s.cadence.stride) == 0 || *f == number || used.contains(f);
+            let feeding = |f: &i64| {
+                f.rem_euclid(s.analysis_step.every) == 0 || *f == number || used.contains(f)
+            };
             (oldest..=number).filter(feeding).collect()
         };
         for frame in visit {
@@ -327,7 +328,7 @@ impl Incremental {
                 let view = image.and_then(C::view);
                 match &view {
                     None => {
-                        self.forget(frame, feeds);
+                        self.forget(frame, frames_fed);
                         missing.insert(frame);
                     }
                     Some(_) if fixed && self.prints.contains_key(&frame) => {}
@@ -345,7 +346,7 @@ impl Incremental {
                             // changed what later frames worked out from it; elsewhere a
                             // frame that wasn't kept may have.
                             if !fixed {
-                                self.forget(frame, feeds);
+                                self.forget(frame, frames_fed);
                             }
                             self.grids.insert(frame, downsample(v, s.grid_width));
                             self.prints.insert(frame, print);
@@ -368,7 +369,7 @@ impl Incremental {
                             let mut motion = match s.detect {
                                 Detect::Motion => {
                                     let history = (basis.from..frame)
-                                        .filter(|k| k.rem_euclid(s.cadence.stride) == 0)
+                                        .filter(|k| k.rem_euclid(s.analysis_step.every) == 0)
                                         .map(|k| self.grids.get(&k).unwrap_or(&empty));
                                     motion::detect(history, grid, &s.motion)
                                 }
@@ -402,9 +403,9 @@ impl Incremental {
                         }
                     };
                     if swarm {
-                        // A trail no longer than the stride draws no earlier analysis, so
+                        // A trail no longer than the step draws no earlier analysis, so
                         // reused faces need tiles here.
-                        let reused = targets <= s.cadence.stride;
+                        let reused = targets <= s.analysis_step.every;
                         let tiles =
                             frame_tiles(&motion, view.as_ref(), frame, w, h, s.mirror, reused);
                         self.tiles.insert(frame, (basis, s.mirror, tiles));
@@ -417,9 +418,9 @@ impl Incremental {
             });
         }
         for &frame in &missing {
-            self.forget(frame, feeds);
+            self.forget(frame, frames_fed);
         }
-        let reach = background + targets + 2 * Cadence::MAX_STRIDE;
+        let reach = background + targets + 2 * AnalysisStep::MAX_EVERY;
         self.keep(number - reach..=number + reach);
         if swarm {
             self.release(s, count, number, (w, h), gone);
@@ -474,7 +475,7 @@ impl Incremental {
                 }
             }
         }
-        let shows_at_most = number - Cadence::MAX_STRIDE;
+        let shows_at_most = number - AnalysisStep::MAX_EVERY;
         for (_, (_, motion)) in self.motion.range_mut(..gone.min(shows_at_most)) {
             motion.mask = Vec::new();
         }
@@ -496,7 +497,7 @@ impl Incremental {
         let mut wanted = BTreeSet::from([number]);
         let grids = |target: i64| {
             (basis(s, target, first).from.max(gone)..target)
-                .filter(|k| k.rem_euclid(s.cadence.stride) == 0 && !self.grids.contains_key(k))
+                .filter(|k| k.rem_euclid(s.analysis_step.every) == 0 && !self.grids.contains_key(k))
         };
         for target in worked_out(s, number, first)
             .into_iter()
@@ -618,7 +619,7 @@ impl Incremental {
     /// The frame whose analysis frame `number` shows: the last analysed, or its own where that
     /// one is missing.
     fn shows(&self, s: &RenderSettings, number: i64, first: i64) -> i64 {
-        let analysis = s.cadence.analysis(number, first);
+        let analysis = s.analysis_step.analysis_frame(number, first);
         match self.motion(analysis, &basis(s, analysis, first)) {
             Some(_) => analysis,
             None => number,
@@ -828,7 +829,7 @@ fn detection(s: &RenderSettings) -> Detection {
         detect: s.detect,
         motion: s.motion,
         background_frames: s.background_frames,
-        stride: s.cadence.stride,
+        every: s.analysis_step.every,
         threshold: s.threshold,
         faces: s.faces,
     }
@@ -837,10 +838,10 @@ fn detection(s: &RenderSettings) -> Detection {
 /// What `frame` is worked out from in a render whose frames start at `first`.
 fn basis(s: &RenderSettings, frame: i64, first: i64) -> Basis {
     // The background's analyses end at the last one before the frame, on it or not.
-    let stride = s.cadence.stride;
+    let every = s.analysis_step.every;
     let from = |frame: i64| {
-        let last = frame - 1 - (frame - 1).rem_euclid(stride);
-        let oldest = last + stride - i64::from(history_frames(s));
+        let last = frame - 1 - (frame - 1).rem_euclid(every);
+        let oldest = last + every - i64::from(history_frames(s));
         oldest.min(frame).max(first)
     };
     Basis {
@@ -856,16 +857,16 @@ fn basis(s: &RenderSettings, frame: i64, first: i64) -> Basis {
 /// trail, or the analysis the frame shows.
 fn analysed(s: &RenderSettings, number: i64, first: i64) -> impl Iterator<Item = i64> {
     // The trail's oldest frame is never analysed early, or its windows would come and go with it.
-    let (frames, stride) = if s.mode == OutputMode::Swarm {
+    let (frames, every) = if s.mode == OutputMode::Swarm {
         (
             (number - targets(s) + 1).max(first)..=number,
-            s.cadence.stride,
+            s.analysis_step.every,
         )
     } else {
-        let shown = s.cadence.analysis(number, first);
+        let shown = s.analysis_step.analysis_frame(number, first);
         (shown..=shown, 1)
     };
-    frames.filter(move |f| f.rem_euclid(stride) == 0)
+    frames.filter(move |f| f.rem_euclid(every) == 0)
 }
 
 /// How many frames up to the current one are drawn from: the trail for the swarm.
@@ -880,9 +881,9 @@ fn targets(s: &RenderSettings) -> i64 {
 /// The frame whose faces `frame` shows in a render whose frames start at `first`. As in
 /// segcam, faces run on every 2nd analysis; the analysis between reuses the one before's.
 fn faces_from(s: &RenderSettings, frame: i64, first: i64) -> i64 {
-    let stride = s.cadence.stride;
-    let before = frame - stride;
-    if s.faces.any() && frame.rem_euclid(2 * stride) == stride && before >= first {
+    let every = s.analysis_step.every;
+    let before = frame - every;
+    if s.faces.any() && frame.rem_euclid(2 * every) == every && before >= first {
         before
     } else {
         frame
