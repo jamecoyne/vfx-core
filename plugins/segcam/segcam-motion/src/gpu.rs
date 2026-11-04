@@ -34,7 +34,7 @@ use crate::render::{
 use crate::swarm::{ShadowKernel, SwarmMetrics, Tile, TitleBar, WindowPlan};
 
 /// The device every instance draws with, made on first use, and its pipelines.
-pub struct Device {
+pub struct GpuContext {
     pub(crate) device: wgpu::Device,
     queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
@@ -43,12 +43,12 @@ pub struct Device {
     overlay: wgpu::ComputePipeline,
     swarm: wgpu::ComputePipeline,
     /// Why the device was lost; from then on nothing draws on it.
-    lost: Arc<Mutex<Option<String>>>,
+    lost: Lost,
     /// How many errors the device has reported and the last one. A render that sees the count
     /// move falls back; the device stays.
-    errors: Arc<Mutex<(u64, String)>>,
+    errors: Errors,
     /// An atlas made ahead for the first instance, so its first render needn't.
-    spare: Mutex<Option<Atlas>>,
+    preallocated_atlas: Mutex<Option<Atlas>>,
     /// What writes the swarm into a host's frame, per frame format, made on first use.
     #[cfg(not(target_arch = "wasm32"))]
     unpacks: Mutex<Vec<Arc<Unpack>>>,
@@ -62,9 +62,9 @@ struct Unpack {
     pipeline: wgpu::RenderPipeline,
 }
 
-impl Device {
+impl GpuContext {
     /// Whether `device` is this one.
-    pub(crate) fn is(&self, device: &wgpu::Device) -> bool {
+    pub(crate) fn wraps(&self, device: &wgpu::Device) -> bool {
         self.device == *device
     }
 
@@ -169,23 +169,23 @@ impl Device {
 pub struct Fault(pub String);
 
 /// How long a render waits for its draw before drawing on the CPU instead.
-const WAIT: Duration = Duration::from_secs(1);
+const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The wait on a software adapter, which draws on the CPU's cores beside the host's own work
 /// and can be slow without hanging.
-const SOFTWARE_WAIT: Duration = Duration::from_secs(10);
+const SOFTWARE_READBACK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Faults within the last [`WINDOW`] renders tried on the GPU after which renders stay off it
-/// for [`REST`].
-pub(crate) const TRIES: u32 = 3;
-const WINDOW: u32 = 10;
+/// Faults within the last [`FAULT_HISTORY_RENDERS`] renders tried on the GPU after which renders stay off it
+/// for [`FAULT_COOLDOWN`].
+pub(crate) const MAX_RECENT_FAULTS: u32 = 3;
+const FAULT_HISTORY_RENDERS: u32 = 10;
 
 /// Long next to a render's wait, so a GPU that hangs without being lost leaves a show on the
 /// CPU at its own speed, with a try now and then.
-const REST: Duration = Duration::from_secs(30);
+const FAULT_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Whether to draw on the GPU where there is one: yes, unless `SEGCAM_GPU=0`.
-pub fn wanted() -> bool {
+pub fn enabled_by_env() -> bool {
     std::env::var("SEGCAM_GPU").map_or(true, |v| v != "0")
 }
 
@@ -209,7 +209,7 @@ impl std::fmt::Display for NoGpu {
 
 /// Whether there is a working GPU, or why not. Waits for the device to open.
 pub fn status() -> Result<(), NoGpu> {
-    start();
+    open_shared_device();
     status_of(&DEVICE)
 }
 
@@ -222,18 +222,18 @@ fn status_of(opened: &OnceLock<Opened>) -> Result<(), NoGpu> {
 
 /// Whether the shared device is still opening: no answer yet from [`device`].
 pub fn opening() -> bool {
-    start();
+    open_shared_device();
     DEVICE.get().is_none()
 }
 
 /// The shared device, or `None` while it opens, where there is no adapter, or once it is lost.
-pub fn device() -> Option<Arc<Device>> {
-    start();
+pub fn device() -> Option<Arc<GpuContext>> {
+    open_shared_device();
     let dev = DEVICE.get()?.as_ref().ok()?;
     dev.lost().is_none().then(|| dev.clone())
 }
 
-type Opened = Result<Arc<Device>, NoGpu>;
+type Opened = Result<Arc<GpuContext>, NoGpu>;
 
 static DEVICE: OnceLock<Opened> = OnceLock::new();
 
@@ -241,14 +241,14 @@ static DEVICE: OnceLock<Opened> = OnceLock::new();
 /// compiling its pipelines would stall a render. Software adapters (WARP, lavapipe) are left
 /// out unless `SEGCAM_GPU_ADAPTER=fallback` asks for one; `SEGCAM_GPU_ADAPTER=low` picks the
 /// low power adapter (an integrated GPU).
-fn start() {
+fn open_shared_device() {
     static START: Once = Once::new();
     START.call_once(|| {
         let load = || {
             #[cfg(not(target_arch = "wasm32"))]
             let _turn = segcam_face::device_turn();
             let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-            settle(&DEVICE, || open(&choice));
+            open_and_publish(&DEVICE, || open(&choice));
         };
         #[cfg(not(target_arch = "wasm32"))]
         let spawned = std::thread::Builder::new()
@@ -265,11 +265,11 @@ fn start() {
 
 /// Opens the device with `open` and gives the answer to `opened`. A broken driver can panic
 /// wgpu; that is a failed GPU, not an answer that never comes.
-fn settle(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<Device, NoGpu>) {
+fn open_and_publish(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<GpuContext, NoGpu>) {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let dev = Arc::new(open()?);
-        if let Ok(mut spare) = dev.spare.lock() {
-            *spare = Some(Atlas::new(&dev));
+        if let Ok(mut preallocated_atlas) = dev.preallocated_atlas.lock() {
+            *preallocated_atlas = Some(Atlas::new(&dev));
         }
         Ok(dev)
     }))
@@ -289,14 +289,14 @@ fn settle(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<Device, NoGpu
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
+pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
     // A host that shows frames from the GPU shares the device they're on (FFGL), so the swarm
     // can draw its output there. It doesn't watch the device, so this does, as on its own.
     // An adapter asked for by name still gets a device of its own.
     if choice.is_empty()
         && let Some(gpu) = vfx_core::Gpu::shared()
     {
-        let (lost, errors) = watch(&gpu.device);
+        let (lost, errors) = track_device_errors(&gpu.device);
         let dev = on_shared(gpu, lost, errors);
         return match (dev.lost(), dev.errors()) {
             (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
@@ -318,11 +318,11 @@ pub(crate) fn open(choice: &str) -> Result<Device, NoGpu> {
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| NoGpu::Failed(e.to_string()))?;
-    let (lost, errors) = watch(&device);
+    let (lost, errors) = track_device_errors(&device);
     let max_binding = supported
         .max_storage_buffer_binding_size
         .min(supported.max_buffer_size);
-    let dev = Device::build(device, queue, info, max_binding, lost, errors);
+    let dev = GpuContext::build(device, queue, info, max_binding, lost, errors);
     match (dev.lost(), dev.errors()) {
         (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
         _ => Ok(dev),
@@ -358,7 +358,7 @@ fn pick_adapter(choice: &str) -> Result<wgpu::Adapter, NoGpu> {
 
 /// Drawers on it think any size binds, so growth reaches the device's own limit.
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) fn device_with_buffer_limit(choice: &str, bytes: u64) -> Result<Device, NoGpu> {
+pub(crate) fn device_with_buffer_limit(choice: &str, bytes: u64) -> Result<GpuContext, NoGpu> {
     let limits = wgpu::Limits {
         max_storage_buffer_binding_size: bytes,
         max_buffer_size: bytes,
@@ -368,7 +368,7 @@ pub(crate) fn device_with_buffer_limit(choice: &str, bytes: u64) -> Result<Devic
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-fn test_device(adapter: wgpu::Adapter, limits: wgpu::Limits) -> Result<Device, NoGpu> {
+fn test_device(adapter: wgpu::Adapter, limits: wgpu::Limits) -> Result<GpuContext, NoGpu> {
     let info = adapter.get_info();
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("segcam Motion"),
@@ -376,8 +376,15 @@ fn test_device(adapter: wgpu::Adapter, limits: wgpu::Limits) -> Result<Device, N
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| NoGpu::Failed(e.to_string()))?;
-    let (lost, errors) = watch(&device);
-    Ok(Device::build(device, queue, info, u64::MAX, lost, errors))
+    let (lost, errors) = track_device_errors(&device);
+    Ok(GpuContext::build(
+        device,
+        queue,
+        info,
+        u64::MAX,
+        lost,
+        errors,
+    ))
 }
 
 /// The GPU tests take turns: several devices open at once on WARP crash it now and then
@@ -395,7 +402,7 @@ type Errors = Arc<Mutex<(u64, String)>>;
 
 /// Counts `device`'s errors, keeping the last, and notes why it was lost.
 #[cfg(not(target_arch = "wasm32"))]
-fn watch(device: &wgpu::Device) -> (Lost, Errors) {
+fn track_device_errors(device: &wgpu::Device) -> (Lost, Errors) {
     let errors = Arc::new(Mutex::new((0, String::new())));
     let noted = errors.clone();
     device.on_uncaptured_error(Arc::new(move |e| {
@@ -414,34 +421,34 @@ fn watch(device: &wgpu::Device) -> (Lost, Errors) {
 }
 
 /// Draws on a device a host shared ([`vfx_core::Gpu::share`]), binding as much as it allows.
-fn on_shared(gpu: vfx_core::Gpu, lost: Lost, errors: Errors) -> Device {
+fn on_shared(gpu: vfx_core::Gpu, lost: Lost, errors: Errors) -> GpuContext {
     let limits = gpu.device.limits();
     let max_binding = limits
         .max_storage_buffer_binding_size
         .min(limits.max_buffer_size);
     let info = gpu.device.adapter_info();
-    Device::build(gpu.device, gpu.queue, info, max_binding, lost, errors)
+    GpuContext::build(gpu.device, gpu.queue, info, max_binding, lost, errors)
 }
 
 // Browsers can't wait for a device inside a render, so this draws on the one the host shared.
 // Its error and loss callbacks stay the host's.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn open(_choice: &str) -> Result<Device, NoGpu> {
+pub(crate) fn open(_choice: &str) -> Result<GpuContext, NoGpu> {
     let gpu =
         vfx_core::Gpu::shared().ok_or_else(|| NoGpu::NoAdapter("the host shared no GPU".into()))?;
     let (lost, errors) = Default::default();
     Ok(on_shared(gpu, lost, errors))
 }
 
-impl Device {
+impl GpuContext {
     /// The draw's layout and pipelines on `device`.
     fn build(
         device: wgpu::Device,
         queue: wgpu::Queue,
         info: wgpu::AdapterInfo,
         max_binding: u64,
-        lost: Arc<Mutex<Option<String>>>,
-        errors: Arc<Mutex<(u64, String)>>,
+        lost: Lost,
+        errors: Errors,
     ) -> Self {
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
@@ -491,7 +498,7 @@ impl Device {
                 cache: None,
             })
         };
-        Device {
+        GpuContext {
             max_binding,
             overlay: pipeline("overlay"),
             swarm: pipeline("swarm"),
@@ -501,7 +508,7 @@ impl Device {
             info,
             lost,
             errors,
-            spare: Mutex::new(None),
+            preallocated_atlas: Mutex::new(None),
             #[cfg(not(target_arch = "wasm32"))]
             unpacks: Mutex::new(Vec::new()),
         }
@@ -521,22 +528,22 @@ struct Globals {
     backdrop: u32,
     count: u32,
     corner: u32,
-    corner_lo: i32,
+    corner_min_offset: i32,
     corner_size: i32,
     title_height: i32,
     bar_h: i32,
     scale: f32,
     radius: f32,
-    full: f32,
+    inner_coverage: f32,
     opacity: f32,
     edge_shade: f32,
     line: i32,
     text_scale: i32,
-    units: u32,
+    unit_table: u32,
     bar_x: u32,
     bar_y: u32,
     _padding: u32,
-    green: [f32; 4],
+    box_color: [f32; 4],
 }
 
 const STRAIGHT: u32 = 1;
@@ -552,24 +559,24 @@ const BLOB_WORDS: usize = 12;
 pub struct Slot {
     pixels: u32,
     /// False where the tile had no frame to be cut from: its picture is black.
-    cut: bool,
+    has_pixels: bool,
     bar: u32,
     bar_width: i32,
     plan: u32,
     /// The window, and the part of the canvas it and its shadow reach.
-    frame: PixelRect,
-    area: PixelRect,
+    window_rect: PixelRect,
+    shadow_rect: PixelRect,
 }
 
 /// One frame's tiles in the atlas; dropping it gives the space back.
-pub struct Cut {
+pub struct AtlasAllocation {
     atlas: Arc<Mutex<Atlas>>,
     start: u64,
     len: u64,
     pub slots: Vec<Slot>,
 }
 
-impl Drop for Cut {
+impl Drop for AtlasAllocation {
     fn drop(&mut self) {
         if let Ok(mut atlas) = self.atlas.lock() {
             atlas.free(self.start, self.len);
@@ -598,7 +605,7 @@ struct PendingGrowth {
 }
 
 impl PendingGrowth {
-    fn new(dev: &Device, words: u64) -> Self {
+    fn new(dev: &GpuContext, words: u64) -> Self {
         let validation = dev.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let out_of_memory = dev.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let buffer = atlas_buffer(dev, words);
@@ -614,14 +621,14 @@ impl PendingGrowth {
 
 impl Atlas {
     /// 4 MB: hosts make instances often, and the atlas grows with the trail.
-    const FIRST_WORDS: u64 = 1 << 20;
+    const INITIAL_WORDS: u64 = 1 << 20;
     const GROWTH_RETRY_AFTER: Duration = Duration::from_secs(60);
 
-    fn new(dev: &Device) -> Self {
-        Self::with(dev, Self::FIRST_WORDS)
+    fn new(dev: &GpuContext) -> Self {
+        Self::with_words(dev, Self::INITIAL_WORDS)
     }
 
-    fn with(dev: &Device, words: u64) -> Self {
+    fn with_words(dev: &GpuContext, words: u64) -> Self {
         Self {
             buffer: atlas_buffer(dev, words),
             words,
@@ -635,7 +642,7 @@ impl Atlas {
 
     /// Room for `len` words, growing the atlas up to `limit` bytes or as far as the GPU allows;
     /// `None` when it is full or the GPU hasn't answered yet.
-    fn alloc(&mut self, dev: &Device, len: u64, limit: u64) -> Option<u64> {
+    fn alloc(&mut self, dev: &GpuContext, len: u64, limit: u64) -> Option<u64> {
         let len = len.max(1);
         loop {
             if let Some(i) = self.free.iter().position(|&(_, n)| n >= len) {
@@ -712,7 +719,7 @@ impl Atlas {
     }
 }
 
-fn atlas_buffer(dev: &Device, words: u64) -> wgpu::Buffer {
+fn atlas_buffer(dev: &GpuContext, words: u64) -> wgpu::Buffer {
     dev.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("segcam atlas"),
         size: words * 4,
@@ -724,13 +731,13 @@ fn atlas_buffer(dev: &Device, words: u64) -> wgpu::Buffer {
 }
 
 /// A buffer that grows to the largest size asked of it.
-struct Grown {
+struct GrowableBuffer {
     buffer: Option<wgpu::Buffer>,
     usage: wgpu::BufferUsages,
     label: &'static str,
 }
 
-impl Grown {
+impl GrowableBuffer {
     fn new(label: &'static str, usage: wgpu::BufferUsages) -> Self {
         Self {
             buffer: None,
@@ -741,7 +748,12 @@ impl Grown {
 
     /// The buffer, at least `bytes` long; a fault where that is more than `limit`, the most the
     /// device binds.
-    fn get(&mut self, dev: &Device, limit: u64, bytes: u64) -> Result<&wgpu::Buffer, Fault> {
+    fn ensure_size(
+        &mut self,
+        dev: &GpuContext,
+        limit: u64,
+        bytes: u64,
+    ) -> Result<&wgpu::Buffer, Fault> {
         let bytes = bytes.max(16).next_multiple_of(16);
         if bytes > limit {
             return Err(Fault(format!(
@@ -763,48 +775,48 @@ impl Grown {
 
 /// One instance's buffers.
 pub struct Drawer {
-    dev: Arc<Device>,
+    dev: Arc<GpuContext>,
     globals: wgpu::Buffer,
     /// The canvas width for an unpack into a host's frame.
     #[cfg(not(target_arch = "wasm32"))]
-    canvas: wgpu::Buffer,
-    frame: Grown,
-    out: Grown,
-    staging: Grown,
-    data: Grown,
+    unpack_uniform: wgpu::Buffer,
+    frame_buffer: GrowableBuffer,
+    output_buffer: GrowableBuffer,
+    readback_buffer: GrowableBuffer,
+    table_buffer: GrowableBuffer,
     atlas: Arc<Mutex<Atlas>>,
     /// The most a buffer may take: what the device binds.
-    limit: u64,
+    max_binding_bytes: u64,
     /// How long a render waits for its draw; browsers don't.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    wait: Duration,
+    readback_timeout: Duration,
     /// The device's error count as this render began.
-    seen: u64,
+    errors_at_render_start: u64,
     /// Which frame the frame buffer holds, this render.
-    loaded: Option<i64>,
+    uploaded_frame: Option<i64>,
     /// Renders drawn on the GPU.
     pub drawn: u64,
     /// Renders the GPU failed, drawn on the CPU instead.
     pub faults: u64,
-    /// The last [`WINDOW`] renders tried on the GPU, newest in the lowest bit, set for a fault.
-    recent: u16,
-    /// When the last of [`TRIES`] faults in the window sent renders to the CPU.
-    resting: Option<Instant>,
-    rest: Duration,
+    /// The last [`FAULT_HISTORY_RENDERS`] renders tried on the GPU, newest in the lowest bit, set for a fault.
+    recent_faults: u16,
+    /// When the last of [`MAX_RECENT_FAULTS`] faults in the window sent renders to the CPU.
+    cooldown_started: Option<Instant>,
+    cooldown: Duration,
     /// This render's draw is still on its way back; the next render of it takes it (browsers).
     pub unfinished: bool,
     #[cfg(target_arch = "wasm32")]
-    flight: Option<Flight>,
+    in_flight: Option<InFlightDraw>,
     /// Draws replaced in a row before they came back, as when a parameter moves every frame.
     #[cfg(target_arch = "wasm32")]
-    restarts: u32,
+    superseded_draws: u32,
 }
 
 /// A draw submitted without waiting: what it drew, its readback and how the map went.
 #[cfg(target_arch = "wasm32")]
-struct Flight {
+struct InFlightDraw {
     key: u64,
-    staging: wgpu::Buffer,
+    readback_buffer: wgpu::Buffer,
     state: Arc<std::sync::atomic::AtomicU8>,
 }
 
@@ -815,14 +827,18 @@ const MAPPED: u8 = 1;
 
 /// After this many draws replaced in a row, one render draws on the CPU.
 #[cfg(target_arch = "wasm32")]
-const RESTARTS: u32 = 3;
+const MAX_SUPERSEDED_DRAWS: u32 = 3;
 
 impl Drawer {
     /// On `dev`, unless it is lost.
-    pub fn on(dev: Arc<Device>) -> Option<Self> {
+    pub fn new(dev: Arc<GpuContext>) -> Option<Self> {
         dev.lost().is_none().then_some(())?;
         use wgpu::BufferUsages as U;
-        let spare = dev.spare.lock().ok().and_then(|mut s| s.take());
+        let preallocated_atlas = dev
+            .preallocated_atlas
+            .lock()
+            .ok()
+            .and_then(|mut s| s.take());
         let drawer = Self {
             globals: dev.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("segcam globals"),
@@ -831,35 +847,37 @@ impl Drawer {
                 mapped_at_creation: false,
             }),
             #[cfg(not(target_arch = "wasm32"))]
-            canvas: dev.device.create_buffer(&wgpu::BufferDescriptor {
+            unpack_uniform: dev.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("segcam unpack canvas"),
                 size: 16,
                 usage: U::UNIFORM | U::COPY_DST,
                 mapped_at_creation: false,
             }),
-            frame: Grown::new("segcam frame", U::STORAGE | U::COPY_DST),
-            out: Grown::new("segcam output", U::STORAGE | U::COPY_SRC),
-            staging: Grown::new("segcam readback", U::MAP_READ | U::COPY_DST),
-            data: Grown::new("segcam tables", U::STORAGE | U::COPY_DST),
-            atlas: Arc::new(Mutex::new(spare.unwrap_or_else(|| Atlas::new(&dev)))),
-            limit: dev.max_binding,
-            wait: if dev.info.device_type == wgpu::DeviceType::Cpu {
-                SOFTWARE_WAIT
+            frame_buffer: GrowableBuffer::new("segcam frame", U::STORAGE | U::COPY_DST),
+            output_buffer: GrowableBuffer::new("segcam output", U::STORAGE | U::COPY_SRC),
+            readback_buffer: GrowableBuffer::new("segcam readback", U::MAP_READ | U::COPY_DST),
+            table_buffer: GrowableBuffer::new("segcam tables", U::STORAGE | U::COPY_DST),
+            atlas: Arc::new(Mutex::new(
+                preallocated_atlas.unwrap_or_else(|| Atlas::new(&dev)),
+            )),
+            max_binding_bytes: dev.max_binding,
+            readback_timeout: if dev.info.device_type == wgpu::DeviceType::Cpu {
+                SOFTWARE_READBACK_TIMEOUT
             } else {
-                WAIT
+                READBACK_TIMEOUT
             },
-            seen: dev.errors().0,
-            loaded: None,
+            errors_at_render_start: dev.errors().0,
+            uploaded_frame: None,
             drawn: 0,
             faults: 0,
-            recent: 0,
-            resting: None,
-            rest: REST,
+            recent_faults: 0,
+            cooldown_started: None,
+            cooldown: FAULT_COOLDOWN,
             unfinished: false,
             #[cfg(target_arch = "wasm32")]
-            flight: None,
+            in_flight: None,
             #[cfg(target_arch = "wasm32")]
-            restarts: 0,
+            superseded_draws: 0,
             dev,
         };
         Some(drawer)
@@ -871,7 +889,7 @@ impl Drawer {
 
     /// Whether this draws on `device`.
     pub fn draws_on(&self, device: &wgpu::Device) -> bool {
-        self.dev.is(device)
+        self.dev.wraps(device)
     }
 
     /// Whether the device is lost, which it says when polled.
@@ -880,32 +898,33 @@ impl Drawer {
         self.dev.lost().is_some()
     }
 
-    /// Counts a render the GPU failed. After [`TRIES`] within the window, renders stay off it
+    /// Counts a render the GPU failed. After [`MAX_RECENT_FAULTS`] within the window, renders stay off it
     /// for a while.
-    pub(crate) fn fault(&mut self) {
+    pub(crate) fn record_fault(&mut self) {
         self.faults += 1;
-        self.note(true);
-        if self.recent.count_ones() >= TRIES {
-            self.resting = Some(Instant::now());
+        self.record_outcome(true);
+        if self.recent_faults.count_ones() >= MAX_RECENT_FAULTS {
+            self.cooldown_started = Some(Instant::now());
         }
     }
 
-    fn note(&mut self, fault: bool) {
-        self.recent = (self.recent << 1 | u16::from(fault)) & ((1 << WINDOW) - 1);
+    fn record_outcome(&mut self, fault: bool) {
+        self.recent_faults =
+            (self.recent_faults << 1 | u16::from(fault)) & ((1 << FAULT_HISTORY_RENDERS) - 1);
     }
 
     /// Whether renders stay off the GPU after too many faults.
-    pub fn resting(&self) -> bool {
-        self.resting
-            .is_some_and(|since| since.elapsed() < self.rest)
+    pub fn in_fault_cooldown(&self) -> bool {
+        self.cooldown_started
+            .is_some_and(|since| since.elapsed() < self.cooldown)
     }
 
     /// Called as a render starts: the frame buffer's contents are from an earlier one, and
     /// errors reported before it aren't its own.
-    pub fn begin(&mut self) {
-        self.loaded = None;
+    pub fn begin_render(&mut self) {
+        self.uploaded_frame = None;
         self.unfinished = false;
-        self.seen = self.dev.errors().0;
+        self.errors_at_render_start = self.dev.errors().0;
     }
 
     /// Abandons a draw still on its way back: it shows frames that were just forgotten, and a
@@ -914,15 +933,15 @@ impl Drawer {
         self.unfinished = false;
         #[cfg(target_arch = "wasm32")]
         {
-            self.flight = None;
-            self.restarts = 0;
+            self.in_flight = None;
+            self.superseded_draws = 0;
         }
     }
 
     /// A smaller atlas than usual, for a new drawer.
     #[cfg(test)]
     pub(crate) fn small_atlas(&mut self, words: u64) {
-        self.atlas = Arc::new(Mutex::new(Atlas::with(&self.dev, words)));
+        self.atlas = Arc::new(Mutex::new(Atlas::with_words(&self.dev, words)));
     }
 
     /// The atlas's size and its free space, in words.
@@ -934,28 +953,28 @@ impl Drawer {
 
     /// Buffers no larger than `bytes`, as on a device that binds less.
     #[cfg(test)]
-    pub(crate) fn set_limit(&mut self, bytes: u64) {
-        self.limit = bytes;
+    pub(crate) fn set_max_binding_bytes(&mut self, bytes: u64) {
+        self.max_binding_bytes = bytes;
     }
 
     #[cfg(test)]
-    pub(crate) fn set_wait(&mut self, wait: Duration) {
-        self.wait = wait;
+    pub(crate) fn set_readback_timeout(&mut self, timeout: Duration) {
+        self.readback_timeout = timeout;
     }
 
     #[cfg(test)]
-    pub(crate) fn set_rest(&mut self, rest: Duration) {
-        self.rest = rest;
+    pub(crate) fn set_cooldown(&mut self, cooldown: Duration) {
+        self.cooldown = cooldown;
     }
 
     /// A fault where the device is lost or reported an error since this render began.
-    fn check(&mut self) -> Result<(), Fault> {
+    fn check_device_faults(&mut self) -> Result<(), Fault> {
         if let Some(e) = self.dev.lost() {
             return Err(Fault(e));
         }
         let (count, last) = self.dev.errors();
-        if count != self.seen {
-            self.seen = count;
+        if count != self.errors_at_render_start {
+            self.errors_at_render_start = count;
             return Err(Fault(last));
         }
         Ok(())
@@ -969,7 +988,7 @@ impl Drawer {
         tiles: &[Tile],
         canvas: (i32, i32),
         shadow: &ShadowKernel,
-    ) -> Result<Option<Cut>, Fault> {
+    ) -> Result<Option<AtlasAllocation>, Fault> {
         let m = SwarmMetrics::new(canvas.1);
         let whole = PixelRect::new(0, 0, canvas.0, canvas.1);
         let plans: Vec<_> = tiles
@@ -984,7 +1003,7 @@ impl Drawer {
         for tile in tiles {
             slots.push(Slot {
                 pixels: pixel_words as u32,
-                cut: !tile.pixels.is_empty(),
+                has_pixels: !tile.pixels.is_empty(),
                 ..Slot::default()
             });
             pixel_words += tile.pixels.len() as u64;
@@ -1001,7 +1020,7 @@ impl Drawer {
         // Each window's shadow profiles, corner indices and mask edges, by column then by row.
         for (slot, plan) in slots.iter_mut().zip(&plans) {
             slot.plan = tables.len() as u32;
-            (slot.frame, slot.area) = (plan.frame, plan.area);
+            (slot.window_rect, slot.shadow_rect) = (plan.frame, plan.area);
             let mask = |v: &[f64]| v.iter().map(|&f| (f as f32).to_bits()).collect::<Vec<_>>();
             for (profile, corner, edge) in [
                 (&plan.profile_x, &plan.corner_x, &plan.mask_x),
@@ -1016,7 +1035,7 @@ impl Drawer {
         let len = pixel_words + tables.len() as u64;
         let shared = self.atlas.clone();
         let mut atlas = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(start) = atlas.alloc(&self.dev, len, self.limit) else {
+        let Some(start) = atlas.alloc(&self.dev, len, self.max_binding_bytes) else {
             return Ok(None);
         };
         let tables_at = start + pixel_words;
@@ -1036,14 +1055,14 @@ impl Drawer {
         }
         drop(atlas);
         // Made before the check, so a fault gives the room back.
-        let cut = Cut {
+        let allocation = AtlasAllocation {
             atlas: self.atlas.clone(),
             start,
             len,
             slots,
         };
-        self.check()?;
-        Ok(Some(cut))
+        self.check_device_faults()?;
+        Ok(Some(allocation))
     }
 
     /// Draws the swarm of `windows` (shown tiles, oldest first) into `out`. `frame` is frame
@@ -1059,9 +1078,9 @@ impl Drawer {
         shadow: &ShadowKernel,
     ) -> Result<(), Fault> {
         let size = (out.width, out.height);
-        let (globals, data) = self.swarm_job(size, windows, frame, number, s, shadow)?;
+        let (globals, data) = self.prepare_swarm_draw(size, windows, frame, number, s, shadow)?;
         let pipeline = self.dev.swarm.clone();
-        self.run(&pipeline, &globals, &data, out)
+        self.draw_with_readback(&pipeline, &globals, &data, out)
     }
 
     /// Draws the swarm as [`Drawer::draw_swarm`] does, into `target`, a host's frame on this
@@ -1083,14 +1102,14 @@ impl Drawer {
             ));
         }
         let size = (target.width as i32, target.height as i32);
-        let (globals, data) = self.swarm_job(size, windows, frame, number, s, shadow)?;
+        let (globals, data) = self.prepare_swarm_draw(size, windows, frame, number, s, shadow)?;
         let pipeline = self.dev.swarm.clone();
-        self.run_into(&pipeline, &globals, &data, target)
+        self.draw_into_target(&pipeline, &globals, &data, target)
     }
 
     /// The globals and tables of a swarm draw over a canvas of `(w, h)`, and the frame uploaded
     /// where the backdrop or live windows show it.
-    fn swarm_job<'t, C: Channel>(
+    fn prepare_swarm_draw<'t, C: Channel>(
         &mut self,
         (w, h): (i32, i32),
         windows: impl IntoIterator<Item = (&'t Tile, Slot)>,
@@ -1103,17 +1122,17 @@ impl Drawer {
         let mut data: Vec<u32> = Vec::new();
         let mut widest = 0;
         for (tile, slot) in windows {
-            data.extend(rect_words(slot.frame));
-            data.extend(rect_words(slot.area));
+            data.extend(rect_words(slot.window_rect));
+            data.extend(rect_words(slot.shadow_rect));
             data.extend(rect_words(tile.stored));
-            data.extend([slot.plan, slot.pixels, u32::from(slot.cut), slot.bar]);
+            data.extend([slot.plan, slot.pixels, u32::from(slot.has_pixels), slot.bar]);
             data.extend([slot.bar_width as u32, 0, 0, 0]);
-            widest = widest.max(slot.frame.w);
+            widest = widest.max(slot.window_rect.w);
         }
         let count = data.len() / WINDOW_WORDS;
         let corner = data.len() as u32;
         data.extend(shadow.corner.iter().map(|f| f.to_bits()));
-        let units = units(&mut data);
+        let unit_table = append_unit_table(&mut data);
         // Where each column and row of a window samples its title bar, as the CPU works it out.
         let bar_h = chrome::TITLE_BAR_HEIGHT;
         let place = |f: f64| {
@@ -1146,7 +1165,7 @@ impl Drawer {
         }
         let (frame_w, frame_h) = frame.map_or((0, 0), |f| (f.width, f.height));
         if let Some(frame) = frame.filter(|_| backdrop == 2 || live) {
-            self.upload(frame, number)?;
+            self.upload_frame(frame, number)?;
         }
         let radius = f64::from(chrome::CORNER_RADIUS) * m.scale;
         let globals = Globals {
@@ -1159,16 +1178,16 @@ impl Drawer {
             backdrop,
             count: count as u32,
             corner,
-            units,
+            unit_table,
             bar_x,
             bar_y,
-            corner_lo: shadow.lo,
+            corner_min_offset: shadow.lo,
             corner_size: shadow.size,
             title_height: m.title_height,
             bar_h,
             scale: m.scale as f32,
             radius: radius as f32,
-            full: (radius + 0.5).clamp(0.0, 1.0) as f32,
+            inner_coverage: (radius + 0.5).clamp(0.0, 1.0) as f32,
             opacity: chrome::SHADOW_OPACITY as f32,
             edge_shade: chrome::BAR_EDGE_SHADE,
             ..Globals::default()
@@ -1220,7 +1239,7 @@ impl Drawer {
                 data.push(u32::from_le_bytes([rows[4], rows[5], rows[6], 0]));
             }
         }
-        let units = units(&mut data);
+        let unit_table = append_unit_table(&mut data);
         let mut flags = if s.mirror { MIRRORED } else { 0 };
         if s.boxes {
             flags |= BOXES;
@@ -1228,7 +1247,7 @@ impl Drawer {
         if s.labels {
             flags |= LABELS;
         }
-        self.upload(frame, number)?;
+        self.upload_frame(frame, number)?;
         let c = s.box_color;
         let globals = Globals {
             width: w,
@@ -1238,24 +1257,27 @@ impl Drawer {
             frame_w: frame.width,
             frame_h: frame.height,
             count: blobs.len() as u32,
-            units,
+            unit_table,
             line,
             text_scale: scale,
-            green: [1.0, c.r, c.g, c.b],
+            box_color: [1.0, c.r, c.g, c.b],
             ..Globals::default()
         };
         let pipeline = self.dev.overlay.clone();
-        self.run(&pipeline, &globals, &data, out)
+        self.draw_with_readback(&pipeline, &globals, &data, out)
     }
 
     /// Puts `frame` in the frame buffer, unless it is already there this render.
-    fn upload<C: Channel>(&mut self, frame: &View<C>, number: i64) -> Result<(), Fault> {
-        if self.loaded == Some(number) {
+    fn upload_frame<C: Channel>(&mut self, frame: &View<C>, number: i64) -> Result<(), Fault> {
+        if self.uploaded_frame == Some(number) {
             return Ok(());
         }
         let row = frame.width as usize * size_of::<Argb<C>>();
         let bytes = (row * frame.height as usize) as u64;
-        let buffer = self.frame.get(&self.dev, self.limit, bytes)?.clone();
+        let buffer = self
+            .frame_buffer
+            .ensure_size(&self.dev, self.max_binding_bytes, bytes)?
+            .clone();
         let size = wgpu::BufferSize::new(bytes).expect("frames aren't empty");
         let mut staged = self
             .dev
@@ -1269,7 +1291,7 @@ impl Drawer {
                 .copy_from_slice(pixel_bytes(frame.row(y)));
         }
         drop(staged);
-        self.loaded = Some(number);
+        self.uploaded_frame = Some(number);
         Ok(())
     }
 
@@ -1283,14 +1305,20 @@ impl Drawer {
         let q = &self.dev.queue;
         q.write_buffer(&self.globals, 0, bytemuck::bytes_of(globals));
         let data_buffer = self
-            .data
-            .get(&self.dev, self.limit, data.len() as u64 * 4)?
+            .table_buffer
+            .ensure_size(&self.dev, self.max_binding_bytes, data.len() as u64 * 4)?
             .clone();
         if !data.is_empty() {
             q.write_buffer(&data_buffer, 0, bytemuck::cast_slice(data));
         }
-        let frame = self.frame.get(&self.dev, self.limit, 16)?.clone();
-        let out = self.out.get(&self.dev, self.limit, out_bytes)?.clone();
+        let frame = self
+            .frame_buffer
+            .ensure_size(&self.dev, self.max_binding_bytes, 16)?
+            .clone();
+        let out = self
+            .output_buffer
+            .ensure_size(&self.dev, self.max_binding_bytes, out_bytes)?
+            .clone();
         let entries = [
             self.globals.as_entire_binding(),
             frame.as_entire_binding(),
@@ -1327,7 +1355,10 @@ impl Drawer {
         let bind = self.bind(globals, data, &atlas.buffer, bytes);
         drop(atlas);
         let bind = bind?;
-        let output = self.out.get(&self.dev, self.limit, bytes)?.clone();
+        let output = self
+            .output_buffer
+            .ensure_size(&self.dev, self.max_binding_bytes, bytes)?
+            .clone();
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
@@ -1353,23 +1384,26 @@ impl Drawer {
             data,
             (width, height, bytes),
         )?;
-        let staging = self.staging.get(&self.dev, self.limit, bytes)?.clone();
-        encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, bytes);
+        let readback_buffer = self
+            .readback_buffer
+            .ensure_size(&self.dev, self.max_binding_bytes, bytes)?
+            .clone();
+        encoder.copy_buffer_to_buffer(&output, 0, &readback_buffer, 0, bytes);
         let submitted = self.dev.queue.submit(Some(encoder.finish()));
-        Ok((staging, submitted))
+        Ok((readback_buffer, submitted))
     }
 
     /// Runs a draw over the whole of `target` and writes it there, with no readback. The host's
     /// work that shows `target` comes after it on the same queue, so nothing here waits.
     #[cfg(not(target_arch = "wasm32"))]
-    fn run_into(
+    fn draw_into_target(
         &mut self,
         pipeline: &wgpu::ComputePipeline,
         globals: &Globals,
         data: &[u32],
         target: &vfx_core::Frame,
     ) -> Result<(), Fault> {
-        self.check()?;
+        self.check_device_faults()?;
         let size = (target.width as i32, target.height as i32);
         let bytes = u64::from(target.width) * u64::from(target.height) * 4;
         let mut encoder = self.dev.device.create_command_encoder(&Default::default());
@@ -1384,7 +1418,7 @@ impl Drawer {
         let canvas = [target.width, 0, 0, 0];
         self.dev
             .queue
-            .write_buffer(&self.canvas, 0, bytemuck::cast_slice(&canvas));
+            .write_buffer(&self.unpack_uniform, 0, bytemuck::cast_slice(&canvas));
         let bind = self
             .dev
             .device
@@ -1398,7 +1432,7 @@ impl Drawer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: self.canvas.as_entire_binding(),
+                        resource: self.unpack_uniform.as_entire_binding(),
                     },
                 ],
             });
@@ -1424,40 +1458,40 @@ impl Drawer {
             pass.draw(0..3, 0..1);
         }
         self.dev.queue.submit(Some(encoder.finish()));
-        self.check()?;
+        self.check_device_faults()?;
         self.drawn += 1;
-        self.note(false);
+        self.record_outcome(false);
         Ok(())
     }
 
     /// Runs a draw over the whole of `out` and reads it back into `out`. Waits only for this
     /// render's work, and not for long: a render that isn't back in time is a fault.
     #[cfg(not(target_arch = "wasm32"))]
-    fn run<C: Channel>(
+    fn draw_with_readback<C: Channel>(
         &mut self,
         pipeline: &wgpu::ComputePipeline,
         globals: &Globals,
         data: &[u32],
         out: &mut ViewMut<C>,
     ) -> Result<(), Fault> {
-        self.check()?;
+        self.check_device_faults()?;
         let row = out.width as usize * size_of::<Argb<C>>();
         let bytes = (row * out.height as usize) as u64;
-        let (staging, submitted) =
+        let (readback_buffer, submitted) =
             self.submit(pipeline, globals, data, (out.width, out.height, bytes))?;
 
-        let slice = staging.slice(..bytes);
+        let slice = readback_buffer.slice(..bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
         let wait = wgpu::PollType::Wait {
             submission_index: Some(submitted),
-            timeout: Some(self.wait),
+            timeout: Some(self.readback_timeout),
         };
         // Another instance's poll may be the one that calls back, a moment later.
         let mapped = match self.dev.device.poll(wait) {
-            Ok(_) => match rx.recv_timeout(self.wait) {
+            Ok(_) => match rx.recv_timeout(self.readback_timeout) {
                 Ok(result) => result.map_err(|e| e.to_string()),
                 Err(_) => Err("the readback never finished".into()),
             },
@@ -1465,7 +1499,7 @@ impl Drawer {
         };
         if let Err(e) = mapped {
             // The map may still be pending on the buffer: the next render takes a new one.
-            self.staging.buffer = None;
+            self.readback_buffer.buffer = None;
             return Err(Fault(e));
         }
 
@@ -1473,7 +1507,7 @@ impl Drawer {
             let mapped = match slice.get_mapped_range() {
                 Ok(mapped) => mapped,
                 Err(e) => {
-                    self.staging.buffer = None;
+                    self.readback_buffer.buffer = None;
                     return Err(Fault(e.to_string()));
                 }
             };
@@ -1491,10 +1525,10 @@ impl Drawer {
                 }
             });
         }
-        staging.unmap();
-        self.check()?;
+        readback_buffer.unmap();
+        self.check_device_faults()?;
         self.drawn += 1;
-        self.note(false);
+        self.record_outcome(false);
         Ok(())
     }
 
@@ -1502,7 +1536,7 @@ impl Drawer {
     /// [`unfinished`](Self::unfinished). The next render that asks for the same draw reads it
     /// back into `out`; one that asks for another drops it.
     #[cfg(target_arch = "wasm32")]
-    fn run<C: Channel>(
+    fn draw_with_readback<C: Channel>(
         &mut self,
         pipeline: &wgpu::ComputePipeline,
         globals: &Globals,
@@ -1512,43 +1546,50 @@ impl Drawer {
         use std::hash::{Hash, Hasher};
         use std::sync::atomic::{AtomicU8, Ordering};
 
-        self.check()?;
+        self.check_device_faults()?;
         let mut key = std::hash::DefaultHasher::new();
-        (pipeline, bytemuck::bytes_of(globals), data, self.loaded).hash(&mut key);
+        (
+            pipeline,
+            bytemuck::bytes_of(globals),
+            data,
+            self.uploaded_frame,
+        )
+            .hash(&mut key);
         let key = key.finish();
-        if let Some(flight) = self.flight.take() {
-            let state = flight.state.load(Ordering::Acquire);
-            match (flight.key == key, state) {
-                (true, MAPPED) => return self.take(flight, out),
+        if let Some(in_flight) = self.in_flight.take() {
+            let state = in_flight.state.load(Ordering::Acquire);
+            match (in_flight.key == key, state) {
+                (true, MAPPED) => return self.read_in_flight_draw(in_flight, out),
                 (true, PENDING) => {
-                    self.flight = Some(flight);
+                    self.in_flight = Some(in_flight);
                     self.unfinished = true;
                     return Ok(());
                 }
                 (true, _) => return Err(Fault("the readback failed to map".into())),
-                (false, PENDING) => self.restarts += 1,
+                (false, PENDING) => self.superseded_draws += 1,
                 (false, _) => {}
             }
         }
-        if self.restarts >= RESTARTS {
-            self.restarts = 0;
+        if self.superseded_draws >= MAX_SUPERSEDED_DRAWS {
+            self.superseded_draws = 0;
             return Err(Fault("the draw changed before the GPU was done".into()));
         }
         let row = out.width as usize * size_of::<Argb<C>>();
         let bytes = (row * out.height as usize) as u64;
-        let (staging, _) = self.submit(pipeline, globals, data, (out.width, out.height, bytes))?;
+        let (readback_buffer, _) =
+            self.submit(pipeline, globals, data, (out.width, out.height, bytes))?;
         // The next draw takes another buffer while this one is mapped.
-        self.staging.buffer = None;
+        self.readback_buffer.buffer = None;
         let state = Arc::new(AtomicU8::new(PENDING));
         let done = state.clone();
-        staging
+        readback_buffer
             .slice(..bytes)
             .map_async(wgpu::MapMode::Read, move |r| {
                 done.store(if r.is_ok() { MAPPED } else { u8::MAX }, Ordering::Release);
             });
-        self.flight = Some(Flight {
+        self.in_flight = Some(InFlightDraw {
             key,
-            staging,
+            readback_buffer,
             state,
         });
         self.unfinished = true;
@@ -1557,29 +1598,35 @@ impl Drawer {
 
     /// Reads a draw that came back into `out`.
     #[cfg(target_arch = "wasm32")]
-    fn take<C: Channel>(&mut self, flight: Flight, out: &mut ViewMut<C>) -> Result<(), Fault> {
+    fn read_in_flight_draw<C: Channel>(
+        &mut self,
+        in_flight: InFlightDraw,
+        out: &mut ViewMut<C>,
+    ) -> Result<(), Fault> {
         let row = out.width as usize * size_of::<Argb<C>>();
         let bytes = (row * out.height as usize) as u64;
         {
-            let slice = flight.staging.slice(..bytes);
+            let slice = in_flight.readback_buffer.slice(..bytes);
             let mapped = slice.get_mapped_range().map_err(|e| Fault(e.to_string()))?;
             for y in 0..out.height {
                 let at = y as usize * row;
                 pixel_bytes_mut(out.row_mut(y)).copy_from_slice(&mapped[at..at + row]);
             }
         }
-        flight.staging.unmap();
-        self.staging.buffer.get_or_insert(flight.staging);
-        self.restarts = 0;
-        self.check()?;
+        in_flight.readback_buffer.unmap();
+        self.readback_buffer
+            .buffer
+            .get_or_insert(in_flight.readback_buffer);
+        self.superseded_draws = 0;
+        self.check_device_faults()?;
         self.drawn += 1;
-        self.note(false);
+        self.record_outcome(false);
         Ok(())
     }
 }
 
 /// Appends the 8-bit levels as units, as `Channel::to_unit` makes them; where they start.
-fn units(data: &mut Vec<u32>) -> u32 {
+fn append_unit_table(data: &mut Vec<u32>) -> u32 {
     let at = data.len() as u32;
     data.extend((0..=255u8).map(|n| n.to_unit().to_bits()));
     at
@@ -1613,7 +1660,7 @@ mod tests {
         std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default()
     }
 
-    fn atlas_accepts_writes(atlas: &Atlas, dev: &Device) -> bool {
+    fn atlas_accepts_writes(atlas: &Atlas, dev: &GpuContext) -> bool {
         let before = dev.errors().0;
         dev.queue.write_buffer(&atlas.buffer, 0, &[0; 4]);
         dev.errors().0 == before
@@ -1643,7 +1690,7 @@ mod tests {
             .expect("the noop adapter");
         let limits = adapter.limits();
         let dev = test_device(adapter, limits).expect("a noop device");
-        let atlas = Atlas::with(&dev, 1024);
+        let atlas = Atlas::with_words(&dev, 1024);
         let errors = dev.errors().0;
         let pending = PendingGrowth::new(&dev, 1 << 58);
         let refusal = pollster::block_on(pending.refusal);
@@ -1675,7 +1722,7 @@ mod tests {
                 .checked_sub(Atlas::GROWTH_RETRY_AFTER)
                 .expect("up for a minute")
         };
-        let mut atlas = Atlas::with(&dev, 1024);
+        let mut atlas = Atlas::with_words(&dev, 1024);
         let errors = dev.errors().0;
         let oversized = bytes;
         assert!(atlas.alloc(&dev, oversized, u64::MAX).is_none());
@@ -1700,7 +1747,7 @@ mod tests {
         );
         assert!(atlas.words >= words);
 
-        let mut atlas = Atlas::with(&dev, 1024);
+        let mut atlas = Atlas::with_words(&dev, 1024);
         assert!(atlas.alloc(&dev, 1024, u64::MAX).is_some());
         atlas.ceiling = 1024;
         atlas.last_refusal = Some(Instant::now());
@@ -1721,7 +1768,8 @@ mod tests {
     #[test]
     fn a_panic_while_opening_is_a_failed_gpu() {
         static OPENED: OnceLock<Opened> = OnceLock::new();
-        let opening = std::thread::spawn(|| settle(&OPENED, || panic!("a broken driver")));
+        let opening =
+            std::thread::spawn(|| open_and_publish(&OPENED, || panic!("a broken driver")));
         opening.join().expect("the panic got out of the opening");
         assert!(OPENED.get().is_some(), "still opening after the panic");
         match status_of(&OPENED) {

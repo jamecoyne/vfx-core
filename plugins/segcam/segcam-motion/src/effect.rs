@@ -144,7 +144,7 @@ pub struct SegcamMotion {
 impl Default for SegcamMotion {
     /// Draws Swarm on the GPU where there is one, unless `SEGCAM_GPU=0`.
     fn default() -> Self {
-        Self::with_gpu(crate::gpu::wanted())
+        Self::with_gpu(crate::gpu::enabled_by_env())
     }
 }
 

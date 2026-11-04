@@ -20,7 +20,7 @@ use vfx_core::wgpu;
 use vfx_core::{Reading, Report};
 use vfx_plugin::vfx_host::by_rows;
 
-use crate::gpu::{self, Cut, Drawer, Fault};
+use crate::gpu::{self, AtlasAllocation, Drawer, Fault};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
@@ -72,7 +72,7 @@ pub struct IncrementalRenderer {
     /// there. The drawer is made by the first render that draws on the GPU once the device is
     /// open, as hosts make instances often.
     drawer: Option<Box<Drawer>>,
-    atlas_allocations: BTreeMap<i64, Cut>,
+    atlas_allocations: BTreeMap<i64, AtlasAllocation>,
     gpu_wanted: bool,
     gpu_overlay: bool,
     /// The last fault told of, so a fault that repeats every render is told of once.
@@ -245,7 +245,7 @@ impl IncrementalRenderer {
             s.mode == OutputMode::Swarm || s.mode == OutputMode::Overlay && self.gpu_overlay;
         // While the device opens, renders draw on the CPU.
         if self.gpu_wanted && self.drawer.is_none() && mode_uses_gpu && !gpu::opening() {
-            let drawer = gpu::device().and_then(Drawer::on).map(Box::new);
+            let drawer = gpu::device().and_then(Drawer::new).map(Box::new);
             self.gpu_wanted = drawer.is_some();
             self.set_drawer(drawer);
         }
@@ -575,11 +575,11 @@ impl IncrementalRenderer {
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
     ) -> Result<(), Fault> {
-        let Some(mut drawer) = self.drawer.take_if(|drawer| !drawer.resting()) else {
+        let Some(mut drawer) = self.drawer.take_if(|drawer| !drawer.in_fault_cooldown()) else {
             self.draw_cpu(s, count, number, frame, out);
             return Ok(());
         };
-        drawer.begin();
+        drawer.begin_render();
         let drawn = self.draw_gpu(&mut drawer, s, count, number, frame, out);
         self.unfinished = drawn.is_ok() && drawer.unfinished;
         self.drawer = Some(drawer);
@@ -601,7 +601,7 @@ impl IncrementalRenderer {
                 self.gpu_wanted = false;
                 self.set_drawer(None);
             }
-            Some(drawer) => drawer.fault(),
+            Some(drawer) => drawer.record_fault(),
             None => {}
         }
     }
@@ -699,7 +699,7 @@ impl IncrementalRenderer {
                 continue;
             };
             match drawer.upload_tiles(tiles, (w, h), &shadow)? {
-                Some(cut) => self.atlas_allocations.insert(f, cut),
+                Some(allocation) => self.atlas_allocations.insert(f, allocation),
                 None => {
                     draw_output(out, s, frame, motion, number, shown.iter().map(|p| p.tile));
                     return Ok(());
@@ -1101,7 +1101,7 @@ mod tests {
 
     /// A device of the test's own, on the adapter `SEGCAM_GPU_ADAPTER` picks or on a software
     /// one where there is none; `None` where there is no adapter at all.
-    fn own_device() -> Option<Arc<gpu::Device>> {
+    fn own_device() -> Option<Arc<gpu::GpuContext>> {
         let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
         match gpu::open(&choice).or_else(|_| gpu::open("fallback")) {
             Ok(dev) => Some(Arc::new(dev)),
@@ -1113,9 +1113,9 @@ mod tests {
     }
 
     /// An instance drawing every swarm render on `dev`.
-    fn on_device(dev: &Arc<gpu::Device>) -> IncrementalRenderer {
+    fn on_device(dev: &Arc<gpu::GpuContext>) -> IncrementalRenderer {
         let mut on_gpu = IncrementalRenderer::default();
-        on_gpu.use_drawer(gpu::Drawer::on(dev.clone()).expect("a drawer on a working device"));
+        on_gpu.use_drawer(gpu::Drawer::new(dev.clone()).expect("a drawer on a working device"));
         on_gpu.set_gpu_min_coverage(0.0);
         on_gpu
     }
@@ -1173,7 +1173,7 @@ mod tests {
         );
         assert!(!on_gpu.gpu_wanted, "the instance still looks for a GPU");
         assert!(
-            gpu::Drawer::on(dev).is_none(),
+            gpu::Drawer::new(dev).is_none(),
             "a new instance draws on the lost device"
         );
     }
@@ -1287,7 +1287,11 @@ mod tests {
         let mut on_gpu = on_device(&dev);
         for n in 0..frames.len() {
             let limit = if n == 7 { 1024 } else { u64::MAX };
-            on_gpu.drawer.as_mut().expect("on the GPU").set_limit(limit);
+            on_gpu
+                .drawer
+                .as_mut()
+                .expect("on the GPU")
+                .set_max_binding_bytes(limit);
             let before = drawn(&on_gpu);
             let (a, b) = (
                 render(&mut cpu, &frames, n),
@@ -1321,12 +1325,16 @@ mod tests {
         let mut cpu = IncrementalRenderer::default();
         let mut on_gpu = on_device(&dev);
         for n in 0..frames.len() {
-            let wait = if n == 7 {
+            let timeout = if n == 7 {
                 std::time::Duration::ZERO
             } else {
                 std::time::Duration::from_secs(10)
             };
-            on_gpu.drawer.as_mut().expect("on the GPU").set_wait(wait);
+            on_gpu
+                .drawer
+                .as_mut()
+                .expect("on the GPU")
+                .set_readback_timeout(timeout);
             let before = drawn(&on_gpu);
             let (a, b) = (
                 render(&mut cpu, &frames, n),
@@ -1361,12 +1369,15 @@ mod tests {
         for n in 0..frames.len() {
             let drawer = on_gpu.drawer.as_mut().expect("on the GPU");
             let failing = n < 8 && n % 2 == 0 || resting_frames.contains(&n);
-            drawer.set_limit(if failing { 1024 } else { u64::MAX });
+            drawer.set_max_binding_bytes(if failing { 1024 } else { u64::MAX });
             if n == resting_frames.end {
-                assert!(drawer.resting(), "still trying the GPU at frame {n}");
-                drawer.set_rest(Duration::ZERO);
+                assert!(
+                    drawer.in_fault_cooldown(),
+                    "still trying the GPU at frame {n}"
+                );
+                drawer.set_cooldown(Duration::ZERO);
             }
-            let resting = drawer.resting();
+            let resting = drawer.in_fault_cooldown();
             let (before, faulted) = (drawn(&on_gpu), faults(&on_gpu));
             let (a, b) = (
                 render(&mut cpu, &frames, n),
@@ -1382,7 +1393,7 @@ mod tests {
                 assert_eq!(drawn(&on_gpu), before + 1, "frame {n} wasn't on the GPU");
             }
         }
-        assert_eq!(faults(&on_gpu), u64::from(gpu::TRIES));
+        assert_eq!(faults(&on_gpu), u64::from(gpu::MAX_RECENT_FAULTS));
         assert!(dev.lost().is_none(), "the device was given up");
     }
 
@@ -1426,9 +1437,9 @@ mod tests {
         let _lock = gpu_test_lock();
         let Some(dev) = own_device() else { return };
         let frames = crossing();
-        let mut drawer = gpu::Drawer::on(dev.clone()).expect("a drawer on a working device");
-        let first_words = 1024;
-        drawer.small_atlas(first_words);
+        let mut drawer = gpu::Drawer::new(dev.clone()).expect("a drawer on a working device");
+        let initial_words = 1024;
+        drawer.small_atlas(initial_words);
         let mut on_gpu = IncrementalRenderer::default();
         on_gpu.use_drawer(drawer);
         on_gpu.set_gpu_min_coverage(0.0);
@@ -1437,7 +1448,7 @@ mod tests {
         }
         let drawer = on_gpu.drawer().expect("a drawer");
         let (drawer_address, grown_words) = (drawer as *const gpu::Drawer, drawer.atlas_words().0);
-        assert!(grown_words > first_words, "the atlas never grew");
+        assert!(grown_words > initial_words, "the atlas never grew");
 
         on_gpu.clear_history();
         let drawer = on_gpu.drawer().expect("a drawer");
@@ -1468,11 +1479,11 @@ mod tests {
         let Some(dev) = own_device() else { return };
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
-        let mut drawer = gpu::Drawer::on(dev.clone()).expect("a drawer on a working device");
+        let mut drawer = gpu::Drawer::new(dev.clone()).expect("a drawer on a working device");
         // Room for the canvas and a few frames' tiles, and no more.
         let bytes = (W * H * 4) as u64 + 4096;
         drawer.small_atlas(1024);
-        drawer.set_limit(bytes);
+        drawer.set_max_binding_bytes(bytes);
         let mut on_gpu = IncrementalRenderer::default();
         on_gpu.use_drawer(drawer);
         on_gpu.set_gpu_min_coverage(0.0);
@@ -1507,7 +1518,7 @@ mod tests {
         };
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
-        let mut drawer = gpu::Drawer::on(dev.clone()).expect("a drawer on a working device");
+        let mut drawer = gpu::Drawer::new(dev.clone()).expect("a drawer on a working device");
         // The usual first atlas is over the limit too.
         drawer.small_atlas(1024);
         let errors = dev.errors().0;
