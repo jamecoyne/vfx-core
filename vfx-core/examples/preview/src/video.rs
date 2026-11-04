@@ -2,7 +2,9 @@
 //! only).
 //!
 //! Live playback: ffmpeg writes raw ARGB frames to a pipe, and a reader thread queues them with
-//! their times. A loop that falls behind loses the oldest. Recording goes through [`Encoder`].
+//! their times. A loop that falls behind loses the oldest. A file played from its start loops
+//! inside one ffmpeg process, so the picture has no gap at the loop. Recording goes through
+//! [`Encoder`].
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -168,6 +170,11 @@ pub struct Info {
     pub fps: f64,
     /// Infinite for cameras.
     pub duration: f64,
+    /// Frames ffmpeg delivers per pass of a file, when that count is exact: ffprobe reports it
+    /// and the rate is constant. The reader counts frames to find the loop, and a count that
+    /// is off by one would move the loop one frame further each pass over a show. `None` plays
+    /// each pass in its own process.
+    frames_per_pass: Option<u64>,
     /// Fitted into `size` with transparent padding, not scaled to it (see [`Info::fitted`]).
     pub fit: bool,
 }
@@ -205,7 +212,7 @@ impl Info {
                     "-select_streams",
                     "v:0",
                     "-show_entries",
-                    "stream=width,height,avg_frame_rate:format=duration",
+                    "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames:format=duration",
                     "-of",
                     "default=noprint_wrappers=1",
                 ])
@@ -241,6 +248,10 @@ impl Info {
                     .filter(|d| *d > 0.0)
                     .unwrap_or(1.0 / fps),
             };
+            let frames_per_pass = field("nb_frames")
+                .and_then(|v| v.parse().ok())
+                .filter(|&frames| frames > 0)
+                .filter(|_| field("r_frame_rate") == Some(rate.as_str()));
 
             let scale = (max_side as f32 / w.max(h) as f32).min(1.0);
             let even = |v: u32| ((v as f32 * scale) as u32 & !1).max(2);
@@ -250,6 +261,7 @@ impl Info {
                 rate,
                 fps,
                 duration,
+                frames_per_pass,
                 fit: false,
             });
         }
@@ -260,6 +272,14 @@ impl Info {
         (self.size.0 * self.size.1) as usize
     }
 
+    /// The frames per pass of a process decoding from `start` seconds, if it loops. Only a pass
+    /// from the very start loops: with `-ss`, ffmpeg's accurate seek trim also applies to later
+    /// passes and cuts their beginnings.
+    fn looping_pass(&self, start: f64, pace: Pace) -> Option<u64> {
+        self.frames_per_pass
+            .filter(|_| start == 0.0 && pace == Pace::Live)
+    }
+
     /// ffmpeg arguments that decode this input to raw ARGB at `size` on stdout, from `start`
     /// seconds (files only). No `-re`: it hands over the first half second at once.
     fn decode_command(&self, start: f64, pace: Pace) -> Command {
@@ -267,6 +287,9 @@ impl Info {
         cmd.args(["-v", "error"]);
         if self.file().is_some() && start > 0.0 {
             cmd.args(["-ss", &format!("{start:.3}")]);
+        }
+        if self.looping_pass(start, pace).is_some() {
+            cmd.args(["-stream_loop", "-1"]);
         }
         let (w, h) = self.size;
         // Through RGBA first: swscale rounds YUV to ARGB differently, up to 3 levels off.
@@ -307,7 +330,8 @@ enum Pace {
 
 /// Live playback that can pause and seek. Each seek replaces the ffmpeg process with
 /// one started at the new position; a reader thread per process queues its frames, and
-/// frames from a replaced process are ignored.
+/// frames from a replaced process are ignored. The caller restarts a process that ended; one
+/// started at the beginning of a file with an exact frame count keeps looping instead.
 pub struct Video {
     pub info: Info,
     shared: Arc<Mutex<Playback>>,
@@ -330,12 +354,14 @@ struct Playback {
     position: f64,
     /// Where the current decode started, in seconds.
     start: f64,
-    /// Frames the current decode has delivered.
+    /// Frames the current decode has delivered in this pass of the file.
     frames: u64,
     /// Frames that arrived since the last [`Video::take_arrived_count`], dropped ones too.
     arrived: u64,
+    /// A frame of a later pass was taken since the last [`Video::take_looped`].
+    looped: bool,
     playing: bool,
-    /// A playing file reached its end (the caller loops it with `seek`).
+    /// A playing process ended (the caller starts another with `seek`).
     ended: bool,
 }
 
@@ -364,6 +390,7 @@ impl Video {
                 start: 0.0,
                 frames: 0,
                 arrived: 0,
+                looped: false,
                 playing: true,
                 ended: false,
             })),
@@ -403,6 +430,7 @@ impl Video {
         s.position = position;
         s.start = position;
         s.frames = 0;
+        s.looped = false;
         s.playing = play || camera;
         s.ended = false;
         while let Some(old) = s.queue.pop_front() {
@@ -413,6 +441,7 @@ impl Video {
         let shared = Arc::clone(&self.shared);
         let size = self.info.frame_pixels();
         let (fps, duration) = (self.info.fps, self.info.duration);
+        let looping_pass = self.info.looping_pass(position, pace);
         let mut pixels = s.spare.pop().unwrap_or_else(|| bytemuck::zeroed_vec(size));
         let mut first_frame_at = None;
         let mut frames_read = 0u32;
@@ -423,7 +452,8 @@ impl Video {
                 .is_ok()
             {
                 if !camera {
-                    // Due by the clock from the first frame; a late one goes straight on.
+                    // Due by the clock from the process's first frame, whatever the pass, so a
+                    // loop doesn't restart the pacing; a late one goes straight on.
                     let now = Instant::now();
                     let since_first = Duration::from_secs_f64(f64::from(frames_read) / fps);
                     let due = *first_frame_at.get_or_insert(now) + since_first;
@@ -436,6 +466,9 @@ impl Video {
                 }
                 let time = (s.start + s.frames as f64 / fps).min(duration);
                 s.frames += 1;
+                if looping_pass == Some(s.frames) {
+                    s.frames = 0;
+                }
                 s.arrived += 1;
                 let next = if s.queue.len() == MAX_QUEUED {
                     s.queue.pop_front().map(|oldest| oldest.pixels)
@@ -463,8 +496,16 @@ impl Video {
         if old.len() == self.info.frame_pixels() {
             s.spare.push(old);
         }
+        // Compared here, not where the reader wraps: that frame may be dropped from the queue.
+        s.looped |= frame.time < s.position;
         s.position = frame.time;
         Some(frame.time)
+    }
+
+    /// Whether playback went back to the start of the file inside its process since the last
+    /// call. A seek clears it.
+    pub fn take_looped(&self) -> bool {
+        std::mem::take(&mut self.shared.lock().unwrap().looped)
     }
 
     /// As [`Video::take_frame`], skipping to the newest waiting frame.
@@ -492,7 +533,7 @@ impl Video {
         self.shared.lock().unwrap().playing
     }
 
-    /// Whether a playing file has reached its end and its last frame was taken.
+    /// Whether a playing process has ended and its last frame was taken.
     pub fn ended(&self) -> bool {
         let s = self.shared.lock().unwrap();
         s.ended && s.queue.is_empty()
@@ -705,6 +746,81 @@ mod tests {
             video.ended()
         });
         assert!(video.position() > 2.8, "{}", video.position());
+    }
+
+    /// Playing from the start wraps time at the frame count, in the same process and with the
+    /// same picture as the first pass, and reports the loop once.
+    #[test]
+    #[ignore]
+    fn file_loops_in_one_process() {
+        let video = Video::open(Input::File(test_clip("loop-test")), 1920).unwrap();
+        assert_eq!(video.info.frames_per_pass, Some(75));
+        let child = |video: &Video| {
+            let s = video.shared.lock().unwrap();
+            (s.generation, s.child.as_ref().unwrap().id())
+        };
+        let process = child(&video);
+
+        let mut pixels = Vec::new();
+        wait_for("the first frame", || {
+            video.take_frame(&mut pixels).is_some()
+        });
+        assert_eq!(video.position(), 0.0);
+        let first_pass = pixels.clone();
+        wait_for("the next pass", || {
+            video.take_frame(&mut pixels);
+            video.take_looped()
+        });
+        assert_eq!(video.position(), 0.0);
+        assert!(first_pass == pixels, "the next pass starts elsewhere");
+        assert!(!video.take_looped());
+        assert!(!video.ended());
+        assert_eq!(child(&video), process);
+    }
+
+    /// A seek away from the start ends with its process, at the file's end, and the caller's
+    /// restart from the start then loops.
+    #[test]
+    #[ignore]
+    fn seek_plays_to_end_then_restart_loops() {
+        let video = Video::open(Input::File(test_clip("seek-loop-test")), 1920).unwrap();
+        video.seek(2.5, true).unwrap();
+        let mut pixels = Vec::new();
+        wait_for("the end", || {
+            video.take_frame(&mut pixels);
+            video.ended()
+        });
+        assert!(!video.take_looped());
+        video.seek(0.0, true).unwrap();
+        wait_for("the next pass", || {
+            video.take_frame(&mut pixels);
+            video.take_looped()
+        });
+        assert!(!video.ended());
+    }
+
+    /// Without an exact count a file keeps one process per pass: mkv doesn't report one, and
+    /// a variable rate doesn't give one.
+    #[test]
+    fn inexact_frame_count_does_not_loop() {
+        let dir = std::env::temp_dir().join("vfx-preview-count-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let encode = |name: &str, filter: &str| {
+            let clip = dir.join(name);
+            let made = Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg("testsrc2=size=160x120:rate=25:duration=1")
+                .args(["-vf", filter, "-fps_mode", "vfr", "-pix_fmt", "yuv420p"])
+                .arg(&clip)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            Info::probe(Input::File(clip), 160).unwrap().frames_per_pass
+        };
+        assert_eq!(encode("constant.mp4", "null"), Some(25));
+        assert_eq!(encode("constant.mkv", "null"), None);
+        let gap_after_12_frames = "settb=1/1000,setpts='(N/25+if(gt(N,12),0.2,0))/TB'";
+        assert_eq!(encode("variable.mp4", gap_after_12_frames), None);
     }
 
     #[test]

@@ -449,6 +449,14 @@ impl Preview {
             {
                 tracker.submit(pixels, media.video.info.size);
             }
+            // The picture looped without a seek. The sound is restarted with it, not looped by
+            // ffplay, which would drift from the picture over a show.
+            if media.video.take_looped() {
+                media.sound = None;
+                if self.sound_on {
+                    media.sound = video::Sound::play(&media.video.info, 0.0);
+                }
+            }
             let position = media.video.position();
             frame_time = position;
             self.sources = modulation::sources(
