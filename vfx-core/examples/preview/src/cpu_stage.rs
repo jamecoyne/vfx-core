@@ -73,6 +73,12 @@ impl CpuStage {
         self.effect.clear_history();
         self.last_time = None;
         self.rendered_with = None;
+        // Frames still on their way belong to the old source. When a loop lands here the reader
+        // is out in `push_input`, and its frames stay valid.
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.reader = None;
+        }
     }
 
     /// Follows a new frame size, keeping the effect and its GPU resources.
@@ -297,23 +303,37 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Frames a browser may have on their way back at once. A map takes more than a screen refresh,
+/// so with fewer the render rate falls below the source's; each one more costs a buffer, and the
+/// output can run this many frames behind the input.
+#[cfg(target_arch = "wasm32")]
+const MAX_IN_FLIGHT: usize = 3;
+
 /// Reads input frames back to the CPU. On the desktop it waits for each one, so every frame
-/// an export renders is in the history. Browsers can't wait on the GPU, so the web build
-/// maps each frame without waiting and takes it at a later render: the output runs a frame
-/// or two behind the input.
+/// reaches the history. Browsers can't wait on the GPU, so the web build maps each frame without
+/// waiting and takes it at a later render, in order.
 struct GpuFrameReader {
     eight_bit: Frame,
     pass: FullscreenPass,
+    #[cfg(not(target_arch = "wasm32"))]
     buffer: wgpu::Buffer,
     pitch: u32,
+    /// Oldest first, at most [`MAX_IN_FLIGHT`].
     #[cfg(target_arch = "wasm32")]
-    in_flight: Option<InFlight>,
+    in_flight: std::collections::VecDeque<InFlight>,
+    /// Buffers back from a frame, to map again.
+    #[cfg(target_arch = "wasm32")]
+    free_buffers: Vec<wgpu::Buffer>,
+    /// The time of the frame last copied.
+    #[cfg(target_arch = "wasm32")]
+    newest_copied: Option<f64>,
 }
 
-/// A frame copied and being mapped: its time, and how the map went.
+/// A frame copied and being mapped: its time, its buffer and how the map went.
 #[cfg(target_arch = "wasm32")]
 struct InFlight {
     time: f64,
+    buffer: wgpu::Buffer,
     state: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
@@ -328,13 +348,9 @@ impl GpuFrameReader {
     fn new(gpu: &Gpu, size: (u32, u32)) -> Self {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let pitch = (size.0 * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("CPU effect readback"),
-            size: u64::from(pitch) * u64::from(size.1),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            buffer: new_readback_buffer(gpu, pitch, size.1),
             eight_bit: Frame::new(gpu, size.0, size.1, format),
             pass: FullscreenPass::new(
                 &gpu.device,
@@ -346,14 +362,17 @@ impl GpuFrameReader {
                 },
                 format,
             ),
-            buffer,
             pitch,
             #[cfg(target_arch = "wasm32")]
-            in_flight: None,
+            in_flight: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            free_buffers: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            newest_copied: None,
         }
     }
 
-    fn copy_to_buffer(&self, gpu: &Gpu, input: &Frame) {
+    fn copy_to_buffer(&self, gpu: &Gpu, input: &Frame, buffer: &wgpu::Buffer) {
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.pass.layout,
@@ -367,7 +386,7 @@ impl GpuFrameReader {
         encoder.copy_texture_to_buffer(
             self.eight_bit.texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.buffer,
+                buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.pitch),
@@ -379,17 +398,21 @@ impl GpuFrameReader {
         gpu.queue.submit(Some(encoder.finish()));
     }
 
-    /// Hands `f` the mapped buffer as RGBA rows `pitch` bytes apart, with the time of the
+    /// Hands `f` the mapped `buffer` as RGBA rows `pitch` bytes apart, with the time of the
     /// frame in it, then unmaps it.
-    fn with_mapped_rows(&self, time: f64, f: impl FnOnce(f64, &[u8], usize)) {
-        let data = self
-            .buffer
+    fn with_mapped_rows(
+        &self,
+        buffer: &wgpu::Buffer,
+        time: f64,
+        f: impl FnOnce(f64, &[u8], usize),
+    ) {
+        let data = buffer
             .slice(..)
             .get_mapped_range()
             .expect("readback is mapped");
         f(time, &data, self.pitch as usize);
         drop(data);
-        self.buffer.unmap();
+        buffer.unmap();
     }
 
     /// Reads the input back if it is a new frame (a time other than `last`) and hands it
@@ -407,7 +430,7 @@ impl GpuFrameReader {
         if last == Some(time) {
             return;
         }
-        self.copy_to_buffer(gpu, input);
+        self.copy_to_buffer(gpu, input, &self.buffer);
         let (tx, rx) = std::sync::mpsc::channel();
         self.buffer
             .slice(..)
@@ -420,9 +443,11 @@ impl GpuFrameReader {
         rx.recv()
             .expect("map callback dropped")
             .expect("readback failed to map");
-        self.with_mapped_rows(time, f);
+        self.with_mapped_rows(&self.buffer, time, f);
     }
 
+    /// Starts reading the input back if it is a new frame, room permitting, and hands `f` the
+    /// oldest frame that has arrived, if any.
     #[cfg(target_arch = "wasm32")]
     fn read(
         &mut self,
@@ -433,35 +458,53 @@ impl GpuFrameReader {
         f: impl FnOnce(f64, &[u8], usize),
     ) {
         use std::sync::atomic::{AtomicU8, Ordering};
-        if let Some(flight) = self.in_flight.take() {
-            match flight.state.load(Ordering::Acquire) {
-                MAP_DONE => {
-                    self.with_mapped_rows(flight.time, f);
-                    return;
-                }
-                MAP_FAILED => {} // a new frame is read below; the lost one is skipped
-                _ => {
-                    self.in_flight = Some(flight);
-                    return; // still on its way; the next render looks again
-                }
-            }
-        }
-        if last == Some(time) {
-            return;
-        }
-        self.copy_to_buffer(gpu, input);
-        let state = std::sync::Arc::new(AtomicU8::new(MAP_PENDING));
-        let done = state.clone();
-        self.buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |r| {
+        let new_frame = last != Some(time) && self.newest_copied != Some(time);
+        if new_frame && self.in_flight.len() < MAX_IN_FLIGHT {
+            let buffer = self
+                .free_buffers
+                .pop()
+                .unwrap_or_else(|| new_readback_buffer(gpu, self.pitch, self.eight_bit.height));
+            self.copy_to_buffer(gpu, input, &buffer);
+            let state = std::sync::Arc::new(AtomicU8::new(MAP_PENDING));
+            let done = state.clone();
+            buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
                 done.store(
                     if r.is_ok() { MAP_DONE } else { MAP_FAILED },
                     Ordering::Release,
                 );
             });
-        self.in_flight = Some(InFlight { time, state });
+            self.newest_copied = Some(time);
+            self.in_flight.push_back(InFlight {
+                time,
+                buffer,
+                state,
+            });
+        }
+        while let Some(oldest) = self.in_flight.front() {
+            match oldest.state.load(Ordering::Acquire) {
+                MAP_PENDING => return, // on its way; a later render looks again
+                MAP_DONE => {
+                    let flight = self.in_flight.pop_front().expect("just looked");
+                    self.with_mapped_rows(&flight.buffer, flight.time, f);
+                    self.free_buffers.push(flight.buffer);
+                    return;
+                }
+                // A lost frame is skipped; its buffer is left to drop, as its state is unknown.
+                _ => {
+                    self.in_flight.pop_front();
+                }
+            }
+        }
     }
+}
+
+fn new_readback_buffer(gpu: &Gpu, pitch: u32, height: u32) -> wgpu::Buffer {
+    gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("CPU effect readback"),
+        size: u64::from(pitch) * u64::from(height),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    })
 }
 
 #[cfg(test)]
