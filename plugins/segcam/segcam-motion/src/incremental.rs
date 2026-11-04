@@ -326,7 +326,7 @@ impl IncrementalRenderer {
             (oldest..=number).filter(feeding).collect()
         };
         let live = frames.live();
-        if live && !s.faces.any() {
+        if !live || !s.faces.any() {
             self.live_faces.forget();
         }
         for frame in frames_to_read {
@@ -371,7 +371,6 @@ impl IncrementalRenderer {
                         && frame == number
                         && self.displayed_analysis_frame(s, number, first) == number;
                 if wanted && !self.is_cached(frame, &key, s) {
-                    let mut detection = None;
                     let motion = match self.cached_motion(frame, &key) {
                         Some(motion) => motion.clone(),
                         None => {
@@ -414,9 +413,7 @@ impl IncrementalRenderer {
                                     // A live render takes the newest faces there are, and those
                                     // already shown stay until newer ones arrive.
                                     let (cells, first) = (grid.count(), motion.blobs.len());
-                                    detection = self
-                                        .live_faces
-                                        .exchange(view, s.faces, cells, frame, first);
+                                    self.live_faces.exchange(view, s.faces, cells, frame, first);
                                     motion.blobs.extend(self.live_faces.faces_on(frame));
                                 } else {
                                     // Any other render may be exported, so it has this frame's
@@ -430,14 +427,19 @@ impl IncrementalRenderer {
                         }
                     };
                     if swarm {
-                        // A trail no longer than the step draws no earlier analysis, so
-                        // reused faces need tiles here.
-                        let include_reused_faces = trail_len <= s.analysis_step.every;
-                        let faces_frame = detection.as_ref().and_then(|d| d.frame::<C>());
+                        // Reused faces need tiles here if a trail no longer than the step draws
+                        // no earlier analysis, or if the windows of held faces would leave it
+                        // before the next analysis, as a slow detection's do on a short trail.
+                        let next_analysis = frame + s.analysis_step.every;
+                        let held_windows_leaving = self
+                            .live_faces
+                            .windows_leave_before(next_analysis, trail_len);
+                        let include_reused_faces =
+                            trail_len <= s.analysis_step.every || held_windows_leaving;
                         let tiles = cut_frame_tiles(
                             &motion,
                             view.as_ref(),
-                            faces_frame.as_ref(),
+                            self.live_faces.found_in::<C>().as_ref(),
                             frame,
                             (w, h),
                             s.mirror,
@@ -445,9 +447,9 @@ impl IncrementalRenderer {
                         );
                         self.tiles.insert(frame, (key, s.mirror, tiles));
                         self.atlas_allocations.remove(&frame);
-                    }
-                    if let Some(found) = detection {
-                        self.live_faces.recycle(found);
+                        if held_windows_leaving {
+                            self.live_faces.windows_cut_on(frame);
+                        }
                     }
                 }
                 if frame == number {
@@ -1343,7 +1345,8 @@ mod tests {
         assert!(!state.live_faces.holds_faces());
     }
 
-    /// Faces stay on screen however long the next detection takes, past what the frame cache keeps.
+    /// Faces stay on screen however long the next detection takes, past the trail and what the
+    /// frame cache keeps, in windows showing the frame they were found in.
     #[test]
     fn held_faces_outlast_the_frame_cache() {
         wait_for_models();
@@ -1352,7 +1355,19 @@ mod tests {
         let mut state = IncrementalRenderer::default();
         let face = motion::Blob {
             kind: motion::SegmentKind::Face,
+            bounds: motion::NormRect {
+                x: 0.25,
+                y: 0.25,
+                w: 0.5,
+                h: 0.5,
+            },
             ..motion::Blob::default()
+        };
+        let found_in = Argb::<u8> {
+            alpha: 255,
+            red: 255,
+            green: 0,
+            blue: 0,
         };
         let settings = with_faces(ALL_PARTS);
         let before = crate::previous_frames_needed(&settings) as usize;
@@ -1363,20 +1378,19 @@ mod tests {
             history
                 .next(before, before)
                 .copy_from_slice(&frames[n as usize % frames.len()]);
+            let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+            let view = &mut ViewMut::from_pixels(&mut out, W, H);
             let count = history.len();
-            face_detection_calls_in(&mut state, &mut history, count, n);
+            state.render_frame(&settings, &mut history, count, n, view);
             // The first render takes in the frame format, which clears everything.
             if n == 0 {
                 state.live_faces.hold(ALL_PARTS, vec![face], 0, 0);
+                let pixels = vec![found_in; (W * H) as usize];
+                state.live_faces.hold_pixels(pixels, W, H);
+            } else if n >= i64::from(settings.trail_frames) {
+                assert!(out.contains(&found_in), "no window at {n}");
             }
         }
-        let (_, newest) = state.motion.values().next_back().unwrap();
-        assert!(
-            newest
-                .blobs
-                .iter()
-                .any(|b| b.kind == motion::SegmentKind::Face)
-        );
         drop(models);
     }
 
@@ -1438,6 +1452,54 @@ mod tests {
             state.render_frame(&settings, &mut history, count, n as i64, view);
         }
         assert!(!state.live_faces.holds_faces());
+    }
+
+    /// Live renders that leave frames out, then an export from there: nothing of the live stretch
+    /// reaches it, neither faces held nor frames analysed.
+    #[test]
+    fn non_live_render_after_held_faces_matches_fresh() {
+        wait_for_models();
+        let frames = crossing();
+        let s = with_faces(ALL_PARTS);
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let clip_to = |n: usize| &frames[n - needed.min(n)..=n];
+        let mut state = IncrementalRenderer::default();
+        for n in [6, 8, 10] {
+            let clip = clip_to(n);
+            let mut source = OnlyNewestFrame {
+                frames: clip,
+                reads: 0,
+            };
+            face_detection_calls_in(&mut state, &mut source, clip.len(), n as i64);
+            if n == 6 {
+                let face = motion::Blob {
+                    kind: motion::SegmentKind::Face,
+                    bounds: motion::NormRect {
+                        x: 0.25,
+                        y: 0.25,
+                        w: 0.5,
+                        h: 0.5,
+                    },
+                    ..motion::Blob::default()
+                };
+                state.live_faces.hold(ALL_PARTS, vec![face], 6, 0);
+            }
+        }
+        for n in [11, 13] {
+            let clip = clip_to(n);
+            let render = |state: &mut IncrementalRenderer| {
+                let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+                let view = &mut ViewMut::from_pixels(&mut out, W, H);
+                state.render_frame(&s, &mut Frames(clip), clip.len(), n as i64, view);
+                out
+            };
+            let exported = render(&mut state);
+            assert!(!state.live_faces.holds_faces());
+            assert!(
+                exported == render(&mut IncrementalRenderer::default()),
+                "frame {n}"
+            );
+        }
     }
 
     /// New face windows show the frame the face was found in, and motion windows the current one.

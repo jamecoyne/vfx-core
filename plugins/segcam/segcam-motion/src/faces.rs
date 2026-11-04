@@ -142,22 +142,13 @@ mod live {
             .as_ref()
     }
 
-    /// The faces found in one frame, and that frame's pixels, which their windows are cut from: a
-    /// box found a few frames ago doesn't fit the current frame's picture of a moving face.
-    pub struct Detection {
+    /// The faces found in one frame, and that frame's pixels.
+    struct Detection {
         blobs: Vec<Blob>,
         parts: FaceParts,
-        frame: Arc<dyn Any + Send + Sync>,
+        pixels: Arc<dyn Any + Send + Sync>,
         width: i32,
         height: i32,
-    }
-
-    impl Detection {
-        /// The frame it was found in, if that was at depth `C`.
-        pub fn frame<C: Channel>(&self) -> Option<View<'_, C>> {
-            let pixels = self.frame.downcast_ref::<Vec<Argb<C>>>()?;
-            Some(View::from_pixels(pixels, self.width, self.height))
-        }
     }
 
     /// The newest faces, which every analysis shows until newer ones arrive. They are kept here and
@@ -168,6 +159,13 @@ mod live {
         frame: i64,
         first_index: usize,
         blobs: Vec<Blob>,
+        /// The frame they were found in, which their windows are cut from: a box found a few frames
+        /// ago doesn't fit the current frame's picture of a moving face.
+        pixels: Arc<dyn Any + Send + Sync>,
+        width: i32,
+        height: i32,
+        /// The newest frame with windows cut for them.
+        windows_on: i64,
     }
 
     #[derive(Default)]
@@ -178,7 +176,7 @@ mod live {
         /// Whether a request of this instance is queued or running, forgotten or not, which keeps
         /// it to one queued whatever the renders do.
         requested: Arc<AtomicBool>,
-        /// The last frame copied for a request, whose allocation the next copy reuses.
+        /// A frame no longer held or asked about, whose allocation the next copy reuses.
         spare_frame: Option<Arc<dyn Any + Send + Sync>>,
         held: Option<HeldFaces>,
         /// The parts last asked for.
@@ -188,8 +186,8 @@ mod live {
     }
 
     impl LiveFaces {
-        /// The detection finished since the last call, if any, for these `parts`, whose faces it
-        /// holds for [`LiveFaces::faces_on`] as attached to `frame` from blob `first_index` on.
+        /// Takes the detection finished since the last call, if any, for these `parts`, whose faces
+        /// it holds for [`LiveFaces::faces_on`] as attached to `frame` from blob `first_index` on.
         /// Unless a request is still out, also asks for a detection in the frame's pixels. `cells`
         /// is as in [`super::find`].
         pub fn exchange<C: Channel>(
@@ -199,23 +197,30 @@ mod live {
             cells: usize,
             frame: i64,
             first_index: usize,
-        ) -> Option<Detection> {
+        ) {
             if self.parts != parts {
                 // Faces found for other parts stop showing.
                 self.parts = parts;
                 self.held = None;
             }
             let finished = self.answer.lock().ok().and_then(|mut a| a.take());
+            if let Some(found) = finished.filter(|found| found.parts == parts) {
+                if let Some(replaced) = self.held.take() {
+                    self.spare_frame = Some(replaced.pixels);
+                }
+                self.held = Some(HeldFaces {
+                    frame,
+                    first_index,
+                    blobs: found.blobs,
+                    pixels: found.pixels,
+                    width: found.width,
+                    height: found.height,
+                    windows_on: frame,
+                });
+            }
             if !self.requested.load(Ordering::Acquire) {
                 self.request(view, parts, cells);
             }
-            let mut detection = finished.filter(|detection| detection.parts == parts)?;
-            self.held = Some(HeldFaces {
-                frame,
-                first_index,
-                blobs: std::mem::take(&mut detection.blobs),
-            });
-            Some(detection)
         }
 
         /// The held faces, for `frame`'s blobs. On the frame they were attached to they count as
@@ -229,6 +234,28 @@ mod live {
                     ..*blob
                 })
             })
+        }
+
+        /// The frame the held faces were found in, if that was at depth `C`.
+        pub fn found_in<C: Channel>(&self) -> Option<View<'_, C>> {
+            let held = self.held.as_ref()?;
+            let pixels = held.pixels.downcast_ref::<Vec<Argb<C>>>()?;
+            Some(View::from_pixels(pixels, held.width, held.height))
+        }
+
+        /// Whether the held faces' windows leave a trail of `trail_len` frames before frame `next`,
+        /// the next that can cut any.
+        pub fn windows_leave_before(&self, next: i64, trail_len: i64) -> bool {
+            self.held
+                .as_ref()
+                .is_some_and(|held| held.windows_on + trail_len < next)
+        }
+
+        /// Records that `frame` has windows of its own for the held faces.
+        pub fn windows_cut_on(&mut self, frame: i64) {
+            if let Some(held) = &mut self.held {
+                held.windows_on = frame;
+            }
         }
 
         fn request<C: Channel>(&mut self, frame: &View<C>, parts: FaceParts, cells: usize) {
@@ -262,7 +289,7 @@ mod live {
                         *answer = Some(Detection {
                             blobs,
                             parts,
-                            frame: Arc::new(pixels),
+                            pixels: Arc::new(pixels),
                             width,
                             height,
                         });
@@ -280,13 +307,9 @@ mod live {
             }
         }
 
-        /// Takes back a detection's frame once its windows are cut.
-        pub fn recycle(&mut self, detection: Detection) {
-            self.spare_frame = Some(detection.frame);
-        }
-
-        /// Drops the faces held and any answer on its way: the frames changed, or a render stopped
-        /// asking for faces.
+        /// Drops the faces held and any answer on its way: the frames changed, a render stopped
+        /// asking for faces, or a render isn't live, so what the next live one holds would be from
+        /// wherever the host was before.
         pub fn forget(&mut self) {
             if Arc::strong_count(&self.answer) > 1 {
                 self.answer = Arc::default();
@@ -308,7 +331,22 @@ mod live {
                 frame,
                 first_index,
                 blobs,
+                pixels: Arc::new(()),
+                width: 0,
+                height: 0,
+                windows_on: frame,
             });
+        }
+
+        #[cfg(test)]
+        pub fn hold_pixels(&mut self, pixels: Vec<Argb<u8>>, width: i32, height: i32) {
+            let held = self.held.as_mut().expect("faces held");
+            (held.pixels, held.width, held.height) = (Arc::new(pixels), width, height);
+        }
+
+        #[cfg(test)]
+        pub fn request_out(&self) -> bool {
+            self.requested.load(Ordering::Acquire)
         }
     }
 }
@@ -321,7 +359,7 @@ pub fn lock_models() -> std::sync::MutexGuard<'static, Option<segcam_face::Segme
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use live::{Detection, LiveFaces};
+pub use live::LiveFaces;
 #[cfg(not(target_arch = "wasm32"))]
 pub use models::{ready, runs_on, start, wait};
 
@@ -432,16 +470,6 @@ pub fn find<C: Channel>(_frame: &View<C>, _parts: FaceParts, _cells: usize) -> V
 pub struct LiveFaces;
 
 #[cfg(target_arch = "wasm32")]
-pub struct Detection;
-
-#[cfg(target_arch = "wasm32")]
-impl Detection {
-    pub fn frame<C: Channel>(&self) -> Option<View<'_, C>> {
-        None
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
 impl LiveFaces {
     pub fn exchange<C: Channel>(
         &mut self,
@@ -450,15 +478,22 @@ impl LiveFaces {
         _cells: usize,
         _frame: i64,
         _first_index: usize,
-    ) -> Option<Detection> {
-        None
+    ) {
     }
 
     pub fn faces_on(&self, _frame: i64) -> impl Iterator<Item = Blob> + '_ {
         std::iter::empty()
     }
 
-    pub fn recycle(&mut self, _detection: Detection) {}
+    pub fn found_in<C: Channel>(&self) -> Option<View<'_, C>> {
+        None
+    }
+
+    pub fn windows_leave_before(&self, _next: i64, _trail_len: i64) -> bool {
+        false
+    }
+
+    pub fn windows_cut_on(&mut self, _frame: i64) {}
 
     pub fn forget(&mut self) {}
 }
@@ -551,13 +586,45 @@ mod tests {
             ..FaceParts::default()
         };
         let mut live = LiveFaces::default();
-        assert!(live.exchange(&view, parts, 1, 0, 0).is_none());
+        live.exchange(&view, parts, 1, 0, 0);
         for frame in 1..4 {
             live.forget();
-            assert!(live.exchange(&view, parts, 1, frame, 0).is_none());
+            live.exchange(&view, parts, 1, frame, 0);
         }
         assert_eq!(live.requests_sent, 1);
         drop(models);
+    }
+
+    /// An answer that was on its way when the renders moved elsewhere never attaches.
+    #[test]
+    fn an_answer_due_when_forgetting_stays_out() {
+        let _gpu_lock = crate::gpu::gpu_test_lock();
+        let models = lock_models();
+        let pixels = vec![crate::pixel::Argb::<u8>::default(); 16];
+        let view = View::from_pixels(&pixels, 4, 4);
+        let parts = FaceParts {
+            face: true,
+            ..FaceParts::default()
+        };
+        let mut live = LiveFaces::default();
+        live.exchange(&view, parts, 1, 0, 0);
+        live.forget();
+        drop(models);
+        while live.request_out() {
+            std::thread::yield_now();
+        }
+        live.exchange(&view, parts, 1, 1, 0);
+        assert!(!live.holds_faces());
+    }
+
+    #[test]
+    fn windows_are_cut_again_before_they_leave_the_trail() {
+        let mut live = LiveFaces::default();
+        live.hold(FaceParts::default(), vec![Blob::default()], 10, 0);
+        assert!(!live.windows_leave_before(16, 6));
+        assert!(live.windows_leave_before(17, 6));
+        live.windows_cut_on(16);
+        assert!(!live.windows_leave_before(17, 6));
     }
 
     /// A panic while the models ran doesn't leave every later find without faces.
