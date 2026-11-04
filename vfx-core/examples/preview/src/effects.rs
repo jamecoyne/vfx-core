@@ -739,8 +739,7 @@ impl Effects {
                 };
                 #[cfg(target_arch = "wasm32")]
                 let input = cpu_stage::Input::Gpu(source);
-                // Browsers have no target path yet.
-                let offer_target = cfg!(not(target_arch = "wasm32")) && !self.keep_output_in_ram;
+                let offer_target = !self.keep_output_in_ram;
                 self.last_outcome =
                     stage.render(gpu, input, values, time, self.frame_rate, offer_target);
             }
