@@ -91,21 +91,26 @@ impl Controls {
 pub struct Actions {
     pub use_pattern: bool,
     /// Open a file picker for a layer's video or image.
+    #[cfg(not(target_arch = "wasm32"))]
     pub import_layer: bool,
     /// Feed the layer from this index of `PanelStatus::cameras`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub start_layer_camera: Option<usize>,
     /// Go back to a test pattern (or none) for the layer.
     pub clear_layer: bool,
     /// The video's sound was switched on or off.
     pub sound: Option<bool>,
     /// Record was pressed: starts recording, or stops and asks where to save.
+    #[cfg(not(target_arch = "wasm32"))]
     pub toggle_record: bool,
     /// Open a file picker for a video or image.
     pub import: bool,
     /// Start the camera at this index of `PanelStatus::cameras`.
     pub start_camera: Option<usize>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub refresh_cameras: bool,
     /// Face tracking was switched on or off.
+    #[cfg(not(target_arch = "wasm32"))]
     pub face_tracking: Option<bool>,
     pub toggle_play: bool,
     /// The position slider is being dragged here (seconds).
@@ -129,10 +134,13 @@ pub struct PanelStatus<'a> {
     pub video: bool,
     pub sound_on: bool,
     /// Whether Record is on.
+    #[cfg(not(target_arch = "wasm32"))]
     pub recording: bool,
     /// How the last recording ended: saved, discarded or failed.
+    #[cfg(not(target_arch = "wasm32"))]
     pub record_result: Option<&'a str>,
     pub cameras: &'a [String],
+    #[cfg(not(target_arch = "wasm32"))]
     pub face_tracking: bool,
     /// Set for video files.
     pub playback: Option<Playback>,

@@ -198,6 +198,7 @@ impl FullscreenPass {
 }
 
 /// Whether `pixels` is one float RGBA frame of `size`.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn frame_fits(pixels: &[f32], size: (u32, u32)) -> bool {
     pixels.len() == (size.0 * size.1 * 4) as usize
 }
@@ -466,11 +467,13 @@ impl Effects {
 
     /// Names the fed layer, which the next frames' writes fill. Its frames are the
     /// current size (see [`Effects::size`]), so a feed must be fitted to that.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn set_layer_name(&mut self, name: String) {
         self.layer_name = Some(name);
     }
 
     /// Goes back to the generated patterns for the layer.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn clear_layer(&mut self) {
         self.layer_name = None;
     }

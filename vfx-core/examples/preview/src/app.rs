@@ -5,9 +5,9 @@ use web_time::Instant;
 
 use crate::catalog;
 use crate::controls::{self, Controls, PanelStatus};
+use crate::effects::Effects;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::effects::Output;
-use crate::effects::{self, Effects};
+use crate::effects::{self, Output};
 use crate::modulation::{self, Expressions, VariableValues};
 use crate::stats;
 #[cfg(target_arch = "wasm32")]
@@ -100,6 +100,20 @@ struct Media {
     sound: Option<video::SoundPlayer>,
     /// While the position slider is being dragged.
     scrub: Option<Scrub>,
+}
+
+/// Asks for a video or image file.
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_media_file(title: &str) -> Option<std::path::PathBuf> {
+    let extensions: Vec<&str> = video::VIDEO_EXTENSIONS
+        .iter()
+        .chain(&["png", "jpg", "jpeg"])
+        .copied()
+        .collect();
+    rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("Video or image", &extensions)
+        .pick_file()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -504,13 +518,6 @@ impl Preview {
         return false;
     }
 
-    fn is_recording(&self) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        return self.recording.is_some();
-        #[cfg(target_arch = "wasm32")]
-        return false;
-    }
-
     /// Writes one recorded frame. A frame of another size, or a failed write, stops the
     /// recording and removes its partial file.
     #[cfg(not(target_arch = "wasm32"))]
@@ -602,16 +609,7 @@ impl Preview {
             self.toggle_record();
         }
         if actions.import
-            && let Some(path) = rfd::FileDialog::new()
-                .set_title("Import a video or image")
-                .add_filter(
-                    "Video or image",
-                    &[
-                        "mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv", "png", "jpg",
-                        "jpeg",
-                    ],
-                )
-                .pick_file()
+            && let Some(path) = pick_media_file("Import a video or image")
         {
             self.open(&path, None);
         }
@@ -624,16 +622,7 @@ impl Preview {
             self.cameras = video::cameras();
         }
         if actions.import_layer
-            && let Some(path) = rfd::FileDialog::new()
-                .set_title("Import a layer: video or image")
-                .add_filter(
-                    "Video or image",
-                    &[
-                        "mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv", "png", "jpg",
-                        "jpeg",
-                    ],
-                )
-                .pick_file()
+            && let Some(path) = pick_media_file("Import a layer: video or image")
         {
             self.open_layer(&path);
         }
@@ -753,13 +742,12 @@ impl Preview {
         let input = self.egui_state.take_egui_input(&self.window);
         let (display_texture, display_size) = (self.display_texture, self.display_size);
         #[cfg(not(target_arch = "wasm32"))]
-        let (video, sound_on, cameras, face_tracking) = (
+        let (video, sound_on, cameras) = (
             self.media
                 .as_ref()
                 .is_some_and(|m| m.video.info.file().is_some()),
             self.sound_on,
             self.cameras.as_slice(),
-            self.tracker.is_some(),
         );
         #[cfg(not(target_arch = "wasm32"))]
         let playback = self
@@ -778,8 +766,7 @@ impl Preview {
                     .map_or_else(|| m.video.playing(), |s| s.resume),
             });
         #[cfg(target_arch = "wasm32")]
-        let (video, sound_on, cameras, face_tracking) =
-            (false, false, &web_media::CAMERAS[..], false);
+        let (video, sound_on, cameras) = (false, false, &web_media::CAMERAS[..]);
         #[cfg(target_arch = "wasm32")]
         let playback =
             self.web_video
@@ -790,19 +777,18 @@ impl Preview {
                     duration: v.duration(),
                     playing: v.playing(),
                 });
-        #[cfg(not(target_arch = "wasm32"))]
-        let record_result = self.record_result.as_deref();
-        #[cfg(target_arch = "wasm32")]
-        let record_result: Option<&str> = None;
         let status = PanelStatus {
             source_name: self.effects.source_name(),
             message: self.message.as_deref(),
             video,
             sound_on,
-            recording: self.is_recording(),
-            record_result,
+            #[cfg(not(target_arch = "wasm32"))]
+            recording: self.recording.is_some(),
+            #[cfg(not(target_arch = "wasm32"))]
+            record_result: self.record_result.as_deref(),
             cameras,
-            face_tracking,
+            #[cfg(not(target_arch = "wasm32"))]
+            face_tracking: self.tracker.is_some(),
             playback,
             layers: self.effects.layers(),
             layer_name: self.effects.layer_name(),

@@ -21,7 +21,7 @@ use vfx_core::cpu::{Argb, Channel};
 const MAX_QUEUED: usize = 2;
 
 /// File extensions treated as video when dropped on the window.
-const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv"];
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv"];
 
 pub fn is_video(path: &Path) -> bool {
     path.extension()
