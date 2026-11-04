@@ -139,7 +139,14 @@ struct CpuEffectState {
     output_pixels: Vec<Argb<u8>>,
     /// Per-stage frame times, when `VFX_FFGL_TIMING` is set.
     stage_times: Option<timing::StageTimes>,
+    /// Whether the last frame stayed on the GPU, and the frames since the effect's report was
+    /// logged. A report clones what the effect found, so it isn't asked for every frame.
+    last_on_gpu: Option<bool>,
+    frames_since_report: u32,
 }
+
+/// Frames between logging an effect's report while its draw path holds.
+const FRAMES_PER_REPORT: u32 = 300;
 
 struct Instance {
     values: Vec<f32>,
@@ -178,6 +185,8 @@ impl Instance {
                 history: History::default(),
                 output_pixels: Vec::new(),
                 stage_times: timing::enabled().then(timing::StageTimes::default),
+                last_on_gpu: None,
+                frames_since_report: 0,
             }
         });
         Self {
@@ -604,6 +613,18 @@ unsafe fn process_cpu(
             (w, h),
             &instance.values,
         );
+    }
+    cpu.frames_since_report += 1;
+    if cpu.last_on_gpu != Some(on_gpu) || cpu.frames_since_report >= FRAMES_PER_REPORT {
+        cpu.last_on_gpu = Some(on_gpu);
+        cpu.frames_since_report = 0;
+        let report = cpu.effect.report();
+        if let Some(draw) = report.draw {
+            LOG.note(&format!("drawing on: {draw}"));
+        }
+        if let Some(faces) = report.faces {
+            LOG.note(&format!("face models on: {faces}"));
+        }
     }
     LOG.note(match on_gpu {
         true => "render path: CPU effect, output kept on the GPU (Vulkan shared with OpenGL)",

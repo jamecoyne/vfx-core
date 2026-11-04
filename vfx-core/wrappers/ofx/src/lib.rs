@@ -686,12 +686,25 @@ fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> 
     Ok(())
 }
 
+/// Frames between logging a kept effect's report.
+const FRAMES_PER_REPORT: i64 = 300;
+
 fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
     if let Some(kept) = kept_for_instance(effect)? {
         let frame = in_args.get_double(PROP_TIME, 0)?.round() as i64;
         let last = *kept.last_render.lock().unwrap_or_else(|p| p.into_inner());
         let earlier_frames_unchanged = host::is_resolve() && continues_stream(last, frame);
         let rendered = render_cpu_effect(&kept.effect, effect, in_args, earlier_frames_unchanged);
+        // A report clones what the effect found, so it isn't asked for every frame.
+        if last.is_none() || frame.rem_euclid(FRAMES_PER_REPORT) == 0 {
+            let report = kept.effect.report();
+            if let Some(draw) = report.draw {
+                LOG.note(&format!("drawing on: {draw}"));
+            }
+            if let Some(faces) = report.faces {
+                LOG.note(&format!("face models on: {faces}"));
+            }
+        }
         *kept.last_render.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastRender {
             frame,
             finished: std::time::Instant::now(),
