@@ -34,11 +34,15 @@ pub const VARIABLES: &[(&str, &str)] = &[
     ("mouthy", "mouth centre, y"),
 ];
 
+/// Where the audio and face variables start in VARIABLES.
+const AUDIO_START: usize = 3;
+const FACE_START: usize = 8;
+
 /// One frame's variable values, indexed like VARIABLES.
-pub type VariableValues = [f32; 20];
+pub type VariableValues = [f32; VARIABLES.len()];
 
 /// The face-tracking variables, in VARIABLES order from `face`.
-pub type FaceValues = [f32; 12];
+pub type FaceValues = [f32; VARIABLES.len() - FACE_START];
 
 /// Face values before any face is found (or with tracking off): centred guesses, so
 /// expressions using them stay sensible, with `face` at 0.
@@ -63,7 +67,7 @@ pub fn apply_face_readings(
             false
         }
         Some(_) => {
-            let names = VARIABLES[8..].iter().map(|(name, _)| *name);
+            let names = VARIABLES[FACE_START..].iter().map(|(name, _)| *name);
             let mut missing = false;
             for (value, name) in face.iter_mut().zip(names) {
                 match reading(name) {
@@ -84,12 +88,12 @@ pub fn variable_values(
     face: FaceValues,
 ) -> VariableValues {
     let (position, duration) = video.unwrap_or((0.0, 1.0));
-    let mut values = [0.0; 20];
+    let mut values = [0.0; VARIABLES.len()];
     values[0] = time as f32;
     values[1] = position as f32;
     values[2] = (position / duration).clamp(0.0, 1.0) as f32;
-    values[3..8].copy_from_slice(&audio);
-    values[8..].copy_from_slice(&face);
+    values[AUDIO_START..FACE_START].copy_from_slice(&audio);
+    values[FACE_START..].copy_from_slice(&face);
     values
 }
 
@@ -771,7 +775,10 @@ mod tests {
     #[test]
     fn readings_fill_face_variables() {
         use vfx_core::Reading;
-        let names: Vec<_> = VARIABLES[8..].iter().map(|(name, _)| *name).collect();
+        let names: Vec<_> = VARIABLES[FACE_START..]
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
         let all: Vec<_> = names.iter().map(|n| Reading::new(*n, 0.25)).collect();
         let mut face = FACE_NONE;
         assert!(
@@ -844,7 +851,7 @@ mod tests {
         ParamValues::new((crate::catalog::entries()[effect].make)().params())
     }
 
-    /// Expressions and values for the named effect.
+    /// The named effect's catalog index and default values.
     fn effect_with_defaults(name: &str) -> (usize, ParamValues) {
         let effect = find(name).expect("in the catalog");
         (effect, values(effect))

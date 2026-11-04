@@ -1,8 +1,8 @@
-//! A video's sound as numbers for control rules: overall level and four frequency
-//! bands, from an FFT around any point in time.
+//! A video's sound as numbers for expressions: overall level and four frequency bands, from
+//! an FFT around any point in time.
 //!
-//! The whole track is decoded once (mono, 22 kHz) in the background, so the live
-//! preview and exports analyse exactly the same samples at the same times.
+//! The whole track is decoded once (mono, 22 kHz) in the background, so any position reads the
+//! same samples, after a loop or a seek too.
 
 use std::io::Read;
 use std::path::Path;
@@ -40,7 +40,8 @@ impl AudioAnalysis {
             let decoded = Command::new("ffmpeg")
                 .args(["-v", "error", "-i"])
                 .arg(&path)
-                .args(["-vn", "-ac", "1", "-ar", "22050", "-f", "f32le", "-"])
+                .args(["-vn", "-ac", "1", "-ar", &(SAMPLE_RATE as u32).to_string()])
+                .args(["-f", "f32le", "-"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())

@@ -155,7 +155,7 @@ impl MachineLoad {
         #[cfg(target_os = "macos")]
         {
             let shared = Arc::clone(&gpu);
-            // Its own thread, since asking the OS for GPU load takes a few milliseconds.
+            // Its own thread, so querying the OS can't hold up the render loop.
             std::thread::spawn(move || {
                 loop {
                     *shared.lock().unwrap() = gpu_percent();
@@ -166,7 +166,7 @@ impl MachineLoad {
         let usage = Arc::new(Mutex::new(None));
         let shared = Arc::clone(&usage);
         // Its own thread too: where Windows can't open its CPU counters, each CPU reading
-        // loads them again first, which takes a third of a second or more.
+        // reloads them first, which would stall the render loop.
         std::thread::spawn(move || {
             let Ok(mut sys) = System::new() else {
                 return;
@@ -214,8 +214,8 @@ impl Sampler {
     }
 
     /// The latest numbers, with `counts` as the render loop keeps them and `render` the
-    /// time of the render this loop finished, if any. The rates, CPU and memory are only
-    /// worked out again once a second.
+    /// time of the render this loop finished, if any. The rates, CPU and memory are recomputed
+    /// once a second.
     pub fn sample(
         &mut self,
         counts: Counts,
@@ -277,7 +277,7 @@ pub fn source_text(s: &Snapshot) -> String {
     }
 }
 
-/// ", draw GPU (RTX 4070), faces DirectML 0".
+/// The effect's report as ", draw ..., faces ...", for the end of the effect slot.
 pub fn report_text(report: &Report) -> String {
     let mut text = String::new();
     if let Some(draw) = &report.draw {

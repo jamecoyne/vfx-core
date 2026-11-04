@@ -63,8 +63,8 @@ pub enum StopAfter {
 }
 
 impl Options {
-    /// Whether anything beyond the old `--effect SLUG [FILE]` was asked for. Mistakes in
-    /// those flags end the run instead of showing in the panel.
+    /// Whether any flag beyond `--effect SLUG [FILE]` was given. A mistake then ends the run
+    /// instead of showing in the panel.
     pub fn scripted(&self) -> bool {
         self.mode.is_some()
             || !self.params.is_empty()

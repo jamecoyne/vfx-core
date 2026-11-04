@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use vfx_core::cpu::{Argb, Channel};
 
-/// Also how many frames late a loop that stays behind shows the picture.
+/// Decoded frames waiting for the render loop, at most. A render loop that stays behind sits at
+/// a full queue, so this is also how many frames late it shows the picture.
 const MAX_QUEUED: usize = 2;
 
 /// File extensions treated as video when dropped on the window.
@@ -165,7 +166,7 @@ pub struct Info {
     pub input: Input,
     /// Decoded size: the input's, scaled to fit the preview's limit, even.
     pub size: (u32, u32),
-    /// As ffmpeg writes it ("30000/1001"), so exports keep the exact rate.
+    /// As ffprobe reports it ("30000/1001"), given to ffmpeg's fps filter so the rate stays exact.
     pub rate: String,
     pub fps: f64,
     /// Infinite for cameras.

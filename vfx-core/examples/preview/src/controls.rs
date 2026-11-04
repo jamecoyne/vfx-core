@@ -96,8 +96,6 @@ pub struct Actions {
     pub start_layer_camera: Option<usize>,
     /// Go back to a test pattern (or none) for the layer.
     pub clear_layer: bool,
-    /// Another effect was picked.
-    pub effect_changed: bool,
     /// The video's sound was switched on or off.
     pub sound: Option<bool>,
     /// Record was pressed: starts recording, or stops and asks where to save.
@@ -127,7 +125,7 @@ pub struct Playback {
 pub struct PanelStatus<'a> {
     pub image: Option<&'a str>,
     pub message: Option<&'a str>,
-    /// The source is a video file (so it can play sound and be rendered).
+    /// The source is a video file, so the Play sound box applies.
     pub video: bool,
     pub sound_on: bool,
     /// Whether Record is on.
@@ -204,7 +202,6 @@ fn choice_menu(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) -> bo
     *value != before
 }
 
-/// One parameter's control, with expression boxes under the ones expressions can drive.
 /// A slider across the whole row, with room left at its end for the value.
 fn full_slider(ui: &mut Ui, slider: egui::Slider) -> egui::Response {
     ui.scope(|ui| {
@@ -214,6 +211,7 @@ fn full_slider(ui: &mut Ui, slider: egui::Slider) -> egui::Response {
     .inner
 }
 
+/// One parameter's control, with expression boxes under the ones expressions can drive.
 fn param(
     ui: &mut Ui,
     spec: &ParamSpec,
@@ -463,7 +461,7 @@ fn effect_box(
 ) {
     let entries = catalog::entries();
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-    actions.effect_changed = choice_menu(ui, "effect", &mut c.effect, &names);
+    choice_menu(ui, "effect", &mut c.effect, &names);
     ui.label(RichText::new(&entries[c.effect].about).weak());
     if status.layers > 0 {
         ui.label("Layer");

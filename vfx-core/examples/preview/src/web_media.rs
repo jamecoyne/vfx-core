@@ -41,11 +41,10 @@ pub struct WebVideo {
     /// The last frame the browser presented, its media time and count, from
     /// `requestVideoFrameCallback`; `None` until the first.
     presented: Rc<Cell<Option<(f64, u32)>>>,
-    /// Whether the browser reports presented frames. Without that, copies follow the clock.
-    reports_frames: bool,
     /// The count of the last presented frame copied.
     last_copied_count: Option<u32>,
-    /// The frame callback and its pending request, cancelled and freed on drop.
+    /// The frame callback and its pending request, cancelled and freed on drop. `None` where the
+    /// browser doesn't report presented frames, and copies follow the clock.
     watch: Option<FrameWatch>,
 }
 
@@ -150,7 +149,6 @@ impl WebVideo {
         let _ = video.play();
         let presented = Rc::new(Cell::new(None));
         let watch = FrameWatch::new(&video, &presented);
-        let reports_frames = watch.is_some();
         Self {
             video,
             name,
@@ -159,7 +157,6 @@ impl WebVideo {
             canvas: None,
             last_copied_time: None,
             presented,
-            reports_frames,
             last_copied_count: None,
             watch,
         }
@@ -229,7 +226,7 @@ impl WebVideo {
     pub fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> Result<bool, String> {
         let time = self.video.current_time();
         let presented = self.presented.get().map(|(_, count)| count);
-        let fresh = match (self.reports_frames, presented) {
+        let fresh = match (self.watch.is_some(), presented) {
             (true, Some(count)) => self.last_copied_count != Some(count),
             (true, None) => false,
             (false, _) => self.last_copied_time != Some(time) || self.is_camera(),

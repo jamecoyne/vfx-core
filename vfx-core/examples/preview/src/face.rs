@@ -133,8 +133,7 @@ impl Detector {
     }
 }
 
-/// ONNX Runtime allows one environment per process, so the live tracker and an
-/// export's detector share this one.
+/// ONNX Runtime allows one environment per process, so every detector shares this one.
 #[cfg(target_os = "macos")]
 static ENVIRONMENT: OnceLock<Result<Environment, String>> = OnceLock::new();
 

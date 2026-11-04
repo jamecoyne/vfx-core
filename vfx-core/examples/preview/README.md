@@ -6,7 +6,7 @@ or a webcam. [docs/DEVELOPING.md](../../../docs/DEVELOPING.md#the-preview) descr
 ## Scripted runs
 
 Flags set the preview up and measure it, so a measurement is a command and needs no clicks.
-With no flags it opens as before.
+With no flags it opens the window with nothing set up.
 
 ```sh
 cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
@@ -55,4 +55,4 @@ CPU: rendered 39 fps, 9 ms, worst 24 ms | screen 20 fps`, then the machine. The 
 worst above is the face models loading in the first render.
 
 In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
-`--effect` and a file, mistakes show in the panel as before.
+`--effect` and a file, mistakes show in the panel.
