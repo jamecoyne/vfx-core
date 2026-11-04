@@ -580,6 +580,7 @@ impl IncrementalRenderer {
             .map(str::to_owned);
         report.readings = self.readings.clone();
         report.gpu_fault = self.last_reported_fault.clone();
+        report.out_of_gpu_memory = self.oldest_frame_in_atlas.is_some();
         report
     }
 
@@ -1559,6 +1560,7 @@ mod tests {
         );
         assert_eq!(drawn(&state), frames.len() as u64, "a render left the GPU");
         assert_eq!(faults(&state), 0);
+        assert!(state.report().out_of_gpu_memory);
         assert!(
             out.iter().any(|p| p.alpha == 255),
             "the newest windows are gone"
