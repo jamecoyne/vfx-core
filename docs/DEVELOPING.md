@@ -78,10 +78,12 @@ A `CpuEffect` with slow setup starts it in `values_known`, which OpenFX and FFGL
 the first render.
 
 A `CpuEffect` that keeps work between renders says so with `keeps_state`. OpenFX, FFGL
-and the preview then keep one per instance (`vfx_host::CpuInstance`, which also starts it
-over after a panic, a seek back or a resize); After Effects never does. Either way every
-frame must match a fresh effect's, even after earlier frames change upstream or a host
-misses one: test it with `vfx_host::contract::check`, as `plugins/segcam/segcam-motion` does.
+and the preview then keep one per instance (`vfx_host::CpuInstance`, which also rebuilds it
+after a panic); After Effects never does. When a host's frames stop following on (a seek back,
+a clip loop, a resize) it calls `clear_history`, which an effect holding GPU resources implements
+so they survive; without it the effect is rebuilt. Either way every frame must match a fresh
+effect's, even after earlier frames change upstream or a host misses one: test it with
+`vfx_host::contract::check`, as `plugins/segcam/segcam-motion` does.
 One that can work from what it kept says how few frames a host keeping its own need hold in
 full with `frames_held`.
 
@@ -101,6 +103,7 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `Effect` (GPU): `params`, `prepare`, `render`, `layer_inputs`, `layer_name`, `render_layers`, `region` | vfx-core | from the start |
 | `CpuEffect`: `params`, `frames_before` (the frame rate since #57), `render` | vfx-core | from the start |
 | `CpuEffect::keeps_state` | vfx-core | #11 |
+| `CpuEffect::clear_history` (forget earlier frames, keeping GPU resources; default `false`, and the host rebuilds the effect) | vfx-core | #100 |
 | `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core | #47 |
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |
 | `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core | #59 |

@@ -387,7 +387,7 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
                         && let Some(cpu) = &mut me.cpu
                     {
                         cpu.history.clear();
-                        cpu.effect.reset();
+                        cpu.effect.clear_history();
                     }
                     me.time = Some(time);
                 }
@@ -499,7 +499,7 @@ unsafe fn process_cpu(
             }
         }
         cpu.history.resize(w as i32, h as i32);
-        cpu.effect.reset();
+        cpu.effect.clear_history();
         cpu.rendered
             .resize(w as usize * h as usize, Argb::default());
     }

@@ -189,6 +189,29 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
     let mut kept = cpu(make);
     compare(&mut *kept, clip, last, &missing, values, "frames missing")?;
     compare(&mut *kept, clip, last, &[], values, "missing frames back")?;
+
+    // A clip loop or new source reuses frame numbers for other pixels.
+    let mut kept = cpu(make);
+    compare(
+        &mut *kept,
+        clip,
+        last,
+        &[],
+        values,
+        "before clearing history",
+    )?;
+    if kept.clear_history() {
+        for number in 0..=last {
+            compare(
+                &mut *kept,
+                &edited,
+                number,
+                &[],
+                values,
+                "after clearing history",
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -282,6 +305,44 @@ mod tests {
         };
         let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("stale");
         assert!(err.contains("edited"), "{err}");
+    }
+
+    /// Says it cleared its history, but its next renders differ from a fresh effect's.
+    #[derive(Default)]
+    struct ClearsBadly {
+        cleared: bool,
+    }
+
+    impl CpuEffect for ClearsBadly {
+        fn params(&self) -> &[ParamSpec] {
+            &[]
+        }
+        fn keeps_state(&self) -> bool {
+            true
+        }
+        fn clear_history(&mut self) -> bool {
+            self.cleared = true;
+            true
+        }
+        fn render(
+            &mut self,
+            _: &mut dyn FrameSource,
+            _: usize,
+            output: ImageMut<'_>,
+            _: &ParamValues,
+            _: &Context,
+        ) {
+            if let ImageMut::U8(mut out) = output {
+                out.row_mut(0)[0].red = u8::from(self.cleared);
+            }
+        }
+    }
+
+    #[test]
+    fn clear_history_differing_from_fresh_breaks_contract() {
+        let make = || Processor::Cpu(Box::new(ClearsBadly::default()));
+        let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("differs");
+        assert!(err.contains("after clearing history"), "{err}");
     }
 
     /// Leaves each frame's first render unfinished with a wrong pixel, as a browser's GPU draw

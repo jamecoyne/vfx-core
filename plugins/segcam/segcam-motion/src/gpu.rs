@@ -929,10 +929,28 @@ impl Drawer {
         self.seen = self.dev.errors().0;
     }
 
+    /// Abandons a draw still on its way back: it shows frames that were just forgotten, and a
+    /// later render of a reused frame number could otherwise match its key.
+    pub(crate) fn drop_unfinished_draw(&mut self) {
+        self.unfinished = false;
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.flight = None;
+            self.restarts = 0;
+        }
+    }
+
     /// A smaller atlas than usual, for a new drawer.
     #[cfg(test)]
     pub(crate) fn small_atlas(&mut self, words: u64) {
         self.atlas = Arc::new(Mutex::new(Atlas::with(&self.dev, words)));
+    }
+
+    /// The atlas's size and its free space, in words.
+    #[cfg(test)]
+    pub(crate) fn atlas_words(&self) -> (u64, u64) {
+        let atlas = self.atlas.lock().unwrap_or_else(|e| e.into_inner());
+        (atlas.words, atlas.free.iter().map(|&(_, len)| len).sum())
     }
 
     /// Buffers no larger than `bytes`, as on a device that binds less.

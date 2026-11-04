@@ -174,6 +174,11 @@ impl CpuEffect for SegcamMotion {
         true
     }
 
+    fn clear_history(&mut self) -> bool {
+        self.state.clear_history();
+        true
+    }
+
     fn frames_before(&self, params: &ParamValues, frame_rate: Option<f64>) -> usize {
         let s = RenderSettings {
             analysis_step: AnalysisStep::at(frame_rate),

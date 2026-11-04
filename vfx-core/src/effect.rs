@@ -129,6 +129,14 @@ pub trait CpuEffect: Send {
         false
     }
 
+    /// Forgets everything derived from earlier frames, because the host's frames no longer follow
+    /// on (a seek back, a clip loop, a new source or size). The next render must match a fresh
+    /// effect's; allocations and GPU resources should stay. Returns `false` if the effect can't
+    /// do this, and the host makes a new effect instead.
+    fn clear_history(&mut self) -> bool {
+        false
+    }
+
     /// The values a host holds for this instance, ahead of a render where it can give them: when
     /// it makes the instance or a value changes. Slow setup they call for can start here, off
     /// the render thread.
