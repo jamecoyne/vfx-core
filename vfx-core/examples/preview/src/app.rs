@@ -188,23 +188,19 @@ impl Preview {
             .create_surface(window.clone())
             .map_err(|e| format!("couldn't create a surface: {e}"))?;
         let adapter = pick_adapter(&instance, &surface, gpu_choice.as_deref()).await?;
-        #[cfg(target_arch = "wasm32")]
-        let required_limits = wgpu::Limits::default();
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!(
+            "preview: drawing on {} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
         // Effects draw on this device, and segcam's atlas grows with the trail: as much of a
         // binding as the adapter allows, or the atlas stops at wgpu's default.
-        #[cfg(not(target_arch = "wasm32"))]
-        let required_limits = {
-            let supported = adapter.limits();
-            eprintln!(
-                "preview: drawing on {} ({:?})",
-                adapter.get_info().name,
-                adapter.get_info().backend
-            );
-            wgpu::Limits {
-                max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
-                max_buffer_size: supported.max_buffer_size,
-                ..wgpu::Limits::default()
-            }
+        let supported = adapter.limits();
+        let required_limits = wgpu::Limits {
+            max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
+            max_buffer_size: supported.max_buffer_size,
+            ..wgpu::Limits::default()
         };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
