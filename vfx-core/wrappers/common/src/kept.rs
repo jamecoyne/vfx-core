@@ -31,6 +31,7 @@ impl CpuInstance {
         let Processor::Cpu(effect) = make() else {
             return None;
         };
+        crate::pin::pin_module();
         let kept = (host_keeps && effect.keeps_state()).then(|| Mutex::new(effect));
         Some(Self { make, kept })
     }
