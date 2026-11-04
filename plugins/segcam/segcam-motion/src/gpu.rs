@@ -6,8 +6,9 @@
 //! ([`crate::IncrementalRenderer::gpu_overlay`]). The device opens in the background, and renders
 //! draw on the CPU until it is ready. A render the GPU fails is drawn on the CPU and the next one
 //! retries the GPU, or after `MAX_RECENT_FAULTS`, retries after `FAULT_COOLDOWN`; a lost device
-//! is disabled for every instance. In browsers it draws on the device the host shares, and a draw
-//! is read back at the next render of the same frame.
+//! is disabled for every instance. In browsers it draws on the device the host shares. A draw into
+//! a host's frame needs no readback anywhere; otherwise a browser reads it back at the next render
+//! of the same frame.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
@@ -53,12 +54,10 @@ pub struct GpuContext {
     /// An atlas built ahead for the first drawer, so its first render doesn't allocate one.
     preallocated_atlas: Mutex<Option<Atlas>>,
     /// What writes the swarm into a host's frame, per frame format, made on first use.
-    #[cfg(not(target_arch = "wasm32"))]
     unpacks: Mutex<Vec<Arc<Unpack>>>,
 }
 
 /// Writes a draw's 8-bit output words into a host's frame of `format` (`unpack.wgsl`).
-#[cfg(not(target_arch = "wasm32"))]
 struct Unpack {
     format: wgpu::TextureFormat,
     layout: wgpu::BindGroupLayout,
@@ -72,7 +71,6 @@ impl GpuContext {
     }
 
     /// The unpack for frames of `format`.
-    #[cfg(not(target_arch = "wasm32"))]
     fn unpack(&self, format: wgpu::TextureFormat) -> Arc<Unpack> {
         let mut unpacks = self.unpacks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(unpack) = unpacks.iter().find(|u| u.format == format) {
@@ -299,13 +297,6 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
         && let Some(gpu) = vfx_core::Gpu::shared()
     {
         let dev = on_shared(gpu);
-        // The formats hosts offer, built here so the first offered render doesn't stall on it.
-        for format in [
-            wgpu::TextureFormat::Rgba8Unorm,
-            wgpu::TextureFormat::Rgba32Float,
-        ] {
-            dev.unpack(format);
-        }
         return match (dev.lost(), dev.errors()) {
             (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
             _ => Ok(dev),
@@ -411,7 +402,15 @@ fn on_shared(gpu: vfx_core::Gpu) -> GpuContext {
         .min(limits.max_buffer_size);
     let info = gpu.device.adapter_info();
     let faults = vfx_core::Gpu::shared_faults();
-    GpuContext::build(gpu.device, gpu.queue, info, max_binding, faults, true)
+    let dev = GpuContext::build(gpu.device, gpu.queue, info, max_binding, faults, true);
+    // The formats hosts offer, built here so the first offered render doesn't stall on it.
+    for format in [
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Rgba32Float,
+    ] {
+        dev.unpack(format);
+    }
+    dev
 }
 
 // Browsers can't wait for a device inside a render, so this draws on the one the host shared.
@@ -491,7 +490,6 @@ impl GpuContext {
             faults,
             host_shared,
             preallocated_atlas: Mutex::new(None),
-            #[cfg(not(target_arch = "wasm32"))]
             unpacks: Mutex::new(Vec::new()),
         }
     }
@@ -760,7 +758,6 @@ pub struct Drawer {
     dev: Arc<GpuContext>,
     globals: wgpu::Buffer,
     /// Holds the canvas width for an unpack into a host's frame.
-    #[cfg(not(target_arch = "wasm32"))]
     unpack_uniform: wgpu::Buffer,
     frame_buffer: GrowableBuffer,
     output_buffer: GrowableBuffer,
@@ -829,7 +826,6 @@ impl Drawer {
                 usage: U::UNIFORM | U::COPY_DST,
                 mapped_at_creation: false,
             }),
-            #[cfg(not(target_arch = "wasm32"))]
             unpack_uniform: dev.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("segcam unpack canvas"),
                 size: 16,
@@ -1071,7 +1067,6 @@ impl Drawer {
     /// Draws the swarm as [`Drawer::draw_swarm`] does, into `target`, a host's frame on this
     /// device the size of the canvas, with no readback: the host shows it from there. An
     /// 8-bit canvas only.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn draw_swarm_into<'t, C: Channel>(
         &mut self,
         target: &vfx_core::Frame,
@@ -1371,7 +1366,6 @@ impl Drawer {
 
     /// Runs a draw over the whole of `target` and writes it there, with no readback. The host's
     /// work that shows `target` comes after it on the same queue, so nothing here waits.
-    #[cfg(not(target_arch = "wasm32"))]
     fn draw_into_target(
         &mut self,
         pipeline: &wgpu::ComputePipeline,

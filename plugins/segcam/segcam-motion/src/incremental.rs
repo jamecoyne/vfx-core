@@ -14,7 +14,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
 use vfx_core::cpu::FrameSource;
-#[cfg(not(target_arch = "wasm32"))]
 use vfx_core::wgpu;
 use vfx_core::{Reading, Report};
 use vfx_plugin::vfx_host::by_rows;
@@ -91,13 +90,11 @@ pub struct IncrementalRenderer {
     #[cfg(test)]
     face_detection_calls: u32,
     /// A host's GPU frame the render may draw into instead of its output.
-    #[cfg(not(target_arch = "wasm32"))]
     target: Option<TargetOffer>,
 }
 
 /// A host's frame on `device`, offered to one render ([`vfx_core::CpuEffect::render_to`]), and
 /// whether the render drew into it.
-#[cfg(not(target_arch = "wasm32"))]
 struct TargetOffer {
     device: wgpu::Device,
     frame: vfx_core::Frame,
@@ -177,7 +174,6 @@ impl IncrementalRenderer {
     /// Offers the next render `target` to draw into instead of its output, which a swarm drawn
     /// on the GPU of the same device takes; [`IncrementalRenderer::took_target`] says whether it
     /// did.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn offer_target(&mut self, target: vfx_core::Target<'_>) {
         let f = target.frame;
         self.target = Some(TargetOffer {
@@ -194,7 +190,6 @@ impl IncrementalRenderer {
     }
 
     /// Whether the last render drew into the target offered for it. The offer ends.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn took_target(&mut self) -> bool {
         self.target.take().is_some_and(|offer| offer.drawn_into)
     }
@@ -202,17 +197,10 @@ impl IncrementalRenderer {
     /// Whether this render can draw a swarm of `(w, h)` at `C` into the offered target: one
     /// on `drawer`'s device, of the canvas's size, for an 8-bit canvas.
     fn can_draw_into_target<C: Channel>(&self, drawer: &Drawer, (w, h): (i32, i32)) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
         let fits = self.target.as_ref().is_some_and(|offer| {
             (offer.frame.width, offer.frame.height) == (w as u32, h as u32)
                 && drawer.draws_on(&offer.device)
         });
-        // No browser host offers a frame.
-        #[cfg(target_arch = "wasm32")]
-        let fits = {
-            let _ = (drawer, w, h);
-            false
-        };
         size_of::<C>() == 1 && fits
     }
 
@@ -733,7 +721,6 @@ impl IncrementalRenderer {
         let windows = visible
             .iter()
             .map(|p| (p.tile, self.atlas_allocations[&p.frame].slots[p.index]));
-        #[cfg(not(target_arch = "wasm32"))]
         if into_target && let Some(offer) = self.target.as_mut() {
             drawer.draw_swarm_into(&offer.frame, windows, frame.as_ref(), number, s, &shadow)?;
             offer.drawn_into = true;
