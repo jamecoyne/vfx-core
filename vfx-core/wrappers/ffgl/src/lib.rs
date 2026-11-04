@@ -155,9 +155,9 @@ struct Instance {
     #[cfg(target_os = "macos")]
     interop: Option<surface::Interop>,
     #[cfg(target_os = "windows")]
-    interop: Option<shared::Interop>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    interop: shared::InteropSlot,
     /// Frames go through RAM: `VFX_FFGL_PATH=ram`, or the interop failed for this instance.
+    #[cfg(target_os = "macos")]
     interop_disabled: bool,
     /// The frame a CPU effect may draw its output into, on the interop's device.
     #[cfg(target_os = "windows")]
@@ -189,9 +189,11 @@ impl Instance {
             cpu_effect,
             #[cfg(target_os = "windows")]
             float_transfer: None,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "macos")]
             interop: None,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "windows")]
+            interop: shared::InteropSlot::new(ram_path_forced()),
+            #[cfg(target_os = "macos")]
             interop_disabled: ram_path_forced(),
             #[cfg(target_os = "windows")]
             gpu_output_frame: None,
@@ -367,10 +369,12 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
                     if let Some(blit) = instance.pass_through_blit.take() {
                         blit.delete();
                     }
-                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    #[cfg(target_os = "macos")]
                     if let Some(interop) = instance.interop.take() {
                         interop.delete();
                     }
+                    #[cfg(target_os = "windows")]
+                    instance.interop.delete();
                 }
                 FFMixed::success()
             }
@@ -484,9 +488,7 @@ unsafe fn process_cpu(
     let (w, h) = (input_texture.width, input_texture.height);
     // SAFETY: the host's context is current.
     #[cfg(target_os = "windows")]
-    unsafe {
-        prepare_gpu_output(instance, (w, h))
-    };
+    let gpu_output_ready = unsafe { prepare_gpu_output(instance, &values, (w, h)) };
     let Some(cpu) = instance.cpu_effect.as_mut() else {
         return false;
     };
@@ -542,11 +544,10 @@ unsafe fn process_cpu(
         h as i32,
     ));
     #[cfg(target_os = "windows")]
-    let target = (instance
-        .interop
-        .as_ref()
-        .zip(instance.gpu_output_frame.as_ref()))
-    .map(|(interop, frame)| vfx_core::Target::new(interop.gpu(), frame));
+    let target = (instance.interop.current())
+        .zip(instance.gpu_output_frame.as_ref())
+        .filter(|_| gpu_output_ready)
+        .map(|(interop, frame)| vfx_core::Target::new(interop.gpu(), frame));
     #[cfg(not(target_os = "windows"))]
     let target = None;
     let effect = &cpu.effect;
@@ -562,18 +563,25 @@ unsafe fn process_cpu(
     };
     let render_time = started.elapsed() - read_time;
     #[cfg(target_os = "windows")]
-    if let (true, Some(interop), Some(frame)) =
-        (on_gpu, &instance.interop, &instance.gpu_output_frame)
-    {
-        // SAFETY: the context is current with the host's framebuffer bound, and the effect drew
-        // `frame` on the interop's device.
-        if let Err(e) = unsafe { interop.present(frame) } {
-            // This frame is on the GPU only; the next ones go through RAM.
-            LOG.note(&format!(
-                "warning: showing the GPU output failed, using RAM: {e}"
-            ));
-            instance.interop_disabled = true;
-            return false;
+    if on_gpu {
+        let presented = (instance.interop.current())
+            .zip(instance.gpu_output_frame.as_ref())
+            // SAFETY: the context is current with the host's framebuffer bound, and the effect drew
+            // `frame` on the interop's device.
+            .map(|(interop, frame)| unsafe { interop.present(frame) });
+        if let Some(Err(e)) = presented {
+            // This frame exists only on the GPU, so the input stands in for it. The next ones go
+            // through RAM.
+            instance.interop.record_render_error(e);
+            if let Some(blit) = &instance.pass_through_blit {
+                let max_uv = [
+                    w as f32 / input_texture.hardware_width.max(1) as f32,
+                    h as f32 / input_texture.hardware_height.max(1) as f32,
+                ];
+                // SAFETY: the context is current with the host's framebuffer bound.
+                unsafe { blit.draw(input_texture.handle, gl::TEXTURE_2D, max_uv) };
+            }
+            return true;
         }
     }
     if !on_gpu {
@@ -602,44 +610,51 @@ unsafe fn process_cpu(
     true
 }
 
-/// Readies a CPU effect's GPU output at `size`: the shared images and the frame the effect
-/// draws into, on the device shared at instantiation. Leaves both unset where that device
-/// isn't there or the path has failed, so frames go through RAM.
+/// Readies a CPU effect's GPU output at `size`, and says whether this render can offer it. The
+/// images and the frame the effect draws into are about 100 MB at 1080p, so an instance allocates
+/// them when the effect can use them, and keeps them while the size holds so that switching modes
+/// in a show doesn't allocate on the render thread.
 ///
 /// # Safety
 /// The host's context must be current.
 #[cfg(target_os = "windows")]
-unsafe fn prepare_gpu_output(instance: &mut Instance, size: (u32, u32)) {
-    let ready = instance.interop.as_ref().is_some_and(|i| i.size() == size)
-        && instance.gpu_output_frame.is_some();
-    if ready && !instance.interop_disabled {
-        return;
+unsafe fn prepare_gpu_output(
+    instance: &mut Instance,
+    values: &ParamValues,
+    size: (u32, u32),
+) -> bool {
+    let can_draw =
+        (instance.cpu_effect.as_ref()).is_some_and(|cpu| cpu.effect.can_draw_to_target(values));
+    let same_size = instance.interop.current().is_some_and(|i| i.size() == size);
+    if !can_draw {
+        if !same_size {
+            instance.gpu_output_frame = None;
+            // SAFETY: the context is current; the interop belongs to it.
+            unsafe { instance.interop.release() };
+        }
+        LOG.note("GPU output not set up: the effect draws these settings on the CPU");
+        return false;
     }
-    instance.gpu_output_frame = None;
-    if let Some(old) = instance.interop.take() {
-        // SAFETY: the context is current; the old interop belongs to it.
-        unsafe { old.delete() };
-    }
-    if instance.interop_disabled || vfx_core::Gpu::shared().is_none() {
-        return;
+    if vfx_core::Gpu::shared().is_none() {
+        LOG.note("GPU output not set up: no device is shared with OpenGL");
+        return false;
     }
     // SAFETY: the context is current.
-    match unsafe { shared::Interop::new(size) } {
-        Ok(interop) => {
-            let (w, h) = size;
-            instance.gpu_output_frame = Some(vfx_core::Frame::new(
-                interop.gpu(),
-                w,
-                h,
-                pipeline::FRAME_FORMAT,
-            ));
-            instance.interop = Some(interop);
-        }
-        Err(e) => {
-            LOG.note(&format!("warning: GPU output unavailable, using RAM: {e}"));
-            instance.interop_disabled = true;
-        }
+    let Some(interop) = (unsafe { instance.interop.ready(size) }) else {
+        instance.gpu_output_frame = None;
+        return false;
+    };
+    let frame = &mut instance.gpu_output_frame;
+    if frame.as_ref().is_none_or(|f| (f.width, f.height) != size) {
+        let (w, h) = size;
+        *frame = Some(vfx_core::Frame::new(
+            interop.gpu(),
+            w,
+            h,
+            pipeline::FRAME_FORMAT,
+        ));
     }
+    true
 }
 
 /// A GPU effect: GPU-native where the platform allows, else through RAM.
@@ -663,51 +678,28 @@ unsafe fn process_gpu(
     let values = instance.effect_values();
     let ctx = Context::at(instance.time.unwrap_or(0.0));
 
+    // SAFETY: the caller has the host's context current.
     #[cfg(target_os = "windows")]
-    if !instance.interop_disabled {
-        if instance.interop.as_ref().is_none_or(|i| i.size() != (w, h)) {
-            // SAFETY: the current context owns the old shared objects.
-            if let Some(old) = instance.interop.take() {
-                unsafe { old.delete() };
+    if let Some(interop) = unsafe { instance.interop.ready((w, h)) } {
+        // SAFETY: the context is current and the host supplies its texture and FBO.
+        let rendered = catch_unwind(AssertUnwindSafe(|| unsafe {
+            interop.render(
+                &values,
+                ctx,
+                input_texture.handle,
+                (input_texture.hardware_width, input_texture.hardware_height),
+                args.host_fbo,
+            )
+        }));
+        match rendered {
+            Ok(Ok(())) => {
+                LOG.note("render path: GPU-native (Vulkan shared with OpenGL, no CPU copies)");
+                return true;
             }
-            // SAFETY: the caller has the host's context current.
-            match unsafe { shared::Interop::new((w, h)) } {
-                Ok(interop) => instance.interop = Some(interop),
-                Err(e) => {
-                    LOG.note(&format!(
-                        "warning: zero-copy path unavailable, using RAM: {e}"
-                    ));
-                    instance.interop_disabled = true;
-                }
-            }
-        }
-        if let Some(interop) = &instance.interop {
-            // SAFETY: the context is current and the host supplies its texture and FBO.
-            let rendered = catch_unwind(AssertUnwindSafe(|| unsafe {
-                interop.render(
-                    &values,
-                    ctx,
-                    input_texture.handle,
-                    (input_texture.hardware_width, input_texture.hardware_height),
-                    args.host_fbo,
-                )
-            }));
-            match rendered {
-                Ok(Ok(())) => {
-                    LOG.note("render path: GPU-native (Vulkan shared with OpenGL, no CPU copies)");
-                    return true;
-                }
-                Ok(Err(e)) => {
-                    LOG.note(&format!(
-                        "warning: shared GPU render failed, using RAM: {e}"
-                    ));
-                    instance.interop_disabled = true;
-                }
-                Err(_) => {
-                    LOG.note("warning: shared GPU render failed, using RAM");
-                    instance.interop_disabled = true;
-                }
-            }
+            Ok(Err(e)) => instance.interop.record_render_error(e),
+            Err(_) => instance
+                .interop
+                .record_render_error(shared::InteropError::Failed("the render panicked".into())),
         }
     }
 

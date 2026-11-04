@@ -51,7 +51,14 @@ effect draws on the CPU goes up through RAM as before.
 If sharing can't be set up (missing extensions, a device mismatch, unsupported export
 formats or a setup error), the plugin reads the texture back through RAM instead.
 A Windows shared render error also disables sharing for that instance and uses RAM;
-if RAM rendering fails, the plugin draws the input unchanged.
+if RAM rendering fails, the plugin draws the input unchanged. Setup that may succeed later,
+such as a device short of memory, is tried again after 60 s.
+
+A frame waits at most 1 s for the GPU (`VFX_FFGL_GPU_WAIT_MS` changes it, for tests). After that
+the instance goes through RAM and tries the shared path again 60 s later, once the GPU has
+finished with the old images; if it never does, they are leaked rather than waited on.
+A CPU effect's shared images are allocated when the effect can draw its settings on the GPU
+(`CpuEffect::can_draw_to_target`), and kept while the frame size holds.
 Headless GPU setup uses Vulkan, Metal or DX12 so wgpu leaves the host's
 OpenGL context alone. On Windows, GL draws convert the row order and alpha before
 readback and after upload; the RAM buffers already match the pipeline's canvas.

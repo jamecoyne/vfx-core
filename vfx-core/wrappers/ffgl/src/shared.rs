@@ -8,6 +8,7 @@
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use ash::vk::Handle;
 use ash::{khr, vk};
@@ -16,7 +17,44 @@ use vfx_core::{Context, ParamValues};
 use vfx_core::{Frame, Gpu};
 use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
-use crate::{gl, ram};
+use crate::{LOG, gl, ram};
+
+/// How long a frame waits for the GPU before the instance goes through RAM, so a GPU that hangs
+/// without being lost stalls a show for a bounded time: this wait once, then whatever the effect's
+/// own draws wait before they stop using that GPU (segcam: this limit per draw, three times).
+const FRAME_GPU_WAIT: Duration = Duration::from_secs(1);
+/// How long setup and teardown wait for the GPU, which no frame is waiting on as closely.
+const SETUP_GPU_WAIT: Duration = Duration::from_secs(5);
+/// How long after a failure that may clear (a device short of memory, a hang) setup is tried again.
+/// An FFGL instance can live a whole show, and a try costs a stall on the host's render thread.
+const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Why the interop can't be used.
+#[derive(Debug)]
+pub enum InteropError {
+    /// This machine can't share frames between OpenGL and Vulkan. Trying again can't help.
+    Unsupported(String),
+    /// Something failed that may not fail next time.
+    Failed(String),
+    /// The GPU didn't finish in time. Vulkan may still own the images and its work may still be
+    /// running, so GL must not wait on the semaphore and nothing may be deleted until it is idle.
+    Hung,
+}
+
+impl From<String> for InteropError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl std::fmt::Display for InteropError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(message) | Self::Failed(message) => f.write_str(message),
+            Self::Hung => f.write_str("the GPU did not finish in time"),
+        }
+    }
+}
 
 /// One device per GL device LUID, for the life of the process: instances share it.
 static OPEN_DEVICES: Mutex<Vec<Arc<SharedDevice>>> = Mutex::new(Vec::new());
@@ -463,6 +501,8 @@ enum OwnershipTransfer {
 /// The shared images and semaphores of one plugin instance at one frame size.
 pub struct Interop {
     size: (u32, u32),
+    /// [`FRAME_GPU_WAIT`], or `VFX_FFGL_GPU_WAIT_MS` when set, which tests the hang path.
+    frame_gpu_wait: Duration,
     device: Arc<SharedDevice>,
     input: SharedImage,
     output: SharedImage,
@@ -478,16 +518,16 @@ pub struct Interop {
 impl Interop {
     /// # Safety
     /// The host's GL context must be current.
-    pub unsafe fn new(size: (u32, u32)) -> Result<Self, String> {
+    pub unsafe fn new(size: (u32, u32)) -> Result<Self, InteropError> {
         // SAFETY: the caller has the current context; each failed step cleans earlier GL objects.
         unsafe {
-            let luid = gl::shared_memory_luid()?;
-            let device = SharedDevice::open(luid)?;
+            let luid = gl::shared_memory_luid().map_err(InteropError::Unsupported)?;
+            let device = SharedDevice::open(luid).map_err(InteropError::Unsupported)?;
             let limit = device.gpu.device.limits().max_texture_dimension_2d;
             if size.0 > limit || size.1 > limit {
-                return Err(format!(
+                return Err(InteropError::Failed(format!(
                     "shared frame exceeds the device's {limit}-pixel texture limit"
-                ));
+                )));
             }
             let input = SharedImage::new(&device, size, true)?;
             let output = SharedImage::new(&device, size, false).inspect_err(|_| input.delete())?;
@@ -516,8 +556,13 @@ impl Interop {
                 input_framebuffer.delete();
                 cleanup();
             })?;
+            let frame_gpu_wait = std::env::var("VFX_FFGL_GPU_WAIT_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+                .map_or(FRAME_GPU_WAIT, Duration::from_millis);
             let interop = Self {
                 size,
+                frame_gpu_wait,
                 device,
                 input,
                 output,
@@ -534,20 +579,24 @@ impl Interop {
                 interop.barrier(&mut encoder, OwnershipTransfer::FirstRelease);
                 interop.signal_vulkan_finished();
                 gpu.queue.submit([encoder.finish()]);
-                gpu.device
-                    .poll(wgpu::PollType::wait_indefinitely())
-                    .map_err(|e| e.to_string())
-                    .and_then(|_| {
-                        interop.gl_wait_for_vulkan();
-                        gl::finish_shared();
-                        gl::check_error("initial shared image handoff")
-                    })
+                interop.wait_for_gpu(SETUP_GPU_WAIT).and_then(|()| {
+                    interop.gl_wait_for_vulkan();
+                    gl::finish_shared();
+                    gl::check_error("initial shared image handoff").map_err(InteropError::from)
+                })
             };
-            if let Err(e) = handoff {
-                interop.delete_objects();
-                return Err(e);
+            match handoff {
+                Ok(()) => Ok(interop),
+                Err(InteropError::Hung) => {
+                    // Vulkan may still be using all of this, and no later frame will know of it.
+                    std::mem::forget(interop);
+                    Err(InteropError::Hung)
+                }
+                Err(e) => {
+                    interop.delete_objects();
+                    Err(e)
+                }
             }
-            Ok(interop)
         }
     }
 
@@ -567,6 +616,27 @@ impl Interop {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Waits for everything submitted to the queue.
+    fn wait_for_gpu(&self, timeout: Duration) -> Result<(), InteropError> {
+        let wait = wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(timeout),
+        };
+        match self.device.gpu.device.poll(wait) {
+            Ok(_) => Ok(()),
+            Err(wgpu::PollError::Timeout) => Err(InteropError::Hung),
+            Err(e) => Err(InteropError::Failed(e.to_string())),
+        }
+    }
+
+    /// Whether everything submitted to the queue has finished. Doesn't wait.
+    fn gpu_is_idle(&self) -> bool {
+        matches!(
+            self.device.gpu.device.poll(wgpu::PollType::Poll),
+            Ok(wgpu::PollStatus::QueueEmpty)
+        )
+    }
+
     fn extent(&self) -> wgpu::Extent3d {
         wgpu::Extent3d {
             width: self.size.0,
@@ -582,7 +652,7 @@ impl Interop {
     /// # Safety
     /// The host's context must be current, with its framebuffer bound; `frame` is
     /// [`FRAME_FORMAT`] at this interop's size, on its device.
-    pub unsafe fn present(&self, frame: &Frame) -> Result<(), String> {
+    pub unsafe fn present(&self, frame: &Frame) -> Result<(), InteropError> {
         let _queue = self.lock_queue();
         let gpu = &self.device.gpu;
         // SAFETY: GL owns both images, and the queue lock is held.
@@ -609,7 +679,7 @@ impl Interop {
         texture: u32,
         hardware: (u32, u32),
         host_fbo: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), InteropError> {
         let _queue = self.lock_queue();
         let gpu = &self.device.gpu;
         let (w, h) = self.size;
@@ -700,7 +770,7 @@ impl Interop {
     /// # Safety
     /// The host's context must be current, Vulkan must own both images with its work on them
     /// submitted, and the queue lock must be held.
-    unsafe fn draw_output_to_host(&self) -> Result<(), String> {
+    unsafe fn draw_output_to_host(&self) -> Result<(), InteropError> {
         let gpu = &self.device.gpu;
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         // SAFETY: the caller's copies are ahead of this release, and the caller holds the lock.
@@ -709,15 +779,13 @@ impl Interop {
             self.signal_vulkan_finished();
         }
         gpu.queue.submit([encoder.finish()]);
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| e.to_string())?;
+        self.wait_for_gpu(self.frame_gpu_wait)?;
         // SAFETY: Vulkan finished writing and released the images before GL reads them.
         unsafe {
             self.gl_wait_for_vulkan();
             self.canvas_to_host
                 .draw(self.output.gl_texture, gl::TEXTURE_2D, [1.0, 1.0]);
-            gl::check_error("Vulkan to GL handoff")
+            Ok(gl::check_error("Vulkan to GL handoff")?)
         }
     }
 
@@ -850,16 +918,135 @@ impl Interop {
         }
     }
 
+    /// Deletes the interop, or leaks it if the GPU is still using it: a leak ends with the process,
+    /// and a wait here would freeze the host.
+    ///
     /// # Safety
     /// The context that made the interop must be current.
-    pub unsafe fn delete(&self) {
-        let _queue = self.lock_queue();
-        let _ = self
-            .device
-            .gpu
-            .device
-            .poll(wgpu::PollType::wait_indefinitely());
-        // SAFETY: the caller has the context current and Vulkan has finished.
-        unsafe { self.delete_objects() };
+    unsafe fn delete(self) {
+        let finished = {
+            let _queue = self.lock_queue();
+            self.wait_for_gpu(SETUP_GPU_WAIT).is_ok()
+        };
+        if finished {
+            // SAFETY: the caller has the context current and Vulkan has finished.
+            unsafe { self.delete_objects() };
+        } else {
+            LOG.note("warning: leaking shared images the GPU never finished with");
+            std::mem::forget(self);
+        }
+    }
+}
+
+/// One instance's way to the interop: what it has, and whether and when it may try for one.
+pub struct InteropSlot {
+    current: Option<Interop>,
+    /// An interop the GPU hasn't finished with, deleted once it has.
+    hung: Option<Interop>,
+    /// `VFX_FFGL_PATH=ram`, a machine that can't share frames, or a render that failed.
+    disabled: bool,
+    no_setup_before: Option<Instant>,
+}
+
+impl InteropSlot {
+    pub fn new(disabled: bool) -> Self {
+        Self {
+            current: None,
+            hung: None,
+            disabled,
+            no_setup_before: None,
+        }
+    }
+
+    pub fn current(&self) -> Option<&Interop> {
+        self.current.as_ref()
+    }
+
+    /// The interop at `size`, set up if the instance has none and may try.
+    ///
+    /// # Safety
+    /// The host's GL context must be current.
+    pub unsafe fn ready(&mut self, size: (u32, u32)) -> Option<&Interop> {
+        if let Some(hung) = self.hung.take() {
+            if hung.gpu_is_idle() {
+                // SAFETY: the context is current and the GPU has finished.
+                unsafe { hung.delete_objects() };
+            } else {
+                self.hung = Some(hung);
+            }
+        }
+        if self.disabled || self.current.as_ref().is_some_and(|i| i.size != size) {
+            // SAFETY: the context is current.
+            unsafe { self.release() };
+        }
+        let may_try = !self.disabled
+            && self.hung.is_none()
+            && self
+                .no_setup_before
+                .is_none_or(|time| Instant::now() >= time);
+        if self.current.is_none() && may_try {
+            // SAFETY: the context is current.
+            match unsafe { Interop::new(size) } {
+                Ok(interop) => self.current = Some(interop),
+                Err(e) => self.record_setup_error(e),
+            }
+        }
+        self.current.as_ref()
+    }
+
+    fn record_setup_error(&mut self, error: InteropError) {
+        LOG.note(&format!(
+            "warning: zero-copy path unavailable, using RAM: {error}"
+        ));
+        match error {
+            InteropError::Unsupported(_) => self.disabled = true,
+            InteropError::Failed(_) | InteropError::Hung => {
+                self.no_setup_before = Some(Instant::now() + RETRY_AFTER);
+            }
+        }
+    }
+
+    /// Takes a failed frame's error: frames go through RAM, for now after a hang and for good
+    /// after a failure, whose images may be left in any state.
+    pub fn record_render_error(&mut self, error: InteropError) {
+        LOG.note(&format!(
+            "warning: shared GPU render failed, using RAM: {error}"
+        ));
+        match error {
+            InteropError::Hung => {
+                self.hung = self.current.take();
+                self.no_setup_before = Some(Instant::now() + RETRY_AFTER);
+            }
+            InteropError::Unsupported(_) | InteropError::Failed(_) => self.disabled = true,
+        }
+    }
+
+    /// Frees the current interop.
+    ///
+    /// # Safety
+    /// The context that made the interop must be current.
+    pub unsafe fn release(&mut self) {
+        if let Some(interop) = self.current.take() {
+            // SAFETY: the caller has the context current.
+            unsafe { interop.delete() };
+        }
+    }
+
+    /// Frees everything, for an instance's end, without waiting on a GPU already known to hang.
+    ///
+    /// # Safety
+    /// The context that made the interop must be current.
+    pub unsafe fn delete(&mut self) {
+        // SAFETY: the caller has the context current.
+        unsafe { self.release() };
+        if let Some(hung) = self.hung.take() {
+            if hung.gpu_is_idle() {
+                // SAFETY: the caller has the context current and the GPU has finished.
+                unsafe { hung.delete_objects() };
+            } else {
+                LOG.note("warning: leaking shared images the GPU never finished with");
+                std::mem::forget(hung);
+            }
+        }
     }
 }

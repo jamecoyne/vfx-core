@@ -664,6 +664,44 @@ static void case_sharing(void) {
         CHECK(logged_message("render path: GPU-native (Vulkan"), "Vulkan shared path did not run in this process");
     }
 }
+
+/* A frame whose GPU wait runs out, as on a GPU that hangs without being lost: the instance goes on
+ * through RAM with the right pixels, and deleting it returns. */
+static void case_gpu_wait(void) {
+    void *timing_out = instantiate(63, 37);
+    _putenv_s("VFX_FFGL_PATH", "ram");
+    void *ram = instantiate(63, 37);
+    _putenv_s("VFX_FFGL_PATH", "");
+    Frame f = frame(63, 37, 80, 48);
+    float *reference = malloc((size_t)f.w * f.h * 4 * sizeof(float));
+    CHECK(render(ram, &f), "forced RAM reference render");
+    memcpy(reference, f.out, (size_t)f.w * f.h * 4 * sizeof(float));
+    /* A strict run requires one shared frame in the process, and the frames below may have none. */
+    void *normal = instantiate(63, 37);
+    CHECK(render(normal, &f), "render at the normal wait");
+    call(DEINSTANTIATE_GL, u(0), normal);
+    /* Read when the first render sets up the shared images. A wait of 0 ms can still find a frame
+     * this small finished, so it takes many frames to be sure of one that isn't. */
+    _putenv_s("VFX_FFGL_GPU_WAIT_MS", "0");
+    for (int i = 0; i < 500; i++) {
+        CHECK(render(timing_out, &f), "render %d after the wait ran out", i);
+        float worst = 0;
+        for (int k = 0; k < f.w * f.h * 4; k++) {
+            float diff = fabsf(reference[k] - f.out[k]);
+            if (diff > worst) worst = diff;
+        }
+        CHECK(worst < 1e-4f, "render %d differs from RAM: %g", i, worst);
+        CHECK(glGetError() == GL_NO_ERROR, "render %d left a GL error", i);
+    }
+    _putenv_s("VFX_FFGL_GPU_WAIT_MS", "");
+    free(reference);
+    free_frame(&f);
+    CHECK(call(DEINSTANTIATE_GL, u(0), timing_out).u == 0, "delete after the wait ran out");
+    call(DEINSTANTIATE_GL, u(0), ram);
+    if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
+        CHECK(logged_message("the GPU did not finish in time"), "the wait never ran out");
+    }
+}
 #endif
 
 typedef struct { const char *name; void (*run)(void); } Case;
@@ -671,6 +709,7 @@ static Case cases[] = {
 #ifdef _WIN32
     {"context", case_context},
     {"sharing", case_sharing},
+    {"gpu_wait", case_gpu_wait},
 #endif
     {"info", case_info}, {"passthrough", case_passthrough}, {"brightness", case_brightness},
     {"padding", case_padding}, {"blur", case_blur}, {"vignette", case_vignette},
@@ -743,7 +782,8 @@ int main(int argc, char **argv) {
     if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
         CHECK(logged_message("render path: GPU-native (Vulkan"), "required Vulkan shared path absent from this process's log");
         CHECK(!logged_message("warning: zero-copy path unavailable"), "shared setup fell back during this run");
-        CHECK(!logged_message("warning: shared GPU render failed"), "shared rendering fell back during this run");
+        CHECK(!logged_message("warning: shared GPU render failed, using RAM: GL")
+                  && !logged_message("the render panicked"), "shared rendering fell back during this run");
     }
 #endif
     if (!ran) { fprintf(stderr, "unknown case %s\n", only); return 2; }
