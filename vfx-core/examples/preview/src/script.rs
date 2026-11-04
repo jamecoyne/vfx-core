@@ -512,6 +512,7 @@ mod tests {
                 on_cpu: true,
                 source: SourceKind::Video,
                 size: (1920, 1080),
+                screen_counts_drawn: false,
             },
             ..Default::default()
         };
@@ -533,6 +534,7 @@ mod tests {
                 on_cpu: false,
                 source: SourceKind::Pattern,
                 size: (0, 0),
+                screen_counts_drawn: false,
             },
             ..Default::default()
         };

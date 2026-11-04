@@ -552,6 +552,9 @@ impl Preview {
         let values = self
             .exprs
             .apply(c.effect, c.values(), &self.variables, dt as f32);
+        // Record reads the picture from RAM.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.effects.keep_output_in_ram(self.recording.is_some());
         self.effects.render(&self.gpu, c, &values, frame_time);
         #[cfg(not(target_arch = "wasm32"))]
         self.record_frame();
@@ -778,6 +781,7 @@ impl Preview {
                 on_cpu: self.effects.on_cpu(),
                 source,
                 size: self.effects.size(),
+                screen_counts_drawn: self.effects.output_drawn_on_gpu(),
             };
             self.stats.sample(
                 self.counts,

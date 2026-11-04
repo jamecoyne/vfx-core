@@ -67,6 +67,9 @@ pub struct ShownEffect {
     pub source: SourceKind,
     /// The effect output's size, in pixels.
     pub size: (u32, u32),
+    /// The output is drawn on the GPU, so the screen rate counts drawn pictures, not ones
+    /// compared with the last.
+    pub screen_counts_drawn: bool,
 }
 
 /// What the bar shows, and on the desktop what `--stats` prints.
@@ -104,6 +107,7 @@ impl Default for Snapshot {
                 on_cpu: false,
                 source: SourceKind::default(),
                 size: (0, 0),
+                screen_counts_drawn: false,
             },
             report: Report::default(),
             source: 0.0,
@@ -314,7 +318,12 @@ pub fn bar(ui: &mut Ui, s: &Snapshot) {
         ui.separator();
         ui.monospace(effect_text(s));
         ui.separator();
-        ui.monospace(format!("screen {:.0} fps", s.screen));
+        let drawn = if s.shown.screen_counts_drawn {
+            " drawn"
+        } else {
+            ""
+        };
+        ui.monospace(format!("screen {:.0} fps{drawn}", s.screen));
         #[cfg(not(target_arch = "wasm32"))]
         machine_load(ui, s);
     });

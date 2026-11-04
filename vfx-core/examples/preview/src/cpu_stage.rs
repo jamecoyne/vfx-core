@@ -12,7 +12,7 @@ use web_time::Instant;
 
 use crate::effects::{FullscreenPass, RenderOutcome};
 use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
-use vfx_core::{Context, Frame, Gpu, ParamValues};
+use vfx_core::{Context, Frame, Gpu, ParamValues, Target};
 use vfx_host::{CpuInstance, by_rows};
 
 pub enum Input<'a> {
@@ -33,10 +33,15 @@ pub struct CpuStage {
     rendered_with: Option<ParamValues>,
     /// Time spent so far on the render in progress, over its unfinished calls.
     partial_render_time: Duration,
-    /// The picture in the output frame, and the same as RGBA for its upload.
+    /// The last picture in RAM, and the same as RGBA for its upload. Empty when the effect drew
+    /// the last picture straight into the output frame.
     shown: Vec<Argb<u8>>,
     upload_rgba: Vec<u8>,
+    /// `upload_rgba` holds a picture the output frame doesn't have yet.
+    upload_pending: bool,
     output: Frame,
+    /// The effect drew the picture in the output frame, so RAM doesn't hold it.
+    output_drawn_on_gpu: bool,
     reader: Option<GpuFrameReader>,
 }
 
@@ -55,7 +60,9 @@ impl CpuStage {
             partial_render_time: Duration::ZERO,
             shown: Vec::new(),
             upload_rgba: vec![0; pixels * 4],
+            upload_pending: false,
             output: Frame::new(gpu, size.0, size.1, wgpu::TextureFormat::Rgba8Unorm),
+            output_drawn_on_gpu: false,
             reader: None,
         }
     }
@@ -78,7 +85,9 @@ impl CpuStage {
         self.partial_render_time = Duration::ZERO;
         self.shown = Vec::new();
         self.upload_rgba = vec![0; pixels * 4];
+        self.upload_pending = false;
         self.output = Frame::new(gpu, size.0, size.1, wgpu::TextureFormat::Rgba8Unorm);
+        self.output_drawn_on_gpu = false;
         self.reader = None;
     }
 
@@ -86,7 +95,12 @@ impl CpuStage {
         &self.output
     }
 
-    /// The last picture in RAM; empty until the first.
+    /// Whether the effect drew the last picture straight into the output frame.
+    pub fn output_drawn_on_gpu(&self) -> bool {
+        self.output_drawn_on_gpu
+    }
+
+    /// The last picture in RAM; empty until the first, and after one drawn into the output frame.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn shown(&self) -> &[Argb<u8>] {
         &self.shown
@@ -151,13 +165,19 @@ impl CpuStage {
         }
     }
 
-    /// Renders the newest frame again if anything changed since the last render.
+    /// Renders the newest frame again if anything changed since the last render, or if RAM has to
+    /// hold a picture only the output frame has. Offers the output frame when `offer_target`.
     fn render_newest(
         &mut self,
+        gpu: &Gpu,
         values: &ParamValues,
         time: f64,
         frame_rate: Option<f64>,
+        offer_target: bool,
     ) -> RenderOutcome {
+        if !offer_target && self.output_drawn_on_gpu {
+            self.rendered_with = None;
+        }
         if self.rendered_with.as_ref() == Some(values) || self.history.is_empty() {
             return RenderOutcome::default();
         }
@@ -171,15 +191,33 @@ impl CpuStage {
         let out = ImageMut::U8(ViewMut::from_pixels(&mut self.rendered, w, h));
         // A render that panicked starts the effect over; its frame shows what it drew.
         let started = Instant::now();
-        let _ = self
-            .effect
-            .render(&mut self.history, count, out, values, &ctx);
+        let drawn_on_gpu = if offer_target {
+            let target = Target::new(gpu, &self.output);
+            self.effect
+                .render_to(&mut self.history, count, out, target, values, &ctx)
+                .unwrap_or(false)
+        } else {
+            let _ = self
+                .effect
+                .render(&mut self.history, count, out, values, &ctx);
+            false
+        };
         self.partial_render_time += started.elapsed();
         if self.effect.unfinished() {
             return RenderOutcome::default(); // the next render of this frame finishes it
         }
         let render_time = Some(std::mem::take(&mut self.partial_render_time));
         self.rendered_with = Some(values.clone());
+        self.output_drawn_on_gpu = drawn_on_gpu;
+        if drawn_on_gpu {
+            // Empty, so the next picture in RAM compares as new and replaces this one on the GPU.
+            self.shown.clear();
+            return RenderOutcome {
+                finished: true,
+                new_picture: true,
+                render_time,
+            };
+        }
         // The same picture again, as Swarm draws between analyses, needs no copy to the GPU.
         let new_picture = bytemuck::cast_slice::<_, u8>(&self.rendered)
             != bytemuck::cast_slice::<_, u8>(&self.shown);
@@ -195,6 +233,7 @@ impl CpuStage {
                     *dst = [p.red, p.green, p.blue, p.alpha];
                 }
             });
+            self.upload_pending = true;
         }
         RenderOutcome {
             finished: true,
@@ -214,12 +253,13 @@ impl CpuStage {
         values: &ParamValues,
         time: f64,
         frame_rate: Option<f64>,
+        offer_target: bool,
     ) -> RenderOutcome {
         // A frame still waiting on the GPU keeps its place until it's done.
         if !self.effect.unfinished() {
             self.push_input(gpu, input, time, values, frame_rate);
         }
-        let rendered = self.render_newest(values, time, frame_rate);
+        let rendered = self.render_newest(gpu, values, time, frame_rate, offer_target);
         if self.effect.unfinished() {
             return rendered; // the last output stays up
         }
@@ -234,7 +274,7 @@ impl CpuStage {
                 );
                 gpu.queue.submit(Some(encoder.finish()));
             }
-        } else if rendered.new_picture {
+        } else if std::mem::take(&mut self.upload_pending) {
             self.output.write(gpu, &self.upload_rgba);
         }
         rendered
@@ -428,7 +468,9 @@ impl GpuFrameReader {
 mod tests {
     use super::*;
     use crate::catalog::{self, find};
+    use segcam_motion::SegcamMotion;
     use vfx_core::cpu::{Channel, FrameSource, Image};
+    use vfx_core::{CpuEffect as _, ParamValue, Processor};
 
     /// Every value of every channel, so a rounding on the way would show.
     fn varied_pixels(width: usize, height: usize) -> Vec<Argb<u8>> {
@@ -470,6 +512,109 @@ mod tests {
         });
         assert_eq!(seen, decoded);
         assert!(stage.reader.is_none(), "RAM frames need no readback");
+    }
+
+    /// In a process of its own: the device has to be shared before segcam opens one, and segcam
+    /// opens one once per process.
+    #[test]
+    fn output_frame_test_in_own_process() {
+        let test = "cpu_stage::tests::output_frame_matches_ram_path";
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--ignored"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// A swarm drawn straight into the output frame against the same swarm kept in RAM, then the
+    /// switch Record makes, to RAM on the frame already shown.
+    #[test]
+    #[ignore = "run by output_frame_test_in_own_process"]
+    fn output_frame_matches_ram_path() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        if gpu.device.adapter_info().device_type == wgpu::DeviceType::Cpu {
+            eprintln!("no hardware GPU adapter: skipped");
+            return;
+        }
+        gpu.share();
+        segcam_motion::gpu::status().expect("segcam draws on the shared device");
+        let (w, h) = (320usize, 180usize);
+        let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu_min_coverage(0.0)));
+        let stage = || {
+            let effect = CpuInstance::new(make, true).expect("a CPU effect");
+            CpuStage::new(&gpu, effect, (w as u32, h as u32))
+        };
+        let (mut drawn, mut in_ram) = (stage(), stage());
+        let mut values = ParamValues::new(SegcamMotion::with_gpu_min_coverage(0.0).params());
+        for (name, value) in [
+            ("output", ParamValue::Int(3)),
+            ("detect", ParamValue::Int(0)),
+            ("eyes", ParamValue::Bool(false)),
+            ("mouth", ParamValue::Bool(false)),
+            ("background", ParamValue::Int(4)),
+            ("trail", ParamValue::Int(12)),
+            ("max_tiles", ParamValue::Int(30)),
+        ] {
+            values.set(name, value).expect(name);
+        }
+        let same_picture = |out: &[u8], ram: &[Argb<u8>], at: &str| {
+            assert_eq!(out.len(), ram.len() * 4, "{at}");
+            for (rgba, p) in out.as_chunks::<4>().0.iter().zip(ram) {
+                let want = [p.red, p.green, p.blue, p.alpha];
+                for (got, want) in rgba.iter().zip(want) {
+                    assert!(got.abs_diff(want) <= 1, "{at}: {rgba:?} for {want}");
+                }
+            }
+        };
+
+        let mut drawn_frames = 0;
+        for f in 0..24 {
+            let square = 10 + f * 7;
+            let pixels: Vec<Argb<u8>> = (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    let inside = (square..square + 30).contains(&x) && (60..100).contains(&y);
+                    let (red, green, blue) = match inside {
+                        true => (230, 120, 30),
+                        false => (40 + (x % 50) as u8, 90, 150 - (y % 40) as u8),
+                    };
+                    Argb {
+                        alpha: 255,
+                        red,
+                        green,
+                        blue,
+                    }
+                })
+                .collect();
+            let time = f as f64 / 60.0;
+            drawn.render(&gpu, Input::Ram(&pixels), &values, time, Some(60.0), true);
+            in_ram.render(&gpu, Input::Ram(&pixels), &values, time, Some(60.0), false);
+            drawn_frames += u32::from(drawn.output_drawn_on_gpu());
+            same_picture(
+                &drawn.output().read_rgba8(&gpu),
+                in_ram.shown(),
+                &format!("frame {f}"),
+            );
+        }
+        assert!(drawn_frames > 0, "no frame was drawn into the output frame");
+        assert!(drawn.output_drawn_on_gpu(), "the last frame stayed in RAM");
+        assert!(drawn.shown().is_empty());
+
+        // Nothing changed, and RAM still has to come up with the picture on screen.
+        let frame = vec![Argb::default(); w * h];
+        let last = 23.0 / 60.0;
+        drawn.render(&gpu, Input::Ram(&frame), &values, last, Some(60.0), false);
+        assert!(!drawn.output_drawn_on_gpu());
+        same_picture(
+            &drawn.output().read_rgba8(&gpu),
+            drawn.shown(),
+            "back in RAM",
+        );
+        same_picture(
+            &in_ram.output().read_rgba8(&gpu),
+            drawn.shown(),
+            "the same picture",
+        );
     }
 
     /// Within 1 level of the float readback: the GPU rounds a tie its own way.

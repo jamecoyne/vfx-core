@@ -37,14 +37,15 @@ done frames=905 seconds=20.00 effect=segcam-motion on=cpu source=59.9 rendered=3
 
 The keys follow the frames: `source` is the rate they arrive from the decoder, whether they
 are taken or dropped (or `pattern` and `still`), `rendered` the renders the effect finished each second, and
-`screen` the new frames presented in the window each second, where a CPU effect's render
-counts only if its output differs from the last one, and a GPU effect's only if its time or
-parameters changed. segcam's Swarm on a transparent canvas only changes when it analyses.
+`screen` the new frames presented in the window each second. A picture in RAM counts only if
+it differs from the last one. A picture drawn on the GPU (a GPU effect, or segcam's Swarm drawn
+into the output frame) counts if its frame or parameters changed, and the bar then says
+`screen 60 fps drawn`.
 `on` says whether the
 effect renders on the CPU or in GPU passes; it can't see what a CPU effect does inside its
 render. For a CPU effect `rendered_ms` and `worst_ms` are a render's mean and longest time
 over the second (the run, on the `done` line); a GPU effect's work ends on the GPU, so it has
-neither. `frames` counts passes of the app's loop, which a visible window paces by vsync and
+neither, and for a CPU effect drawing into the output frame the times stop at its submit. `frames` counts passes of the app's loop, which a visible window paces by vsync and
 which repeats the last frame when nothing new came in; `--frames N` stops after that many.
 `cpu` is the machine's, `app_cpu` this process's as a share of one core, and `gpu` is `n/a`
 where the OS doesn't report it. Under `--quiet` loops are unpaced and each waits for the GPU,

@@ -362,6 +362,8 @@ pub struct Effects {
     stage: EffectStage,
     /// The size generated patterns render at.
     pattern_size: (u32, u32),
+    /// A CPU effect's picture has to stay readable in RAM ([`Effects::output`]).
+    keep_output_in_ram: bool,
 }
 
 impl Effects {
@@ -404,6 +406,7 @@ impl Effects {
             last_outcome: RenderOutcome::default(),
             stage: EffectStage::new(gpu, 0, PATTERN_SIZE),
             pattern_size: PATTERN_SIZE,
+            keep_output_in_ram: false,
         }
     }
 
@@ -453,6 +456,21 @@ impl Effects {
 
     pub fn size(&self) -> (u32, u32) {
         self.frames.size
+    }
+
+    /// Whether later renders keep a CPU effect's picture in RAM, for [`Effects::output`], instead
+    /// of letting the effect draw it straight into the output frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn keep_output_in_ram(&mut self, keep: bool) {
+        self.keep_output_in_ram = keep;
+    }
+
+    /// Whether the last output was drawn on the GPU, not uploaded from RAM.
+    pub fn output_drawn_on_gpu(&self) -> bool {
+        match &self.stage.run {
+            EffectRun::Gpu { .. } => true,
+            EffectRun::Cpu(stage) => stage.output_drawn_on_gpu(),
+        }
     }
 
     /// The texture egui shows. Changes identity when the size changes.
@@ -721,7 +739,10 @@ impl Effects {
                 };
                 #[cfg(target_arch = "wasm32")]
                 let input = cpu_stage::Input::Gpu(source);
-                self.last_outcome = stage.render(gpu, input, values, time, self.frame_rate);
+                // Browsers have no target path yet.
+                let offer_target = cfg!(not(target_arch = "wasm32")) && !self.keep_output_in_ram;
+                self.last_outcome =
+                    stage.render(gpu, input, values, time, self.frame_rate, offer_target);
             }
         }
 
@@ -743,7 +764,8 @@ impl Effects {
         gpu.queue.submit(Some(encoder.finish()));
     }
 
-    /// The last render's output: a CPU effect's from RAM, a GPU effect's read back, blocking.
+    /// The last render's output: a CPU effect's from RAM, which needs
+    /// [`Effects::keep_output_in_ram`] before that render, a GPU effect's read back, blocking.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn output(&mut self, gpu: &Gpu) -> Output<'_> {
         match &self.stage.run {
@@ -797,6 +819,7 @@ mod tests {
     fn flip_mirrors_the_frame() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
+        effects.keep_output_in_ram(true);
         let (controls, mut values) = shown("Flip");
         let plain = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
         values.set("flip_x", ParamValue::Float(1.0)).unwrap();
@@ -823,6 +846,7 @@ mod tests {
     fn every_effect_renders() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
+        effects.keep_output_in_ram(true);
         for (i, entry) in catalog::entries().iter().enumerate() {
             let mut controls = Controls::default();
             controls.effect = i;
@@ -839,6 +863,7 @@ mod tests {
     fn segcam_finds_the_moving_disc() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
+        effects.keep_output_in_ram(true);
         let (controls, mut values) = shown("segcam Motion (Rust)");
         values.set("output", ParamValue::Int(1)).unwrap();
         values.set("detect", ParamValue::Int(0)).unwrap();
@@ -859,6 +884,7 @@ mod tests {
     fn repeated_picture_is_not_new() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
+        effects.keep_output_in_ram(true);
         let (controls, values) = shown("segcam Motion (Rust)");
         let size = (64, 64);
         effects.start_stream(&gpu, "still".into(), size, None);
@@ -893,6 +919,7 @@ mod tests {
     fn video_frame_passes_unchanged() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
+        effects.keep_output_in_ram(true);
         let (controls, values) = shown("segcam Motion (Rust)");
         let pixels: Vec<Argb<u8>> = (0..64 * 64)
             .map(|i: usize| Argb {
@@ -935,6 +962,7 @@ mod tests {
     fn new_video_replaces_picture() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
+        effects.keep_output_in_ram(true);
         let (controls, values) = shown("segcam Motion (Rust)");
         for shade in [64, 192] {
             let grey = Argb {
