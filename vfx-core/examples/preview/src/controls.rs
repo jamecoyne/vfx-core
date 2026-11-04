@@ -123,7 +123,7 @@ pub struct Playback {
 
 /// Status shown at the top of the panel.
 pub struct PanelStatus<'a> {
-    pub image: Option<&'a str>,
+    pub source_name: Option<&'a str>,
     pub message: Option<&'a str>,
     /// The source is a video file, so the Play sound box applies.
     pub video: bool,
@@ -333,7 +333,7 @@ fn refresh_button(ui: &mut Ui) -> egui::Response {
 /// controls for whichever is running.
 fn input_box(ui: &mut Ui, c: &mut Controls, status: &PanelStatus, actions: &mut Actions) {
     ui.horizontal(|ui| {
-        let shown = match status.image {
+        let shown = match status.source_name {
             Some(name) => name.to_string(),
             None => PATTERNS[c.pattern].to_string(),
         };
@@ -344,9 +344,11 @@ fn input_box(ui: &mut Ui, c: &mut Controls, status: &PanelStatus, actions: &mut 
             .truncate()
             .selected_text(shown)
             .show_ui(ui, |ui| {
-                if let Some(i) = pattern_items(ui, |i| status.image.is_none() && c.pattern == i) {
+                if let Some(i) =
+                    pattern_items(ui, |i| status.source_name.is_none() && c.pattern == i)
+                {
                     c.pattern = i;
-                    if status.image.is_some() {
+                    if status.source_name.is_some() {
                         actions.use_pattern = true;
                     }
                 }
@@ -363,7 +365,7 @@ fn input_box(ui: &mut Ui, c: &mut Controls, status: &PanelStatus, actions: &mut 
         }
     });
 
-    if status.image.is_some() {
+    if status.source_name.is_some() {
         if let Some(playback) = &status.playback {
             transport(ui, playback, actions);
         }

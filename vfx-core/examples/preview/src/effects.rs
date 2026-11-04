@@ -1,4 +1,4 @@
-//! Everything on the effects side of the preview: a test-pattern generator (or an image
+//! Everything on the effects side of the preview: a test-pattern pattern_pass (or an image
 //! or video someone dropped on the window), the one effect being shown, and a pass that
 //! turns the result into an 8-bit texture egui can draw.
 
@@ -33,7 +33,7 @@ pub const PATTERNS: &[&str] = &[
     "Soft shapes (alpha)",
 ];
 
-const GENERATOR_WGSL: &str = r#"
+const PATTERN_WGSL: &str = r#"
 struct U { p: vec4<f32> } // x: pattern, y: time, zw: size
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -111,12 +111,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 "#;
 
 /// A fullscreen-triangle pass with one bind group.
-pub struct Pass {
+pub struct FullscreenPass {
     pipeline: wgpu::RenderPipeline,
     pub layout: wgpu::BindGroupLayout,
 }
 
-impl Pass {
+impl FullscreenPass {
     pub fn new(
         device: &wgpu::Device,
         wgsl: &str,
@@ -203,7 +203,7 @@ pub fn frame_fits(pixels: &[f32], size: (u32, u32)) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn to_float(pixels: &[Argb<u8>], width: usize, float: &mut Vec<f32>) {
+fn argb_to_float(pixels: &[Argb<u8>], width: usize, float: &mut Vec<f32>) {
     float.resize(pixels.len() * 4, 0.0);
     let table: [f32; 256] = std::array::from_fn(|b| (b as u8).to_unit());
     vfx_host::by_rows(float, width * 4, |y, dst| {
@@ -230,7 +230,7 @@ pub enum Output<'a> {
 }
 
 /// Size-dependent frames, rebuilt when the source size changes.
-struct Frames {
+struct SizedFrames {
     size: (u32, u32),
     source: Frame,
     layer: Frame,
@@ -239,7 +239,7 @@ struct Frames {
     display_view: wgpu::TextureView,
 }
 
-impl Frames {
+impl SizedFrames {
     fn new(gpu: &Gpu, size: (u32, u32)) -> Self {
         let display = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("preview display"),
@@ -268,15 +268,15 @@ impl Frames {
 
 /// The effect being shown, prepared for the current size: a GPU effect in a chain, with
 /// the alpha conversions around it that its catalog entry asks for, or a CPU effect.
-struct Stage {
+struct EffectStage {
     /// Index into the catalog.
     effect: usize,
     /// How many extra layers it reads.
     layers: usize,
-    run: Run,
+    run: EffectRun,
 }
 
-enum Run {
+enum EffectRun {
     Gpu {
         chain: Box<EffectChain>,
         /// The effect's own position in `chain`.
@@ -287,7 +287,7 @@ enum Run {
     Cpu(Box<CpuStage>),
 }
 
-impl Stage {
+impl EffectStage {
     fn new(gpu: &Gpu, effect: usize, size: (u32, u32)) -> Self {
         let entry = &catalog::entries()[effect];
         match (entry.make)() {
@@ -305,7 +305,7 @@ impl Stage {
                 Self {
                     effect,
                     layers,
-                    run: Run::Gpu {
+                    run: EffectRun::Gpu {
                         chain: Box::new(chain),
                         index,
                         drawn: None,
@@ -317,7 +317,7 @@ impl Stage {
                 Self {
                     effect,
                     layers: 0,
-                    run: Run::Cpu(Box::new(CpuStage::new(gpu, made, size))),
+                    run: EffectRun::Cpu(Box::new(CpuStage::new(gpu, made, size))),
                 }
             }
         }
@@ -326,7 +326,7 @@ impl Stage {
 
 /// What the last [`Effects::render`] did, for the stats.
 #[derive(Clone, Copy, Default)]
-pub struct Rendered {
+pub struct RenderOutcome {
     pub finished: bool,
     pub new_picture: bool,
     /// How long a CPU effect's finished render took. A GPU effect's work ends later, on
@@ -335,38 +335,39 @@ pub struct Rendered {
 }
 
 pub struct Effects {
-    rendered: Rendered,
-    frames: Frames,
-    /// A dropped image, uploaded once, used instead of the generated pattern.
-    image: Option<(String, Frame)>,
-    /// With a playing video as the source, its frame; `image` is that frame for a GPU effect.
+    last_outcome: RenderOutcome,
+    frames: SizedFrames,
+    /// A loaded image, or a stream's frame on the GPU, with its name, used in place of the
+    /// generated pattern.
+    loaded_source: Option<(String, Frame)>,
+    /// With a playing video as the source, its frame; `loaded_source` is that frame for a GPU effect.
     #[cfg(not(target_arch = "wasm32"))]
     video: Option<VideoFrame>,
     #[cfg(not(target_arch = "wasm32"))]
     layer_pixels: Vec<Argb<u8>>,
     /// A decoded frame as float, kept for the next.
     #[cfg(not(target_arch = "wasm32"))]
-    float: Vec<f32>,
+    float_scratch: Vec<f32>,
     /// The fed layer's name, when a video, webcam or image is its source; its pixels are
     /// written into `frames.layer` (see [`Effects::write_layer`]).
     layer_name: Option<String>,
     /// The streamed video's frames a second, for effects that pace their work by it.
     frame_rate: Option<f64>,
-    /// Reads results back for exports; made on first use for the current size.
+    /// Reads results back for recording; made on first use for the current size.
     #[cfg(not(target_arch = "wasm32"))]
     readback: Option<Readback>,
-    generator: Pass,
-    display_pass: Pass,
-    stage: Stage,
+    pattern_pass: FullscreenPass,
+    display_pass: FullscreenPass,
+    stage: EffectStage,
     /// The size generated patterns render at.
     pattern_size: (u32, u32),
 }
 
 impl Effects {
     pub fn new(gpu: &Gpu) -> Self {
-        let generator = Pass::new(
+        let pattern_pass = FullscreenPass::new(
             &gpu.device,
-            GENERATOR_WGSL,
+            PATTERN_WGSL,
             wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -374,7 +375,7 @@ impl Effects {
             },
             FRAME_FORMAT,
         );
-        let display_pass = Pass::new(
+        let display_pass = FullscreenPass::new(
             &gpu.device,
             DISPLAY_WGSL,
             wgpu::BindingType::Texture {
@@ -385,22 +386,22 @@ impl Effects {
             DISPLAY_FORMAT,
         );
         Self {
-            frames: Frames::new(gpu, PATTERN_SIZE),
-            image: None,
+            frames: SizedFrames::new(gpu, PATTERN_SIZE),
+            loaded_source: None,
             #[cfg(not(target_arch = "wasm32"))]
             video: None,
             #[cfg(not(target_arch = "wasm32"))]
             layer_pixels: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
-            float: Vec::new(),
+            float_scratch: Vec::new(),
             layer_name: None,
             frame_rate: None,
             #[cfg(not(target_arch = "wasm32"))]
             readback: None,
-            generator,
+            pattern_pass,
             display_pass,
-            rendered: Rendered::default(),
-            stage: Stage::new(gpu, 0, PATTERN_SIZE),
+            last_outcome: RenderOutcome::default(),
+            stage: EffectStage::new(gpu, 0, PATTERN_SIZE),
             pattern_size: PATTERN_SIZE,
         }
     }
@@ -423,26 +424,28 @@ impl Effects {
     /// Whether the shown effect renders on the CPU (a `CpuEffect`) rather than in a chain
     /// of GPU passes.
     pub fn on_cpu(&self) -> bool {
-        matches!(self.stage.run, Run::Cpu(_))
+        matches!(self.stage.run, EffectRun::Cpu(_))
     }
 
     pub fn report(&self) -> vfx_core::Report {
         match &self.stage.run {
-            Run::Cpu(stage) => stage.report(),
+            EffectRun::Cpu(stage) => stage.report(),
             _ => vfx_core::Report::default(),
         }
     }
 
     fn set_size(&mut self, gpu: &Gpu, size: (u32, u32)) {
         if self.frames.size != size {
-            self.frames = Frames::new(gpu, size);
+            self.frames = SizedFrames::new(gpu, size);
             #[cfg(not(target_arch = "wasm32"))]
             {
                 self.readback = None;
             }
             match &mut self.stage.run {
-                Run::Cpu(stage) => stage.resize(gpu, size),
-                Run::Gpu { .. } => self.stage = Stage::new(gpu, self.stage.effect, size),
+                EffectRun::Cpu(stage) => stage.resize(gpu, size),
+                EffectRun::Gpu { .. } => {
+                    self.stage = EffectStage::new(gpu, self.stage.effect, size)
+                }
             }
         }
     }
@@ -484,17 +487,17 @@ impl Effects {
     pub fn take_layer_frame(&mut self, gpu: &Gpu, video: &Video) {
         let fresh = video.take_newest(&mut self.layer_pixels).is_some();
         if fresh && self.stage.layers > 0 && video.info.size == self.frames.size {
-            to_float(
+            argb_to_float(
                 &self.layer_pixels,
                 video.info.size.0 as usize,
-                &mut self.float,
+                &mut self.float_scratch,
             );
-            self.write_layer(gpu, &self.float);
+            self.write_layer(gpu, &self.float_scratch);
         }
     }
 
-    pub fn image_name(&self) -> Option<&str> {
-        self.image.as_ref().map(|(name, _)| name.as_str())
+    pub fn source_name(&self) -> Option<&str> {
+        self.loaded_source.as_ref().map(|(name, _)| name.as_str())
     }
 
     /// Loads a PNG or JPEG as the source, scaled to fit MAX_IMAGE_SIDE.
@@ -521,7 +524,7 @@ impl Effects {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.image = Some((name, frame));
+        self.loaded_source = Some((name, frame));
         self.video = None;
         Ok(())
     }
@@ -539,12 +542,12 @@ impl Effects {
         self.set_size(gpu, size);
         self.frame_rate = frame_rate;
         let frame = Frame::new(gpu, size.0, size.1, FRAME_FORMAT);
-        self.image = Some((name, frame));
+        self.loaded_source = Some((name, frame));
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.video = None;
         }
-        if let Run::Cpu(stage) = &mut self.stage.run {
+        if let EffectRun::Cpu(stage) = &mut self.stage.run {
             stage.restart();
         }
     }
@@ -570,7 +573,7 @@ impl Effects {
     /// Replaces the source's pixels (float RGBA at the source size).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn write_source(&self, gpu: &Gpu, pixels: &[f32]) {
-        if let Some((_, frame)) = &self.image {
+        if let Some((_, frame)) = &self.loaded_source {
             frame.write(gpu, bytemuck::cast_slice(pixels));
         }
     }
@@ -579,22 +582,22 @@ impl Effects {
     /// into on the GPU.
     #[cfg(target_arch = "wasm32")]
     pub fn source_frame(&self) -> Option<&Frame> {
-        self.image.as_ref().map(|(_, frame)| frame)
+        self.loaded_source.as_ref().map(|(_, frame)| frame)
     }
 
     /// What the last render did.
-    pub fn rendered(&self) -> Rendered {
-        self.rendered
+    pub fn last_outcome(&self) -> RenderOutcome {
+        self.last_outcome
     }
 
     /// Goes back to the generated patterns.
-    pub fn clear_image(&mut self, gpu: &Gpu) {
+    pub fn use_pattern_source(&mut self, gpu: &Gpu) {
         self.frame_rate = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.video = None;
         }
-        if self.image.take().is_some() {
+        if self.loaded_source.take().is_some() {
             self.set_size(gpu, self.pattern_size);
         }
     }
@@ -603,12 +606,12 @@ impl Effects {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn set_pattern_size(&mut self, gpu: &Gpu, size: (u32, u32)) {
         self.pattern_size = size;
-        if self.image.is_none() {
+        if self.loaded_source.is_none() {
             self.set_size(gpu, size);
         }
     }
 
-    fn generate(
+    fn draw_pattern(
         &self,
         gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
@@ -632,48 +635,50 @@ impl Effects {
         );
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &self.generator.layout,
+            layout: &self.pattern_pass.layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: uniform.as_entire_binding(),
             }],
         });
-        self.generator.draw(encoder, &bind, &target.view);
+        self.pattern_pass.draw(encoder, &bind, &target.view);
     }
 
     /// Renders one frame of `controls`' effect with `values` (its parameters, after
     /// expressions). A video's frame has its own time, in place of `time`.
     pub fn render(&mut self, gpu: &Gpu, controls: &Controls, values: &ParamValues, time: f64) {
         if self.stage.effect != controls.effect {
-            self.stage = Stage::new(gpu, controls.effect, self.frames.size);
+            self.stage = EffectStage::new(gpu, controls.effect, self.frames.size);
         }
         #[cfg(not(target_arch = "wasm32"))]
         let time = self.video.as_ref().map_or(time, |video| video.time);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        let source = match &self.image {
+        let source = match &self.loaded_source {
             Some((_, frame)) => frame,
             None => {
                 let target = &self.frames.source;
-                self.generate(gpu, &mut encoder, controls.pattern, time, target);
+                self.draw_pattern(gpu, &mut encoder, controls.pattern, time, target);
                 target
             }
         };
         // A fed layer (a video, webcam or image) takes the place of a generated pattern.
-        let fed = self.layer_name.is_some() && self.stage.layers > 0;
-        let layer = controls.layer().filter(|_| self.stage.layers > 0 && !fed);
+        let layer_is_fed = self.layer_name.is_some() && self.stage.layers > 0;
+        let layer = controls
+            .layer()
+            .filter(|_| self.stage.layers > 0 && !layer_is_fed);
         if let Some(pattern) = layer {
             let target = &self.frames.layer;
-            self.generate(gpu, &mut encoder, pattern, time, target);
+            self.draw_pattern(gpu, &mut encoder, pattern, time, target);
         }
         gpu.queue.submit(Some(encoder.finish()));
 
-        let layers: &[&Frame] = if fed || layer.is_some() {
+        let layers: &[&Frame] = if layer_is_fed || layer.is_some() {
             &[&self.frames.layer]
         } else {
             &[]
         };
         match &mut self.stage.run {
-            Run::Gpu {
+            EffectRun::Gpu {
                 chain,
                 index,
                 drawn,
@@ -684,8 +689,12 @@ impl Effects {
                     && !video.pixels.is_empty()
                 {
                     video.on_gpu = true;
-                    to_float(&video.pixels, source.width as usize, &mut self.float);
-                    source.write(gpu, bytemuck::cast_slice(&self.float));
+                    argb_to_float(
+                        &video.pixels,
+                        source.width as usize,
+                        &mut self.float_scratch,
+                    );
+                    source.write(gpu, bytemuck::cast_slice(&self.float_scratch));
                 }
                 *chain.params_mut(*index) = values.clone();
                 chain.render_with_layers(gpu, source, layers, &self.frames.output, time);
@@ -695,13 +704,13 @@ impl Effects {
                 if new_picture {
                     *drawn = Some((time, values.clone()));
                 }
-                self.rendered = Rendered {
+                self.last_outcome = RenderOutcome {
                     finished: true,
                     new_picture,
                     render_time: None,
                 };
             }
-            Run::Cpu(stage) => {
+            EffectRun::Cpu(stage) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 let input = match &self.video {
                     Some(video) => cpu_stage::Input::Ram(&video.pixels),
@@ -709,13 +718,13 @@ impl Effects {
                 };
                 #[cfg(target_arch = "wasm32")]
                 let input = cpu_stage::Input::Gpu(source);
-                self.rendered = stage.render(gpu, input, values, time, self.frame_rate);
+                self.last_outcome = stage.render(gpu, input, values, time, self.frame_rate);
             }
         }
 
         let result = match &self.stage.run {
-            Run::Gpu { .. } => &self.frames.output,
-            Run::Cpu(stage) => stage.output(),
+            EffectRun::Gpu { .. } => &self.frames.output,
+            EffectRun::Cpu(stage) => stage.output(),
         };
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -735,7 +744,7 @@ impl Effects {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn output(&mut self, gpu: &Gpu) -> Output<'_> {
         match &self.stage.run {
-            Run::Gpu { .. } => {
+            EffectRun::Gpu { .. } => {
                 let result = &self.frames.output;
                 let pixels = self
                     .readback
@@ -743,7 +752,7 @@ impl Effects {
                     .read_f32(gpu, result);
                 Output::Gpu(pixels)
             }
-            Run::Cpu(stage) => Output::Cpu(stage.shown()),
+            EffectRun::Cpu(stage) => Output::Cpu(stage.shown()),
         }
     }
 }
@@ -782,7 +791,7 @@ mod tests {
     /// Renders the moving-disc pattern (a left-to-right red gradient underneath) through
     /// Flip, off and then on, and checks the result is mirrored.
     #[test]
-    fn flip_mirrors_the_preview() {
+    fn flip_mirrors_the_frame() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
         let (controls, mut values) = shown("Flip");
@@ -844,7 +853,7 @@ mod tests {
     /// A render that draws the same picture again is finished but not new, and a new one
     /// still reaches the output.
     #[test]
-    fn a_repeated_picture_is_not_new() {
+    fn repeated_picture_is_not_new() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
         let (controls, values) = shown("segcam Motion (Rust)");
@@ -852,7 +861,7 @@ mod tests {
         effects.start_stream(&gpu, "still".into(), size, None);
         let render = |effects: &mut Effects, time| {
             let frame = render_to_float(effects, &gpu, &controls, &values, time);
-            (effects.rendered(), frame)
+            (effects.last_outcome(), frame)
         };
 
         effects.write_source(&gpu, &vec![0.25; 64 * 64 * 4]);
@@ -892,7 +901,7 @@ mod tests {
             .collect();
         effects.start_video(&gpu, "clip".into(), (64, 64), 60.0);
         effects.render(&gpu, &controls, &values, 0.0);
-        assert!(!effects.rendered().finished, "no frame has arrived");
+        assert!(!effects.last_outcome().finished, "no frame has arrived");
 
         effects.video.as_mut().unwrap().pixels = pixels.clone();
         effects.render(&gpu, &controls, &values, 0.0);
@@ -901,7 +910,7 @@ mod tests {
         };
         assert_eq!(out, pixels);
         // The texture the display pass reads holds the same picture in RGBA order.
-        let Run::Cpu(stage) = &effects.stage.run else {
+        let EffectRun::Cpu(stage) = &effects.stage.run else {
             panic!("segcam is a CPU effect");
         };
         let on_gpu = stage.output().read_rgba8(&gpu);
@@ -947,7 +956,7 @@ mod frame_size_tests {
     use super::frame_fits;
 
     #[test]
-    fn a_frame_fits_its_size_in_pixels() {
+    fn frame_fits_its_size_in_pixels() {
         let frame = vec![0.0f32; 4 * 3 * 4];
         assert!(frame_fits(&frame, (4, 3)));
         assert!(!frame_fits(&frame, (4, 2)));

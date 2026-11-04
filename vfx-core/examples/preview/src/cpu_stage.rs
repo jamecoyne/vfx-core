@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use web_time::Instant;
 
-use crate::effects::{Pass, Rendered};
+use crate::effects::{FullscreenPass, RenderOutcome};
 use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, Gpu, ParamValues};
 use vfx_host::{CpuInstance, by_rows};
@@ -32,12 +32,12 @@ pub struct CpuStage {
     rendered: Vec<Argb<u8>>,
     rendered_with: Option<ParamValues>,
     /// Time spent so far on the render in progress, over its unfinished calls.
-    rendering: Duration,
+    partial_render_time: Duration,
     /// The picture in the output frame, and the same as RGBA for its upload.
     shown: Vec<Argb<u8>>,
-    upload: Vec<u8>,
+    upload_rgba: Vec<u8>,
     output: Frame,
-    reader: Option<Reader>,
+    reader: Option<GpuFrameReader>,
 }
 
 impl CpuStage {
@@ -52,9 +52,9 @@ impl CpuStage {
             last_time: None,
             rendered: vec![Argb::default(); pixels],
             rendered_with: None,
-            rendering: Duration::ZERO,
+            partial_render_time: Duration::ZERO,
             shown: Vec::new(),
-            upload: vec![0; pixels * 4],
+            upload_rgba: vec![0; pixels * 4],
             output: Frame::new(gpu, size.0, size.1, wgpu::TextureFormat::Rgba8Unorm),
             reader: None,
         }
@@ -75,9 +75,9 @@ impl CpuStage {
         self.history.resize(size.0 as i32, size.1 as i32);
         self.size = size;
         self.rendered = vec![Argb::default(); pixels];
-        self.rendering = Duration::ZERO;
+        self.partial_render_time = Duration::ZERO;
         self.shown = Vec::new();
-        self.upload = vec![0; pixels * 4];
+        self.upload_rgba = vec![0; pixels * 4];
         self.output = Frame::new(gpu, size.0, size.1, wgpu::TextureFormat::Rgba8Unorm);
         self.reader = None;
     }
@@ -92,7 +92,7 @@ impl CpuStage {
         &self.shown
     }
 
-    fn next_frame(
+    fn next_history_frame(
         &mut self,
         time: f64,
         values: &ParamValues,
@@ -108,7 +108,7 @@ impl CpuStage {
         self.history.next(before, held)
     }
 
-    fn push(
+    fn push_input(
         &mut self,
         gpu: &Gpu,
         input: Input,
@@ -121,10 +121,10 @@ impl CpuStage {
                 let mut reader = self
                     .reader
                     .take()
-                    .unwrap_or_else(|| Reader::new(gpu, self.size));
+                    .unwrap_or_else(|| GpuFrameReader::new(gpu, self.size));
                 let width = self.size.0 as usize;
                 reader.read(gpu, frame, time, self.last_time, |time, rgba, pitch| {
-                    let frame = self.next_frame(time, values, frame_rate);
+                    let frame = self.next_history_frame(time, values, frame_rate);
                     by_rows(frame, width, |y, dst| {
                         let src = &rgba[y * pitch..][..width * 4];
                         for (dst, &[red, green, blue, alpha]) in
@@ -144,7 +144,7 @@ impl CpuStage {
             #[cfg(not(target_arch = "wasm32"))]
             Input::Ram(pixels) => {
                 if !pixels.is_empty() && self.last_time != Some(time) {
-                    self.next_frame(time, values, frame_rate)
+                    self.next_history_frame(time, values, frame_rate)
                         .copy_from_slice(pixels);
                 }
             }
@@ -152,9 +152,14 @@ impl CpuStage {
     }
 
     /// Renders the newest frame again if anything changed since the last render.
-    fn refresh(&mut self, values: &ParamValues, time: f64, frame_rate: Option<f64>) -> Rendered {
+    fn render_newest(
+        &mut self,
+        values: &ParamValues,
+        time: f64,
+        frame_rate: Option<f64>,
+    ) -> RenderOutcome {
         if self.rendered_with.as_ref() == Some(values) || self.history.is_empty() {
-            return Rendered::default();
+            return RenderOutcome::default();
         }
         let (w, h) = (self.size.0 as i32, self.size.1 as i32);
         let ctx = Context {
@@ -169,11 +174,11 @@ impl CpuStage {
         let _ = self
             .effect
             .render(&mut self.history, count, out, values, &ctx);
-        self.rendering += started.elapsed();
+        self.partial_render_time += started.elapsed();
         if self.effect.unfinished() {
-            return Rendered::default(); // the next render of this frame finishes it
+            return RenderOutcome::default(); // the next render of this frame finishes it
         }
-        let render_time = Some(std::mem::take(&mut self.rendering));
+        let render_time = Some(std::mem::take(&mut self.partial_render_time));
         self.rendered_with = Some(values.clone());
         // The same picture again, as Swarm draws between analyses, needs no copy to the GPU.
         let new_picture = bytemuck::cast_slice::<_, u8>(&self.rendered)
@@ -184,14 +189,14 @@ impl CpuStage {
             self.rendered.resize(self.shown.len(), Argb::default());
             let width = self.size.0 as usize;
             let shown = &self.shown;
-            by_rows(&mut self.upload, width * 4, |y, dst| {
+            by_rows(&mut self.upload_rgba, width * 4, |y, dst| {
                 let src = &shown[y * width..][..width];
                 for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
                     *dst = [p.red, p.green, p.blue, p.alpha];
                 }
             });
         }
-        Rendered {
+        RenderOutcome {
             finished: true,
             new_picture,
             render_time,
@@ -209,12 +214,12 @@ impl CpuStage {
         values: &ParamValues,
         time: f64,
         frame_rate: Option<f64>,
-    ) -> Rendered {
+    ) -> RenderOutcome {
         // A frame still waiting on the GPU keeps its place until it's done.
         if !self.effect.unfinished() {
-            self.push(gpu, input, time, values, frame_rate);
+            self.push_input(gpu, input, time, values, frame_rate);
         }
-        let rendered = self.refresh(values, time, frame_rate);
+        let rendered = self.render_newest(values, time, frame_rate);
         if self.effect.unfinished() {
             return rendered; // the last output stays up
         }
@@ -230,7 +235,7 @@ impl CpuStage {
                 gpu.queue.submit(Some(encoder.finish()));
             }
         } else if rendered.new_picture {
-            self.output.write(gpu, &self.upload);
+            self.output.write(gpu, &self.upload_rgba);
         }
         rendered
     }
@@ -256,9 +261,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 /// an export renders is in the history. Browsers can't wait on the GPU, so the web build
 /// maps each frame without waiting and takes it at a later render: the output runs a frame
 /// or two behind the input.
-struct Reader {
+struct GpuFrameReader {
     eight_bit: Frame,
-    pass: Pass,
+    pass: FullscreenPass,
     buffer: wgpu::Buffer,
     pitch: u32,
     #[cfg(target_arch = "wasm32")]
@@ -273,13 +278,13 @@ struct InFlight {
 }
 
 #[cfg(target_arch = "wasm32")]
-const PENDING: u8 = 0;
+const MAP_PENDING: u8 = 0;
 #[cfg(target_arch = "wasm32")]
-const MAPPED: u8 = 1;
+const MAP_DONE: u8 = 1;
 #[cfg(target_arch = "wasm32")]
-const FAILED: u8 = 2;
+const MAP_FAILED: u8 = 2;
 
-impl Reader {
+impl GpuFrameReader {
     fn new(gpu: &Gpu, size: (u32, u32)) -> Self {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let pitch = (size.0 * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -291,7 +296,7 @@ impl Reader {
         });
         Self {
             eight_bit: Frame::new(gpu, size.0, size.1, format),
-            pass: Pass::new(
+            pass: FullscreenPass::new(
                 &gpu.device,
                 EIGHT_BIT_WGSL,
                 wgpu::BindingType::Texture {
@@ -308,7 +313,7 @@ impl Reader {
         }
     }
 
-    fn copy(&self, gpu: &Gpu, input: &Frame) {
+    fn copy_to_buffer(&self, gpu: &Gpu, input: &Frame) {
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.pass.layout,
@@ -336,7 +341,7 @@ impl Reader {
 
     /// Hands `f` the mapped buffer as RGBA rows `pitch` bytes apart, with the time of the
     /// frame in it, then unmaps it.
-    fn take(&self, time: f64, f: impl FnOnce(f64, &[u8], usize)) {
+    fn with_mapped_rows(&self, time: f64, f: impl FnOnce(f64, &[u8], usize)) {
         let data = self
             .buffer
             .slice(..)
@@ -362,7 +367,7 @@ impl Reader {
         if last == Some(time) {
             return;
         }
-        self.copy(gpu, input);
+        self.copy_to_buffer(gpu, input);
         let (tx, rx) = std::sync::mpsc::channel();
         self.buffer
             .slice(..)
@@ -375,7 +380,7 @@ impl Reader {
         rx.recv()
             .expect("map callback dropped")
             .expect("readback failed to map");
-        self.take(time, f);
+        self.with_mapped_rows(time, f);
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -390,11 +395,11 @@ impl Reader {
         use std::sync::atomic::{AtomicU8, Ordering};
         if let Some(flight) = self.in_flight.take() {
             match flight.state.load(Ordering::Acquire) {
-                MAPPED => {
-                    self.take(flight.time, f);
+                MAP_DONE => {
+                    self.with_mapped_rows(flight.time, f);
                     return;
                 }
-                FAILED => {} // a new frame is read below; the lost one is skipped
+                MAP_FAILED => {} // a new frame is read below; the lost one is skipped
                 _ => {
                     self.in_flight = Some(flight);
                     return; // still on its way; the next render looks again
@@ -404,13 +409,16 @@ impl Reader {
         if last == Some(time) {
             return;
         }
-        self.copy(gpu, input);
-        let state = std::sync::Arc::new(AtomicU8::new(PENDING));
+        self.copy_to_buffer(gpu, input);
+        let state = std::sync::Arc::new(AtomicU8::new(MAP_PENDING));
         let done = state.clone();
         self.buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |r| {
-                done.store(if r.is_ok() { MAPPED } else { FAILED }, Ordering::Release);
+                done.store(
+                    if r.is_ok() { MAP_DONE } else { MAP_FAILED },
+                    Ordering::Release,
+                );
             });
         self.in_flight = Some(InFlight { time, state });
     }
@@ -445,10 +453,10 @@ mod tests {
         let mut stage = CpuStage::new(&gpu, effect, (64, 48));
         let decoded = varied_pixels(64, 48);
 
-        stage.push(&gpu, Input::Ram(&[]), 0.0, &values, None);
+        stage.push_input(&gpu, Input::Ram(&[]), 0.0, &values, None);
         assert!(stage.history.is_empty(), "nothing has arrived yet");
-        stage.push(&gpu, Input::Ram(&decoded), 0.0, &values, None);
-        stage.push(&gpu, Input::Ram(&decoded), 0.0, &values, None);
+        stage.push_input(&gpu, Input::Ram(&decoded), 0.0, &values, None);
+        stage.push_input(&gpu, Input::Ram(&decoded), 0.0, &values, None);
         assert_eq!(stage.history.frame_number(), 0);
 
         let mut seen = Vec::new();
@@ -484,7 +492,7 @@ mod tests {
             .collect();
         let input = Frame::new(&gpu, w as u32, h as u32, crate::effects::FRAME_FORMAT);
         input.write(&gpu, bytemuck::cast_slice(&float));
-        stage.push(&gpu, Input::Gpu(&input), 0.0, &values, None);
+        stage.push_input(&gpu, Input::Gpu(&input), 0.0, &values, None);
 
         stage.history.with_frame(0, &mut |image| {
             let Some(Image::U8(view)) = image else {
