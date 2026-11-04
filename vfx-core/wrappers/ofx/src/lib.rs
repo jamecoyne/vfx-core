@@ -632,8 +632,9 @@ struct StreamPosition {
     /// It follows, and so did the last, so earlier frames are taken as unchanged. The render that
     /// breaks a stream and the next check them: an export can still step back after it.
     continues: bool,
-    /// How many renders of the stream have stepped one frame. A constant larger step, as a retimed
-    /// clip may have, doesn't count, so it can't look like playback dropping frames.
+    /// How many renders in a row have stepped one frame. Any other step starts the count over, so
+    /// a retimed clip's steps can't add up to look like playback dropping frames. Once frames are
+    /// dropped it keeps its count, which a possible stop needs.
     single_steps: u32,
     /// The stream skipped a frame after running in order, which an export doesn't do past its
     /// first few frames. It stays so until the stream breaks, since later frames build on what
@@ -652,9 +653,10 @@ const RUN_BEFORE_DROPS: u32 = 8;
 /// to be exact.
 const MAX_STREAM_STEP: i64 = 16;
 
-/// The longest step that still resumes playback after a possible stop. It has to span the check
-/// that stop made, which playback carried on through.
-const MAX_RESUME_STEP: i64 = 120;
+/// How soon after a possible stop's render the next has to start to resume playback. It tells
+/// Resolve carrying on, which asks for the next frame at once, from a person seeking, who can't be
+/// this quick. A step of any size then is playback, since the check made it long.
+const MAX_RESUME_GAP: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Where a render of `frame` starting at `now` stands.
 fn stream_position(
@@ -667,17 +669,26 @@ fn stream_position(
         return StreamPosition::default();
     };
     let step = frame - last.frame;
-    let soon = now.duration_since(last.finished) < MAX_STREAM_GAP;
+    let gap = now.duration_since(last.finished);
+    let soon = gap < MAX_STREAM_GAP;
     // Renders carrying on straight after what looked like a stop: playback had a hitch. The check
     // that stop made leaves it where it was, so it goes on without another, which can't loop.
-    let resumes = last.stream.possible_stop && soon && (2..=MAX_RESUME_STEP).contains(&step);
+    let resumes = last.stream.possible_stop && gap < MAX_RESUME_GAP && step >= 2;
     let follows = resumes || soon && (1..=MAX_STREAM_STEP).contains(&step);
     let continues = follows && (resumes || last.stream.follows);
+    let frames_dropped = continues
+        && (resumes
+            || last.stream.frames_dropped
+            || step > 1 && last.stream.single_steps >= RUN_BEFORE_DROPS);
     // The render that made a possible stop broke the stream, so resuming restores the count.
     let single_steps = if resumes {
         last.stream.single_steps.max(RUN_BEFORE_DROPS)
-    } else if continues {
-        last.stream.single_steps + u32::from(step == 1)
+    } else if !continues {
+        0
+    } else if step == 1 {
+        last.stream.single_steps + 1
+    } else if frames_dropped {
+        last.stream.single_steps
     } else {
         0
     };
@@ -685,10 +696,7 @@ fn stream_position(
         follows,
         continues,
         single_steps,
-        frames_dropped: continues
-            && (resumes
-                || last.stream.frames_dropped
-                || step > 1 && last.stream.single_steps >= RUN_BEFORE_DROPS),
+        frames_dropped,
         possible_stop: soon
             && step > MAX_STREAM_STEP
             && last.stream.single_steps >= RUN_BEFORE_DROPS,
@@ -1053,20 +1061,43 @@ mod tests {
         assert!(next.continues && next.frames_dropped);
     }
 
-    /// Past the gap, what follows a big step is new: an ordinary break, not a hitch.
+    /// However long the check took, a render straight after it is playback.
     #[test]
-    fn big_step_with_a_gap_after_it_stays_a_break() {
+    fn hitch_resumes_at_any_step() {
+        let jump = RUN_END + MAX_STREAM_STEP + 1;
+        let frames = run_then(&[jump, jump + 300]);
+        let resumed = *positions(&frames, std::time::Duration::ZERO)
+            .last()
+            .unwrap();
+        assert!(resumed.continues && resumed.frames_dropped);
+    }
+
+    /// The render after a possible stop, starting `gap` after it.
+    fn after_possible_stop(gap: std::time::Duration) -> StreamPosition {
         let jump = RUN_END + MAX_STREAM_STEP + 1;
         let frames = run_then(&[jump, jump + 3]);
         let last_index = frames.len() - 1;
         let streams = positions_with_gaps(&frames, std::time::Duration::ZERO, |i| {
             if i == last_index {
-                std::time::Duration::from_secs(2)
+                gap
             } else {
                 std::time::Duration::ZERO
             }
         });
-        let after = *streams.last().unwrap();
+        *streams.last().unwrap()
+    }
+
+    /// A person can be this quick, so this doesn't resume, though it follows.
+    #[test]
+    fn later_render_after_possible_stop_doesnt_resume() {
+        let after = after_possible_stop(std::time::Duration::from_millis(200));
+        assert!(after.follows && !after.continues && !after.frames_dropped);
+    }
+
+    /// Past the stream's gap, what follows a big step is new: an ordinary break.
+    #[test]
+    fn big_step_with_a_gap_after_it_stays_a_break() {
+        let after = after_possible_stop(std::time::Duration::from_secs(2));
         assert!(!after.follows && !after.continues && !after.frames_dropped);
     }
 
@@ -1074,6 +1105,15 @@ mod tests {
     #[test]
     fn constant_step_never_drops_frames() {
         let frames: Vec<i64> = (0..40).map(|n| n * 2).collect();
+        let streams = positions(&frames, std::time::Duration::ZERO);
+        assert!(streams.iter().all(|p| !p.frames_dropped));
+    }
+
+    /// A 1.5x retime has many steps of one frame, none of them in a row.
+    #[test]
+    fn retime_pattern_never_drops_frames() {
+        let frames: Vec<i64> = (0..60).map(|n| (n * 3 + 1) / 2).collect();
+        assert_eq!(frames[..6], [0, 2, 3, 5, 6, 8]);
         let streams = positions(&frames, std::time::Duration::ZERO);
         assert!(streams.iter().all(|p| !p.frames_dropped));
     }
