@@ -23,7 +23,7 @@ vfx-preview [FLAGS] [FILE]
   --size WxH           the frame size (patterns, and videos, webcams and stills fitted into it)
   --detect-faces       tick the Expressions panel's Detect faces
   --stats              print the stats bar to stdout once a second
-  --frames N          exit after N frames
+  --frames N           exit after N frames
   --seconds N          exit after N seconds
   --quiet              no window on screen (frames unpaced, not shown)
   --list               print the effects and their parameters, then exit
