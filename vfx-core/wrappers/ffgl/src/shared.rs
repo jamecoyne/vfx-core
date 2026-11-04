@@ -7,7 +7,7 @@
 //! the output image ([`Interop::present`]).
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::catch_unwind;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use ash::vk::Handle;
 use ash::{khr, vk};
 use vfx_core::wgpu::{self, hal};
 use vfx_core::{Context, ParamValues};
-use vfx_core::{Frame, Gpu};
+use vfx_core::{Frame, Gpu, PollFailure};
 use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
 use crate::{LOG, float_transfer, gl};
@@ -155,6 +155,8 @@ impl SharedDevice {
                 .map_err(|e| e.to_string())?
         };
         let gpu = Gpu::from_parts(device, queue);
+        // Only CPU effects share it, and a GPU effect's instance has to learn of a loss too.
+        gpu.watch_faults();
         // SAFETY: this device was opened exclusively with the Vulkan backend.
         let (raw, instance, physical_device, queue_family) = unsafe {
             let d = gpu.device.as_hal::<hal::api::Vulkan>().unwrap();
@@ -621,23 +623,22 @@ impl Interop {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Polls the device. wgpu panics when a poll finds the device lost, so the unwind is caught
-    /// here and comes back as [`InteropError::Lost`].
+    /// Polls the device, with a lost device as [`InteropError::Lost`] however it shows up.
     fn poll(&self, poll_type: wgpu::PollType) -> Result<wgpu::PollStatus, InteropError> {
-        let polled = catch_unwind(AssertUnwindSafe(|| self.device.gpu.device.poll(poll_type)));
-        match polled {
-            Ok(Ok(status)) => match self.device.gpu.faults().lost() {
+        match vfx_core::poll_device(&self.device.gpu.device, poll_type) {
+            Ok(status) => match self.device.gpu.faults().lost() {
                 Some(reason) => Err(InteropError::Lost(reason)),
                 None => Ok(status),
             },
-            Ok(Err(wgpu::PollError::Timeout)) => Err(InteropError::Hung),
-            Ok(Err(e)) => Err(InteropError::Failed(e.to_string())),
-            Err(panic) => {
-                let reason = (panic.downcast_ref::<String>().cloned())
-                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "the poll panicked".into());
-                Err(InteropError::Lost(reason))
-            }
+            Err(PollFailure::Other(wgpu::PollError::Timeout)) => Err(InteropError::Hung),
+            Err(PollFailure::Other(e)) => Err(InteropError::Failed(e.to_string())),
+            Err(failure @ PollFailure::DeviceLost) => Err(InteropError::Lost(
+                self.device
+                    .gpu
+                    .faults()
+                    .lost()
+                    .unwrap_or_else(|| failure.to_string()),
+            )),
         }
     }
 

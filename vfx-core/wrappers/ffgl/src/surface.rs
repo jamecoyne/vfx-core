@@ -312,7 +312,7 @@ impl Interop {
             extent,
         );
         gpu.queue.submit(Some(encoder.finish()));
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = vfx_core::poll_device(&gpu.device, wgpu::PollType::wait_indefinitely());
 
         // 3. Output surface -> host framebuffer (premultiplied, bottom-up).
         // SAFETY: the caller has the context current; Metal has finished writing.
