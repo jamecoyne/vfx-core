@@ -625,6 +625,9 @@ unsafe fn process_cpu(
         if let Some(faces) = report.faces {
             LOG.note(&format!("face models on: {faces}"));
         }
+        if let Some(fault) = report.gpu_fault {
+            LOG.note(&format!("warning: GPU fault, drawn another way: {fault}"));
+        }
     }
     LOG.note(match on_gpu {
         true => "render path: CPU effect, output kept on the GPU (Vulkan shared with OpenGL)",

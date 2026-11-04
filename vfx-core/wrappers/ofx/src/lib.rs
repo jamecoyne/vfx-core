@@ -704,6 +704,9 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
             if let Some(faces) = report.faces {
                 LOG.note(&format!("face models on: {faces}"));
             }
+            if let Some(fault) = report.gpu_fault {
+                LOG.note(&format!("warning: GPU fault, drawn another way: {fault}"));
+            }
         }
         *kept.last_render.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastRender {
             frame,
