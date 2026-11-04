@@ -25,15 +25,15 @@ void main() {
 }
 ";
 
-pub struct Canvas {
+pub struct ArgbTransfer {
     pub size: (u32, u32),
-    input: gl::Texture,
-    target: gl::Target,
+    argb_texture: gl::Texture,
+    argb_framebuffer: gl::Target,
     to_argb: gl::Blit,
     from_argb: gl::Blit,
 }
 
-impl Canvas {
+impl ArgbTransfer {
     /// # Safety
     /// The host's GL context must be current.
     pub unsafe fn new(size: (u32, u32)) -> Result<Self, String> {
@@ -47,12 +47,13 @@ impl Canvas {
                     return Err(e);
                 }
             };
-            let mut input = gl::Texture::new();
-            input.allocate_bytes(size);
-            let target = match gl::Target::new(input.handle, gl::TEXTURE_2D, size) {
-                Ok(target) => target,
+            let mut argb_texture = gl::Texture::new();
+            argb_texture.allocate_bytes(size);
+            let argb_framebuffer = match gl::Target::new(argb_texture.handle, gl::TEXTURE_2D, size)
+            {
+                Ok(framebuffer) => framebuffer,
                 Err(e) => {
-                    input.delete();
+                    argb_texture.delete();
                     to_argb.delete();
                     from_argb.delete();
                     return Err(e);
@@ -60,8 +61,8 @@ impl Canvas {
             };
             Ok(Self {
                 size,
-                input,
-                target,
+                argb_texture,
+                argb_framebuffer,
                 to_argb,
                 from_argb,
             })
@@ -87,10 +88,10 @@ impl Canvas {
         };
         // SAFETY: the caller supplies the current context, texture and full output storage.
         unsafe {
-            self.target.draw_into(host_fbo, || {
+            self.argb_framebuffer.draw_into(host_fbo, || {
                 self.to_argb.draw(texture, gl::TEXTURE_2D, max_uv)
             });
-            gl::read_texture_bytes_into(self.input.handle, self.size, bytes);
+            gl::read_texture_bytes_into(self.argb_texture.handle, self.size, bytes);
         }
     }
 
@@ -106,15 +107,15 @@ impl Canvas {
     pub unsafe fn delete(mut self) {
         // SAFETY: all objects belong to the caller's current context.
         unsafe {
-            self.target.delete();
-            self.input.delete();
+            self.argb_framebuffer.delete();
+            self.argb_texture.delete();
             self.to_argb.delete();
             self.from_argb.delete();
         }
     }
 }
 
-pub fn bytes(pixels: &[Argb<u8>]) -> &[u8] {
+pub fn pixel_bytes(pixels: &[Argb<u8>]) -> &[u8] {
     // SAFETY: Argb<u8> is repr(C), four bytes, without padding; the borrow stays shared.
     unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast(), size_of_val(pixels)) }
 }
