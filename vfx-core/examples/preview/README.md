@@ -5,8 +5,13 @@ or a webcam. [docs/DEVELOPING.md](../../../docs/DEVELOPING.md#the-preview) descr
 
 ## Keys
 
-`c` clears the shown effect's earlier frames, as the Clear button does. Space plays and pauses a
-video on the desktop, and Escape quits there.
+| Key | What |
+|---|---|
+| `c` | clears the shown effect's earlier frames, as the Clear button does |
+| `h` | hides the panel and the bar, so only the picture shows |
+| `m`, `l`, `i`, `a` | flip segcam's Mirror, Labels, Invert and Auto level |
+| `[`, `]` | step segcam's Sensitivity, or Level while it detects by threshold, by 2% of its range |
+| Space, Escape | play and pause a video, and quit; on the desktop |
 
 ## Scripted runs
 

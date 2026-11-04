@@ -40,6 +40,8 @@ struct Preview {
     display_size: (u32, u32),
     controls: Controls,
     view: View,
+    /// `h`: only the picture shows, for a live show.
+    panel_hidden: bool,
     /// The effect's second input, when it's fed from a video, webcam or image.
     #[cfg(not(target_arch = "wasm32"))]
     layer: Layer,
@@ -274,6 +276,7 @@ impl Preview {
             display_size,
             controls: Controls::default(),
             view: View::default(),
+            panel_hidden: false,
             #[cfg(not(target_arch = "wasm32"))]
             layer: Layer::Off,
             #[cfg(not(target_arch = "wasm32"))]
@@ -737,8 +740,16 @@ impl Preview {
         let Key::Character(key) = key else {
             return;
         };
-        if key == "c" {
-            self.effects.clear_history(&self.gpu);
+        match key.as_str() {
+            "c" => self.effects.clear_history(&self.gpu),
+            "h" => self.panel_hidden = !self.panel_hidden,
+            "m" => self.controls.flip_toggle("mirror"),
+            "l" => self.controls.flip_toggle("labels"),
+            "i" => self.controls.flip_toggle("invert"),
+            "a" => self.controls.flip_toggle("auto_level"),
+            "[" => self.controls.step_primary(-1.0),
+            "]" => self.controls.step_primary(1.0),
+            _ => {}
         }
     }
 
@@ -863,17 +874,20 @@ impl Preview {
         let exprs = &mut self.exprs;
         let variables = &self.variables;
         let mut actions = controls::Actions::default();
+        let panel_hidden = self.panel_hidden;
         let mut output = self.egui.run_ui(input, |ui| {
-            // Added first, so it runs the window's full width under the controls.
-            egui::Panel::bottom("status")
-                .resizable(false)
-                .show(ui, |ui| stats::bar(ui, &stats));
-            egui::Panel::right("controls")
-                .resizable(false)
-                .exact_size(320.0)
-                .show(ui, |ui| {
-                    actions = controls::panel(ui, controls, exprs, variables, &status)
-                });
+            if !panel_hidden {
+                // Added first, so it runs the window's full width under the controls.
+                egui::Panel::bottom("status")
+                    .resizable(false)
+                    .show(ui, |ui| stats::bar(ui, &stats));
+                egui::Panel::right("controls")
+                    .resizable(false)
+                    .exact_size(320.0)
+                    .show(ui, |ui| {
+                        actions = controls::panel(ui, controls, exprs, variables, &status)
+                    });
+            }
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(18)))
                 .show(ui, |ui| {

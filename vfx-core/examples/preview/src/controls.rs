@@ -54,6 +54,39 @@ impl Controls {
         }
     }
 
+    /// Flips the shown effect's toggle called `name`, if it has one.
+    pub fn flip_toggle(&mut self, name: &str) {
+        let values = &mut self.params[self.effect];
+        if let Some(ParamValue::Bool(on)) = values.get(name) {
+            let _ = values.set(name, ParamValue::Bool(!on));
+        }
+    }
+
+    /// Moves the shown effect's primary control by `steps` of 2% of its range: for segcam the
+    /// level while it detects by threshold, otherwise its sensitivity. Those are segcam's
+    /// parameter names, frozen once shipped; an effect without them is left alone.
+    pub fn step_primary(&mut self, steps: f32) {
+        let values = &self.params[self.effect];
+        let name = match values.get("detect") {
+            Some(ParamValue::Int(1)) => "level",
+            _ => "sensitivity",
+        };
+        let Some(spec) = self.specs[self.effect].iter().find(|s| s.name == name) else {
+            return;
+        };
+        let value = match (spec.kind, values.get(name)) {
+            (ParamKind::Float { min, max, .. }, Some(ParamValue::Float(v))) => {
+                ParamValue::Float(v + steps * 0.02 * (max - min))
+            }
+            (ParamKind::Int { min, max, .. }, Some(ParamValue::Int(v))) => {
+                let step = (0.02 * (max - min) as f32).ceil().max(1.0);
+                ParamValue::Int(v + (steps * step) as i32)
+            }
+            _ => return,
+        };
+        let _ = self.params[self.effect].set(name, value);
+    }
+
     /// The shown effect's values.
     pub fn values(&self) -> &ParamValues {
         &self.params[self.effect]
@@ -526,7 +559,8 @@ pub fn panel(
 ) -> Actions {
     let mut actions = Actions::default();
     ui.add_space(4.0);
-    ui.heading("VFX Preview");
+    ui.heading("VFX Preview")
+        .on_hover_text("h hides this panel and the bar");
     if let Some(message) = status.message {
         ui.colored_label(Color32::from_rgb(230, 120, 90), message);
     }
@@ -599,6 +633,33 @@ pub fn panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_reach_the_shown_effects_parameters() {
+        let mut c = Controls {
+            effect: catalog::find("segcam Motion (Rust)").unwrap(),
+            ..Controls::default()
+        };
+        c.flip_toggle("labels");
+        assert!(!c.values().bool("labels"));
+        c.flip_toggle("no such toggle");
+
+        let before = c.values().float("sensitivity");
+        c.step_primary(1.0);
+        assert!((c.values().float("sensitivity") - before - 2.0).abs() < 1e-3);
+
+        c.params[c.effect]
+            .set("detect", ParamValue::Int(1))
+            .unwrap();
+        let level = c.values().int("level");
+        c.step_primary(-1.0);
+        assert_eq!(c.values().int("level"), level - 6);
+
+        // An effect with neither is left alone.
+        c.effect = catalog::find("Flip").unwrap();
+        c.step_primary(1.0);
+        c.flip_toggle("labels");
+    }
 
     #[test]
     fn camera_turns_mirror_on_and_file_turns_it_off() {
