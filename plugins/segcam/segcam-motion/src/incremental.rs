@@ -24,7 +24,7 @@ use crate::gpu::{self, Cut, Drawer, Fault};
 use crate::motion::{self, LumaGrid, Motion, MotionSettings, ThresholdSettings};
 use crate::pixel::{Argb, Channel, Depth, View, ViewMut};
 use crate::render::{
-    AnalysisStep, Detect, FaceParts, OutputMode, Pile, PiledTile, PixelRect, RenderSettings,
+    AnalysisStep, Detect, FaceParts, OutputMode, Pile, PileEntry, PixelRect, RenderSettings,
     downsample, draw_output, fill_rect, frame_tiles, history_frames,
 };
 use crate::swarm::{self, SwarmMetrics, Tile};
@@ -79,7 +79,6 @@ pub struct Incremental {
     told: Option<String>,
     /// From what share of the canvas in window pixels the swarm draws on the GPU.
     gpu_from: Option<f64>,
-    window_share: f64,
     /// The last render's draw hasn't come back from the GPU yet (browsers).
     unfinished: bool,
     /// `None` before the first render.
@@ -104,19 +103,6 @@ struct Offer {
     device: wgpu::Device,
     frame: vfx_core::Frame,
     taken: bool,
-}
-
-/// A tile in the pile, and where it is kept: frame and index.
-struct Placed<'a> {
-    tile: &'a Tile,
-    frame: i64,
-    index: usize,
-}
-
-impl PiledTile for Placed<'_> {
-    fn tile(&self) -> &Tile {
-        self.tile
-    }
 }
 
 /// Below these shares of the canvas in window pixels (each window with its shadow, overlaps
@@ -152,11 +138,6 @@ impl Incremental {
     /// render there. By default, what was measured to be faster at the canvas's depth.
     pub fn gpu_threshold(&mut self, share: f64) {
         self.gpu_from = Some(share);
-    }
-
-    /// The share of the canvas the last swarm render's windows covered, overlaps counted.
-    pub fn window_share(&self) -> f64 {
-        self.window_share
     }
 
     /// Whether the last render is still waiting on the GPU (see [`vfx_core::CpuEffect::unfinished`]).
@@ -528,7 +509,6 @@ impl Incremental {
         self.drew_on_gpu = Some(false);
         self.update_face_readings(s, number, number - count as i64 + 1);
         if let Err(fault) = self.try_draw(s, count, number, frame, out) {
-            self.drew_on_gpu = Some(false);
             self.fall_back(&fault);
             self.draw_cpu(s, count, number, frame, out);
         }
@@ -670,9 +650,8 @@ impl Incremental {
         let m = SwarmMetrics::new(h);
         let shadow = swarm::shadow_kernel(m.scale);
         let pile = pile(&self.tiles, s, count, number, w, h);
-        let shown: Vec<&Placed> = pile.shown_entries().collect();
+        let shown: Vec<PileEntry> = pile.shown_entries().collect();
         let drawn = window_pixels(shown.iter().map(|p| p.tile), &m, &shadow, w, h);
-        self.window_share = drawn as f64 / canvas as f64;
         let empty = Motion::default();
         let motion = motion_of(&self.motion, number, &basis(s, number, first)).unwrap_or(&empty);
         if drawn * 1000 < canvas * from {
@@ -791,14 +770,14 @@ fn pile<'a>(
     number: i64,
     width: i32,
     height: i32,
-) -> Pile<Placed<'a>> {
+) -> Pile<'a> {
     let first = number - count as i64 + 1;
     let mut pile = Pile::new(width, height, s.max_tiles);
     if s.mode == OutputMode::Swarm {
         for target in analysed(s, number, first) {
             let tiles = tiles_of(kept, target, &basis(s, target, first), s.mirror);
             for (index, tile) in tiles.into_iter().flatten().enumerate() {
-                pile.push(Placed {
+                pile.push(PileEntry {
                     tile,
                     frame: target,
                     index,

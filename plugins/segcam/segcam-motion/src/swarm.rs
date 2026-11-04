@@ -447,16 +447,6 @@ pub fn render_title_bar(w: i32, title: &str) -> Vec<Color> {
 // ---------------------------------------------------------------------------------------
 // The window
 
-/// How much of a pixel the window's rounded mask keeps: 1 inside, 0 outside, in between on
-/// the arc. `x`, `y` are pixel indices within a frame `w` by `h`.
-pub fn mask_coverage(x: i32, y: i32, w: i32, h: i32, radius: f64) -> f32 {
-    let (cx, cy) = (f64::from(x) + 0.5, f64::from(y) + 0.5);
-    let nx = cx.max(radius).min(f64::from(w) - radius);
-    let ny = cy.max(radius).min(f64::from(h) - radius);
-    let d = (cx - nx).hypot(cy - ny);
-    (radius + 0.5 - d).clamp(0.0, 1.0) as f32
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 unsafe extern "C" {
     // The platform's C library, as the C++ effect uses; Rust's standard library has no erfc.
@@ -478,7 +468,6 @@ fn normal_cdf(z: f64) -> f64 {
 pub struct ShadowKernel {
     pub sigma: f64,
     pub drop: f64,
-    pub radius: f64,
     /// How far the shadow is drawn past the frame.
     pub reach: i32,
     /// The corner table covers offsets `lo..lo + size` from a corner.
@@ -526,7 +515,6 @@ impl ShadowKernel {
         Self {
             sigma,
             drop,
-            radius,
             reach,
             lo,
             size,
@@ -755,8 +743,8 @@ pub fn draw_window_with<C: Channel>(
         return;
     }
     let opacity = chrome::SHADOW_OPACITY as f32;
-    // The mask keeps all of a pixel off the arcs, as `mask_coverage` works out.
-    let full = (radius + 0.5 - 0f64.hypot(0.0)).clamp(0.0, 1.0) as f32;
+    // Mask coverage of a pixel away from the rounded corners.
+    let full = (radius + 0.5).clamp(0.0, 1.0) as f32;
     let first = (area.x - plan.area.x) as usize;
     let columns = first..first + area.w as usize;
     // Where the mask covers a frozen tile's pixel whole, the window hides the shadow and
@@ -896,8 +884,6 @@ pub fn draw_swarm<'t, C: Channel>(
     mirrored: bool,
 ) {
     let live = live.map(|frame| LiveFrame { frame, mirrored });
-    // More threads only compete with the host's own render threads.
-    const THREADS: usize = 6;
     const BANDS_PER_THREAD: usize = 4;
     let m = SwarmMetrics::new(out.height);
     let shadow = shadow_kernel(m.scale);
@@ -913,9 +899,7 @@ pub fn draw_swarm<'t, C: Channel>(
             )
         })
         .collect();
-    let threads = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(THREADS);
+    let threads = vfx_plugin::vfx_host::worker_threads();
     let count = (threads * BANDS_PER_THREAD).min((out.height / 32).max(1) as usize);
     let bands = std::sync::Mutex::new(out.bands(count));
     let next = || bands.lock().ok().and_then(|mut bands| bands.pop());

@@ -13,7 +13,6 @@ struct Globals {
     // 0: clear, 1: black, 2: the frame.
     backdrop: u32,
     count: u32,
-    items: u32,
     corner: u32,
     corner_lo: i32,
     corner_size: i32,
@@ -167,7 +166,7 @@ fn overlay(@builtin(global_invocation_id) id: vec3<u32>) {
     let line = g.line;
     let s = g.text_scale;
     for (var b = 0u; b < g.count; b++) {
-        let o = g.items + b * BLOB_WORDS;
+        let o = b * BLOB_WORDS;
         let r = rect(o);
         if has(BOXES) && (inside(Rect(r.x, r.y, r.w, line), x, y)
             || inside(Rect(r.x, r.y + r.h - line, r.w, line), x, y)
@@ -263,7 +262,7 @@ fn sample_bar(bar: u32, width: i32, lx: i32, ly: i32) -> vec3<f32> {
 
 /// Draws window `w` over `px`; false if the window doesn't reach the pixel.
 fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
-    let o = g.items + w * WINDOW_WORDS;
+    let o = w * WINDOW_WORDS;
     let area = rect(o + 4u);
     if !inside(area, x, y) {
         return false;
@@ -344,7 +343,7 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
 /// Whether window `w` covers the pixel whole, so nothing under it shows: exactly at 8 and 16
 /// bits, within a rounding step at float.
 fn covers(w: u32, x: i32, y: i32) -> bool {
-    let o = g.items + w * WINDOW_WORDS;
+    let o = w * WINDOW_WORDS;
     if !inside(rect(o), x, y) {
         return false;
     }
@@ -382,7 +381,7 @@ fn swarm(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation
     for (var first = 0u; first < g.count; first += 256u) {
         var hit = 0u;
         if first + li < g.count {
-            let area = rect(g.items + (first + li) * WINDOW_WORDS + 4u);
+            let area = rect((first + li) * WINDOW_WORDS + 4u);
             hit = u32(area.x < block.x + block.w && block.x < area.x + area.w
                 && area.y < block.y + block.h && block.y < area.y + area.h);
         }

@@ -207,11 +207,6 @@ impl std::fmt::Display for NoGpu {
     }
 }
 
-/// Whether there is a working GPU to draw on.
-pub fn available() -> bool {
-    status().is_ok()
-}
-
 /// Whether there is a working GPU, or why not. Waits for the device to open.
 pub fn status() -> Result<(), NoGpu> {
     start();
@@ -525,7 +520,6 @@ struct Globals {
     frame_h: i32,
     backdrop: u32,
     count: u32,
-    items: u32,
     corner: u32,
     corner_lo: i32,
     corner_size: i32,
@@ -541,6 +535,7 @@ struct Globals {
     units: u32,
     bar_x: u32,
     bar_y: u32,
+    _padding: u32,
     green: [f32; 4],
 }
 
@@ -728,19 +723,6 @@ fn atlas_buffer(dev: &Device, words: u64) -> wgpu::Buffer {
     })
 }
 
-/// How long the last draw's parts took, in ms.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Timings {
-    /// Frames and new tiles into the GPU's staging memory.
-    pub upload: f64,
-    /// Tables and windows worked out on the CPU and written.
-    pub prepare: f64,
-    /// From submitting the draw until its output is mapped: drawing and the copy back.
-    pub wait: f64,
-    /// The mapped output into the host's image.
-    pub read: f64,
-}
-
 /// A buffer that grows to the largest size asked of it.
 struct Grown {
     buffer: Option<wgpu::Buffer>,
@@ -800,7 +782,6 @@ pub struct Drawer {
     seen: u64,
     /// Which frame the frame buffer holds, this render.
     loaded: Option<i64>,
-    pub timings: Timings,
     /// Renders drawn on the GPU.
     pub drawn: u64,
     /// Renders the GPU failed, drawn on the CPU instead.
@@ -869,7 +850,6 @@ impl Drawer {
             },
             seen: dev.errors().0,
             loaded: None,
-            timings: Timings::default(),
             drawn: 0,
             faults: 0,
             recent: 0,
@@ -925,7 +905,6 @@ impl Drawer {
     pub fn begin(&mut self) {
         self.loaded = None;
         self.unfinished = false;
-        self.timings = Timings::default();
         self.seen = self.dev.errors().0;
     }
 
@@ -991,7 +970,6 @@ impl Drawer {
         canvas: (i32, i32),
         shadow: &ShadowKernel,
     ) -> Result<Option<Cut>, Fault> {
-        let t = Instant::now();
         let m = SwarmMetrics::new(canvas.1);
         let whole = PixelRect::new(0, 0, canvas.0, canvas.1);
         let plans: Vec<_> = tiles
@@ -1057,7 +1035,6 @@ impl Drawer {
             q.write_buffer(&atlas.buffer, tables_at * 4, bytemuck::cast_slice(&tables));
         }
         drop(atlas);
-        self.timings.upload += ms(t);
         // Made before the check, so a fault gives the room back.
         let cut = Cut {
             atlas: self.atlas.clone(),
@@ -1081,11 +1058,9 @@ impl Drawer {
         s: &RenderSettings,
         shadow: &ShadowKernel,
     ) -> Result<(), Fault> {
-        let t = Instant::now();
         let size = (out.width, out.height);
         let (globals, data) = self.swarm_job(size, windows, frame, number, s, shadow)?;
         let pipeline = self.dev.swarm.clone();
-        self.timings.prepare += ms(t);
         self.run(&pipeline, &globals, &data, out)
     }
 
@@ -1107,11 +1082,9 @@ impl Drawer {
                 "only an 8-bit canvas draws into a host's frame".into(),
             ));
         }
-        let t = Instant::now();
         let size = (target.width as i32, target.height as i32);
         let (globals, data) = self.swarm_job(size, windows, frame, number, s, shadow)?;
         let pipeline = self.dev.swarm.clone();
-        self.timings.prepare += ms(t);
         self.run_into(&pipeline, &globals, &data, target)
     }
 
@@ -1185,7 +1158,6 @@ impl Drawer {
             frame_h,
             backdrop,
             count: count as u32,
-            items: 0,
             corner,
             units,
             bar_x,
@@ -1281,7 +1253,6 @@ impl Drawer {
         if self.loaded == Some(number) {
             return Ok(());
         }
-        let t = Instant::now();
         let row = frame.width as usize * size_of::<Argb<C>>();
         let bytes = (row * frame.height as usize) as u64;
         let buffer = self.frame.get(&self.dev, self.limit, bytes)?.clone();
@@ -1299,7 +1270,6 @@ impl Drawer {
         }
         drop(staged);
         self.loaded = Some(number);
-        self.timings.upload += ms(t);
         Ok(())
     }
 
@@ -1400,7 +1370,6 @@ impl Drawer {
         target: &vfx_core::Frame,
     ) -> Result<(), Fault> {
         self.check()?;
-        let t = Instant::now();
         let size = (target.width as i32, target.height as i32);
         let bytes = u64::from(target.width) * u64::from(target.height) * 4;
         let mut encoder = self.dev.device.create_command_encoder(&Default::default());
@@ -1455,7 +1424,6 @@ impl Drawer {
             pass.draw(0..3, 0..1);
         }
         self.dev.queue.submit(Some(encoder.finish()));
-        self.timings.prepare += ms(t);
         self.check()?;
         self.drawn += 1;
         self.note(false);
@@ -1473,14 +1441,11 @@ impl Drawer {
         out: &mut ViewMut<C>,
     ) -> Result<(), Fault> {
         self.check()?;
-        let t = Instant::now();
         let row = out.width as usize * size_of::<Argb<C>>();
         let bytes = (row * out.height as usize) as u64;
         let (staging, submitted) =
             self.submit(pipeline, globals, data, (out.width, out.height, bytes))?;
-        self.timings.prepare += ms(t);
 
-        let t = Instant::now();
         let slice = staging.slice(..bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -1503,9 +1468,7 @@ impl Drawer {
             self.staging.buffer = None;
             return Err(Fault(e));
         }
-        self.timings.wait += ms(t);
 
-        let t = Instant::now();
         {
             let mapped = match slice.get_mapped_range() {
                 Ok(mapped) => mapped,
@@ -1515,9 +1478,10 @@ impl Drawer {
                 }
             };
             let mapped: &[u8] = &mapped;
-            let count = bands(out.height).len();
+            let threads =
+                vfx_plugin::vfx_host::worker_threads().clamp(1, out.height.max(1) as usize);
             std::thread::scope(|scope| {
-                for mut band in out.bands(count) {
+                for mut band in out.bands(threads) {
                     scope.spawn(move || {
                         for y in band.rows() {
                             let at = y as usize * row;
@@ -1528,7 +1492,6 @@ impl Drawer {
             });
         }
         staging.unmap();
-        self.timings.read += ms(t);
         self.check()?;
         self.drawn += 1;
         self.note(false);
@@ -1550,7 +1513,6 @@ impl Drawer {
         use std::sync::atomic::{AtomicU8, Ordering};
 
         self.check()?;
-        let t = Instant::now();
         let mut key = std::hash::DefaultHasher::new();
         (pipeline, bytemuck::bytes_of(globals), data, self.loaded).hash(&mut key);
         let key = key.finish();
@@ -1590,14 +1552,12 @@ impl Drawer {
             state,
         });
         self.unfinished = true;
-        self.timings.prepare += ms(t);
         Ok(())
     }
 
     /// Reads a draw that came back into `out`.
     #[cfg(target_arch = "wasm32")]
     fn take<C: Channel>(&mut self, flight: Flight, out: &mut ViewMut<C>) -> Result<(), Fault> {
-        let t = Instant::now();
         let row = out.width as usize * size_of::<Argb<C>>();
         let bytes = (row * out.height as usize) as u64;
         {
@@ -1611,24 +1571,11 @@ impl Drawer {
         flight.staging.unmap();
         self.staging.buffer.get_or_insert(flight.staging);
         self.restarts = 0;
-        self.timings.read += ms(t);
         self.check()?;
         self.drawn += 1;
         self.note(false);
         Ok(())
     }
-}
-
-/// Rows split for copying on a few threads, as `ViewMut::bands` splits them. More threads only
-/// compete with the host's own render threads.
-#[cfg(not(target_arch = "wasm32"))]
-fn bands(height: i32) -> Vec<std::ops::Range<i32>> {
-    const THREADS: usize = 6;
-    let threads = std::thread::available_parallelism().map_or(1, usize::from);
-    let count = threads.min(THREADS).clamp(1, height.max(1) as usize) as i32;
-    (0..count)
-        .map(|i| i * height / count..(i + 1) * height / count)
-        .collect()
 }
 
 /// Appends the 8-bit levels as units, as `Channel::to_unit` makes them; where they start.
@@ -1656,10 +1603,6 @@ fn pixel_bytes<C: Channel>(row: &[Argb<C>]) -> &[u8] {
 
 fn pixel_bytes_mut<C: Channel>(row: &mut [Argb<C>]) -> &mut [u8] {
     bytemuck::cast_slice_mut(row)
-}
-
-fn ms(t: Instant) -> f64 {
-    t.elapsed().as_secs_f64() * 1000.0
 }
 
 #[cfg(test)]

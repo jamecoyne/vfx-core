@@ -517,11 +517,7 @@ pub fn frame_tiles<C: Channel>(
     };
     // A camera move makes big segments, each copied whole, so they're shared out over a
     // few threads, as the swarm's drawing is.
-    const THREADS: usize = 6;
-    let threads = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(THREADS)
-        .min(count);
+    let threads = vfx_plugin::vfx_host::worker_threads().min(count);
     if threads < 2 {
         return (0..count).map(make).collect();
     }
@@ -546,44 +542,26 @@ pub fn frame_tiles<C: Channel>(
     tiles.into_inner().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A tile in a [`Pile`]: owned, so a buried one can drop its pixels, or borrowed from a cache.
-pub trait PiledTile {
-    fn tile(&self) -> &Tile;
-    /// Called when a newer tile covers this one whole.
-    fn bury(&mut self) {}
-}
-
-impl PiledTile for Tile {
-    fn tile(&self) -> &Tile {
-        self
-    }
-    fn bury(&mut self) {
-        self.hidden = true;
-        self.pixels = Vec::new();
-        self.bar = None;
-    }
-}
-
-impl PiledTile for &Tile {
-    fn tile(&self) -> &Tile {
-        self
-    }
+/// A kept tile in a [`Pile`], and where it is kept: its frame and its index in that frame.
+#[derive(Clone, Copy)]
+pub struct PileEntry<'a> {
+    pub tile: &'a Tile,
+    pub frame: i64,
+    pub index: usize,
 }
 
 /// segcam's pile, oldest first. It is only trimmed by count, so a window stays until
-/// `max_tiles` newer ones push it out. To keep memory bounded, tiles are stored at 8 bits and
-/// a tile buried whole under a newer one drops its pixels, which does not change the picture.
-/// The byte budget is a last resort for extreme piles.
-pub struct Pile<T> {
-    /// Each tile, whether it is buried, and the pixels it still counts for.
-    tiles: VecDeque<(T, bool, usize)>,
+/// `max_tiles` newer ones push it out. The byte budget is a last resort for extreme piles.
+pub struct Pile<'a> {
+    /// Each tile, whether a newer tile covers it whole, and the pixels it still counts for.
+    tiles: VecDeque<(PileEntry<'a>, bool, usize)>,
     stored_pixels: usize,
     title_height: i32,
     canvas: PixelRect,
     max_tiles: usize,
 }
 
-impl<T: PiledTile> Pile<T> {
+impl<'a> Pile<'a> {
     const BYTE_BUDGET: usize = 768 << 20;
 
     pub fn new(canvas_w: i32, canvas_h: i32, max_tiles: i32) -> Self {
@@ -597,24 +575,22 @@ impl<T: PiledTile> Pile<T> {
     }
 
     /// Adds `tile` on top, burying older tiles it covers and trimming the oldest.
-    pub fn push(&mut self, tile: T) {
-        let kept = tile.tile().pixels.len();
+    pub fn push(&mut self, entry: PileEntry<'a>) {
+        let kept = entry.tile.pixels.len();
         self.stored_pixels += kept;
-        let cover = swarm::tile_extent(tile.tile().video, self.title_height);
+        let cover = swarm::tile_extent(entry.tile.video, self.title_height);
         for (older, buried, counted) in self.tiles.iter_mut().filter(|(_, b, _)| !b) {
             let shown = intersect(
-                swarm::tile_extent(older.tile().video, self.title_height),
+                swarm::tile_extent(older.tile.video, self.title_height),
                 self.canvas,
             );
             if contains(cover, shown) {
                 *buried = true;
                 self.stored_pixels -= *counted;
                 *counted = 0;
-                older.bury();
             }
         }
-        let hidden = tile.tile().hidden;
-        self.tiles.push_back((tile, hidden, kept));
+        self.tiles.push_back((entry, entry.tile.hidden, kept));
         while self.tiles.len() > self.max_tiles
             || (self.stored_pixels * size_of::<Argb<u8>>() > Self::BYTE_BUDGET
                 && self.tiles.len() > 1)
@@ -626,13 +602,13 @@ impl<T: PiledTile> Pile<T> {
     }
 
     /// The tiles still drawn, oldest first.
-    pub fn shown(&self) -> impl Iterator<Item = &Tile> {
-        self.shown_entries().map(PiledTile::tile)
+    pub fn shown(&self) -> impl Iterator<Item = &'a Tile> + '_ {
+        self.shown_entries().map(|entry| entry.tile)
     }
 
     /// The entries still drawn, oldest first.
-    pub fn shown_entries(&self) -> impl Iterator<Item = &T> {
-        self.tiles.iter().filter(|(_, b, _)| !b).map(|(t, _, _)| t)
+    pub fn shown_entries(&self) -> impl Iterator<Item = PileEntry<'a>> + '_ {
+        self.tiles.iter().filter(|(_, b, _)| !b).map(|(e, _, _)| *e)
     }
 }
 

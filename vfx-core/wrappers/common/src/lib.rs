@@ -13,7 +13,7 @@ mod rows;
 
 pub use kept::{CpuInstance, Panicked};
 pub use plugin::{Info, Kind, Outline, Plugin, gpu, map_points, plugin, register, same, served};
-pub use rows::by_rows;
+pub use rows::{by_rows, worker_threads};
 
 /// The plugin's identity, from the effect crate's `[package.metadata.vfx]`, which its
 /// build script (`vfx_build::configure`) passes on as `VFX_*` compile-time variables.
