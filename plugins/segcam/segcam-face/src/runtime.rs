@@ -61,9 +61,14 @@ pub fn chosen_device() -> Option<Device> {
 /// The bundled models on the fastest device, or on DirectML when it comes within
 /// `DIRECTML_MARGIN` of the CPU, with the mesh if `mesh` and bodies if `bodies`, or `None` if
 /// no device loads the detector. The first call times each device; later calls reuse its choice.
+/// `SEGCAM_FACE_DEVICE` skips the trial: `cpu`, or a DXGI adapter's index for DirectML.
 pub fn fastest(mesh: bool, bodies: bool) -> Option<(OrtSegmenter, Device)> {
-    let (mut detector, face_mesh, device) = match CHOSEN.get() {
-        Some(&device) => {
+    let settled = CHOSEN.get().copied().or_else(|| {
+        let device = device_named(&std::env::var("SEGCAM_FACE_DEVICE").ok()?)?;
+        Some(*CHOSEN.get_or_init(|| device))
+    });
+    let (mut detector, face_mesh, device) = match settled {
+        Some(device) => {
             let detector = OrtYuNet::new(YUNET_MODEL, device).ok()?;
             let face_mesh = mesh.then(|| OrtFaceMesh::new(FACE_MESH_MODEL, device).ok());
             (detector, face_mesh.flatten(), device)
@@ -96,6 +101,16 @@ pub fn fastest(mesh: bool, bodies: bool) -> Option<(OrtSegmenter, Device)> {
     Some((FaceSegmenter::new(detector, face_mesh, bodies), device))
 }
 
+fn device_named(name: &str) -> Option<Device> {
+    if name.eq_ignore_ascii_case("cpu") {
+        return Some(Device::Cpu);
+    }
+    #[cfg(windows)]
+    return name.parse().ok().map(Device::DirectMl);
+    #[cfg(not(windows))]
+    None
+}
+
 /// The lowest YuNet score that becomes a face window. YuNet's usual 0.6 finds half faces and far
 /// faces that Vision, and so segcam 1.1, leave out. This cut agrees best with Vision on which frames
 /// have a face; higher cuts lose faces Vision finds about as fast as they drop extra ones.
@@ -114,26 +129,36 @@ const TIMED_RUNS: usize = 9;
 #[cfg(windows)]
 const MAX_ADAPTERS: u32 = 8;
 
-/// How much longer than the CPU DirectML may take in the trial and still be picked. The trial
-/// runs the models alone with every core free, where in a render the CPU kernels share the cores
-/// with the analysis and the host, so the CPU's time flatters it (#66).
+/// How much longer than the fastest device DirectML may take in the trial and still be picked.
+/// The trial runs the models alone with every core free, where in a render the CPU kernels share
+/// the cores with the analysis and the host, so the CPU's time flatters it (#66).
 #[cfg(windows)]
 pub const DIRECTML_MARGIN: f64 = 1.5;
 
-/// Which of `times` (each trial's device and time, fastest first) to keep: the fastest, unless
-/// that is the CPU and a DirectML adapter came within `DIRECTML_MARGIN` of it.
+/// Which of `times` (each trial's device and time, fastest first) to keep: the fastest, unless a
+/// DirectML adapter came within `DIRECTML_MARGIN` of it, then the lowest numbered such adapter.
+/// How close two GPUs time depends on what else is running on them, so taking the fastest would
+/// make the choice differ from one launch to the next.
 fn preferred_trial_index(times: &[(Device, Duration)]) -> Option<usize> {
+    let &(_, fastest) = times.first()?;
     #[cfg(windows)]
-    if let Some(&(Device::Cpu, cpu)) = times.first() {
-        let close = |time: &Duration| time.as_secs_f64() <= cpu.as_secs_f64() * DIRECTML_MARGIN;
-        if let Some(index) = times
-            .iter()
-            .position(|(device, time)| *device != Device::Cpu && close(time))
-        {
+    {
+        let close = |time: &Duration| time.as_secs_f64() <= fastest.as_secs_f64() * DIRECTML_MARGIN;
+        let adapters =
+            times
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (device, time))| match device {
+                    Device::DirectMl(adapter) if close(time) => Some((*adapter, index)),
+                    _ => None,
+                });
+        if let Some((_, index)) = adapters.min() {
             return Some(index);
         }
     }
-    (!times.is_empty()).then_some(0)
+    #[cfg(not(windows))]
+    let _ = fastest;
+    Some(0)
 }
 
 /// Loads the face models, with the mesh if `mesh`, on the CPU and each DirectML adapter, times a
@@ -141,7 +166,7 @@ fn preferred_trial_index(times: &[(Device, Duration)]) -> Option<usize> {
 pub fn trials(image: &Image, mesh: bool) -> Vec<Trial> {
     let devices = std::iter::once(Device::Cpu);
     #[cfg(windows)]
-    let devices = devices.chain((0..MAX_ADAPTERS).map(Device::DirectMl));
+    let devices = devices.chain(adapters_to_try().into_iter().map(Device::DirectMl));
     let mut trials = Vec::new();
     for device in devices {
         let loaded = OrtYuNet::new(YUNET_MODEL, device).and_then(|detector| {
@@ -150,23 +175,62 @@ pub fn trials(image: &Image, mesh: bool) -> Vec<Trial> {
                 .transpose()?;
             Ok((detector, mesh))
         });
-        match loaded {
-            Ok((mut detector, mut mesh)) => {
-                let time = time_runs(&mut detector, mesh.as_mut(), image);
-                trials.push(Trial {
-                    device,
-                    detector,
-                    mesh,
-                    time,
-                });
-            }
-            // Adapters are numbered from 0, so the first that fails is past the last.
-            Err(_) if device != Device::Cpu => break,
-            Err(_) => {}
+        if let Ok((mut detector, mut mesh)) = loaded {
+            let time = time_runs(&mut detector, mesh.as_mut(), image);
+            trials.push(Trial {
+                device,
+                detector,
+                mesh,
+                time,
+            });
         }
     }
     trials.sort_by_key(|trial| trial.time);
     trials
+}
+
+/// The DXGI adapters worth a trial on this machine.
+#[cfg(windows)]
+fn adapters_to_try() -> Vec<u32> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
+    };
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return Vec::new();
+    };
+    let adapters: Vec<AdapterMemory> = (0..MAX_ADAPTERS)
+        .map_while(|index| {
+            let desc = unsafe { factory.EnumAdapters1(index).and_then(|a| a.GetDesc1()) }.ok()?;
+            Some(AdapterMemory {
+                index,
+                dedicated: desc.DedicatedVideoMemory,
+                software: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+            })
+        })
+        .collect();
+    adapters_worth_a_trial(&adapters)
+}
+
+/// What decides whether a DXGI adapter gets a trial.
+#[cfg(windows)]
+struct AdapterMemory {
+    index: u32,
+    dedicated: usize,
+    software: bool,
+}
+
+/// Leaves out software adapters and an integrated GPU beside a discrete one. Such a GPU can't win
+/// the trial, and compiling the models for it is the slowest part of a first load (#83). Integrated
+/// GPUs are told apart by their little dedicated memory, since asking D3D12 whether an adapter has
+/// unified memory would open a device on each.
+#[cfg(windows)]
+fn adapters_worth_a_trial(adapters: &[AdapterMemory]) -> Vec<u32> {
+    let hardware = || adapters.iter().filter(|adapter| !adapter.software);
+    let most = hardware().map(|a| a.dedicated).max().unwrap_or(0);
+    hardware()
+        .filter(|adapter| adapter.dedicated >= most / 4)
+        .map(|adapter| adapter.index)
+        .collect()
 }
 
 fn time_runs(
@@ -438,11 +502,59 @@ mod tests {
             (Device::DirectMl(1), ms(14)),
             (Device::DirectMl(0), ms(15)),
         ];
-        assert_eq!(preferred_trial_index(&times), Some(1));
+        assert_eq!(preferred_trial_index(&times), Some(2));
         assert_eq!(
             preferred_trial_index(&[(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(15))]),
             Some(1)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn close_adapters_pick_the_lowest_number_whichever_timed_faster() {
+        let times = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(12))];
+        assert_eq!(preferred_trial_index(&times), Some(1));
+        let far = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(40))];
+        assert_eq!(preferred_trial_index(&far), Some(0));
+    }
+
+    #[cfg(windows)]
+    fn adapter(index: u32, dedicated_gb: usize, software: bool) -> AdapterMemory {
+        AdapterMemory {
+            index,
+            dedicated: dedicated_gb << 30,
+            software,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn integrated_gpu_beside_a_discrete_one_gets_no_trial() {
+        let adapters = [
+            adapter(0, 12, false),
+            AdapterMemory {
+                index: 1,
+                dedicated: 128 << 20,
+                software: false,
+            },
+            adapter(2, 8, false),
+            adapter(3, 0, true),
+        ];
+        assert_eq!(adapters_worth_a_trial(&adapters), [0, 2]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn integrated_gpu_alone_gets_a_trial() {
+        let adapters = [
+            AdapterMemory {
+                index: 0,
+                dedicated: 512 << 20,
+                software: false,
+            },
+            adapter(1, 0, true),
+        ];
+        assert_eq!(adapters_worth_a_trial(&adapters), [0]);
     }
 
     #[cfg(windows)]
