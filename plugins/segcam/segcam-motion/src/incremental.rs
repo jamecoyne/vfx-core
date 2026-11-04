@@ -571,9 +571,7 @@ impl Incremental {
             return Ok(());
         };
         gpu.begin();
-        let drawn_before = gpu.drawn;
         let drawn = self.draw_gpu(&mut gpu, s, count, number, frame, out);
-        self.drew_on_gpu = Some(drawn.is_ok() && gpu.drawn > drawn_before);
         self.unfinished = drawn.is_ok() && gpu.unfinished;
         self.gpu = Some(gpu);
         drawn
