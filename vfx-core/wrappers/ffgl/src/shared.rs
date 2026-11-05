@@ -15,7 +15,7 @@ use ash::vk::Handle;
 use ash::{khr, vk};
 use vfx_core::wgpu::{self, hal};
 use vfx_core::{Context, ParamValues};
-use vfx_core::{Frame, Gpu, PollFailure};
+use vfx_core::{DeviceFaults, Frame, Gpu, PollFailure};
 use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
 use crate::{LOG, float_transfer, gl};
@@ -529,6 +529,10 @@ impl Interop {
         unsafe {
             let luid = gl::shared_memory_luid().map_err(InteropError::Unsupported)?;
             let device = SharedDevice::open(luid).map_err(InteropError::Unsupported)?;
+            // A lost device stays in the list of open devices, and nothing set up on it can work.
+            if let Some(reason) = device.gpu.faults().lost() {
+                return Err(InteropError::Lost(reason));
+            }
             let limit = device.gpu.device.limits().max_texture_dimension_2d;
             if size.0 > limit || size.1 > limit {
                 return Err(InteropError::Failed(format!(
@@ -973,6 +977,9 @@ pub struct InteropSlot {
     /// `VFX_FFGL_PATH=ram`, a machine that can't share frames, or a render that failed.
     disabled: bool,
     no_setup_before: Option<Instant>,
+    /// What the device of this slot's latest interop has reported. Instances on another GL device
+    /// have a device of their own, whose loss says nothing about this one.
+    device_faults: Option<DeviceFaults>,
 }
 
 impl InteropSlot {
@@ -982,6 +989,7 @@ impl InteropSlot {
             hung: None,
             disabled,
             no_setup_before: None,
+            device_faults: None,
         }
     }
 
@@ -994,13 +1002,7 @@ impl InteropSlot {
     /// # Safety
     /// The host's GL context must be current.
     pub unsafe fn ready(&mut self, size: (u32, u32)) -> Option<&Interop> {
-        // Every instance shares the device for the life of the process, so a lost one stays lost.
-        if !self.disabled
-            && let Some(reason) = Gpu::shared_faults().lost()
-        {
-            LOG.note(&format!("warning: GPU device lost, using RAM: {reason}"));
-            self.disabled = true;
-        }
+        self.check_device();
         if let Some(hung) = self.hung.take() {
             if hung.gpu_is_idle() {
                 // SAFETY: the context is current and the GPU has finished.
@@ -1022,12 +1024,26 @@ impl InteropSlot {
             // A setup that panics on a lost device would otherwise fail every frame from here on.
             // SAFETY: the context is current.
             match catch_unwind(|| unsafe { Interop::new(size) }) {
-                Ok(Ok(interop)) => self.current = Some(interop),
+                Ok(Ok(interop)) => {
+                    self.device_faults = Some(interop.gpu().faults());
+                    self.current = Some(interop);
+                }
                 Ok(Err(e)) => self.record_setup_error(e),
                 Err(_) => self.record_setup_error(InteropError::Failed("setup panicked".into())),
             }
         }
         self.current.as_ref()
+    }
+
+    /// Goes through RAM for good once this slot's device is lost: a device stays open for the life
+    /// of the process, so a lost one stays lost.
+    fn check_device(&mut self) {
+        if !self.disabled
+            && let Some(reason) = self.device_faults.as_ref().and_then(DeviceFaults::lost)
+        {
+            LOG.note(&format!("warning: GPU device lost, using RAM: {reason}"));
+            self.disabled = true;
+        }
     }
 
     fn record_setup_error(&mut self, error: InteropError) {
@@ -1089,5 +1105,65 @@ impl InteropSlot {
                 std::mem::forget(hung);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slot with an interop on `gpu`. An interop needs a GL context, so this has its record only.
+    fn slot_on(gpu: &Gpu) -> InteropSlot {
+        let mut slot = InteropSlot::new(false);
+        slot.device_faults = Some(gpu.faults());
+        slot
+    }
+
+    fn lose(gpu: &Gpu) {
+        gpu.device.destroy();
+        let _ = vfx_core::poll_device(&gpu.device, wgpu::PollType::Poll);
+        assert!(gpu.faults().lost().is_some(), "the loss wasn't reported");
+    }
+
+    fn two_devices() -> Option<(Gpu, Gpu)> {
+        let open = || pollster::block_on(Gpu::headless()).ok();
+        let devices = open().zip(open());
+        if devices.is_none() {
+            eprintln!("no GPU adapter: skipped");
+        }
+        devices
+    }
+
+    /// Effects that share a device: the one shared last being lost leaves the other's slot alone,
+    /// and the other way round.
+    #[test]
+    fn losing_one_shared_device_disables_only_its_slots() {
+        let Some((a, b)) = two_devices() else {
+            return;
+        };
+        a.share();
+        b.share();
+        let (mut on_a, mut on_b) = (slot_on(&a), slot_on(&b));
+        lose(&b);
+        on_a.check_device();
+        on_b.check_device();
+        assert!(!on_a.disabled, "a healthy device's slot went to RAM");
+        assert!(on_b.disabled, "the lost device's slot kept its interop");
+    }
+
+    /// GPU effects share nothing, so only the slot's own record can tell of a loss.
+    #[test]
+    fn loss_of_a_device_nothing_shared_disables_its_slot() {
+        let Some((a, b)) = two_devices() else {
+            return;
+        };
+        a.watch_faults();
+        b.watch_faults();
+        let (mut on_a, mut on_b) = (slot_on(&a), slot_on(&b));
+        lose(&a);
+        on_a.check_device();
+        on_b.check_device();
+        assert!(on_a.disabled, "the lost device's slot kept its interop");
+        assert!(!on_b.disabled, "a healthy device's slot went to RAM");
     }
 }
