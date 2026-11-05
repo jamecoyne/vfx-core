@@ -3460,6 +3460,7 @@ name = "vfx-host"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "libc",
  "pollster 1.0.1",
  "rayon",
  "vfx-core",

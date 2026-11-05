@@ -11,6 +11,9 @@ vfx-core = { path = "../.." }
 bytemuck = "1.25.2"
 pollster = "1.0.1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
 # Browsers can't start threads: frame work runs on the calling thread there.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1.12.0"

@@ -21,7 +21,7 @@ pub fn worker_threads() -> usize {
 /// Threads kept for the life of the process, so that frame work starts none. A thread started per
 /// frame costs a call into every loaded DLL, and NVIDIA's D3D driver keeps a record of each thread
 /// ever started, which adds up over a show. The caller takes a share of the work, so one fewer is
-/// enough. They outlive an effect instance, which is safe since an instance pins its module.
+/// enough. They outlive an effect instance, which pins its plugin binary before its first render.
 #[cfg(not(target_arch = "wasm32"))]
 static WORKERS: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
     rayon::ThreadPoolBuilder::new()
