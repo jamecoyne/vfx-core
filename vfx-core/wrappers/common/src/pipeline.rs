@@ -129,10 +129,14 @@ pub fn run(gpu: &Gpu, device: usize, job: &Job) -> Vec<f32> {
 }
 
 /// Drops what was prepared on the device `device` keys: it's lost, and a new device may be given
-/// the same key.
+/// the same key. The instances are dropped after the pool is unlocked, since dropping a lost
+/// device's objects can wait and every render takes the lock.
 pub fn forget_device(device: usize) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.retain(|p| p.key.device != device);
+    let forgotten: Vec<Prepared> = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.extract_if(.., |p| p.key.device == device).collect()
+    };
+    drop(forgotten);
 }
 
 fn take(gpu: &Gpu, key: Key) -> Prepared {

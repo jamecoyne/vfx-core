@@ -11,6 +11,13 @@
 //! the rest of the process). The first open is not final because it can be the one that meets a
 //! reset. On a machine with no usable GPU the cost is one adapter enumeration on a background
 //! thread every 30 s.
+//!
+//! A try reopens on whichever adapter [`Gpu::headless`] picks by power preference, which after a
+//! reset is normally the one that was lost, and ignores [`ReopenBackoff::same_adapter_only`].
+//!
+//! An open that never returns, such as a driver hanging in adapter or device creation during a
+//! reset, leaves the slot opening for good: [`gpu_now`] then passes frames through for the rest of
+//! the process, and [`gpu`] blocks its caller as an open on the render thread would.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,7 +50,8 @@ impl<D> OwnDevice<D> {
 }
 
 /// The top bit marks the pool keys of the plugin's own devices. The other keys in a process are
-/// Vulkan device handles, which are addresses, and After Effects' device indexes, which are small.
+/// Vulkan device handles, which are addresses in a 64 bit process, and After Effects' device
+/// indexes, which are small.
 const OWN_DEVICE_KEYS: usize = 1 << (usize::BITS - 1);
 
 /// The plugin's own device, for an export host: waits while one is opening, the very first open
@@ -215,7 +223,8 @@ impl<D: Send + Sync + 'static> DeviceSlot<D> {
 
 /// Drops a lost device and what was prepared on it once the last render holding it has finished,
 /// off the render thread: wgpu's queue waits when it drops. If the drop panics, what's left of the
-/// device leaks.
+/// device leaks. The thread lives as long as the last holder: on macOS an instance's IOSurface path
+/// holds the lost device until a replacement rebuilds it, or until the instance is deleted.
 fn retire<D: Send + Sync + 'static>(device: Arc<OwnDevice<D>>) {
     let kept = device.clone();
     let spawned = std::thread::Builder::new()
