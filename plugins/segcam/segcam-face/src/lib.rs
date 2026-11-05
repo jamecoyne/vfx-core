@@ -336,20 +336,26 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
                 }
             }
         };
-        match (bodies.as_mut().filter(|_| parts.body), &*BODY_WORKER) {
-            (Some(bodies), Some(worker)) => worker.in_place_scope(|scope| {
-                // As before this worker: a body detector's panic costs its bodies, not the faces.
-                scope.spawn(|_| {
+        match bodies.as_mut().filter(|_| parts.body) {
+            Some(bodies) => {
+                // A body detector's panic costs this frame's bodies, never the faces, and the
+                // detector is kept for the next frame.
+                let mut detect = || {
                     let detect = std::panic::AssertUnwindSafe(|| bodies.detect(image));
                     found = std::panic::catch_unwind(detect).unwrap_or_default();
-                });
-                find_faces();
-            }),
-            (Some(bodies), None) => {
-                find_faces();
-                found = bodies.detect(image);
+                };
+                match &*BODY_WORKER {
+                    Some(worker) => worker.in_place_scope(|scope| {
+                        scope.spawn(|_| detect());
+                        find_faces();
+                    }),
+                    None => {
+                        detect();
+                        find_faces();
+                    }
+                }
             }
-            (None, _) => find_faces(),
+            None => find_faces(),
         }
         self.bodies = bodies;
         for body in found {
@@ -480,6 +486,70 @@ mod tests {
             stride: 1,
         };
         image.rgb(0, 0)
+    }
+
+    struct OneFace;
+    impl Detector for OneFace {
+        fn detect(&mut self, _: &Image) -> Vec<Face> {
+            let rect = Rect {
+                x: 0.4,
+                y: 0.4,
+                w: 0.2,
+                h: 0.2,
+            };
+            vec![Face {
+                rect,
+                landmarks: [(0.5, 0.5); 5],
+                score: 1.0,
+            }]
+        }
+    }
+    struct NoMesh;
+    impl Landmarker for NoMesh {
+        fn landmarks(&mut self, _: &Image, _: &Face) -> Option<Vec<(f64, f64)>> {
+            None
+        }
+    }
+    /// Panics on its first run and finds one body after.
+    struct PanicsOnce(bool);
+    impl BodyDetector for PanicsOnce {
+        fn detect(&mut self, _: &Image) -> Vec<Body> {
+            if !self.0 {
+                self.0 = true;
+                panic!("body detector failed");
+            }
+            vec![Body {
+                rect: Rect {
+                    x: 0.1,
+                    y: 0.1,
+                    w: 0.5,
+                    h: 0.8,
+                },
+                score: 1.0,
+            }]
+        }
+    }
+
+    #[test]
+    fn a_body_detector_panic_costs_only_that_frames_bodies() {
+        let pixels = [0u8; 4 * 4 * 4];
+        let image = Image {
+            pixels: Pixels::Argb8(&pixels),
+            width: 4,
+            height: 4,
+            stride: 4,
+        };
+        let all = Parts {
+            face: true,
+            eyes: false,
+            mouth: false,
+            body: true,
+        };
+        let mut segmenter = FaceSegmenter::new(OneFace, None::<NoMesh>, Some(PanicsOnce(false)));
+        let kinds = |s: &[Segment]| s.iter().map(|s| s.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(segmenter.find(&image, all)), [Kind::Face]);
+        assert!(segmenter.bodies.is_some());
+        assert_eq!(kinds(segmenter.find(&image, all)), [Kind::Face, Kind::Body]);
     }
 
     #[test]
