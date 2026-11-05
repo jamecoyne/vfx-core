@@ -13,8 +13,8 @@ shows a message.
 On Windows the input menu lists the Spout senders running, such as TouchDesigner's Spout Out,
 beside the webcams, and the list follows senders as they start and stop. Picking one plays its
 frames through the effect as they arrive. They stay on the GPU when the sender draws on the same
-GPU as the preview. A sender on another GPU still plays: its frames are copied through RAM, and
-the log says so. A sender that closes is waited for, and when it starts again, even at another
+GPU as the preview. A sender on another GPU still plays: its frames are copied through RAM, which
+the log reports. A sender that closes is waited for, and when it starts again, even at another
 size, it plays again by itself. The sender's texture can be 8 bit RGBA or BGRA, 10 bit RGB, or 16
 or 32 bit float. Frames larger than 1920 pixels across are scaled down to fit, as videos are.
 The Expressions panel's Detect faces box doesn't read a Spout sender yet; an effect that finds
