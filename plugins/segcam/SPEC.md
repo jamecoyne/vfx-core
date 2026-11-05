@@ -33,7 +33,7 @@ Status: done (on `main`), PR (written, in review), todo.
 
 | ID | Requirement | Acceptance | Status |
 |---|---|---|---|
-| F1 | Detection finds motion, threshold, faces, eyes, mouths and bodies as the reference does | the CLI renders byte for byte what jamecoyne's C++ CLI renders, in every mode (effect README, "Checking it"); `tests/core.rs` passes | done |
+| F1 | Detection finds motion, threshold, faces, eyes, mouths and bodies as the reference does | the CLI renders byte for byte what jamecoyne's C++ CLI renders, in every mode (`segcam-motion/DEVELOPING.md`, "Checking it"); `tests/core.rs` passes | done |
 | F2 | Output modes Overlay, Motion matte, Box matte and Swarm, with every control in the effect README | each mode renders in all three hosts; Overlay and Swarm compared with the CLI by the mini hosts | done |
 | F3 | In editing hosts a kept render equals a fresh render, in any order, after earlier frames change, with frames missing | `vfx_host::contract::check` passes; OpenFX mini host 144 comparisons identical | done |
 | F4 | While an editing host streams, earlier frames are taken as unchanged; the first render after a pause or jump and the one after it check them. Resolve playback that skips frames doesn't read them | Resolve export of frames 0 to 299 identical to stepping frame by frame ([ADR 3](decisions/0003-editing-promise.md)) | done |

@@ -32,8 +32,8 @@ Add segcam Motion to a clip or layer and pick an **Output**:
 | Swarm | the window collage, newest on top |
 
 **Detect** picks what counts as a section: Motion, Threshold (brighter than **Level**, or darker
-with **Invert**) or Faces only. **Face**, **Eyes**, **Mouth** and **Body** add those. **Mirror**
-flips the picture for a selfie camera. Every control is listed in the
+with **Invert**) or Faces only. **Face**, **Eyes**, **Mouth** and **Body** enable detection of
+those. **Mirror** flips the picture for a selfie camera. Every control is listed in the
 [segcam Motion README](segcam-motion/README.md).
 
 In After Effects, and in Resolve when paused or exporting at normal speed, a frame renders the same
@@ -45,13 +45,13 @@ you pause or jump, and when an export starts.
 
 Integrated graphics from 2020 or later (Intel UHD 770 or Iris Xe, AMD Radeon 680M, any Apple M1 or
 newer) with a 6 core CPU. A discrete GPU from 2019 or later (AMD RX 5700 XT, NVIDIA RTX 2060) or an
-Apple M1 Pro and up runs it comfortably. Swarm draws on the GPU when there is one.
+Apple M1 Pro and up runs it comfortably. Segcam draws on the GPU when there is one.
 
 ## Known limits
 
-- After Effects renders every frame from scratch, so segcam is slower there than in Resolve or
-  Resolume.
-- On Windows, if `DirectML.dll` isn't next to the plugin, faces run on the CPU: still right, just
+- After Effects renders every frame from scratch, which makes segcam slower there than in Resolve
+  or Resolume.
+- On Windows, if `DirectML.dll` isn't next to the plugin, faces run on the CPU. Still works, just
   slower.
 - The browser preview has no faces yet.
 - We recommend keeping Resolve's render cache off for segcam. An export can contain wrong pictures
@@ -67,5 +67,7 @@ Apple M1 Pro and up runs it comfortably. Swarm draws on the GPU when there is on
 
 ## For developers
 
-What segcam 1.0 promises and how it's checked: [SPEC.md](SPEC.md). The work order:
-[ROADMAP.md](ROADMAP.md). How to time it: [BENCHMARK.md](BENCHMARK.md).
+- [segcam spec](SPEC.md)
+- [Roadmap](ROADMAP.md)
+- [Testing performance](BENCHMARK.md)
+- [segcam Motion internals](segcam-motion/DEVELOPING.md)
