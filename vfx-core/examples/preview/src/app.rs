@@ -43,6 +43,9 @@ struct Preview {
     view: View,
     /// `h`: only the picture shows, for a live show.
     panel_hidden: bool,
+    /// Where the pointer last moved in the window, in physical pixels.
+    #[cfg(windows)]
+    cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
     /// The shared device's loss has been reported, so nothing draws any more.
     device_lost_reported: bool,
     /// Why a scripted run has to end with an error.
@@ -292,6 +295,8 @@ impl Preview {
             controls: Controls::default(),
             view: View::default(),
             panel_hidden: false,
+            #[cfg(windows)]
+            cursor_position: None,
             device_lost_reported: false,
             #[cfg(not(target_arch = "wasm32"))]
             fatal: None,
@@ -906,6 +911,30 @@ impl Preview {
         }
     }
 
+    /// Tells the panel where the pointer is when it comes back into the window. egui-winit forgets
+    /// the position when the pointer leaves and drops presses until it hears a new one, while
+    /// winit on Windows reports no move to the pixel the pointer left at. So a click there without
+    /// moving, as after another window has covered the pointer, would do nothing. A real move
+    /// follows this straight away when the pointer came back somewhere else.
+    #[cfg(windows)]
+    fn restore_cursor_position(&mut self, event: &WindowEvent) {
+        match *event {
+            WindowEvent::CursorMoved { position, .. } => self.cursor_position = Some(position),
+            WindowEvent::CursorEntered { device_id } => {
+                if let Some(position) = self.cursor_position {
+                    let _ = self.egui_state.on_window_event(
+                        &self.window,
+                        &WindowEvent::CursorMoved {
+                            device_id,
+                            position,
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn draw(&mut self) {
         if self.device_lost() {
             // Nothing paces the loop now that nothing presents.
@@ -1403,6 +1432,8 @@ impl ApplicationHandler<GpuSetup> for App {
         let Some(preview) = self.preview.as_mut() else {
             return;
         };
+        #[cfg(windows)]
+        preview.restore_cursor_position(&event);
         let consumed = preview
             .egui_state
             .on_window_event(&preview.window, &event)
