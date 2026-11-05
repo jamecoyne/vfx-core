@@ -145,6 +145,41 @@ pub unsafe fn decode_into<C: Channel>(image: &Image, canvas: Rect, out: &mut Vec
     });
 }
 
+/// Calls `f` with what [`decode_into`] reads of `image` onto `canvas`, unconverted, top row first,
+/// after a row saying where those rows lie on the canvas and at what depth: the same bytes in the
+/// same place decode to the same canvas. Returns what `f` returns.
+///
+/// # Safety
+/// `image` must describe a live host image.
+pub unsafe fn with_image_bytes(
+    image: &Image,
+    canvas: Rect,
+    f: &mut dyn FnMut(&[&[u8]]) -> bool,
+) -> bool {
+    let r = canvas.intersect(&image.bounds);
+    let placement: Vec<u8> = [
+        r.x1 - canvas.x1,
+        canvas.y2 - r.y2,
+        r.width() as i32,
+        r.height() as i32,
+        image.depth.bytes_per_channel() as i32,
+    ]
+    .iter()
+    .flat_map(|v| v.to_ne_bytes())
+    .collect();
+    let mut rows = Vec::with_capacity(r.height() + 1);
+    rows.push(placement.as_slice());
+    if !r.is_empty() {
+        // SAFETY: the intersection confines each row to the host image, which is only read.
+        rows.extend(
+            (r.y1..r.y2)
+                .rev()
+                .map(|y| unsafe { &*row_bytes(image, r.x1, y, r.width()) }),
+        );
+    }
+    f(&rows)
+}
+
 /// Writes the canvas's `window` into the host image.
 ///
 /// # Safety
@@ -242,6 +277,77 @@ mod tests {
             depth,
             premultiplied: true,
         }
+    }
+
+    fn image_bytes(image: &Image, canvas: Rect) -> Vec<Vec<u8>> {
+        let mut read = Vec::new();
+        // SAFETY: the tests' images are live.
+        unsafe {
+            with_image_bytes(image, canvas, &mut |rows| {
+                read = rows.iter().map(|r| r.to_vec()).collect();
+                true
+            });
+        }
+        read
+    }
+
+    /// Every byte `decode` reads shows up in the bytes handed out, and bytes it doesn't read don't.
+    #[test]
+    fn image_bytes_are_what_decode_reads() {
+        let bounds = Rect {
+            x1: -1,
+            y1: -1,
+            x2: 7,
+            y2: 5,
+        };
+        let canvas = Rect {
+            x1: 0,
+            y1: 0,
+            x2: 4,
+            y2: 4,
+        };
+        let mut host: Vec<u8> = (0..8 * 6 * 4).map(|i| i as u8).collect();
+        let before = image_bytes(&host_image(&mut host, bounds, Depth::Byte), canvas);
+        for at in 0..host.len() {
+            host[at] ^= 0x40;
+            let image = host_image(&mut host, bounds, Depth::Byte);
+            // SAFETY: the image is live.
+            let decoded = unsafe { decode::<u8>(&image, canvas) };
+            host[at] ^= 0x40;
+            let image = host_image(&mut host, bounds, Depth::Byte);
+            // SAFETY: the image is live.
+            let same_canvas = decoded == unsafe { decode::<u8>(&image, canvas) };
+            host[at] ^= 0x40;
+            let image = host_image(&mut host, bounds, Depth::Byte);
+            assert_eq!(
+                image_bytes(&image, canvas) == before,
+                same_canvas,
+                "a change at byte {at}"
+            );
+            host[at] ^= 0x40;
+        }
+    }
+
+    /// The same pixels elsewhere on the canvas, or at another depth, are a different frame.
+    #[test]
+    fn image_bytes_differ_with_placement_and_depth() {
+        let canvas = Rect {
+            x1: 0,
+            y1: 0,
+            x2: 4,
+            y2: 4,
+        };
+        let at = |x1, y1, x2, y2| Rect { x1, y1, x2, y2 };
+        let mut host = vec![7u8; 2 * 2 * 16];
+        let bytes =
+            |host: &mut [u8], bounds, depth| image_bytes(&host_image(host, bounds, depth), canvas);
+        let here = bytes(&mut host, at(0, 0, 2, 2), Depth::Byte);
+        assert_ne!(here, bytes(&mut host, at(1, 0, 3, 2), Depth::Byte));
+        assert_ne!(here, bytes(&mut host, at(0, 1, 2, 3), Depth::Byte));
+        assert_ne!(here, bytes(&mut host, at(0, 0, 2, 2), Depth::Short));
+        assert_eq!(here, bytes(&mut host, at(0, 0, 2, 2), Depth::Byte));
+        let outside = bytes(&mut host, at(9, 9, 11, 11), Depth::Byte);
+        assert_eq!(outside.len(), 1, "only where the rows would lie");
     }
 
     /// A reused buffer holds the last frame: pixels off this image come out clear all the same.

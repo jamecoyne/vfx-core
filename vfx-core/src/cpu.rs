@@ -117,6 +117,16 @@ impl<'a, C: Channel> View<'a, C> {
     pub fn row(&self, y: i32) -> &'a [Argb<C>] {
         row(self.data, y, self.width, self.stride)
     }
+
+    /// Each row's pixels as bytes, top row first.
+    pub fn byte_rows(&self) -> Vec<&'a [u8]> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        (0..self.height)
+            .map(|y| bytemuck::cast_slice(self.row(y)))
+            .collect()
+    }
 }
 
 /// A picture being drawn into.
@@ -253,6 +263,15 @@ impl Image<'_> {
             Image::F32(v) => (v.width, v.height),
         }
     }
+
+    /// Each row's pixels as bytes, top row first.
+    pub fn byte_rows(&self) -> Vec<&[u8]> {
+        match self {
+            Image::U8(v) => v.byte_rows(),
+            Image::U16(v) => v.byte_rows(),
+            Image::F32(v) => v.byte_rows(),
+        }
+    }
 }
 
 impl ImageMut<'_> {
@@ -323,6 +342,26 @@ impl Depth for f32 {
 pub trait FrameSource {
     /// Calls `f` with frame `index`, or with `None` if that frame isn't there.
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>));
+
+    /// [`Self::with_frame`] for an effect that may find it doesn't need the pixels: `wanted` sees
+    /// frame `index` as rows of the bytes this source holds it in, and `f` runs only if it returns
+    /// true, so a source that converts frames needn't convert this one. A frame that isn't there
+    /// skips `wanted` and calls `f` with `None`.
+    ///
+    /// Equal bytes mean equal pixels, so a hash of them stands for the frame. Equal pixels may
+    /// still come as different bytes, and these bytes need not be the ones `with_frame` shows:
+    /// compare them only with this method's, on the same source.
+    fn with_frame_if_wanted(
+        &mut self,
+        index: usize,
+        wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+        f: &mut dyn FnMut(Option<Image<'_>>),
+    ) {
+        self.with_frame(index, &mut |image| match image {
+            Some(frame) if !wanted(&frame.byte_rows()) => {}
+            image => f(image),
+        });
+    }
 
     /// Whether frames arrive from a live stream, so an effect should draw what it has rather than
     /// hold up the output: true for [`History`], false where a render may be exported and has to

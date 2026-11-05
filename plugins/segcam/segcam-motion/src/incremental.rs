@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
-use vfx_core::cpu::FrameSource;
+use vfx_core::cpu::{FrameSource, Image};
 use vfx_core::wgpu;
 use vfx_core::{Reading, Report};
 use vfx_plugin::vfx_host::by_rows;
@@ -297,9 +297,14 @@ impl IncrementalRenderer {
                 self.clear_history();
             }
         } else if fixed {
-            frames.with_frame((number - first) as usize, &mut |image| {
-                current_hash = image.and_then(C::view).map(|v| frame_hash(&v));
-            });
+            frames.with_frame_if_wanted(
+                (number - first) as usize,
+                &mut |rows| {
+                    current_hash = Some(frame_hash(rows));
+                    false
+                },
+                &mut |_| {},
+            );
             if current_hash
                 .is_none_or(|hash| self.frame_hashes.get(&number).is_some_and(|k| *k != hash))
             {
@@ -335,25 +340,37 @@ impl IncrementalRenderer {
             self.live_faces.forget();
         }
         for frame in frames_to_read {
-            frames.with_frame((frame - first) as usize, &mut |image| {
+            let index = (frame - first) as usize;
+            let stored_hash = self.frame_hashes.get(&frame).copied();
+            let hash_known = if numbers_identify_frames {
+                Some(0)
+            } else if fixed && stored_hash.is_some() {
+                stored_hash
+            } else if frame == number {
+                current_hash
+            } else {
+                None
+            };
+            let hash = std::cell::Cell::new(hash_known);
+            // A frame found unchanged with nothing left to work out needs no pixels, and converting
+            // them is most of what a check costs a host that converts. A fixed source lists only
+            // frames it needs.
+            let unchanged_is_enough = !fixed
+                && frame != number
+                && (!to_analyse.contains(&frame)
+                    || self.is_cached(frame, &analysis_key(s, frame, first), s));
+            let mut wanted = |rows: &[&[u8]]| {
+                if hash_known.is_some() {
+                    return true;
+                }
+                let read = frame_hash(rows);
+                hash.set(Some(read));
+                !(unchanged_is_enough && stored_hash == Some(read))
+            };
+            let mut use_frame = |image: Option<Image<'_>>| {
                 let view = image.and_then(C::view);
-                match &view {
-                    None => {
-                        self.invalidate_frame(frame, invalidation_reach);
-                        missing.insert(frame);
-                    }
-                    Some(_) if fixed && self.frame_hashes.contains_key(&frame) => {}
-                    Some(v) => {
-                        // Revalidating existing hashes reads every frame, so hash in parallel.
-                        let hash = current_hash.filter(|_| frame == number).unwrap_or_else(|| {
-                            if numbers_identify_frames {
-                                0
-                            } else if self.frame_hashes.contains_key(&frame) {
-                                frame_hash_parallel(v)
-                            } else {
-                                frame_hash(v)
-                            }
-                        });
+                match (&view, hash.get()) {
+                    (Some(v), Some(hash)) => {
                         if self.frame_hashes.get(&frame) != Some(&hash) {
                             // A fixed source's frame read for the first time can't have
                             // changed what later frames computed from it; in other sources
@@ -364,6 +381,10 @@ impl IncrementalRenderer {
                             self.grids.insert(frame, downsample(v, s.grid_width));
                             self.frame_hashes.insert(frame, hash);
                         }
+                    }
+                    _ => {
+                        self.invalidate_frame(frame, invalidation_reach);
+                        missing.insert(frame);
                     }
                 }
                 let source_frame = face_source_frame(s, frame, first);
@@ -460,7 +481,8 @@ impl IncrementalRenderer {
                 if frame == number {
                     self.draw(s, count, number, view, out);
                 }
-            });
+            };
+            frames.with_frame_if_wanted(index, &mut wanted, &mut use_frame);
         }
         for &frame in &missing {
             self.invalidate_frame(frame, invalidation_reach);
@@ -1030,9 +1052,8 @@ fn fold_hash(hashes: impl Iterator<Item = u64>) -> u64 {
 }
 
 /// A hash of a row, read as u64 words in four lanes so it's limited by memory bandwidth.
-fn row_hash<C: Channel>(row: &[Argb<C>]) -> u64 {
+fn row_hash(bytes: &[u8]) -> u64 {
     let mut lanes = [0u64; 4];
-    let bytes: &[u8] = bytemuck::cast_slice(row);
     let (words, rest) = bytes.as_chunks::<8>();
     for chunk in words.chunks(4) {
         for (lane, word) in lanes.iter_mut().zip(chunk) {
@@ -1047,18 +1068,15 @@ fn row_hash<C: Channel>(row: &[Argb<C>]) -> u64 {
     fold_hash(lanes.into_iter())
 }
 
-/// A hash of every pixel, from the rows' hashes in order, so any thread count gives the same one.
-fn frame_hash<C: Channel>(view: &View<C>) -> u64 {
-    fold_hash((0..view.height).map(|y| row_hash(view.row(y))))
-}
-
-/// [`frame_hash`] on the host worker threads.
-fn frame_hash_parallel<C: Channel>(view: &View<C>) -> u64 {
-    let mut rows = vec![0u64; view.height as usize];
-    by_rows(&mut rows, 1, |y, hash| {
-        hash[0] = row_hash(view.row(y as i32));
+/// A hash of every byte of a frame ([`FrameSource::with_frame_if_wanted`]), on the host worker
+/// threads, from the rows' hashes in order, so any thread count gives the same one. A stream's
+/// single frame hashes on threads too: one thread made a stream render slower at 1080p Float.
+fn frame_hash(rows: &[&[u8]]) -> u64 {
+    let mut hashes = vec![0u64; rows.len()];
+    by_rows(&mut hashes, 1, |y, hash| {
+        hash[0] = row_hash(rows[y]);
     });
-    fold_hash(rows.into_iter())
+    fold_hash(hashes.into_iter())
 }
 
 #[cfg(test)]
@@ -1647,9 +1665,9 @@ mod tests {
         );
     }
 
-    /// Hashes from both paths are compared when a host stops streaming.
+    /// Hashes are compared across renders that may run on different numbers of threads.
     #[test]
-    fn parallel_frame_hash_matches_serial() {
+    fn frame_hash_is_the_rows_hashes_in_order_and_sees_every_pixel() {
         // An odd width leaves a row's last pixel out of the words of 8-bit frames.
         let (w, h) = (201, 130);
         let mut pixels: Vec<Argb<u8>> = (0..w * h)
@@ -1664,10 +1682,10 @@ mod tests {
             })
             .collect();
         let hash = |pixels: &[Argb<u8>]| {
-            let view = View::from_pixels(pixels, w, h);
-            let serial = frame_hash(&view);
-            assert_eq!(frame_hash_parallel(&view), serial);
-            serial
+            let rows = View::from_pixels(pixels, w, h).byte_rows();
+            let hash = frame_hash(&rows);
+            assert_eq!(hash, fold_hash(rows.iter().map(|row| row_hash(row))));
+            hash
         };
         let before = hash(&pixels);
         let last = pixels.len() - 1;
@@ -1689,8 +1707,141 @@ mod tests {
                 blue: 0.5,
             })
             .collect();
-        let view = View::from_pixels(&floats, w, h);
-        assert_eq!(frame_hash_parallel(&view), frame_hash(&view));
+        let rows = View::from_pixels(&floats, w, h).byte_rows();
+        assert_eq!(
+            frame_hash(&rows),
+            fold_hash(rows.iter().map(|row| row_hash(row)))
+        );
+    }
+
+    /// A source whose [`FrameSource::with_frame`] is costly, and which holds frames in other bytes
+    /// than it shows, as a host does: reversed rows, counting the frames it converts.
+    struct ConvertingFrames<'a> {
+        frames: &'a [Vec<Argb<u8>>],
+        converted: Vec<usize>,
+    }
+
+    impl FrameSource for ConvertingFrames<'_> {
+        fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+            self.converted.push(index);
+            f(self
+                .frames
+                .get(index)
+                .map(|p| Image::U8(View::from_pixels(p, W, H))));
+        }
+
+        fn with_frame_if_wanted(
+            &mut self,
+            index: usize,
+            wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+            f: &mut dyn FnMut(Option<Image<'_>>),
+        ) {
+            if let Some(pixels) = self.frames.get(index) {
+                let mut rows = View::from_pixels(pixels, W, H).byte_rows();
+                rows.reverse();
+                if !wanted(&rows) {
+                    return;
+                }
+            }
+            self.with_frame(index, f);
+        }
+    }
+
+    fn render_converting(
+        state: &mut IncrementalRenderer,
+        frames: &[Vec<Argb<u8>>],
+        n: usize,
+    ) -> (Vec<Argb<u8>>, Vec<usize>) {
+        let s = swarm_settings();
+        let start = n.saturating_sub(crate::previous_frames_needed(&s) as usize);
+        let clip = &frames[start..=n];
+        let mut pixels = vec![Argb::default(); (W * H) as usize];
+        let mut source = ConvertingFrames {
+            frames: clip,
+            converted: Vec::new(),
+        };
+        let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
+        state.render_frame(&s, &mut source, clip.len(), n as i64, out);
+        let converted = source.converted.iter().map(|i| i + start).collect();
+        (pixels, converted)
+    }
+
+    /// A check with nothing changed converts only the frame it draws; a change anywhere in an
+    /// earlier frame is still seen, and what it invalidates comes out as a fresh render's.
+    #[test]
+    fn check_converts_only_what_changed() {
+        let mut frames = crossing();
+        let n = frames.len() - 1;
+        let mut state = IncrementalRenderer::default();
+        let (first, _) = render_converting(&mut state, &frames, n);
+        let (same, converted) = render_converting(&mut state, &frames, n);
+        assert_eq!(same, first);
+        assert_eq!(converted, [n], "nothing changed");
+
+        for pixel in [0, frames[4].len() - 1, frames[4].len() / 2] {
+            frames[4][pixel].alpha ^= 1;
+            let (_, converted) = render_converting(&mut state, &frames, n);
+            assert!(converted.contains(&4), "a change at pixel {pixel}");
+            assert!(!converted.contains(&3), "frames before it are unchanged");
+            let (again, converted) = render_converting(&mut state, &frames, n);
+            assert_eq!(converted, [n], "the change is taken in");
+            let mut fresh = IncrementalRenderer::default();
+            let (cold, _) = render_converting(&mut fresh, &frames, n);
+            assert_eq!(again, cold);
+        }
+    }
+
+    /// A frame that goes missing from a check counts as empty, as in a cold render, and one that
+    /// comes back gives what it gave before.
+    #[test]
+    fn check_sees_a_frame_go_missing_and_come_back() {
+        let frames = crossing();
+        let n = frames.len() - 1;
+        let mut state = IncrementalRenderer::default();
+        let (first, _) = render_converting(&mut state, &frames, n);
+
+        struct Gap<'a>(ConvertingFrames<'a>, usize);
+        impl FrameSource for Gap<'_> {
+            fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+                if index == self.1 {
+                    f(None);
+                } else {
+                    self.0.with_frame(index, f);
+                }
+            }
+            fn with_frame_if_wanted(
+                &mut self,
+                index: usize,
+                wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+                f: &mut dyn FnMut(Option<Image<'_>>),
+            ) {
+                if index == self.1 {
+                    f(None);
+                } else {
+                    self.0.with_frame_if_wanted(index, wanted, f);
+                }
+            }
+        }
+        let s = swarm_settings();
+        let start = n.saturating_sub(crate::previous_frames_needed(&s) as usize);
+        let clip = &frames[start..=n];
+        let with_gap = |state: &mut IncrementalRenderer| {
+            let mut pixels = vec![Argb::<u8>::default(); (W * H) as usize];
+            let converting = ConvertingFrames {
+                frames: clip,
+                converted: Vec::new(),
+            };
+            let mut source = Gap(converting, 4 - start);
+            let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
+            state.render_frame(&s, &mut source, clip.len(), n as i64, out);
+            pixels
+        };
+        let after_gap = with_gap(&mut state);
+        let cold = with_gap(&mut IncrementalRenderer::default());
+        assert_eq!(after_gap, cold, "the missing frame counts as empty");
+
+        let (back, _) = render_converting(&mut state, &frames, n);
+        assert_eq!(back, first);
     }
 
     /// A validation error leaves the device usable: it is counted, not kept as a failure, so
