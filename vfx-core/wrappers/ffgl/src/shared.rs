@@ -1080,9 +1080,12 @@ impl InteropSlot {
                 self.hung = Some(hung);
             }
         }
-        if self.disabled || self.current.as_ref().is_some_and(|i| i.size != size) {
+        if self.disabled {
             // SAFETY: the context is current.
             unsafe { self.release() };
+        } else if self.current.as_ref().is_some_and(|i| i.size != size) {
+            // SAFETY: the context is current.
+            unsafe { self.leave_size() };
         }
         let may_try = !self.disabled
             && self.hung.is_none()
@@ -1120,12 +1123,17 @@ impl InteropSlot {
         *calls = calls.saturating_sub(1);
         if *calls == 0 {
             self.calls_until_forced_loss = None;
-            self.destroy_device_for_tests();
+            if let Some(interop) = &self.current {
+                let device = &interop.device.gpu.device;
+                device.destroy();
+                let _ = vfx_core::poll_device(device, wgpu::PollType::wait_indefinitely());
+            }
         }
     }
 
     /// Destroys the interop's device when `VFX_FFGL_LOSE_DEVICE_IN_PRESENT`, read at setup, has
-    /// counted down, so that [`Interop::present`] is what finds the loss.
+    /// counted down, so that [`Interop::present`] is what finds the loss: nothing polls here, and
+    /// it fails before Vulkan has reported it.
     pub fn force_loss_before_present_for_tests(&mut self) {
         let Some(presents) = &mut self.presents_until_forced_loss else {
             return;
@@ -1133,15 +1141,9 @@ impl InteropSlot {
         *presents = presents.saturating_sub(1);
         if *presents == 0 {
             self.presents_until_forced_loss = None;
-            self.destroy_device_for_tests();
-        }
-    }
-
-    fn destroy_device_for_tests(&self) {
-        if let Some(interop) = &self.current {
-            let device = &interop.device.gpu.device;
-            device.destroy();
-            let _ = vfx_core::poll_device(device, wgpu::PollType::wait_indefinitely());
+            if let Some(interop) = &self.current {
+                interop.device.gpu.device.destroy();
+            }
         }
     }
 
@@ -1153,9 +1155,23 @@ impl InteropSlot {
         }
     }
 
-    /// `ready` deletes the images, which needs the context, and a lost device counts as idle.
+    /// Frees the interop for one at another size, which the host's context may have moved to
+    /// another device for, so the loss of this one no longer says anything about this slot. A slot
+    /// `disabled` keeps its record: the loss of that device is what lets it try again.
+    ///
+    /// # Safety
+    /// The context that made the interop must be current.
+    unsafe fn leave_size(&mut self) {
+        // SAFETY: the caller has the context current.
+        unsafe { self.release() };
+        self.device_faults = None;
+    }
+
+    /// `ready` deletes the images, which needs the context, and a lost device counts as idle. A slot
+    /// disabled by a failure tries again, since the images that failure left are going too.
     fn leave_lost_device(&mut self) {
         self.device_faults = None;
+        self.disabled = false;
         if self.hung.is_none() {
             self.hung = self.current.take();
         }
@@ -1192,6 +1208,10 @@ impl InteropSlot {
         LOG.note(&format!(
             "warning: shared GPU render failed, using RAM: {error}"
         ));
+        // A reset can reach GL or panic a render before Vulkan has said so, and only a poll asks.
+        if let Some(interop) = &self.current {
+            let _ = interop.poll(wgpu::PollType::Poll);
+        }
         let device_lost = (self.device_faults.as_ref()).is_some_and(|f| f.lost().is_some());
         match error {
             InteropError::Lost(_) => self.leave_lost_device(),
@@ -1291,27 +1311,60 @@ mod tests {
         slot.no_setup_before.is_some() && slot.backoff.is_some() && !slot.disabled
     }
 
-    /// Effects that share a device: the one shared last being lost leaves the other's slot alone,
-    /// and the other way round.
+    /// Effects that share a device: one being lost leaves the other's slot alone, whichever was
+    /// shared last.
     #[test]
     fn losing_one_shared_device_stops_only_its_slots() {
-        let Some((a, b)) = two_devices() else {
+        for lose_the_last_shared in [true, false] {
+            let Some((a, b)) = two_devices() else {
+                return;
+            };
+            a.share();
+            b.share();
+            let (lost, healthy) = if lose_the_last_shared { (b, a) } else { (a, b) };
+            let (mut on_lost, mut on_healthy) = (slot_on(&lost), slot_on(&healthy));
+            lose(&lost);
+            on_lost.check_device();
+            on_healthy.check_device();
+            assert!(
+                on_healthy.no_setup_before.is_none(),
+                "a healthy device's slot left it"
+            );
+            assert!(
+                waiting_for_new_device(&on_lost),
+                "the lost device's slot stayed"
+            );
+        }
+    }
+
+    /// A failure before the loss is known turns the slot off, and the loss turns it on again.
+    #[test]
+    fn a_loss_undoes_a_failure_that_came_first() {
+        let Some((a, _b)) = two_devices() else {
             return;
         };
-        a.share();
-        b.share();
-        let (mut on_a, mut on_b) = (slot_on(&a), slot_on(&b));
-        lose(&b);
-        on_a.check_device();
-        on_b.check_device();
-        assert!(
-            on_a.no_setup_before.is_none(),
-            "a healthy device's slot left it"
-        );
-        assert!(
-            waiting_for_new_device(&on_b),
-            "the lost device's slot stayed"
-        );
+        a.watch_faults();
+        let mut slot = slot_on(&a);
+        slot.record_render_error(InteropError::Failed("GL to Vulkan handoff".into()));
+        assert!(slot.disabled);
+        lose(&a);
+        slot.check_device();
+        assert!(waiting_for_new_device(&slot), "stayed off after the loss");
+    }
+
+    /// A slot that left a device for another size isn't sent looking for a new one by its loss.
+    #[test]
+    fn a_device_left_behind_says_nothing() {
+        let Some((a, _b)) = two_devices() else {
+            return;
+        };
+        a.watch_faults();
+        let mut slot = slot_on(&a);
+        // SAFETY: the slot has no interop, so nothing touches GL.
+        unsafe { slot.leave_size() };
+        lose(&a);
+        slot.check_device();
+        assert!(slot.no_setup_before.is_none());
     }
 
     /// GPU effects share nothing, so only the slot's own record can tell of a loss.
