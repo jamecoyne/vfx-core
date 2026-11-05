@@ -552,8 +552,8 @@ impl Preview {
             if let Some(frame) = self.effects.source_frame() {
                 receiver.draw(&self.gpu, frame);
             }
-            self.counts.arrived += 1;
         }
+        self.counts.arrived += receiver.take_arrived_count();
         if let Some(status) = receiver.status_change() {
             self.message = status;
         }

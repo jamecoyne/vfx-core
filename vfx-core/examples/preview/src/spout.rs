@@ -197,6 +197,8 @@ struct State {
     status: Option<String>,
     /// RAM frames' buffers, back from the render loop.
     spare: Vec<Vec<u8>>,
+    /// Frames the worker delivered since the render loop last asked, taken or replaced.
+    arrived: u64,
 }
 
 /// A connection to the sender as the render loop sees it.
@@ -278,6 +280,7 @@ impl Receiver {
             import_failed: None,
             status: Some(format!("Waiting for the Spout sender {name}")),
             spare: Vec::new(),
+            arrived: 0,
         }));
         let worker = Worker {
             name: name.clone(),
@@ -320,6 +323,12 @@ impl Receiver {
         })
     }
 
+    /// Frames the sender delivered since the last call, whether drawn or replaced by a newer one
+    /// first, as the source rate counts them.
+    pub fn take_arrived_count(&self) -> u64 {
+        std::mem::take(&mut lock(&self.shared).arrived)
+    }
+
     /// Seconds from the start to the last frame's arrival.
     pub fn frame_time(&self) -> f64 {
         self.frame_time
@@ -341,7 +350,10 @@ impl Receiver {
     /// Takes the newest frame, if one came in since the last call, and returns the size it draws
     /// at. [`Receiver::draw`] draws it.
     pub fn next_frame(&mut self, gpu: &Gpu) -> Option<(u32, u32)> {
-        self.taken = None;
+        // A frame taken and never drawn gives its shared texture back.
+        if let (Some(Taken::Slot(slot)), Some(imported)) = (self.taken.take(), &self.imported) {
+            imported.busy[slot].store(false, Ordering::Release);
+        }
         // Runs the callbacks that free shared textures whose conversion has finished.
         let _ = gpu.device.poll(wgpu::PollType::Poll);
         let mut state = lock(&self.shared);
@@ -729,11 +741,20 @@ impl Worker {
         };
         if let Some(frame) = connection.read(d3d, &self.shared)? {
             let mut state = lock(&self.shared);
-            state.ready = Some(Ready {
+            state.arrived += 1;
+            let replaced = state.ready.replace(Ready {
                 generation: connection.generation,
                 frame,
                 arrived: Instant::now(),
             });
+            // A RAM frame the render loop never took keeps its buffer for the next.
+            if let Some(Ready {
+                frame: ReadyFrame::Bytes(bytes),
+                ..
+            }) = replaced
+            {
+                state.spare.push(bytes);
+            }
         }
         Ok(interval)
     }
