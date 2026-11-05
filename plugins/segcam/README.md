@@ -58,7 +58,7 @@ Apple M1 Pro and up runs it comfortably. Swarm draws on the GPU when there is on
   when all three of these are on:
   - Playback, Render Cache, User
   - The clip's Render Cache OFX Filter, segcam Motion
-  - Use render cached images in the Deliver page's Advanced Settings
+  - Use render cached images in the export's Advanced Settings
 
   Resolve's cache can then hold pictures from playback, and a plugin can't tell a render that will
   be saved from playback. New projects have all three off.

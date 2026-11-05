@@ -26,7 +26,7 @@ as playback and doesn't read the frames Resolve dropped, since fetching one cost
 falls further behind. A step over 16 frames out of a run renders exact, because that frame stays on
 screen at a stop. No property a plugin can read separates playback from a render Resolve will save,
 across the 183 property names in the OpenFX and Resolve headers. So with Render Cache on User, the
-clip's OFX filter marked for caching and Use render cached images ticked in Deliver, an export can
+clip's OFX filter marked for caching and Use render cached images ticked for the export, an export can
 contain playback pictures. All three are off in a new project, and the README's known limits say so.
 
 ## Options considered
