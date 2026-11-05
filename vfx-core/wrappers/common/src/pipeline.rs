@@ -130,6 +130,13 @@ pub fn run(gpu: &Gpu, job: &Job) -> Vec<f32> {
         .read_f32(gpu, &p.output)
 }
 
+/// Drops what was prepared on the device `device` keys: it's lost, and a new device may be given
+/// the same key.
+pub fn forget_device(device: usize) {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.retain(|p| p.key.device != device);
+}
+
 fn take(gpu: &Gpu, key: Key) -> Prepared {
     let found = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());

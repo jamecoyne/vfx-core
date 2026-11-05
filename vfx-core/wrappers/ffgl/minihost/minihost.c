@@ -698,6 +698,51 @@ static void case_pending_gl_error(void) {
     }
 }
 
+/* A device lost, by destroy(), which goes another way through wgpu than a driver's loss: frames stay
+ * right through RAM, and the instance goes back to shared frames on a new device. */
+static void case_device_reopen(void) {
+    _putenv_s("VFX_FFGL_PATH", "ram");
+    void *ram = instantiate(63, 37);
+    _putenv_s("VFX_FFGL_PATH", "");
+    Frame f = frame(63, 37, 80, 48);
+    float *reference = malloc((size_t)f.w * f.h * 4 * sizeof(float));
+    CHECK(render(ram, &f), "forced RAM reference render");
+    memcpy(reference, f.out, (size_t)f.w * f.h * 4 * sizeof(float));
+    _putenv_s("VFX_FFGL_LOSE_DEVICE_AFTER", "20");
+    void *lost = instantiate(63, 37);
+    /* Read when the first render sets up the shared images; the new device stays. The first try
+     * is a second after the loss. */
+    int rendered = 0;
+    for (; rendered < 2000 && !logged_message("shared frames back on a new device"); rendered++) {
+        CHECK(render(lost, &f), "render %d", rendered);
+        _putenv_s("VFX_FFGL_LOSE_DEVICE_AFTER", "");
+        float worst = 0;
+        for (int k = 0; k < f.w * f.h * 4; k++) {
+            float diff = fabsf(reference[k] - f.out[k]);
+            if (diff > worst) worst = diff;
+        }
+        CHECK(worst < 1e-4f, "render %d differs from RAM: %g", rendered, worst);
+        CHECK(glGetError() == GL_NO_ERROR, "render %d left a GL error", rendered);
+        Sleep(2);
+    }
+    for (int i = 0; i < 10; i++) {
+        CHECK(render(lost, &f), "render %d after the new device", i);
+        float worst = 0;
+        for (int k = 0; k < f.w * f.h * 4; k++) {
+            float diff = fabsf(reference[k] - f.out[k]);
+            if (diff > worst) worst = diff;
+        }
+        CHECK(worst < 1e-4f, "render %d on the new device differs from RAM: %g", i, worst);
+    }
+    free(reference);
+    free_frame(&f);
+    CHECK(call(DEINSTANTIATE_GL, u(0), lost).u == 0, "delete after the new device");
+    call(DEINSTANTIATE_GL, u(0), ram);
+    if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
+        CHECK(logged_message("shared frames back on a new device"), "no new device after the loss");
+    }
+}
+
 /* A frame whose GPU wait runs out, as on a GPU that hangs without being lost: the instance goes on
  * through RAM with the right pixels, and deleting it returns. */
 static void case_gpu_wait(void) {
@@ -745,6 +790,7 @@ static Case cases[] = {
     /* Before gpu_wait, whose failed renders this one's log check would find. */
     {"pending_gl_error", case_pending_gl_error},
     {"gpu_wait", case_gpu_wait},
+    {"device_reopen", case_device_reopen},
 #endif
     {"info", case_info}, {"passthrough", case_passthrough}, {"brightness", case_brightness},
     {"padding", case_padding}, {"blur", case_blur}, {"vignette", case_vignette},
