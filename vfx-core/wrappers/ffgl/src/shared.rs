@@ -996,6 +996,34 @@ impl Interop {
     }
 }
 
+/// The frame a CPU effect draws its output into, and the device it's on. A frame can't be used on
+/// another device: wgpu looks its ids up in that device's own tables, and a reopen's new device can
+/// come with a setup in the same call that finds the old one gone.
+pub struct OutputFrame {
+    frame: Frame,
+    faults: DeviceFaults,
+}
+
+impl OutputFrame {
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    /// Keeps `kept` if it is on `gpu` at `size`, and makes a new frame otherwise.
+    pub fn keep_or_make(kept: &mut Option<Self>, gpu: &Gpu, size: (u32, u32)) {
+        let faults = gpu.faults();
+        let usable = kept.as_ref().is_some_and(|output| {
+            (output.frame.width, output.frame.height) == size && output.faults.same_device(&faults)
+        });
+        if !usable {
+            *kept = Some(Self {
+                frame: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
+                faults,
+            });
+        }
+    }
+}
+
 /// One instance's way to the interop: what it has, and whether and when it may try for one.
 pub struct InteropSlot {
     current: Option<Interop>,
@@ -1014,6 +1042,8 @@ pub struct InteropSlot {
     set_up_at: Option<Instant>,
     /// See [`Self::force_loss_for_tests`].
     calls_until_forced_loss: Option<u32>,
+    /// See [`Self::force_loss_before_present_for_tests`].
+    presents_until_forced_loss: Option<u32>,
 }
 
 impl InteropSlot {
@@ -1027,6 +1057,7 @@ impl InteropSlot {
             backoff: None,
             set_up_at: None,
             calls_until_forced_loss: None,
+            presents_until_forced_loss: None,
         }
     }
 
@@ -1065,9 +1096,9 @@ impl InteropSlot {
                 Ok(Ok(interop)) => {
                     self.device_faults = Some(interop.gpu().faults());
                     self.set_up_at = Some(Instant::now());
-                    self.calls_until_forced_loss = std::env::var("VFX_FFGL_LOSE_DEVICE_AFTER")
-                        .ok()
-                        .and_then(|calls| calls.parse().ok());
+                    let count = |name| std::env::var(name).ok()?.parse().ok();
+                    self.calls_until_forced_loss = count("VFX_FFGL_LOSE_DEVICE_AFTER");
+                    self.presents_until_forced_loss = count("VFX_FFGL_LOSE_DEVICE_IN_PRESENT");
                     if self.backoff.is_some() {
                         LOG.note("shared frames back on a new device");
                     }
@@ -1089,11 +1120,28 @@ impl InteropSlot {
         *calls = calls.saturating_sub(1);
         if *calls == 0 {
             self.calls_until_forced_loss = None;
-            if let Some(interop) = &self.current {
-                let device = &interop.device.gpu.device;
-                device.destroy();
-                let _ = vfx_core::poll_device(device, wgpu::PollType::wait_indefinitely());
-            }
+            self.destroy_device_for_tests();
+        }
+    }
+
+    /// Destroys the interop's device when `VFX_FFGL_LOSE_DEVICE_IN_PRESENT`, read at setup, has
+    /// counted down, so that [`Interop::present`] is what finds the loss.
+    pub fn force_loss_before_present_for_tests(&mut self) {
+        let Some(presents) = &mut self.presents_until_forced_loss else {
+            return;
+        };
+        *presents = presents.saturating_sub(1);
+        if *presents == 0 {
+            self.presents_until_forced_loss = None;
+            self.destroy_device_for_tests();
+        }
+    }
+
+    fn destroy_device_for_tests(&self) {
+        if let Some(interop) = &self.current {
+            let device = &interop.device.gpu.device;
+            device.destroy();
+            let _ = vfx_core::poll_device(device, wgpu::PollType::wait_indefinitely());
         }
     }
 
@@ -1212,6 +1260,30 @@ mod tests {
             eprintln!("no GPU adapter: skipped");
         }
         devices
+    }
+
+    /// The path a stale frame takes: an interop on a new device, of the same size, with the frame
+    /// still kept from the old one.
+    #[test]
+    fn output_frame_follows_the_device() {
+        let Some((a, b)) = two_devices() else {
+            return;
+        };
+        let mut kept = None;
+        OutputFrame::keep_or_make(&mut kept, &a, (64, 32));
+        let on_a = kept.as_ref().unwrap().frame.texture.clone();
+        OutputFrame::keep_or_make(&mut kept, &a, (64, 32));
+        assert!(
+            kept.as_ref().unwrap().frame.texture == on_a,
+            "same device and size made a new frame"
+        );
+        OutputFrame::keep_or_make(&mut kept, &a, (32, 32));
+        assert_eq!(kept.as_ref().unwrap().frame.width, 32);
+        OutputFrame::keep_or_make(&mut kept, &b, (32, 32));
+        assert!(
+            kept.as_ref().unwrap().faults.same_device(&b.faults()),
+            "the frame stayed on the old device"
+        );
     }
 
     /// Whether the slot is waiting to set up on a new device.

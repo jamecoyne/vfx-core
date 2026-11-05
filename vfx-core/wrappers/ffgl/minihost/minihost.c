@@ -782,6 +782,48 @@ static void case_gpu_wait(void) {
 }
 #endif
 
+#if defined(SEGCAM_CHECKS) && defined(_WIN32)
+/* A CPU effect's output on the GPU, with the loss found by the present and the next call a while
+ * later, so that it sets up on a new device in that call: nothing kept from the old device may reach
+ * the new one. A panic there fails a render and starts the effect over. */
+static void segcam_device_reopen(void) {
+    _putenv_s("SEGCAM_GPU", "1");
+    _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "30");
+    int w = 320, h = 180;
+    void *inst = instantiate(w, h);
+    segcam_options(inst, 3, 0);
+    Frame f = frame(w, h, w, h);
+    GLuint textures[2] = {segcam_texture(w, h, 0), segcam_texture(w, h, 1)};
+    GLuint original = f.input;
+    int waited = 0, back_frames = 0, picture = 0;
+    for (int n = 0; n < 3000 && back_frames < 60; n++) {
+        f.input = textures[n & 1];
+        double time = n / 30.0;
+        CHECK(call(SET_TIME, ptr(&time), inst).u == 0, "set time failed");
+        CHECK(render(inst, &f), "render %d failed", n);
+        _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "");
+        if (!waited && logged_message("shared GPU render failed, using RAM")) {
+            waited = 1;
+            Sleep(1300);
+        }
+        if (logged_message("shared frames back on a new device")) {
+            back_frames++;
+            for (int i = 0; i < w * h; i++) if (f.out[i * 4 + 3] > 0) { picture = 1; break; }
+        }
+        Sleep(2);
+    }
+    CHECK(waited, "the present never found the loss");
+    CHECK(back_frames >= 60, "no new device after the loss");
+    CHECK(picture, "no picture on the new device");
+    CHECK(!logged_message("CPU render failed"), "a render panicked after the new device");
+    CHECK(call(DEINSTANTIATE_GL, u(0), inst).u == 0, "delete after the new device");
+    glDeleteTextures(2, textures);
+    f.input = original;
+    free_frame(&f);
+    CHECK(glGetError() == GL_NO_ERROR, "GL error after the new device");
+}
+#endif
+
 typedef struct { const char *name; void (*run)(void); } Case;
 static Case cases[] = {
 #ifdef _WIN32
@@ -842,6 +884,14 @@ int main(int argc, char **argv) {
         call(DEINITIALISE, u(0), NULL);
         return result;
     }
+#ifdef _WIN32
+    if (segcam && !strcmp(only, "segcam-device-reopen")) {
+        segcam_device_reopen();
+        printf("segcam-device-reopen: %d failure(s)\n", failures);
+        call(DEINITIALISE, u(0), NULL);
+        return failures ? 1 : 0;
+    }
+#endif
     if (segcam && (!strcmp(only, "segcam") || !strcmp(only, "all") || !strcmp(only, "segcam-timing"))) {
         if (strcmp(only, "segcam-timing")) { case_segcam(); case_state(); }
         if (strcmp(only, "segcam")) segcam_timing();
