@@ -11,7 +11,7 @@ pub mod ffi;
 pub mod host;
 pub mod image;
 
-mod cpu;
+mod cpu_pixels;
 mod params;
 
 use std::ffi::{CStr, c_char, c_void};
@@ -23,7 +23,7 @@ use vfx_core::{Context, ParamSpec, ParamValues, Processor, Region};
 use vfx_host::{Kind, diag, pipeline};
 
 use ffi::*;
-use host::{Props, check, suites};
+use host::{Props, check_status, suites};
 use image::{Depth, Image, Rect};
 
 /// For the export macro.
@@ -102,7 +102,7 @@ fn dispatch(
 ) -> Result<OfxStatus, OfxStatus> {
     let cpu = vfx_host::plugin().kind == Kind::Cpu;
     Ok(if action == ACTION_LOAD {
-        if host::load() {
+        if host::fetch_suites() {
             STAT_OK
         } else {
             STAT_ERR_MISSING_HOST_FEATURE
@@ -151,14 +151,14 @@ fn dispatch(
 fn effect_props(effect: ImageEffect) -> Result<Props, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a descriptor or instance handle from the host.
-    check(unsafe { (suites().effect.getPropertySet)(effect, &mut props) })?;
+    check_status(unsafe { (suites().effect.getPropertySet)(effect, &mut props) })?;
     Ok(Props(props))
 }
 
 /// For properties a host may not know (OpenFX grew over versions, and hosts return
 /// kOfxStatErrUnknown for names they don't recognise). Failing describe over one of
 /// these would hide the plugin, so note it and carry on.
-pub(crate) fn optional(name: &CStr, result: Result<(), OfxStatus>) {
+pub(crate) fn note_if_rejected(name: &CStr, result: Result<(), OfxStatus>) {
     if let Err(status) = result {
         LOG.note(&format!(
             "host rejected optional property {name:?} (status {status})"
@@ -176,41 +176,45 @@ fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
         PROP_SUPPORTED_PIXEL_DEPTHS,
         &[DEPTH_BYTE, DEPTH_SHORT, DEPTH_FLOAT],
     )?;
-    optional(
+    note_if_rejected(
         PROP_GROUPING,
         p.set_string(PROP_GROUPING, plugin.info.category),
     );
     // DaVinci Resolve 21 rejects this one with kOfxStatErrUnknown.
-    optional(
+    note_if_rejected(
         PROP_PLUGIN_DESCRIPTION,
         p.set_string(PROP_PLUGIN_DESCRIPTION, plugin.info.description),
     );
     // GPU effects scale pixel distances themselves; CPU effects see whole frames.
-    optional(
+    note_if_rejected(
         PROP_SUPPORTS_MULTI_RESOLUTION,
         p.set_int(PROP_SUPPORTS_MULTI_RESOLUTION, 0, i32::from(!cpu)),
     );
-    optional(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
-    optional(
+    note_if_rejected(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
+    note_if_rejected(
         PROP_TEMPORAL_CLIP_ACCESS,
-        p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, i32::from(temporal(cpu))),
+        p.set_int(
+            PROP_TEMPORAL_CLIP_ACCESS,
+            0,
+            i32::from(declares_temporal_access(cpu)),
+        ),
     );
-    optional(
+    note_if_rejected(
         PROP_MULTIPLE_CLIP_DEPTHS,
         p.set_int(PROP_MULTIPLE_CLIP_DEPTHS, 0, 0),
     );
     // Each render makes or leases its own instance, so concurrent renders are safe. An effect
     // that keeps state has one per instance, so its renders take turns.
-    let safety = if keeps_state() {
+    let safety = if effect_keeps_state() {
         RENDER_INSTANCE_SAFE
     } else {
         RENDER_FULLY_SAFE
     };
-    optional(
+    note_if_rejected(
         PROP_RENDER_THREAD_SAFETY,
         p.set_str(PROP_RENDER_THREAD_SAFETY, 0, safety),
     );
-    optional(
+    note_if_rejected(
         PROP_HOST_FRAME_THREADING,
         p.set_int(PROP_HOST_FRAME_THREADING, 0, 0),
     );
@@ -220,20 +224,20 @@ fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
 fn define_clip(
     effect: ImageEffect,
     name: &CStr,
-    optional: bool,
-    temporal: bool,
+    is_optional: bool,
+    is_temporal: bool,
 ) -> Result<(), OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a descriptor handle in the describe-in-context action.
-    check(unsafe { (suites().effect.clipDefine)(effect, name.as_ptr(), &mut props) })?;
+    check_status(unsafe { (suites().effect.clipDefine)(effect, name.as_ptr(), &mut props) })?;
     let p = Props(props);
     p.set_str(PROP_SUPPORTED_COMPONENTS, 0, COMPONENT_RGBA)?;
-    self::optional(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
-    if optional {
+    note_if_rejected(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
+    if is_optional {
         p.set_int(CLIP_PROP_OPTIONAL, 0, 1)?;
     }
-    if temporal {
-        self::optional(
+    if is_temporal {
+        note_if_rejected(
             PROP_TEMPORAL_CLIP_ACCESS,
             p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, 1),
         );
@@ -255,7 +259,7 @@ fn describe_in_context(effect: ImageEffect, in_args: Props) -> Result<(), OfxSta
         effect,
         CLIP_SOURCE,
         false,
-        temporal(plugin.kind == Kind::Cpu),
+        declares_temporal_access(plugin.kind == Kind::Cpu),
     )?;
     if layer {
         define_clip(effect, CLIP_LAYER, true, false)?;
@@ -263,11 +267,11 @@ fn describe_in_context(effect: ImageEffect, in_args: Props) -> Result<(), OfxSta
     define_clip(effect, CLIP_OUTPUT, false, false)?;
     let mut set = ptr::null_mut();
     // SAFETY: a descriptor handle.
-    check(unsafe { (suites().effect.getParamSet)(effect, &mut set) })?;
+    check_status(unsafe { (suites().effect.getParamSet)(effect, &mut set) })?;
     params::define(set, plugin.params(), layer)
 }
 
-fn clip(effect: ImageEffect, name: &CStr) -> Option<Clip> {
+fn clip_handle(effect: ImageEffect, name: &CStr) -> Option<Clip> {
     let mut clip = ptr::null_mut();
     // SAFETY: an instance handle; fails for clips this context doesn't define.
     let status = unsafe {
@@ -279,7 +283,7 @@ fn clip(effect: ImageEffect, name: &CStr) -> Option<Clip> {
 fn clip_props(clip: Clip) -> Result<Props, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a clip handle from clipGetHandle.
-    check(unsafe { (suites().effect.clipGetPropertySet)(clip, &mut props) })?;
+    check_status(unsafe { (suites().effect.clipGetPropertySet)(clip, &mut props) })?;
     Ok(Props(props))
 }
 
@@ -290,13 +294,13 @@ fn clip_connected(clip: Clip) -> bool {
         != 0
 }
 
-fn values(effect: ImageEffect, time: OfxTime) -> Result<ParamValues, OfxStatus> {
+fn param_values(effect: ImageEffect, time: OfxTime) -> Result<ParamValues, OfxStatus> {
     params::Reader::new(effect, time)?.values(vfx_host::plugin().params())
 }
 
 /// The GPU effect's region at `scale` (1 in canonical coordinates). CPU effects use the
 /// whole frame.
-fn region(values: &ParamValues, scale: [f64; 2]) -> Region {
+fn gpu_effect_region(values: &ParamValues, scale: [f64; 2]) -> Region {
     match (vfx_host::plugin().make)() {
         Processor::Gpu(e) => e.region(values, [scale[0] as f32, scale[1] as f32]),
         Processor::Cpu(_) => Region::default(),
@@ -304,10 +308,10 @@ fn region(values: &ParamValues, scale: [f64; 2]) -> Region {
 }
 
 fn source_rod(effect: ImageEffect, time: OfxTime) -> Result<[f64; 4], OfxStatus> {
-    let source = clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
+    let source = clip_handle(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
     let mut rod = [0.0f64; 4];
     // SAFETY: a clip handle and a four-double rectangle.
-    check(unsafe { (suites().effect.clipGetRegionOfDefinition)(source, time, &mut rod) })?;
+    check_status(unsafe { (suites().effect.clipGetRegionOfDefinition)(source, time, &mut rod) })?;
     Ok(rod)
 }
 
@@ -315,7 +319,7 @@ fn source_rod(effect: ImageEffect, time: OfxTime) -> Result<[f64; 4], OfxStatus>
 fn frames_needed(effect: ImageEffect, in_args: Props, out_args: Props) -> Result<(), OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
     let before = match (vfx_host::plugin().make)() {
-        Processor::Cpu(e) => e.frames_before(&values(effect, time)?, frame_rate(effect)?),
+        Processor::Cpu(e) => e.frames_before(&param_values(effect, time)?, frame_rate(effect)?),
         Processor::Gpu(_) => 0,
     };
     out_args.set_doubles(CLIP_FRAME_RANGE_SOURCE, &[time - before as f64, time])
@@ -327,8 +331,12 @@ fn region_of_definition(
     in_args: Props,
     out_args: Props,
 ) -> Result<OfxStatus, OfxStatus> {
+    // A CPU effect never grows, so a host's frequent asks needn't read parameters or make an effect.
+    if vfx_host::plugin().kind == Kind::Cpu {
+        return Ok(STAT_REPLY_DEFAULT);
+    }
     let time = in_args.get_double(PROP_TIME, 0)?;
-    let r = region(&values(effect, time)?, [1.0, 1.0]);
+    let r = gpu_effect_region(&param_values(effect, time)?, [1.0, 1.0]);
     if !r.grows {
         return Ok(STAT_REPLY_DEFAULT);
     }
@@ -351,32 +359,32 @@ fn regions_of_interest(
     if vfx_host::plugin().kind == Kind::Cpu {
         return out_args.set_doubles(CLIP_ROI_SOURCE, &source_rod(effect, time)?);
     }
-    let [rx, ry] = region(&values(effect, time)?, [1.0, 1.0])
+    let [rx, ry] = gpu_effect_region(&param_values(effect, time)?, [1.0, 1.0])
         .reach
         .map(f64::from);
     let r = in_args.get_rect_d(PROP_ROI)?;
     let roi = [r[0] - rx, r[1] - ry, r[2] + rx, r[3] + ry];
     out_args.set_doubles(CLIP_ROI_SOURCE, &roi)?;
-    if clip(effect, CLIP_LAYER).is_some() {
+    if clip_handle(effect, CLIP_LAYER).is_some() {
         out_args.set_doubles(CLIP_ROI_LAYER, &roi)?;
     }
     Ok(())
 }
 
 /// A fetched image, released when dropped.
-struct Fetched {
+struct FetchedImage {
     props: Props,
     image: Image,
 }
 
-impl Drop for Fetched {
+impl Drop for FetchedImage {
     fn drop(&mut self) {
         // SAFETY: an image handle from clipGetImage, released once.
         unsafe { (suites().effect.clipReleaseImage)(self.props.0) };
     }
 }
 
-fn fetch(clip: Clip, time: OfxTime) -> Result<Option<Fetched>, OfxStatus> {
+fn fetch_image(clip: Clip, time: OfxTime) -> Result<Option<FetchedImage>, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a clip handle; a null region asks for the whole image.
     let status = unsafe { (suites().effect.clipGetImage)(clip, time, ptr::null(), &mut props) };
@@ -385,7 +393,7 @@ fn fetch(clip: Clip, time: OfxTime) -> Result<Option<Fetched>, OfxStatus> {
     }
     let p = Props(props);
     // Release the image even if describing it fails.
-    let mut fetched = Fetched {
+    let mut fetched = FetchedImage {
         props: p,
         image: Image {
             data: ptr::null_mut(),
@@ -425,18 +433,17 @@ fn fetch(clip: Clip, time: OfxTime) -> Result<Option<Fetched>, OfxStatus> {
     Ok(Some(fetched))
 }
 
-/// The host's time (frames) in seconds.
-fn seconds(effect: ImageEffect, time: OfxTime) -> Result<f64, OfxStatus> {
-    let rate = effect_props(effect)?
-        .get_double(PROP_FRAME_RATE, 0)
-        .unwrap_or(24.0);
-    Ok(if rate > 0.0 { time / rate } else { time })
-}
-
-/// The project's frames a second, if the host says.
+/// The project's frames a second, if the host gives a usable rate.
 fn frame_rate(effect: ImageEffect) -> Result<Option<f64>, OfxStatus> {
     let rate = effect_props(effect)?.get_double(PROP_FRAME_RATE, 0).ok();
     Ok(rate.filter(|r| *r > 0.0))
+}
+
+/// The host's time, in frames, in seconds. Seconds need some rate, so a host that gives none
+/// counts at 24 frames a second; [`Context::frame_rate`] stays `None` for it, so an effect can tell
+/// the rate is unknown.
+fn seconds(time: OfxTime, frame_rate: Option<f64>) -> f64 {
+    time / frame_rate.unwrap_or(24.0)
 }
 
 /// Canonical point values (full-resolution pixels, y up) to normalised canvas coordinates.
@@ -458,24 +465,25 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         in_args.get_double(PROP_RENDER_SCALE, 0)?,
         in_args.get_double(PROP_RENDER_SCALE, 1)?,
     ];
-    let output = fetch(clip(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?.ok_or(STAT_FAILED)?;
-    let source = fetch(clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?, time)?;
-    let layer = match clip(effect, CLIP_LAYER) {
-        Some(c) if clip_connected(c) => fetch(c, time)?,
+    let output = fetch_image(clip_handle(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?
+        .ok_or(STAT_FAILED)?;
+    let source = fetch_image(clip_handle(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?, time)?;
+    let layer = match clip_handle(effect, CLIP_LAYER) {
+        Some(c) if clip_connected(c) => fetch_image(c, time)?,
         _ => None,
     };
-    let mut values = values(effect, time)?;
+    let mut values = param_values(effect, time)?;
 
     let window = window.intersect(&output.image.bounds);
     if window.is_empty() {
         return Ok(());
     }
     // Render a canvas that also covers the pixels the effect reads around the window.
-    let r = region(&values, scale);
-    let reach = window.grow(r.reach[0], r.reach[1]);
+    let r = gpu_effect_region(&values, scale);
+    let read_area = window.grow(r.reach[0], r.reach[1]);
     let canvas = match &source {
-        Some(s) if !r.grows => reach.intersect(&s.image.bounds).union(&window),
-        _ => reach,
+        Some(s) if !r.grows => read_area.intersect(&s.image.bounds).union(&window),
+        _ => read_area,
     };
     map_points(&mut values, plugin.params(), scale, canvas);
     // SAFETY: images come from the host and are described by their own properties.
@@ -487,15 +495,16 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         .as_ref()
         .map(|l| unsafe { image::decode(&l.image, canvas) });
 
+    let rate = frame_rate(effect)?;
     let job = pipeline::Job {
         spec: pipeline::Spec {
             values: &values,
             ctx: Context {
-                time: seconds(effect, time)?,
+                time: seconds(time, rate),
                 frame: time.round() as i64,
                 scale: scale.map(|s| s as f32),
                 premultiplied: false,
-                frame_rate: frame_rate(effect)?,
+                frame_rate: rate,
             },
             width: canvas.width() as u32,
             height: canvas.height() as u32,
@@ -505,7 +514,9 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         layer: layer_pixels.as_deref(),
     };
     let depth = output.image.depth;
-    LOG.note(&format!("render path: CPU (frames through RAM), {depth:?}"));
+    LOG.note(&format!(
+        "render path: GPU effect, frames through RAM, {depth:?}"
+    ));
     let result = match vfx_host::gpu(&LOG) {
         Some(gpu) => {
             catch_unwind(AssertUnwindSafe(|| pipeline::run(gpu, &job))).unwrap_or_else(|_| {
@@ -522,41 +533,43 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
 
 /// Hands a CPU effect the source frames it reads, oldest first, each fetched and
 /// converted when asked for and released straight after.
-struct Source<'a, C> {
+struct ClipFrames<'a, C> {
     clip: Clip,
     /// The clip's first frame; earlier ones don't exist.
-    start: f64,
+    clip_start_time: f64,
     /// The time of frame 0.
-    first: f64,
+    first_frame_time: f64,
     canvas: Rect,
     error: Option<OfxStatus>,
     /// Where each frame is decoded.
-    frame: &'a mut Vec<Argb<C>>,
-    /// The frame `frame` holds, which isn't fetched again if asked for again.
-    decoded: Option<usize>,
+    decoded_pixels: &'a mut Vec<Argb<C>>,
+    /// The frame `decoded_pixels` holds, which isn't fetched again if asked for again.
+    decoded_index: Option<usize>,
     /// Resolve is streaming renders, so earlier frames are taken as unchanged until it pauses.
-    fixed: bool,
+    earlier_frames_unchanged: bool,
+    /// Resolve has dropped frames from this stream, which makes it playback, not an export.
+    frames_dropped: bool,
 }
 
-impl<C: CpuDepth> FrameSource for Source<'_, C> {
+impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<vfx_core::cpu::Image<'_>>)) {
-        let time = self.first + index as f64;
-        if time < self.start {
+        let time = self.first_frame_time + index as f64;
+        if time < self.clip_start_time {
             f(None);
             return;
         }
         let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
-        if self.decoded == Some(index) {
-            f(Some(C::image(View::from_pixels(self.frame, w, h))));
+        if self.decoded_index == Some(index) {
+            f(Some(C::image(View::from_pixels(self.decoded_pixels, w, h))));
             return;
         }
-        self.decoded = None;
-        match fetch(self.clip, time) {
+        self.decoded_index = None;
+        match fetch_image(self.clip, time) {
             Ok(Some(frame)) => {
                 // SAFETY: the fetched image stays alive through the closure.
-                unsafe { cpu::decode_into(&frame.image, self.canvas, self.frame) };
-                self.decoded = Some(index);
-                f(Some(C::image(View::from_pixels(self.frame, w, h))));
+                unsafe { cpu_pixels::decode_into(&frame.image, self.canvas, self.decoded_pixels) };
+                self.decoded_index = Some(index);
+                f(Some(C::image(View::from_pixels(self.decoded_pixels, w, h))));
             }
             Ok(None) => {
                 self.error.get_or_insert(STAT_FAILED);
@@ -570,44 +583,124 @@ impl<C: CpuDepth> FrameSource for Source<'_, C> {
     }
 
     fn fixed(&self) -> bool {
-        self.fixed
+        self.earlier_frames_unchanged
+    }
+
+    /// Playback that has fallen behind must not fall further behind to stay exact.
+    fn live(&self) -> bool {
+        self.frames_dropped
+    }
+
+    /// A frame Resolve dropped costs far more to fetch than one it decoded for playback, so
+    /// playback goes without it, as segcam 1.1 does when it can't keep up.
+    fn held(&self) -> usize {
+        if self.frames_dropped { 1 } else { usize::MAX }
     }
 }
 
 /// Whether to declare temporal clip access. Resolve hands over earlier frames without it and
 /// plays back far slower with it.
-fn temporal(cpu: bool) -> bool {
+fn declares_temporal_access(cpu: bool) -> bool {
     cpu && !host::is_resolve()
 }
 
-fn keeps_state() -> bool {
+fn effect_keeps_state() -> bool {
     vfx_host::CpuInstance::new(vfx_host::plugin().make, true).is_some_and(|i| i.is_kept())
 }
 
 /// An instance's CPU effect, kept between renders under the shared policy
 /// ([`vfx_host::CpuInstance`]) when the effect keeps state, and its last render.
-struct Kept {
+struct KeptEffect {
     effect: vfx_host::CpuInstance,
-    last: std::sync::Mutex<Option<Rendered>>,
+    last_render: std::sync::Mutex<Option<LastRender>>,
 }
 
-/// A frame rendered, when it finished, and whether it didn't follow on from the one before.
+/// A frame rendered, when it finished, and where it stood in its stream.
 #[derive(Clone, Copy)]
-struct Rendered {
+struct LastRender {
     frame: i64,
-    ended: std::time::Instant,
-    broke_stream: bool,
+    finished: std::time::Instant,
+    stream: StreamPosition,
 }
 
-fn steps_forward_soon(last: Option<Rendered>, frame: i64) -> bool {
-    const GAP: std::time::Duration = std::time::Duration::from_secs(1);
-    last.is_some_and(|last| last.ended.elapsed() < GAP && (1..=120).contains(&(frame - last.frame)))
+/// Where a render stands among the renders before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct StreamPosition {
+    /// It follows the last render: a short step forward, soon after that one finished. How long a
+    /// render itself takes says nothing about this.
+    follows: bool,
+    /// It follows, and so did the last, so earlier frames are taken as unchanged. The render that
+    /// breaks a stream and the next check them: an export can still step back after it.
+    continues: bool,
+    /// How many renders in a row have stepped one frame. Any other step starts the count over, so
+    /// a retimed clip's steps can't add up to look like playback dropping frames. Once frames are
+    /// dropped it keeps its count, which a possible stop needs.
+    single_steps: u32,
+    /// The stream skipped a frame after running in order, which an export doesn't do past its
+    /// first few frames. It stays so until the stream breaks, since later frames build on what
+    /// went missing, and the renders that break it check everything again.
+    frames_dropped: bool,
+    /// A big step out of a run: the stop of playback, so this render checks everything, unless
+    /// renders carry on straight after it.
+    possible_stop: bool,
 }
 
-/// Whether a render of `frame` continues a stream, so earlier frames are taken as unchanged. The
-/// render that breaks a stream and the next check them: an export can still step back after it.
-fn streaming(last: Option<Rendered>, frame: i64) -> bool {
-    steps_forward_soon(last, frame) && last.is_some_and(|last| !last.broke_stream)
+/// Steps of one frame before a skipped frame counts as dropped.
+const RUN_BEFORE_DROPS: u32 = 8;
+
+/// The longest step forward that continues a stream. Playback falling behind steps a few frames. A
+/// stop steps further, to the frame the playhead reached, and that frame stays on screen, so it has
+/// to be exact.
+const MAX_STREAM_STEP: i64 = 16;
+
+/// How soon after a possible stop's render the next has to start to resume playback. It tells
+/// Resolve carrying on, which asks for the next frame at once, from a person seeking, who can't be
+/// this quick. A step of any size then is playback, since the check made it long.
+const MAX_RESUME_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Where a render of `frame` starting at `now` stands.
+fn stream_position(
+    last: Option<LastRender>,
+    frame: i64,
+    now: std::time::Instant,
+) -> StreamPosition {
+    const MAX_STREAM_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+    let Some(last) = last else {
+        return StreamPosition::default();
+    };
+    let step = frame - last.frame;
+    let gap = now.duration_since(last.finished);
+    let soon = gap < MAX_STREAM_GAP;
+    // Renders carrying on straight after what looked like a stop: playback had a hitch. The check
+    // that stop made leaves it where it was, so it goes on without another, which can't loop.
+    let resumes = last.stream.possible_stop && gap < MAX_RESUME_GAP && step >= 2;
+    let follows = resumes || soon && (1..=MAX_STREAM_STEP).contains(&step);
+    let continues = follows && (resumes || last.stream.follows);
+    let frames_dropped = continues
+        && (resumes
+            || last.stream.frames_dropped
+            || step > 1 && last.stream.single_steps >= RUN_BEFORE_DROPS);
+    // The render that made a possible stop broke the stream, so resuming restores the count.
+    let single_steps = if resumes {
+        last.stream.single_steps.max(RUN_BEFORE_DROPS)
+    } else if !continues {
+        0
+    } else if step == 1 {
+        last.stream.single_steps + 1
+    } else if frames_dropped {
+        last.stream.single_steps
+    } else {
+        0
+    };
+    StreamPosition {
+        follows,
+        continues,
+        single_steps,
+        frames_dropped,
+        possible_stop: soon
+            && step > MAX_STREAM_STEP
+            && last.stream.single_steps >= RUN_BEFORE_DROPS,
+    }
 }
 
 fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
@@ -617,15 +710,15 @@ fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     if !instance.is_kept() {
         return Ok(());
     }
-    if let Ok(values) = values(effect, 0.0) {
+    if let Ok(values) = param_values(effect, 0.0) {
         instance.values_known(&values);
     }
-    let kept: *mut Kept = Box::into_raw(Box::new(Kept {
+    let kept: *mut KeptEffect = Box::into_raw(Box::new(KeptEffect {
         effect: instance,
-        last: std::sync::Mutex::new(None),
+        last_render: std::sync::Mutex::new(None),
     }));
     // SAFETY: an instance handle; the pointer is freed in destroy-instance.
-    check(unsafe {
+    check_status(unsafe {
         (suites().prop.propSetPointer)(
             effect_props(effect)?.0,
             PROP_INSTANCE_DATA.as_ptr(),
@@ -642,21 +735,21 @@ fn destroy_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
         .unwrap_or(ptr::null_mut());
     if !kept.is_null() {
         // SAFETY: an instance handle; the pointer is cleared before what it points at is freed.
-        check(unsafe {
+        check_status(unsafe {
             (suites().prop.propSetPointer)(props.0, PROP_INSTANCE_DATA.as_ptr(), 0, ptr::null_mut())
         })?;
         // SAFETY: the Box from create-instance, freed once.
-        drop(unsafe { Box::from_raw(kept.cast::<Kept>()) });
+        drop(unsafe { Box::from_raw(kept.cast::<KeptEffect>()) });
     }
     Ok(())
 }
 
-fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a Kept>, OfxStatus> {
+fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a KeptEffect>, OfxStatus> {
     let kept = effect_props(effect)?
         .get_pointer(PROP_INSTANCE_DATA)
         .unwrap_or(ptr::null_mut());
     // SAFETY: set from a Box in create-instance and freed only in destroy-instance.
-    Ok(unsafe { kept.cast::<Kept>().as_ref() })
+    Ok(unsafe { kept.cast::<KeptEffect>().as_ref() })
 }
 
 /// Ends the stream, so the next render checks earlier frames. Hosts send this for single frames
@@ -668,46 +761,68 @@ fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> 
         && last > first
         && let Some(kept) = kept_for_instance(effect)?
     {
-        *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *kept.last_render.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
     Ok(())
 }
 
+/// Frames between logging a kept effect's report.
+const FRAMES_PER_REPORT: i64 = 300;
+
 fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
     if let Some(kept) = kept_for_instance(effect)? {
         let frame = in_args.get_double(PROP_TIME, 0)?.round() as i64;
-        let last = *kept.last.lock().unwrap_or_else(|p| p.into_inner());
-        let fixed = host::is_resolve() && streaming(last, frame);
-        let rendered = render_cpu_with(&kept.effect, effect, in_args, fixed);
-        *kept.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Rendered {
+        let last = *kept.last_render.lock().unwrap_or_else(|p| p.into_inner());
+        let stream = stream_position(last, frame, std::time::Instant::now());
+        let host_stream = if host::is_resolve() {
+            stream
+        } else {
+            StreamPosition::default()
+        };
+        let rendered = render_cpu_effect(&kept.effect, effect, in_args, host_stream);
+        // A report clones what the effect found, so it isn't asked for every frame.
+        if last.is_none() || frame.rem_euclid(FRAMES_PER_REPORT) == 0 {
+            let report = kept.effect.report();
+            if let Some(draw) = report.draw {
+                LOG.note(&format!("drawing on: {draw}"));
+            }
+            if let Some(faces) = report.faces {
+                LOG.note(&format!("face models on: {faces}"));
+            }
+            if let Some(fault) = report.gpu_fault {
+                LOG.note(&format!("warning: GPU fault, drawn another way: {fault}"));
+            }
+        }
+        *kept.last_render.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastRender {
             frame,
-            ended: std::time::Instant::now(),
-            broke_stream: !steps_forward_soon(last, frame),
+            finished: std::time::Instant::now(),
+            stream,
         });
         return rendered;
     }
     let fresh = vfx_host::CpuInstance::new(vfx_host::plugin().make, false).ok_or(STAT_FAILED)?;
-    render_cpu_with(&fresh, effect, in_args, false)
+    render_cpu_effect(&fresh, effect, in_args, StreamPosition::default())
 }
 
-fn render_cpu_with(
+fn render_cpu_effect(
     cpu_effect: &vfx_host::CpuInstance,
     effect: ImageEffect,
     in_args: Props,
-    fixed: bool,
+    stream: StreamPosition,
 ) -> Result<(), OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
-    let output = fetch(clip(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?.ok_or(STAT_FAILED)?;
-    let source = clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
+    let output = fetch_image(clip_handle(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?
+        .ok_or(STAT_FAILED)?;
+    let source = clip_handle(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
     let source_props = clip_props(source)?;
-    let start = source_props.get_double(PROP_FRAME_RANGE, 0)?;
-    let values = values(effect, time)?;
+    let clip_start_time = source_props.get_double(PROP_FRAME_RANGE, 0)?;
+    let values = param_values(effect, time)?;
     // Frames go back to the clip's first: earlier ones aren't missing, there are none.
     let rate = frame_rate(effect)?;
-    let count =
-        (cpu_effect.frames_before(&values, rate) + 1).min((time - start).max(0.0) as usize + 1);
+    let frame_count = (cpu_effect.frames_before(&values, rate) + 1)
+        .min((time - clip_start_time).max(0.0) as usize + 1);
     let ctx = Context {
-        time: seconds(effect, time)?,
+        time: seconds(time, rate),
         frame: time.round() as i64,
         // CPU effects see whole frames; a host may leave the scale out.
         scale: [0, 1].map(|i| in_args.get_double(PROP_RENDER_SCALE, i).unwrap_or(1.0) as f32),
@@ -717,146 +832,300 @@ fn render_cpu_with(
     let window = in_args
         .get_rect_i(PROP_RENDER_WINDOW)?
         .intersect(&output.image.bounds);
-    let canvas = output.image.bounds;
-    let first = time - (count - 1) as f64;
     LOG.note(&format!(
-        "render path: CPU effect, {:?} frames, {count} read",
+        "render path: CPU effect, {:?} frames, {frame_count} read",
         output.image.depth
     ));
+    let render = CpuRender {
+        effect: cpu_effect,
+        source,
+        clip_start_time,
+        first_frame_time: time - (frame_count - 1) as f64,
+        frame_count,
+        canvas: output.image.bounds,
+        values: &values,
+        ctx: &ctx,
+        output: &output.image,
+        window,
+        stream,
+    };
     let error = if output.image.depth == Depth::Byte {
-        draw::<u8>(
-            cpu_effect,
-            source,
-            start,
-            first,
-            count,
-            canvas,
-            &values,
-            &ctx,
-            &output.image,
-            window,
-            fixed,
-        )
+        render.at_depth::<u8>()
     } else {
-        draw::<f32>(
-            cpu_effect,
-            source,
-            start,
-            first,
-            count,
-            canvas,
-            &values,
-            &ctx,
-            &output.image,
-            window,
-            fixed,
-        )
+        render.at_depth::<f32>()
     };
     error.map_or(Ok(()), Err)
 }
 
 /// Buffers kept on each rendering thread, so a render allocates no frame-sized memory. A render
 /// takes them out while it runs, so one nested inside it on the same thread starts empty.
-trait Scratch: CpuDepth {
+trait ScratchBuffers: CpuDepth {
     fn with_scratch<R>(f: impl FnOnce(&mut Vec<Argb<Self>>, &mut Vec<Argb<Self>>) -> R) -> R;
 }
 
 thread_local! {
-    static BYTES: std::cell::RefCell<[Vec<Argb<u8>>; 2]> = const {
+    static SCRATCH_U8: std::cell::RefCell<[Vec<Argb<u8>>; 2]> = const {
         std::cell::RefCell::new([Vec::new(), Vec::new()])
     };
-    static FLOATS: std::cell::RefCell<[Vec<Argb<f32>>; 2]> = const {
+    static SCRATCH_F32: std::cell::RefCell<[Vec<Argb<f32>>; 2]> = const {
         std::cell::RefCell::new([Vec::new(), Vec::new()])
     };
 }
 
-impl Scratch for u8 {
+impl ScratchBuffers for u8 {
     fn with_scratch<R>(f: impl FnOnce(&mut Vec<Argb<u8>>, &mut Vec<Argb<u8>>) -> R) -> R {
-        let [mut a, mut b] = BYTES.take();
+        let [mut a, mut b] = SCRATCH_U8.take();
         let result = f(&mut a, &mut b);
-        BYTES.set([a, b]);
+        SCRATCH_U8.set([a, b]);
         result
     }
 }
 
-impl Scratch for f32 {
+impl ScratchBuffers for f32 {
     fn with_scratch<R>(f: impl FnOnce(&mut Vec<Argb<f32>>, &mut Vec<Argb<f32>>) -> R) -> R {
-        let [mut a, mut b] = FLOATS.take();
+        let [mut a, mut b] = SCRATCH_F32.take();
         let result = f(&mut a, &mut b);
-        FLOATS.set([a, b]);
+        SCRATCH_F32.set([a, b]);
         result
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw<C: Scratch>(
-    effect: &vfx_host::CpuInstance,
-    clip: Clip,
-    start: f64,
-    first: f64,
-    count: usize,
+/// One render of a CPU effect, whichever depth it runs at.
+struct CpuRender<'a> {
+    effect: &'a vfx_host::CpuInstance,
+    source: Clip,
+    clip_start_time: f64,
+    first_frame_time: f64,
+    frame_count: usize,
     canvas: Rect,
-    values: &ParamValues,
-    ctx: &Context,
-    output: &Image,
+    values: &'a ParamValues,
+    ctx: &'a Context,
+    output: &'a Image,
     window: Rect,
-    fixed: bool,
-) -> Option<OfxStatus> {
-    C::with_scratch(|frame, pixels| {
-        let mut frames = Source::<C> {
-            clip,
-            start,
-            first,
-            canvas,
-            error: None,
-            frame,
-            decoded: None,
-            fixed,
-        };
-        let (w, h) = (canvas.width() as i32, canvas.height() as i32);
-        pixels.clear();
-        pixels.resize(canvas.width() * canvas.height(), Argb::default());
-        let view = C::image_mut(ViewMut::from_pixels(pixels, w, h));
-        if effect
-            .render(&mut frames, count, view, values, ctx)
-            .is_err()
-        {
-            return Some(STAT_FAILED);
-        }
-        // SAFETY: the render window is clipped to the output and canvas bounds.
-        unsafe { cpu::encode(pixels, canvas, output, window) };
-        frames.error
-    })
+    stream: StreamPosition,
+}
+
+impl CpuRender<'_> {
+    /// Renders at `C` and writes the window to the host's output. The error is the render's or
+    /// the first failed frame fetch's.
+    fn at_depth<C: ScratchBuffers>(&self) -> Option<OfxStatus> {
+        let canvas = self.canvas;
+        C::with_scratch(|decoded_pixels, output_pixels| {
+            let mut frames = ClipFrames::<C> {
+                clip: self.source,
+                clip_start_time: self.clip_start_time,
+                first_frame_time: self.first_frame_time,
+                canvas,
+                error: None,
+                decoded_pixels,
+                decoded_index: None,
+                earlier_frames_unchanged: self.stream.continues,
+                frames_dropped: self.stream.frames_dropped,
+            };
+            let (w, h) = (canvas.width() as i32, canvas.height() as i32);
+            output_pixels.clear();
+            output_pixels.resize(canvas.width() * canvas.height(), Argb::default());
+            let view = C::image_mut(ViewMut::from_pixels(output_pixels, w, h));
+            let rendered =
+                self.effect
+                    .render(&mut frames, self.frame_count, view, self.values, self.ctx);
+            if rendered.is_err() {
+                return Some(STAT_FAILED);
+            }
+            // SAFETY: the render window is clipped to the output and canvas bounds.
+            unsafe { cpu_pixels::encode(output_pixels, canvas, self.output, self.window) };
+            frames.error
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Which renders of `frames`, in this order, continue a stream.
-    fn streamed(frames: &[i64]) -> Vec<bool> {
+    /// Where renders of `frames`, in this order, stand, each taking `render_time`.
+    fn positions(frames: &[i64], render_time: std::time::Duration) -> Vec<StreamPosition> {
+        positions_with_gaps(frames, render_time, |_| std::time::Duration::ZERO)
+    }
+
+    /// As [`positions`], with `gap_before(i)` passing between render `i - 1` and render `i`.
+    fn positions_with_gaps(
+        frames: &[i64],
+        render_time: std::time::Duration,
+        gap_before: impl Fn(usize) -> std::time::Duration,
+    ) -> Vec<StreamPosition> {
         let mut last = None;
+        let mut now = std::time::Instant::now();
         frames
             .iter()
-            .map(|&frame| {
-                let streaming = streaming(last, frame);
-                last = Some(Rendered {
+            .enumerate()
+            .map(|(i, &frame)| {
+                now += gap_before(i);
+                let stream = stream_position(last, frame, now);
+                now += render_time;
+                last = Some(LastRender {
                     frame,
-                    ended: std::time::Instant::now(),
-                    broke_stream: !steps_forward_soon(last, frame),
+                    finished: now,
+                    stream,
                 });
-                streaming
+                stream
             })
             .collect()
     }
 
+    /// Which renders of `frames`, in this order, continue a stream.
+    fn streamed(frames: &[i64]) -> Vec<bool> {
+        positions(frames, std::time::Duration::ZERO)
+            .iter()
+            .map(|p| p.continues)
+            .collect()
+    }
+
     #[test]
-    fn forward_steps_stream_and_anything_else_checks_again() {
-        // How Resolve 21 starts a Deliver, then playback skipping, a seek back and a jump.
+    fn seconds_and_frame_rate_agree_on_the_rate() {
+        assert_eq!(seconds(48.0, Some(60.0)), 0.8);
+        assert_eq!(seconds(48.0, None), 2.0);
+    }
+
+    #[test]
+    fn only_forward_steps_continue_stream() {
+        // How Resolve 21 starts an export, then playback skipping, a seek back and a jump.
         let frames = [0, 0, 0, 2, 1, 3, 4, 7, 5, 200, 201, 202];
         let expected = [
             false, false, false, false, false, false, true, true, false, false, false, true,
         ];
         assert_eq!(streamed(&frames), expected);
+    }
+
+    /// A render that takes long doesn't end its own stream, which would make the next read every
+    /// frame and take long too, for the rest of the playback.
+    #[test]
+    fn slow_render_continues_stream() {
+        let streams = positions(&[0, 1, 2, 3, 4], std::time::Duration::from_secs(8));
+        assert_eq!(
+            streams.iter().map(|p| p.continues).collect::<Vec<_>>(),
+            [false, false, true, true, true]
+        );
+    }
+
+    /// An export's skips at its start aren't dropped frames; playback's later on are, until the
+    /// stream breaks.
+    #[test]
+    fn only_skips_after_a_run_drop_frames() {
+        let dropped = |frames: &[i64]| {
+            positions(frames, std::time::Duration::ZERO)
+                .iter()
+                .map(|p| p.frames_dropped)
+                .collect::<Vec<_>>()
+        };
+        let export_start = [0, 0, 0, 2, 1, 3, 4, 5, 6];
+        assert!(!dropped(&export_start).contains(&true));
+        let run: Vec<i64> = (0..12).collect();
+        let playback = [&run[..], &[13, 14, 15, 2, 3, 4]].concat();
+        let want = (0..playback.len()).map(|i| (12..=14).contains(&i));
+        assert_eq!(dropped(&playback), want.collect::<Vec<_>>());
+    }
+
+    /// The last frame of [`run_then`]'s playback.
+    const RUN_END: i64 = 15;
+
+    /// `more` after playback of frames 0 to 13 that then drops a frame.
+    fn run_then(more: &[i64]) -> Vec<i64> {
+        let run: Vec<i64> = (0..=13).collect();
+        [&run[..], &[RUN_END], more].concat()
+    }
+
+    /// The jump to where the playhead stopped is checked, since that frame stays on screen.
+    #[test]
+    fn stop_jump_breaks_stream() {
+        let frames = run_then(&[RUN_END + MAX_STREAM_STEP + 1]);
+        let stop = *positions(&frames, std::time::Duration::ZERO)
+            .last()
+            .unwrap();
+        assert!(stop.possible_stop);
+        assert!(!stop.continues && !stop.frames_dropped);
+    }
+
+    /// Renders carrying on after a big step were a hitch: one check, then playback goes on dropping
+    /// frames, where checking again would take long enough to step past the limit again.
+    #[test]
+    fn hitch_resumes_after_one_check() {
+        let jump = RUN_END + MAX_STREAM_STEP + 1;
+        let frames = run_then(&[jump, jump + 3, jump + 6]);
+        let streams = positions(&frames, std::time::Duration::ZERO);
+        let [hitch, resumed, next] = streams[streams.len() - 3..] else {
+            unreachable!()
+        };
+        assert!(hitch.possible_stop && !hitch.continues);
+        assert!(resumed.continues && resumed.frames_dropped);
+        assert!(next.continues && next.frames_dropped);
+    }
+
+    /// However long the check took, a render straight after it is playback.
+    #[test]
+    fn hitch_resumes_at_any_step() {
+        let jump = RUN_END + MAX_STREAM_STEP + 1;
+        let frames = run_then(&[jump, jump + 300]);
+        let resumed = *positions(&frames, std::time::Duration::ZERO)
+            .last()
+            .unwrap();
+        assert!(resumed.continues && resumed.frames_dropped);
+    }
+
+    /// The render after a possible stop, starting `gap` after it.
+    fn after_possible_stop(gap: std::time::Duration) -> StreamPosition {
+        let jump = RUN_END + MAX_STREAM_STEP + 1;
+        let frames = run_then(&[jump, jump + 3]);
+        let last_index = frames.len() - 1;
+        let streams = positions_with_gaps(&frames, std::time::Duration::ZERO, |i| {
+            if i == last_index {
+                gap
+            } else {
+                std::time::Duration::ZERO
+            }
+        });
+        *streams.last().unwrap()
+    }
+
+    /// A person can be this quick, so this doesn't resume, though it follows.
+    #[test]
+    fn later_render_after_possible_stop_doesnt_resume() {
+        let after = after_possible_stop(std::time::Duration::from_millis(200));
+        assert!(after.follows && !after.continues && !after.frames_dropped);
+    }
+
+    /// Past the stream's gap, what follows a big step is new: an ordinary break.
+    #[test]
+    fn big_step_with_a_gap_after_it_stays_a_break() {
+        let after = after_possible_stop(std::time::Duration::from_secs(2));
+        assert!(!after.follows && !after.continues && !after.frames_dropped);
+    }
+
+    /// A clip retimed to a constant step has no dropped frames to tell from an export's.
+    #[test]
+    fn constant_step_never_drops_frames() {
+        let frames: Vec<i64> = (0..40).map(|n| n * 2).collect();
+        let streams = positions(&frames, std::time::Duration::ZERO);
+        assert!(streams.iter().all(|p| !p.frames_dropped));
+    }
+
+    /// A 1.5x retime has many steps of one frame, none of them in a row.
+    #[test]
+    fn retime_pattern_never_drops_frames() {
+        let frames: Vec<i64> = (0..60).map(|n| (n * 3 + 1) / 2).collect();
+        assert_eq!(frames[..6], [0, 2, 3, 5, 6, 8]);
+        let streams = positions(&frames, std::time::Duration::ZERO);
+        assert!(streams.iter().all(|p| !p.frames_dropped));
+    }
+
+    /// A big step before any run, as at an export's start, is no stop of playback.
+    #[test]
+    fn big_step_before_a_run_is_no_stop() {
+        let streams = positions(&[0, 1, 2, 50, 53], std::time::Duration::ZERO);
+        assert!(
+            streams
+                .iter()
+                .all(|p| !p.possible_stop && !p.frames_dropped)
+        );
     }
 }

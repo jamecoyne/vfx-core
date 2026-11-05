@@ -327,6 +327,7 @@ pub unsafe fn shared_memory_luid() -> Result<[u8; 8], String> {
     let mut count = 0;
     // SAFETY: the caller has the host's GL 4.1 context current.
     unsafe {
+        clear_errors();
         glGetIntegerv(0x821D, &mut count); // GL_NUM_EXTENSIONS
         for required in [
             c"GL_EXT_memory_object",
@@ -345,6 +346,20 @@ pub unsafe fn shared_memory_luid() -> Result<[u8; 8], String> {
         glGetUnsignedBytevEXT(0x9599, luid.as_mut_ptr()); // GL_DEVICE_LUID_EXT
         check_error("OpenGL device LUID")?;
         Ok(luid)
+    }
+}
+
+/// Clears errors the host or another plugin left on the context, so that [`check_error`] reports
+/// only the calls made after this. The limit is for a lost context, which can keep reporting one.
+#[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current.
+pub unsafe fn clear_errors() {
+    for _ in 0..16 {
+        // SAFETY: the caller has a current context.
+        if unsafe { glGetError() } == 0 {
+            break;
+        }
     }
 }
 
@@ -692,13 +707,13 @@ impl Texture {
 
 /// A framebuffer drawing into a texture, for pixel conversion or an IOSurface.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub struct Target {
+pub struct TextureFramebuffer {
     fbo: GLuint,
     size: (u32, u32),
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-impl Target {
+impl TextureFramebuffer {
     /// # Safety
     /// The context must be current and `texture` a `target` texture of `size`.
     pub unsafe fn new(texture: GLuint, target: GLenum, size: (u32, u32)) -> Result<Self, String> {

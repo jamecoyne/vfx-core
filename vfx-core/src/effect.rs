@@ -154,6 +154,12 @@ pub trait CpuEffect: Send {
         ctx: &Context,
     );
 
+    /// Whether a render with `params` can draw into a [`Target`] if offered one, so a host
+    /// allocates its GPU output only for those. [`CpuEffect::render_to`] may still decline a frame.
+    fn can_draw_to_target(&self, _params: &ParamValues) -> bool {
+        false
+    }
+
     /// Like [`CpuEffect::render`], for a host that shows its frames from the GPU (FFGL): the
     /// effect may draw the frame into `target` instead of `output`, and says whether it did.
     /// When it didn't, `output` holds the frame. The default renders into `output`.

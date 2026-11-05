@@ -11,7 +11,7 @@ use vfx_ffgl_common::ffi::*;
 
 /// Which part of an effect parameter an FFGL parameter drives.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Part {
+pub enum SpecPart {
     Whole,
     /// A colour channel, 0 red to 2 blue.
     Channel(usize),
@@ -29,10 +29,10 @@ pub struct Param {
     /// Option labels, for FF_TYPE_OPTION. The value is the option's index.
     pub options: Vec<CString>,
     /// The effect parameter (by name) and the part of it this drives.
-    pub spec: &'static str,
-    pub part: Part,
+    pub spec_name: &'static str,
+    pub part: SpecPart,
     /// Rounds to a whole number.
-    pub integer: bool,
+    pub rounds_to_integer: bool,
 }
 
 fn c_string(text: &str) -> CString {
@@ -40,7 +40,7 @@ fn c_string(text: &str) -> CString {
 }
 
 /// `label` without a trailing `word` ("Vignette Center" → "Vignette"), or `label`.
-fn base<'a>(label: &'a str, words: &[&str]) -> &'a str {
+fn label_without_suffix<'a>(label: &'a str, words: &[&str]) -> &'a str {
     for word in words {
         if let Some(stripped) = label.strip_suffix(word)
             && !stripped.is_empty()
@@ -53,7 +53,7 @@ fn base<'a>(label: &'a str, words: &[&str]) -> &'a str {
 
 /// The FFGL parameters for `specs`, in order: FFGL has no groups, second layer or region
 /// ([`vfx_host::controls::layout`]).
-pub fn table(specs: &[ParamSpec]) -> Vec<Param> {
+pub fn param_table(specs: &[ParamSpec]) -> Vec<Param> {
     use vfx_host::controls::{Host, Item, layout};
     let mut out = Vec::new();
     let controls = layout(specs, &Host::default())
@@ -64,7 +64,7 @@ pub fn table(specs: &[ParamSpec]) -> Vec<Param> {
         });
     for spec in controls {
         let label = spec.display_label();
-        let one = |kind, default: f32, min, max, part, name: String| Param {
+        let make_param = |kind, default: f32, min, max, part, name: String| Param {
             name: c_string(&name),
             kind,
             default,
@@ -72,13 +72,20 @@ pub fn table(specs: &[ParamSpec]) -> Vec<Param> {
             max,
             group: spec.group.to_owned(),
             options: Vec::new(),
-            spec: spec.name,
+            spec_name: spec.name,
             part,
-            integer: false,
+            rounds_to_integer: false,
         };
         match spec.kind {
             ParamKind::Float { min, max, default } => {
-                out.push(one(FF_TYPE_STANDARD, default, min, max, Part::Whole, label));
+                out.push(make_param(
+                    FF_TYPE_STANDARD,
+                    default,
+                    min,
+                    max,
+                    SpecPart::Whole,
+                    label,
+                ));
             }
             ParamKind::Int {
                 min,
@@ -92,24 +99,32 @@ pub fn table(specs: &[ParamSpec]) -> Vec<Param> {
                 } else {
                     FF_TYPE_STANDARD
                 };
-                let mut p = one(
+                let mut param = make_param(
                     kind,
                     default as f32,
                     min as f32,
                     max as f32,
-                    Part::Whole,
+                    SpecPart::Whole,
                     label,
                 );
-                p.options = options.iter().map(|o| c_string(o)).collect();
-                p.integer = true;
-                out.push(p);
+                param.options = options.iter().map(|o| c_string(o)).collect();
+                param.rounds_to_integer = true;
+                out.push(param);
             }
             ParamKind::Bool { default } => {
                 let value = if default { 1.0 } else { 0.0 };
-                out.push(one(FF_TYPE_BOOLEAN, value, 0.0, 1.0, Part::Whole, label));
+                out.push(make_param(
+                    FF_TYPE_BOOLEAN,
+                    value,
+                    0.0,
+                    1.0,
+                    SpecPart::Whole,
+                    label,
+                ));
             }
             ParamKind::Color { default } => {
-                let name = base(&label, &[" Color", " color", " Colour", " colour"]);
+                let name =
+                    label_without_suffix(&label, &[" Color", " color", " Colour", " colour"]);
                 let lower = label.ends_with("color") || label.ends_with("colour");
                 let channels = if lower {
                     ["red", "green", "blue"]
@@ -122,25 +137,33 @@ pub fn table(specs: &[ParamSpec]) -> Vec<Param> {
                     .enumerate()
                 {
                     let n = format!("{name} {channel}");
-                    out.push(one(kind, default[i], 0.0, 1.0, Part::Channel(i), n));
+                    out.push(make_param(
+                        kind,
+                        default[i],
+                        0.0,
+                        1.0,
+                        SpecPart::Channel(i),
+                        n,
+                    ));
                 }
             }
             ParamKind::Point { default: [x, y] } => {
-                let name = base(&label, &[" Center", " Centre", " center", " centre"]);
-                out.push(one(
+                let name =
+                    label_without_suffix(&label, &[" Center", " Centre", " center", " centre"]);
+                out.push(make_param(
                     FF_TYPE_XPOS,
                     x,
                     0.0,
                     1.0,
-                    Part::Axis(0),
+                    SpecPart::Axis(0),
                     format!("{name} X"),
                 ));
-                out.push(one(
+                out.push(make_param(
                     FF_TYPE_YPOS,
                     1.0 - y,
                     0.0,
                     1.0,
-                    Part::Axis(1),
+                    SpecPart::Axis(1),
                     format!("{name} Y"),
                 ));
             }
@@ -150,49 +173,53 @@ pub fn table(specs: &[ParamSpec]) -> Vec<Param> {
 }
 
 /// Clamps a host value into the parameter's range; options and integers snap.
-pub fn clamp(p: &Param, value: f32) -> f32 {
+pub fn clamp_to_range(param: &Param, value: f32) -> f32 {
     let v = if value.is_finite() {
-        value.clamp(p.min, p.max)
+        value.clamp(param.min, param.max)
     } else {
-        p.default
+        param.default
     };
-    if p.integer { v.round() } else { v }
+    if param.rounds_to_integer {
+        v.round()
+    } else {
+        v
+    }
 }
 
 /// Formats a value for the host's 16-character parameter display.
-pub fn display(p: &Param, value: f32) -> String {
-    match p.kind {
+pub fn display_text(param: &Param, value: f32) -> String {
+    match param.kind {
         FF_TYPE_BOOLEAN => if value >= 0.5 { "On" } else { "Off" }.to_owned(),
-        FF_TYPE_OPTION => p
+        FF_TYPE_OPTION => param
             .options
             .get(value.round().max(0.0) as usize)
             .map(|o| o.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        _ if p.integer => format!("{value:.0}"),
+        _ if param.rounds_to_integer => format!("{value:.0}"),
         _ => format!("{value:.2}"),
     }
 }
 
 /// The effect's values from the FFGL ones. Points come out in normalised, top-down canvas
 /// coordinates; parameters FFGL doesn't show keep their defaults.
-pub fn values(table: &[Param], raw: &[f32], specs: &[ParamSpec]) -> ParamValues {
+pub fn effect_values(table: &[Param], host_values: &[f32], specs: &[ParamSpec]) -> ParamValues {
     let mut values = ParamValues::new(specs);
-    for (p, &v) in table.iter().zip(raw) {
-        let value = match (values.get(p.spec), p.part) {
-            (Some(ParamValue::Float(_)), Part::Whole) => ParamValue::Float(v),
-            (Some(ParamValue::Int(_)), Part::Whole) => ParamValue::Int(v.round() as i32),
-            (Some(ParamValue::Bool(_)), Part::Whole) => ParamValue::Bool(v >= 0.5),
-            (Some(ParamValue::Color(mut c)), Part::Channel(i)) => {
+    for (param, &v) in table.iter().zip(host_values) {
+        let value = match (values.get(param.spec_name), param.part) {
+            (Some(ParamValue::Float(_)), SpecPart::Whole) => ParamValue::Float(v),
+            (Some(ParamValue::Int(_)), SpecPart::Whole) => ParamValue::Int(v.round() as i32),
+            (Some(ParamValue::Bool(_)), SpecPart::Whole) => ParamValue::Bool(v >= 0.5),
+            (Some(ParamValue::Color(mut c)), SpecPart::Channel(i)) => {
                 c[i] = v;
                 ParamValue::Color(c)
             }
-            (Some(ParamValue::Point(mut xy)), Part::Axis(axis)) => {
+            (Some(ParamValue::Point(mut xy)), SpecPart::Axis(axis)) => {
                 xy[axis] = if axis == 1 { 1.0 - v } else { v };
                 ParamValue::Point(xy)
             }
             _ => continue,
         };
-        let _ = values.set(p.spec, value);
+        let _ = values.set(param.spec_name, value);
     }
     values
 }
@@ -220,8 +247,8 @@ mod tests {
     }
 
     #[test]
-    fn colours_and_points_split_and_unserved_params_go() {
-        let t = table(SPECS);
+    fn colours_and_points_split_and_unserved_params_omitted() {
+        let t = param_table(SPECS);
         assert_eq!(
             names(&t),
             [
@@ -244,18 +271,18 @@ mod tests {
     }
 
     #[test]
-    fn values_map_back() {
-        let t = table(SPECS);
+    fn ffgl_values_map_to_effect_values() {
+        let t = param_table(SPECS);
         let mut raw: Vec<f32> = t.iter().map(|p| p.default).collect();
         raw[1] = 0.25; // X
         raw[2] = 0.25; // Y, up from the bottom
-        raw[10] = clamp(&t[10], 40.6);
-        let v = values(&t, &raw, SPECS);
+        raw[10] = clamp_to_range(&t[10], 40.6);
+        let v = effect_values(&t, &raw, SPECS);
         assert_eq!(v.point("vignette_center"), [0.25, 0.75]);
         assert_eq!(v.int("steps"), 41);
         assert_eq!(v.int("mode"), 1);
         assert_eq!(v.color("box_color"), [0.25, 1.0, 0.4, 1.0]);
-        assert_eq!(display(&t[9], 2.0), "C");
-        assert_eq!(display(&t[10], 41.0), "41");
+        assert_eq!(display_text(&t[9], 2.0), "C");
+        assert_eq!(display_text(&t[10], 41.0), "41");
     }
 }

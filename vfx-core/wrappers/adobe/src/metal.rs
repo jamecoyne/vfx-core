@@ -1,8 +1,8 @@
 //! GPU-native rendering on After Effects' own Metal device (macOS).
 //!
 //! With GPU acceleration on, After Effects keeps frames on the GPU as `MTLBuffer`s
-//! (BGRA, four floats per pixel). We open a wgpu device on the same `MTLDevice`, wrap
-//! those buffers without copying, and convert between them and the chain's textures in
+//! (BGRA, four floats per pixel). The plugin opens a wgpu device on the same `MTLDevice`, wraps
+//! those buffers without copying, and converts between them and the chain's textures in
 //! shaders. No frame passes through the CPU. The CPU path stays as the fallback.
 
 use std::ffi::c_void;
@@ -63,7 +63,7 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// Our wgpu device on one of After Effects' GPUs, plus the buffer ↔ texture pipelines.
+/// The plugin's wgpu device on one of After Effects' GPUs, plus the buffer ↔ texture pipelines.
 /// Stored as After Effects' per-device GPU data, so it lives as long as the device.
 pub struct AeDevice {
     pub gpu: Gpu,
@@ -369,7 +369,7 @@ pub fn render(
         pass.dispatch_workgroups(output.width.div_ceil(8), output.height.div_ceil(8), 1);
     }
     gpu.queue.submit(Some(encoder.finish()));
-    // After Effects reads the output as soon as we return, so wait for the GPU.
+    // After Effects reads the output as soon as the render returns, so wait for the GPU.
     let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
 }
 
@@ -388,7 +388,7 @@ fn uniform_buffer(gpu: &Gpu, bytes: &[u8]) -> wgpu::Buffer {
 mod tests {
     use super::*;
 
-    /// Opens our device on a real `MTLDevice`, as After Effects would hand us, and checks
+    /// Opens the device on a real `MTLDevice`, as After Effects would hand over, and checks
     /// it really is the same GPU.
     #[test]
     fn opens_on_an_existing_metal_device() {

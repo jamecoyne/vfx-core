@@ -31,6 +31,7 @@ impl CpuInstance {
         let Processor::Cpu(effect) = make() else {
             return None;
         };
+        crate::pin::pin_module();
         let kept = (host_keeps && effect.keeps_state()).then(|| Mutex::new(effect));
         Some(Self { make, kept })
     }
@@ -91,6 +92,12 @@ impl CpuInstance {
             self.rebuild();
             Panicked
         })
+    }
+
+    /// Whether a render with `values` can draw into a target (see
+    /// [`CpuEffect::can_draw_to_target`]). An effect that isn't kept has nothing to keep one for.
+    pub fn can_draw_to_target(&self, values: &ParamValues) -> bool {
+        self.kept.is_some() && self.with(|e| e.can_draw_to_target(values))
     }
 
     /// Renders, into `target` where the effect can (see [`CpuEffect::render_to`]), starting over

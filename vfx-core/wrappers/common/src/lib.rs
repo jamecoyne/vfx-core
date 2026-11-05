@@ -7,6 +7,7 @@ pub mod contract;
 pub mod controls;
 pub mod diag;
 mod kept;
+mod pin;
 pub mod pipeline;
 mod plugin;
 mod rows;

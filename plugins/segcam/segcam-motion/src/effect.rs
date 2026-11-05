@@ -226,6 +226,15 @@ impl CpuEffect for SegcamMotion {
         }
     }
 
+    /// Only the swarm draws on the GPU in a form a target can take, and only on the device a host
+    /// shares, which `SEGCAM_GPU=0` and an adapter asked for by name both leave.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn can_draw_to_target(&self, params: &ParamValues) -> bool {
+        settings_from_params(params, false).mode == OutputMode::Swarm
+            && self.renderer.gpu_wanted()
+            && crate::gpu::adapter_choice().is_empty()
+    }
+
     /// A swarm drawn on the GPU goes into `target` when it is on the device the swarm draws
     /// on, which it is where the host shared it before the first render (FFGL).
     fn render_to(

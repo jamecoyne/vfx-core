@@ -47,7 +47,7 @@ pub fn is_resolve() -> bool {
 }
 
 /// Fetches the suites. Called from the load action; false if the host lacks one.
-pub fn load() -> bool {
+pub fn fetch_suites() -> bool {
     let host = HOST.load(Ordering::Acquire);
     if host.is_null() {
         return false;
@@ -80,7 +80,7 @@ pub fn suites() -> &'static Suites {
 }
 
 /// Turns a host status into a Result, so `?` can carry failures up to the action.
-pub fn check(status: OfxStatus) -> Result<(), OfxStatus> {
+pub fn check_status(status: OfxStatus) -> Result<(), OfxStatus> {
     if status == STAT_OK {
         Ok(())
     } else {
@@ -93,14 +93,14 @@ pub fn check(status: OfxStatus) -> Result<(), OfxStatus> {
 pub struct Props(pub PropSet);
 
 impl Props {
-    fn s() -> &'static PropertySuiteV1 {
+    fn suite() -> &'static PropertySuiteV1 {
         suites().prop
     }
 
     pub fn set_str(&self, name: &CStr, index: usize, value: &CStr) -> Result<(), OfxStatus> {
         // SAFETY: valid handle and NUL-terminated strings; the host copies the value.
-        check(unsafe {
-            (Self::s().propSetString)(self.0, name.as_ptr(), index as c_int, value.as_ptr())
+        check_status(unsafe {
+            (Self::suite().propSetString)(self.0, name.as_ptr(), index as c_int, value.as_ptr())
         })
     }
 
@@ -119,13 +119,15 @@ impl Props {
 
     pub fn set_int(&self, name: &CStr, index: usize, value: i32) -> Result<(), OfxStatus> {
         // SAFETY: valid handle and property name.
-        check(unsafe { (Self::s().propSetInt)(self.0, name.as_ptr(), index as c_int, value) })
+        check_status(unsafe {
+            (Self::suite().propSetInt)(self.0, name.as_ptr(), index as c_int, value)
+        })
     }
 
     pub fn set_double(&self, name: &CStr, index: usize, value: f64) -> Result<(), OfxStatus> {
         // SAFETY: valid handle and property name.
-        check(unsafe {
-            (Self::s().propSetDouble)(self.0, name.as_ptr(), index as c_int, value as c_double)
+        check_status(unsafe {
+            (Self::suite().propSetDouble)(self.0, name.as_ptr(), index as c_int, value as c_double)
         })
     }
 
@@ -139,21 +141,25 @@ impl Props {
     pub fn get_int(&self, name: &CStr, index: usize) -> Result<i32, OfxStatus> {
         let mut v = 0;
         // SAFETY: valid handle; the host writes one int.
-        check(unsafe { (Self::s().propGetInt)(self.0, name.as_ptr(), index as c_int, &mut v) })?;
+        check_status(unsafe {
+            (Self::suite().propGetInt)(self.0, name.as_ptr(), index as c_int, &mut v)
+        })?;
         Ok(v)
     }
 
     pub fn get_double(&self, name: &CStr, index: usize) -> Result<f64, OfxStatus> {
         let mut v = 0.0;
         // SAFETY: valid handle; the host writes one double.
-        check(unsafe { (Self::s().propGetDouble)(self.0, name.as_ptr(), index as c_int, &mut v) })?;
+        check_status(unsafe {
+            (Self::suite().propGetDouble)(self.0, name.as_ptr(), index as c_int, &mut v)
+        })?;
         Ok(v)
     }
 
     pub fn get_pointer(&self, name: &CStr) -> Result<*mut c_void, OfxStatus> {
         let mut v = ptr::null_mut();
         // SAFETY: valid handle; the host writes one pointer.
-        check(unsafe { (Self::s().propGetPointer)(self.0, name.as_ptr(), 0, &mut v) })?;
+        check_status(unsafe { (Self::suite().propGetPointer)(self.0, name.as_ptr(), 0, &mut v) })?;
         Ok(v)
     }
 
@@ -161,7 +167,7 @@ impl Props {
     pub fn str_is(&self, name: &CStr, expected: &CStr) -> Result<bool, OfxStatus> {
         let mut v: *mut c_char = ptr::null_mut();
         // SAFETY: valid handle; the host returns a string it owns.
-        check(unsafe { (Self::s().propGetString)(self.0, name.as_ptr(), 0, &mut v) })?;
+        check_status(unsafe { (Self::suite().propGetString)(self.0, name.as_ptr(), 0, &mut v) })?;
         // SAFETY: a NUL-terminated string the host keeps alive for this call.
         Ok(!v.is_null() && unsafe { CStr::from_ptr(v) } == expected)
     }

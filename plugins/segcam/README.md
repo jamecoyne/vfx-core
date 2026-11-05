@@ -36,9 +36,10 @@ with **Invert**) or Faces only. **Face**, **Eyes**, **Mouth** and **Body** add t
 flips the picture for a selfie camera. Every control is listed in the
 [segcam Motion README](segcam-motion/README.md).
 
-In Resolve and After Effects, a frame always renders the same, however you get to it. If you change
-an earlier frame of the clip, segcam picks the change up on the next render after you pause or
-jump, and when an export starts.
+In After Effects, and in Resolve when paused or exporting at normal speed, a frame renders the same
+however you get to it. Resolve playback skips the frames Resolve drops to keep up, and its pictures
+can differ from an export. A change to an earlier frame of the clip shows on the next render after
+you pause or jump, and when an export starts.
 
 ## What it needs
 
@@ -53,6 +54,16 @@ Apple M1 Pro and up runs it comfortably. Swarm draws on the GPU when there is on
 - On Windows, if `DirectML.dll` isn't next to the plugin, faces run on the CPU: still right, just
   slower.
 - The browser preview has no faces yet.
+- We recommend keeping Resolve's render cache off for segcam. An export can contain wrong pictures
+  when all three of these are on:
+  - Playback, Render Cache, User
+  - The clip's Render Cache OFX Filter, segcam Motion
+  - Use render cached images in the export's Advanced Settings
+
+  Resolve's cache can then hold pictures from playback, and a plugin can't tell a render that will
+  be saved from playback. New projects have all three off.
+- Under a constant retime, a Resolve export depends on the order Resolve opens frames in, and two
+  exports can differ.
 
 ## For developers
 

@@ -190,6 +190,11 @@ pub fn enabled_by_env() -> bool {
     std::env::var("SEGCAM_GPU").map_or(true, |v| v != "0")
 }
 
+/// The adapter `SEGCAM_GPU_ADAPTER` asks for, empty when it asks for none.
+pub fn adapter_choice() -> String {
+    std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default()
+}
+
 /// Why there is no GPU to draw on.
 #[derive(Clone, Debug)]
 pub enum NoGpu {
@@ -246,7 +251,7 @@ fn open_shared_device() {
     static START: Once = Once::new();
     START.call_once(|| {
         let load = || {
-            let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+            let choice = adapter_choice();
             // Wrapping a host's device creates none, so it needn't wait behind the face trial.
             #[cfg(not(target_arch = "wasm32"))]
             let _device_lock = (!choice.is_empty() || vfx_core::Gpu::shared().is_none())
