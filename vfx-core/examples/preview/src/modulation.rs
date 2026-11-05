@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use vfx_core::{ParamValue, ParamValues};
 
-/// Variables an expression can read, in the order `Sources` stores them.
+/// Variables an expression can read, in the order `VariableValues` stores them.
 pub const VARIABLES: &[(&str, &str)] = &[
     ("time", "seconds since start (pauses with Animate)"),
     ("vtime", "video position, seconds"),
@@ -34,22 +34,30 @@ pub const VARIABLES: &[(&str, &str)] = &[
     ("mouthy", "mouth centre, y"),
 ];
 
+/// Where the audio and face variables start in VARIABLES.
+const AUDIO_START: usize = 3;
+const FACE_START: usize = 8;
+
 /// One frame's variable values, indexed like VARIABLES.
-pub type Sources = [f32; 20];
+pub type VariableValues = [f32; VARIABLES.len()];
 
 /// The face-tracking variables, in VARIABLES order from `face`.
-pub type Face = [f32; 12];
+pub type FaceValues = [f32; VARIABLES.len() - FACE_START];
 
 /// Face values before any face is found (or with tracking off): centred guesses, so
 /// expressions using them stay sensible, with `face` at 0.
-pub const FACE_NONE: Face = [
+pub const FACE_NONE: FaceValues = [
     0.0, 0.5, 0.5, 0.0, 0.45, 0.45, 0.55, 0.45, 0.5, 0.5, 0.5, 0.6,
 ];
 
 /// Puts an effect's readings into `face`, by name. Says whether a tracker still has work: none
 /// when the readings name every variable, or say there's no face, when `held` stays in place.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn apply_face_readings(face: &mut Face, held: &Face, readings: &[vfx_core::Reading]) -> bool {
+pub fn apply_face_readings(
+    face: &mut FaceValues,
+    held: &FaceValues,
+    readings: &[vfx_core::Reading],
+) -> bool {
     let reading = |name: &str| readings.iter().find(|r| r.name == name).map(|r| r.value);
     match reading("face") {
         None => true,
@@ -59,7 +67,7 @@ pub fn apply_face_readings(face: &mut Face, held: &Face, readings: &[vfx_core::R
             false
         }
         Some(_) => {
-            let names = VARIABLES[8..].iter().map(|(name, _)| *name);
+            let names = VARIABLES[FACE_START..].iter().map(|(name, _)| *name);
             let mut missing = false;
             for (value, name) in face.iter_mut().zip(names) {
                 match reading(name) {
@@ -73,14 +81,19 @@ pub fn apply_face_readings(face: &mut Face, held: &Face, readings: &[vfx_core::R
 }
 
 /// Builds the variable values. Video and audio read 0 without a video.
-pub fn sources(time: f64, video: Option<(f64, f64)>, audio: [f32; 5], face: Face) -> Sources {
+pub fn variable_values(
+    time: f64,
+    video: Option<(f64, f64)>,
+    audio: [f32; 5],
+    face: FaceValues,
+) -> VariableValues {
     let (position, duration) = video.unwrap_or((0.0, 1.0));
-    let mut values = [0.0; 20];
+    let mut values = [0.0; VARIABLES.len()];
     values[0] = time as f32;
     values[1] = position as f32;
     values[2] = (position / duration).clamp(0.0, 1.0) as f32;
-    values[3..8].copy_from_slice(&audio);
-    values[8..].copy_from_slice(&face);
+    values[AUDIO_START..FACE_START].copy_from_slice(&audio);
+    values[FACE_START..].copy_from_slice(&face);
     values
 }
 
@@ -138,19 +151,19 @@ impl Target {
 
 /// One parameter's expression box.
 #[derive(Default)]
-struct Slot {
+struct ExpressionSlot {
     text: String,
     compiled: Option<Expr>,
     error: Option<String>,
     /// What it evaluated to last frame, shown under the box.
-    last: Option<f32>,
+    last_value: Option<f32>,
     /// The F(x) toggle: the expression drives the parameter, in place of its slider.
-    on: bool,
+    drives_param: bool,
 }
 
-impl Slot {
+impl ExpressionSlot {
     fn recompile(&mut self) {
-        self.last = None;
+        self.last_value = None;
         (self.compiled, self.error) = if self.text.trim().is_empty() {
             (None, None)
         } else {
@@ -165,7 +178,7 @@ impl Slot {
 /// Every expression box, for every effect: switching effects keeps what was typed.
 #[derive(Default)]
 pub struct Expressions {
-    slots: HashMap<Target, Slot>,
+    slots: HashMap<Target, ExpressionSlot>,
 }
 
 impl Expressions {
@@ -175,22 +188,26 @@ impl Expressions {
         &mut self,
         effect: usize,
         base: &ParamValues,
-        sources: &Sources,
+        variables: &VariableValues,
         dt: f32,
     ) -> ParamValues {
         let mut values = base.clone();
         for (target, slot) in self
             .slots
             .iter_mut()
-            .filter(|(t, s)| t.effect == effect && s.on)
+            .filter(|(t, s)| t.effect == effect && s.drives_param)
         {
             let (Some(expr), Some(value)) = (&mut slot.compiled, target.read(&values)) else {
                 continue;
             };
-            let v = expr.eval(&Env { sources, value, dt });
+            let v = expr.eval(&EvalContext {
+                variables,
+                value,
+                dt,
+            });
             // NaN or infinity (say, 1/0) keeps the slider's value.
-            slot.last = v.is_finite().then_some(v);
-            if let Some(v) = slot.last {
+            slot.last_value = v.is_finite().then_some(v);
+            if let Some(v) = slot.last_value {
                 target.write(&mut values, v);
             }
         }
@@ -199,26 +216,26 @@ impl Expressions {
 
     /// Whether `target` is driven by its expression (its F(x) toggle is on).
     pub fn is_on(&self, target: Target) -> bool {
-        self.slots.get(&target).is_some_and(|s| s.on)
+        self.slots.get(&target).is_some_and(|s| s.drives_param)
     }
 
     fn toggle(&mut self, target: Target) {
         let slot = self.slots.entry(target).or_default();
-        slot.on = !slot.on;
+        slot.drives_param = !slot.drives_param;
     }
 
     #[cfg(test)]
     pub fn set(&mut self, target: Target, text: &str) {
         let slot = self.slots.entry(target).or_default();
         slot.text = text.into();
-        slot.on = true;
+        slot.drives_param = true;
         slot.recompile();
     }
 }
 
 /// A parameter's label, with its F(x) toggle right after it. Toggling it on swaps the
-/// slider for the expression box (see [`field`]).
-pub fn header(ui: &mut Ui, exprs: &mut Expressions, target: Target, label: &str) {
+/// slider for the expression box (see [`expression_field`]).
+pub fn param_header(ui: &mut Ui, exprs: &mut Expressions, target: Target, label: &str) {
     ui.horizontal(|ui| {
         ui.label(label);
         let on = exprs.is_on(target);
@@ -274,7 +291,7 @@ fn stopwatch(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
 }
 
 /// The expression box for `target`, drawn under its slider.
-pub fn field(ui: &mut Ui, exprs: &mut Expressions, target: Target) {
+pub fn expression_field(ui: &mut Ui, exprs: &mut Expressions, target: Target) {
     let slot = exprs.slots.entry(target).or_default();
     let edit = egui::TextEdit::singleline(&mut slot.text)
         .id_salt(target)
@@ -303,7 +320,7 @@ pub fn field(ui: &mut Ui, exprs: &mut Expressions, target: Target) {
         );
     } else if slot.compiled.is_some() {
         let shown = slot
-            .last
+            .last_value
             .map_or("= (not a number; slider used)".into(), |v| {
                 format!("= {v:.3}")
             });
@@ -313,9 +330,9 @@ pub fn field(ui: &mut Ui, exprs: &mut Expressions, target: Target) {
 }
 
 /// The live variable values and what expressions can use.
-pub fn help(ui: &mut Ui, sources: &Sources) {
+pub fn variables_help(ui: &mut Ui, variables: &VariableValues) {
     egui::Grid::new("variables").num_columns(2).show(ui, |ui| {
-        for ((name, about), value) in VARIABLES.iter().zip(sources) {
+        for ((name, about), value) in VARIABLES.iter().zip(variables) {
             ui.label(RichText::new(*name).monospace())
                 .on_hover_text(*about);
             ui.label(RichText::new(format!("{value:.2}")).monospace().weak());
@@ -378,12 +395,12 @@ fn truthy(v: f32) -> bool {
     v != 0.0 && !v.is_nan()
 }
 
-fn flag(c: bool) -> f32 {
+fn bool_value(c: bool) -> f32 {
     if c { 1.0 } else { 0.0 }
 }
 
-struct Env<'a> {
-    sources: &'a Sources,
+struct EvalContext<'a> {
+    variables: &'a VariableValues,
     value: f32,
     dt: f32,
 }
@@ -419,9 +436,9 @@ const FUNCTIONS: &[Function] = &[
         let t = ((a[2] - a[0]) / (a[1] - a[0])).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     }),
-    ("and", 2, |a| flag(truthy(a[0]) && truthy(a[1]))),
-    ("or", 2, |a| flag(truthy(a[0]) || truthy(a[1]))),
-    ("not", 1, |a| flag(!truthy(a[0]))),
+    ("and", 2, |a| bool_value(truthy(a[0]) && truthy(a[1]))),
+    ("or", 2, |a| bool_value(truthy(a[0]) || truthy(a[1]))),
+    ("not", 1, |a| bool_value(!truthy(a[0]))),
 ];
 
 impl Expr {
@@ -435,10 +452,10 @@ impl Expr {
         }
     }
 
-    fn eval(&mut self, env: &Env) -> f32 {
+    fn eval(&mut self, env: &EvalContext) -> f32 {
         match self {
             Expr::Num(n) => *n,
-            Expr::Var(i) => env.sources[*i],
+            Expr::Var(i) => env.variables[*i],
             Expr::Value => env.value,
             Expr::Neg(e) => -e.eval(env),
             Expr::Bin(op, a, b) => {
@@ -451,12 +468,12 @@ impl Expr {
                     // Always positive, so `time % 4` counts 0..4 like a loop.
                     Op::Rem => a.rem_euclid(b),
                     Op::Pow => a.powf(b),
-                    Op::Lt => flag(a < b),
-                    Op::Gt => flag(a > b),
-                    Op::Le => flag(a <= b),
-                    Op::Ge => flag(a >= b),
-                    Op::Eq => flag(a == b),
-                    Op::Ne => flag(a != b),
+                    Op::Lt => bool_value(a < b),
+                    Op::Gt => bool_value(a > b),
+                    Op::Le => bool_value(a <= b),
+                    Op::Ge => bool_value(a >= b),
+                    Op::Eq => bool_value(a == b),
+                    Op::Ne => bool_value(a != b),
                 }
             }
             Expr::Call(f, args) => {
@@ -726,17 +743,17 @@ fn call(name: &str, mut args: Vec<Expr>) -> Result<Expr, String> {
 mod tests {
     use super::*;
 
-    fn eval(text: &str, sources: &Sources, value: f32) -> f32 {
-        Expr::parse(text).unwrap().eval(&Env {
-            sources,
+    fn eval(text: &str, variables: &VariableValues, value: f32) -> f32 {
+        Expr::parse(text).unwrap().eval(&EvalContext {
+            variables,
             value,
             dt: 1.0 / 60.0,
         })
     }
 
     #[test]
-    fn arithmetic_follows_the_usual_precedence() {
-        let s = sources(8.0, None, [0.0; 5], FACE_NONE);
+    fn operators_follow_precedence() {
+        let s = variable_values(8.0, None, [0.0; 5], FACE_NONE);
         assert_eq!(eval("1 + 2 * 3", &s, 0.0), 7.0);
         assert_eq!(eval("(1 + 2) * 3", &s, 0.0), 9.0);
         assert_eq!(eval("-2^2", &s, 0.0), -4.0);
@@ -748,7 +765,7 @@ mod tests {
         assert_eq!(
             eval(
                 "mix(0, 10, progress)",
-                &sources(0.0, Some((5.0, 10.0)), [0.0; 5], FACE_NONE),
+                &variable_values(0.0, Some((5.0, 10.0)), [0.0; 5], FACE_NONE),
                 0.0
             ),
             5.0
@@ -758,7 +775,10 @@ mod tests {
     #[test]
     fn readings_fill_face_variables() {
         use vfx_core::Reading;
-        let names: Vec<_> = VARIABLES[8..].iter().map(|(name, _)| *name).collect();
+        let names: Vec<_> = VARIABLES[FACE_START..]
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
         let all: Vec<_> = names.iter().map(|n| Reading::new(*n, 0.25)).collect();
         let mut face = FACE_NONE;
         assert!(
@@ -797,9 +817,9 @@ mod tests {
     fn conditions_pick_a_branch() {
         let mut face = FACE_NONE;
         face[3] = 0.1; // facesize
-        let small = sources(0.0, None, [0.0; 5], face);
+        let small = variable_values(0.0, None, [0.0; 5], face);
         face[3] = 0.4;
-        let big = sources(0.0, None, [0.0; 5], face);
+        let big = variable_values(0.0, None, [0.0; 5], face);
         let e = "if(facesize < 0.2, 0.2, facesize * 2)";
         assert_eq!(eval(e, &small, 0.0), 0.2);
         assert_eq!(eval(e, &big, 0.0), 0.8);
@@ -812,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn mistakes_are_reported_not_evaluated() {
+    fn invalid_expressions_fail_to_parse() {
         for bad in [
             "sin(",
             "1 +",
@@ -831,8 +851,8 @@ mod tests {
         ParamValues::new((crate::catalog::entries()[effect].make)().params())
     }
 
-    /// Expressions and values for the named effect.
-    fn setup(name: &str) -> (usize, ParamValues) {
+    /// The named effect's catalog index and default values.
+    fn effect_with_defaults(name: &str) -> (usize, ParamValues) {
         let effect = find(name).expect("in the catalog");
         (effect, values(effect))
     }
@@ -845,10 +865,10 @@ mod tests {
     const SEGCAM: &str = "segcam Motion (Rust)";
 
     #[test]
-    fn expressions_override_sliders_and_empty_ones_dont() {
+    fn valid_expressions_override_sliders() {
         let mut exprs = Expressions::default();
-        let (colour, base) = setup(COLOUR);
-        let s = sources(0.0, None, [0.0, 0.8, 0.0, 0.0, 0.0], FACE_NONE);
+        let (colour, base) = effect_with_defaults(COLOUR);
+        let s = variable_values(0.0, None, [0.0, 0.8, 0.0, 0.0, 0.0], FACE_NONE);
         exprs.set(Target::new(colour, "brightness"), "bass - 0.3");
         exprs.set(Target::new(colour, "contrast"), "  ");
         let out = exprs.apply(colour, &base, &s, 1.0 / 60.0);
@@ -858,7 +878,7 @@ mod tests {
         let out = exprs.apply(colour, &base, &s, 1.0 / 60.0);
         assert_eq!(out.float("brightness"), base.float("brightness"));
         // Another effect's expressions leave this one alone.
-        exprs.set(Target::new(setup(BLUR).0, "radius"), "99");
+        exprs.set(Target::new(effect_with_defaults(BLUR).0, "radius"), "99");
         let out = exprs.apply(colour, &base, &s, 1.0 / 60.0);
         assert_eq!(out.float("contrast"), base.float("contrast"));
     }
@@ -866,12 +886,12 @@ mod tests {
     #[test]
     fn points_take_an_axis_and_integers_round() {
         let mut exprs = Expressions::default();
-        let s = sources(0.0, None, [0.0; 5], FACE_NONE);
-        let (vignette, base) = setup(VIGNETTE);
+        let s = variable_values(0.0, None, [0.0; 5], FACE_NONE);
+        let (vignette, base) = effect_with_defaults(VIGNETTE);
         exprs.set(Target::axis(vignette, "center", 1), "0.25");
         let out = exprs.apply(vignette, &base, &s, 1.0 / 60.0);
         assert_eq!(out.point("center"), [0.5, 0.25]);
-        let (segcam, base) = setup(SEGCAM);
+        let (segcam, base) = effect_with_defaults(SEGCAM);
         exprs.set(Target::new(segcam, "background"), "40.6");
         exprs.set(Target::new(segcam, "output"), "9");
         let out = exprs.apply(segcam, &base, &s, 1.0 / 60.0);
@@ -880,12 +900,12 @@ mod tests {
     }
 
     #[test]
-    fn smooth_eases() {
+    fn smooth_moves_part_way_to_target() {
         let mut exprs = Expressions::default();
-        let (blur, base) = setup(BLUR);
+        let (blur, base) = effect_with_defaults(BLUR);
         exprs.set(Target::new(blur, "radius"), "smooth(bass * 10, 0.9)");
-        let quiet = sources(0.0, None, [0.0; 5], FACE_NONE);
-        let loud = sources(0.0, None, [1.0; 5], FACE_NONE);
+        let quiet = variable_values(0.0, None, [0.0; 5], FACE_NONE);
+        let loud = variable_values(0.0, None, [1.0; 5], FACE_NONE);
         let mut radius = |s| exprs.apply(blur, &base, s, 1.0 / 60.0).float("radius");
         assert_eq!(radius(&quiet), 0.0);
         let eased = radius(&loud);

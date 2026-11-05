@@ -37,30 +37,29 @@ pub struct WebVideo {
     url: Option<String>,
     canvas: Option<(OffscreenCanvas, OffscreenCanvasRenderingContext2d)>,
     /// The video time of the last frame copied, so a paused video isn't copied again.
-    last: Option<f64>,
+    last_copied_time: Option<f64>,
     /// The last frame the browser presented, its media time and count, from
     /// `requestVideoFrameCallback`; `None` until the first.
     presented: Rc<Cell<Option<(f64, u32)>>>,
-    /// Whether the browser reports presented frames. Without that, copies follow the clock.
-    reports_frames: bool,
     /// The count of the last presented frame copied.
-    copied: Option<u32>,
-    /// The frame callback and its pending request, cancelled and freed on drop.
-    watch: Option<Watch>,
+    last_copied_count: Option<u32>,
+    /// The frame callback and its pending request, cancelled and freed on drop. `None` where the
+    /// browser doesn't report presented frames, and copies follow the clock.
+    watch: Option<FrameWatch>,
 }
 
 /// A `requestVideoFrameCallback` callback: the time now and the frame's metadata.
 type FrameCallback = Closure<dyn FnMut(JsValue, JsValue)>;
 
 /// A standing `requestVideoFrameCallback`: the callback asks for the next one itself and
-/// keeps the request's id, so [`Watch::cancel`] can end it.
-struct Watch {
+/// keeps the request's id, so [`FrameWatch::cancel`] can end it.
+struct FrameWatch {
     callback: Rc<RefCell<Option<FrameCallback>>>,
     pending: Rc<Cell<f64>>,
     video: JsValue,
 }
 
-impl Watch {
+impl FrameWatch {
     /// Asks the browser for a callback per presented frame, keeping `presented` current. None
     /// where the browser has no `requestVideoFrameCallback` (web-sys has no binding for it yet).
     fn new(video: &HtmlVideoElement, presented: &Rc<Cell<Option<(f64, u32)>>>) -> Option<Self> {
@@ -115,7 +114,7 @@ impl Watch {
     }
 }
 
-fn error(e: JsValue) -> String {
+fn js_error_text(e: JsValue) -> String {
     e.as_string()
         .or_else(|| {
             e.dyn_ref::<js_sys::Error>()
@@ -124,13 +123,13 @@ fn error(e: JsValue) -> String {
         .unwrap_or_else(|| format!("{e:?}"))
 }
 
-fn element() -> Result<HtmlVideoElement, String> {
+fn new_video_element() -> Result<HtmlVideoElement, String> {
     let document = web_sys::window()
         .and_then(|w| w.document())
         .ok_or("no document")?;
     let video: HtmlVideoElement = document
         .create_element("video")
-        .map_err(error)?
+        .map_err(js_error_text)?
         .dyn_into()
         .map_err(|_| "not a video element")?;
     // Browsers only autoplay muted video; the preview has no sound in the browser yet.
@@ -149,18 +148,16 @@ impl WebVideo {
     ) -> Self {
         let _ = video.play();
         let presented = Rc::new(Cell::new(None));
-        let watch = Watch::new(&video, &presented);
-        let reports_frames = watch.is_some();
+        let watch = FrameWatch::new(&video, &presented);
         Self {
             video,
             name,
             camera,
             url,
             canvas: None,
-            last: None,
+            last_copied_time: None,
             presented,
-            reports_frames,
-            copied: None,
+            last_copied_count: None,
             watch,
         }
     }
@@ -229,10 +226,10 @@ impl WebVideo {
     pub fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> Result<bool, String> {
         let time = self.video.current_time();
         let presented = self.presented.get().map(|(_, count)| count);
-        let fresh = match (self.reports_frames, presented) {
-            (true, Some(count)) => self.copied != Some(count),
+        let fresh = match (self.watch.is_some(), presented) {
+            (true, Some(count)) => self.last_copied_count != Some(count),
             (true, None) => false,
-            (false, _) => self.last != Some(time) || self.is_camera(),
+            (false, _) => self.last_copied_time != Some(time) || self.is_camera(),
         };
         if !fresh {
             return Ok(false);
@@ -243,10 +240,10 @@ impl WebVideo {
             .as_ref()
             .is_none_or(|(c, _)| (c.width(), c.height()) != (w, h))
         {
-            let canvas = OffscreenCanvas::new(w, h).map_err(error)?;
+            let canvas = OffscreenCanvas::new(w, h).map_err(js_error_text)?;
             let context: OffscreenCanvasRenderingContext2d = canvas
                 .get_context("2d")
-                .map_err(error)?
+                .map_err(js_error_text)?
                 .ok_or("no 2D context")?
                 .dyn_into()
                 .map_err(|_| "not a 2D context")?;
@@ -261,7 +258,7 @@ impl WebVideo {
                 f64::from(w),
                 f64::from(h),
             )
-            .map_err(error)?;
+            .map_err(js_error_text)?;
         gpu.queue.copy_external_image_to_texture(
             &wgpu::CopyExternalImageSourceInfo {
                 source: wgpu::ExternalImageSource::OffscreenCanvas(canvas.clone()),
@@ -283,8 +280,8 @@ impl WebVideo {
                 depth_or_array_layers: 1,
             },
         );
-        self.last = Some(time);
-        self.copied = presented;
+        self.last_copied_time = Some(time);
+        self.last_copied_count = presented;
         Ok(true)
     }
 }
@@ -318,7 +315,7 @@ pub fn pick_file(pending: &Pending) {
             .ok_or("no document")?;
         let input: HtmlInputElement = document
             .create_element("input")
-            .map_err(error)?
+            .map_err(js_error_text)?
             .dyn_into()
             .map_err(|_| "not an input element")?;
         input.set_type("file");
@@ -329,8 +326,8 @@ pub fn pick_file(pending: &Pending) {
                 return;
             };
             let opened = (|| {
-                let url = Url::create_object_url_with_blob(&file).map_err(error)?;
-                let video = element()?;
+                let url = Url::create_object_url_with_blob(&file).map_err(js_error_text)?;
+                let video = new_video_element()?;
                 video.set_loop(true);
                 video.set_src(&url);
                 Ok(WebVideo::new(video, file.name(), None, Some(url)))
@@ -372,13 +369,18 @@ pub fn open_camera(pending: &Pending) {
             constraints.set_audio(&false.into());
             let promise = devices
                 .get_user_media_with_constraints(&constraints)
-                .map_err(error)?;
+                .map_err(js_error_text)?;
             let stream: MediaStream = JsFuture::from(promise)
                 .await
-                .map_err(|e| format!("the camera wasn't allowed or isn't there: {}", error(e)))?
+                .map_err(|e| {
+                    format!(
+                        "the camera wasn't allowed or isn't there: {}",
+                        js_error_text(e)
+                    )
+                })?
                 .dyn_into()
                 .map_err(|_| "not a media stream")?;
-            let element = element()?;
+            let element = new_video_element()?;
             element.set_src_object(Some(&stream));
             Ok::<_, String>(WebVideo::new(element, "Webcam".into(), Some(stream), None))
         }

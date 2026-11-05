@@ -3,8 +3,8 @@
 //! `VFX_PLUGIN`, the same static its plugins export) and each core effect.
 //!
 //! The effect crates are listed by the build script, from this crate's dependencies that
-//! have `[package.metadata.vfx]`, and the panel, expressions and export all come from an
-//! effect's parameter list: a new effect crate needs no code here.
+//! have `[package.metadata.vfx]`, and the panel and expressions come from an effect's parameter
+//! list: a new effect crate needs no code here.
 
 use std::sync::OnceLock;
 

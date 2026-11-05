@@ -6,7 +6,7 @@ use vfx_core::{ParamKind, ParamSpec, ParamValue, ParamValues};
 
 use crate::catalog;
 use crate::effects::PATTERNS;
-use crate::modulation::{self, Expressions, Sources, Target};
+use crate::modulation::{self, Expressions, Target, VariableValues};
 
 #[derive(Clone)]
 pub struct Controls {
@@ -43,6 +43,50 @@ impl Default for Controls {
 }
 
 impl Controls {
+    /// Sets every effect's `mirror` toggle for a new source: on for a camera, which otherwise
+    /// reads backwards, and off for a file, as segcam 1.1 does. Every effect and not just the
+    /// shown one, so picking the effect after the camera gives the same result. The panel can
+    /// change it afterwards.
+    pub fn mirror_for_source(&mut self, camera: bool) {
+        for params in &mut self.params {
+            // Most effects have no such parameter.
+            let _ = params.set("mirror", ParamValue::Bool(camera));
+        }
+    }
+
+    /// Flips the shown effect's toggle called `name`, if it has one.
+    pub fn flip_toggle(&mut self, name: &str) {
+        let values = &mut self.params[self.effect];
+        if let Some(ParamValue::Bool(on)) = values.get(name) {
+            let _ = values.set(name, ParamValue::Bool(!on));
+        }
+    }
+
+    /// Moves the shown effect's primary control by `steps` of 2% of its range: for segcam the
+    /// level while it detects by threshold, otherwise its sensitivity. Those are segcam's
+    /// parameter names, frozen once shipped; an effect without them is left alone.
+    pub fn step_primary(&mut self, steps: f32) {
+        let values = &self.params[self.effect];
+        let name = match values.get("detect") {
+            Some(ParamValue::Int(1)) => "level",
+            _ => "sensitivity",
+        };
+        let Some(spec) = self.specs[self.effect].iter().find(|s| s.name == name) else {
+            return;
+        };
+        let value = match (spec.kind, values.get(name)) {
+            (ParamKind::Float { min, max, .. }, Some(ParamValue::Float(v))) => {
+                ParamValue::Float(v + steps * 0.02 * (max - min))
+            }
+            (ParamKind::Int { min, max, .. }, Some(ParamValue::Int(v))) => {
+                let step = (0.02 * (max - min) as f32).ceil().max(1.0);
+                ParamValue::Int(v + (steps * step) as i32)
+            }
+            _ => return,
+        };
+        let _ = self.params[self.effect].set(name, value);
+    }
+
     /// The shown effect's values.
     pub fn values(&self) -> &ParamValues {
         &self.params[self.effect]
@@ -78,25 +122,29 @@ impl Controls {
 /// What the panel reports back to the app.
 #[derive(Default)]
 pub struct Actions {
-    pub clear_image: bool,
+    /// Clear was pressed: the shown effect forgets earlier frames.
+    pub clear_history: bool,
+    pub use_pattern: bool,
     /// Open a file picker for a layer's video or image.
+    #[cfg(not(target_arch = "wasm32"))]
     pub import_layer: bool,
-    /// Feed the layer from this index of `Status::cameras`.
+    /// Feed the layer from this index of `PanelStatus::cameras`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub start_layer_camera: Option<usize>,
     /// Go back to a test pattern (or none) for the layer.
     pub clear_layer: bool,
-    /// Another effect was picked.
-    pub effect_changed: bool,
     /// The video's sound was switched on or off.
     pub sound: Option<bool>,
-    /// Record was pressed: starts recording, or stops and asks where to save.
+    /// Record was pressed: starts recording, or stops and saves.
     pub toggle_record: bool,
     /// Open a file picker for a video or image.
     pub import: bool,
-    /// Start the camera at this index of `Status::cameras`.
+    /// Start the camera at this index of `PanelStatus::cameras`.
     pub start_camera: Option<usize>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub refresh_cameras: bool,
     /// Face tracking was switched on or off.
+    #[cfg(not(target_arch = "wasm32"))]
     pub face_tracking: Option<bool>,
     pub toggle_play: bool,
     /// The position slider is being dragged here (seconds).
@@ -113,10 +161,10 @@ pub struct Playback {
 }
 
 /// Status shown at the top of the panel.
-pub struct Status<'a> {
-    pub image: Option<&'a str>,
+pub struct PanelStatus<'a> {
+    pub source_name: Option<&'a str>,
     pub message: Option<&'a str>,
-    /// The source is a video file (so it can play sound and be rendered).
+    /// The source is a video file, so the Play sound box applies.
     pub video: bool,
     pub sound_on: bool,
     /// Whether Record is on.
@@ -124,6 +172,7 @@ pub struct Status<'a> {
     /// How the last recording ended: saved, discarded or failed.
     pub record_result: Option<&'a str>,
     pub cameras: &'a [String],
+    #[cfg(not(target_arch = "wasm32"))]
     pub face_tracking: bool,
     /// Set for video files.
     pub playback: Option<Playback>,
@@ -134,7 +183,7 @@ pub struct Status<'a> {
 }
 
 /// Seconds as m:ss.s.
-fn clock(seconds: f64) -> String {
+fn format_clock(seconds: f64) -> String {
     let seconds = seconds.max(0.0);
     format!("{}:{:04.1}", (seconds / 60.0) as u32, seconds % 60.0)
 }
@@ -149,8 +198,8 @@ fn transport(ui: &mut Ui, playback: &Playback, actions: &mut Actions) {
         ui.label(
             RichText::new(format!(
                 "{} / {}",
-                clock(playback.position),
-                clock(playback.duration)
+                format_clock(playback.position),
+                format_clock(playback.duration)
             ))
             .monospace(),
         );
@@ -168,7 +217,7 @@ fn transport(ui: &mut Ui, playback: &Playback, actions: &mut Actions) {
 }
 
 /// A boxed section across the sidebar's width, with a heading that opens and closes it.
-fn boxed(ui: &mut Ui, title: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
+fn section(ui: &mut Ui, title: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
         // No vertical line down the open section's left edge.
@@ -180,7 +229,7 @@ fn boxed(ui: &mut Ui, title: &str, default_open: bool, body: impl FnOnce(&mut Ui
     ui.add_space(4.0);
 }
 
-fn choice(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) -> bool {
+fn choice_menu(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) -> bool {
     let before = *value;
     egui::ComboBox::from_id_salt(id)
         .width(ui.available_width())
@@ -193,7 +242,6 @@ fn choice(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) -> bool {
     *value != before
 }
 
-/// One parameter's control, with expression boxes under the ones expressions can drive.
 /// A slider across the whole row, with room left at its end for the value.
 fn full_slider(ui: &mut Ui, slider: egui::Slider) -> egui::Response {
     ui.scope(|ui| {
@@ -203,6 +251,7 @@ fn full_slider(ui: &mut Ui, slider: egui::Slider) -> egui::Response {
     .inner
 }
 
+/// One parameter's control, with expression boxes under the ones expressions can drive.
 fn param(
     ui: &mut Ui,
     spec: &ParamSpec,
@@ -220,9 +269,9 @@ fn param(
     match (spec.kind, value) {
         (ParamKind::Float { min, max, .. }, ParamValue::Float(mut v)) => {
             let target = Target::new(effect, spec.name);
-            modulation::header(ui, exprs, target, &label);
+            modulation::param_header(ui, exprs, target, &label);
             if exprs.is_on(target) {
-                modulation::field(ui, exprs, target);
+                modulation::expression_field(ui, exprs, target);
             } else if full_slider(ui, egui::Slider::new(&mut v, min..=max).fixed_decimals(2))
                 .changed()
             {
@@ -231,21 +280,21 @@ fn param(
         }
         (ParamKind::Int { options, .. }, ParamValue::Int(v)) if !options.is_empty() => {
             let target = Target::new(effect, spec.name);
-            modulation::header(ui, exprs, target, &label);
+            modulation::param_header(ui, exprs, target, &label);
             if exprs.is_on(target) {
-                modulation::field(ui, exprs, target);
+                modulation::expression_field(ui, exprs, target);
             } else {
                 let mut i = v.clamp(0, options.len() as i32 - 1) as usize;
-                if choice(ui, spec.name, &mut i, options) {
+                if choice_menu(ui, spec.name, &mut i, options) {
                     set(ParamValue::Int(i as i32));
                 }
             }
         }
         (ParamKind::Int { min, max, .. }, ParamValue::Int(mut v)) => {
             let target = Target::new(effect, spec.name);
-            modulation::header(ui, exprs, target, &label);
+            modulation::param_header(ui, exprs, target, &label);
             if exprs.is_on(target) {
-                modulation::field(ui, exprs, target);
+                modulation::expression_field(ui, exprs, target);
             } else if full_slider(ui, egui::Slider::new(&mut v, min..=max)).changed() {
                 set(ParamValue::Int(v));
             }
@@ -264,9 +313,9 @@ fn param(
         (ParamKind::Point { .. }, ParamValue::Point(mut p)) => {
             for (axis, name) in ["x", "y"].into_iter().enumerate() {
                 let target = Target::axis(effect, spec.name, axis);
-                modulation::header(ui, exprs, target, &format!("{label} {name}"));
+                modulation::param_header(ui, exprs, target, &format!("{label} {name}"));
                 if exprs.is_on(target) {
-                    modulation::field(ui, exprs, target);
+                    modulation::expression_field(ui, exprs, target);
                 } else if full_slider(
                     ui,
                     egui::Slider::new(&mut p[axis], 0.0..=1.0).fixed_decimals(2),
@@ -322,9 +371,9 @@ fn refresh_button(ui: &mut Ui) -> egui::Response {
 
 /// The input box: one menu of test patterns, a video or image, and webcams, then the
 /// controls for whichever is running.
-fn input_box(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actions) {
+fn input_box(ui: &mut Ui, c: &mut Controls, status: &PanelStatus, actions: &mut Actions) {
     ui.horizontal(|ui| {
-        let shown = match status.image {
+        let shown = match status.source_name {
             Some(name) => name.to_string(),
             None => PATTERNS[c.pattern].to_string(),
         };
@@ -335,10 +384,12 @@ fn input_box(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actio
             .truncate()
             .selected_text(shown)
             .show_ui(ui, |ui| {
-                if let Some(i) = pattern_items(ui, |i| status.image.is_none() && c.pattern == i) {
+                if let Some(i) =
+                    pattern_items(ui, |i| status.source_name.is_none() && c.pattern == i)
+                {
                     c.pattern = i;
-                    if status.image.is_some() {
-                        actions.clear_image = true;
+                    if status.source_name.is_some() {
+                        actions.use_pattern = true;
                     }
                 }
                 source_items(ui, status, &mut actions.import, &mut actions.start_camera);
@@ -354,7 +405,7 @@ fn input_box(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actio
         }
     });
 
-    if status.image.is_some() {
+    if status.source_name.is_some() {
         if let Some(playback) = &status.playback {
             transport(ui, playback, actions);
         }
@@ -382,7 +433,7 @@ fn pattern_items(ui: &mut Ui, current: impl Fn(usize) -> bool) -> Option<usize> 
 
 /// The video-or-image and webcam rows of the source menus. A click sets `import` or
 /// `camera` for the caller to act on.
-fn source_items(ui: &mut Ui, status: &Status, import: &mut bool, camera: &mut Option<usize>) {
+fn source_items(ui: &mut Ui, status: &PanelStatus, import: &mut bool, camera: &mut Option<usize>) {
     // The browser build opens videos only (web_media.rs).
     let open = if cfg!(target_arch = "wasm32") {
         "Video…"
@@ -406,7 +457,7 @@ fn source_items(ui: &mut Ui, status: &Status, import: &mut bool, camera: &mut Op
 }
 
 /// The layer menu: None, a test pattern, or a video, image or webcam (when one is fed).
-fn layer_menu(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Actions) {
+fn layer_menu(ui: &mut Ui, c: &mut Controls, status: &PanelStatus, actions: &mut Actions) {
     let shown = match (status.layer_name, c.layers[c.effect]) {
         (Some(name), _) => name.to_string(),
         (None, Some(pattern)) => PATTERNS[pattern].to_string(),
@@ -446,13 +497,13 @@ fn layer_menu(ui: &mut Ui, c: &mut Controls, status: &Status, actions: &mut Acti
 fn effect_box(
     ui: &mut Ui,
     c: &mut Controls,
-    status: &Status,
+    status: &PanelStatus,
     exprs: &mut Expressions,
     actions: &mut Actions,
 ) {
     let entries = catalog::entries();
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-    actions.effect_changed = choice(ui, "effect", &mut c.effect, &names);
+    choice_menu(ui, "effect", &mut c.effect, &names);
     ui.label(RichText::new(&entries[c.effect].about).weak());
     if status.layers > 0 {
         ui.label("Layer");
@@ -466,6 +517,16 @@ fn effect_box(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("Reset").clicked() {
                 c.params[effect] = ParamValues::new(&c.specs[effect]);
+            }
+            if ui
+                .button("Clear")
+                .on_hover_text(
+                    "Forgets earlier frames, so the collage or trail starts empty (key: c). \
+                     Motion takes a moment to come back.",
+                )
+                .clicked()
+            {
+                actions.clear_history = true;
             }
         });
     });
@@ -490,60 +551,64 @@ pub fn panel(
     ui: &mut Ui,
     c: &mut Controls,
     exprs: &mut Expressions,
-    sources: &Sources,
-    status: &Status,
+    variables: &VariableValues,
+    status: &PanelStatus,
 ) -> Actions {
     let mut actions = Actions::default();
     ui.add_space(4.0);
-    ui.heading("VFX Preview");
+    ui.heading("VFX Preview")
+        .on_hover_text("h hides this panel and the bar");
     if let Some(message) = status.message {
         ui.colored_label(Color32::from_rgb(230, 120, 90), message);
     }
     ui.separator();
 
-    boxed(ui, "Input", true, |ui| {
+    section(ui, "Input", true, |ui| {
         input_box(ui, c, status, &mut actions)
     });
     ui.add_space(4.0);
 
-    boxed(ui, "Effect", true, |ui| {
+    section(ui, "Effect", true, |ui| {
         effect_box(ui, c, status, exprs, &mut actions)
     });
     ui.add_space(4.0);
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        boxed(ui, "Expressions", false, |ui| {
-                ui.checkbox(&mut c.animate, "Animate")
-                    .on_hover_text("Advances the clock behind the time variable and test patterns");
-                #[cfg(not(target_arch = "wasm32"))]
-                if crate::face::HAS_TRACKER {
-                    let mut tracking = status.face_tracking;
-                    if ui
-                        .checkbox(&mut tracking, "Detect faces")
-                        .on_hover_text(
-                            "Finds a face in video or webcam frames for the face, eye, nose \
+        section(ui, "Expressions", false, |ui| {
+            ui.checkbox(&mut c.animate, "Animate")
+                .on_hover_text("Advances the clock behind the time variable and test patterns");
+            #[cfg(not(target_arch = "wasm32"))]
+            if crate::face::HAS_TRACKER {
+                let mut tracking = status.face_tracking;
+                if ui
+                    .checkbox(&mut tracking, "Detect faces")
+                    .on_hover_text(
+                        "Finds a face in video or webcam frames for the face, eye, nose \
                              and mouth variables in expressions",
-                        )
-                        .changed()
-                    {
-                        actions.face_tracking = Some(tracking);
-                    }
+                    )
+                    .changed()
+                {
+                    actions.face_tracking = Some(tracking);
                 }
-                ui.separator();
-                modulation::help(ui, sources);
-            });
+            }
+            ui.separator();
+            modulation::variables_help(ui, variables);
+        });
 
-        #[cfg(not(target_arch = "wasm32"))]
-        boxed(ui, "Record", true, |ui| {
+        section(ui, "Record", true, |ui| {
             let (text, hint) = if status.recording {
                 (
                     "Recording",
-                    "Click again to stop and choose where to save the MP4.",
+                    if cfg!(target_arch = "wasm32") {
+                        "Click again to stop and download the file."
+                    } else {
+                        "Click again to stop and choose where to save the MP4."
+                    },
                 )
             } else {
                 (
                     "Record",
-                    "Saves what the preview shows, with the effect, layers and expressions, to an MP4.",
+                    "Saves the effect's output, with its layers and expressions, to a video file.",
                 )
             };
             let mut button = egui::Button::new(RichText::new(text).strong()).min_size(egui::vec2(
@@ -568,6 +633,45 @@ pub fn panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_reach_the_shown_effects_parameters() {
+        let mut c = Controls {
+            effect: catalog::find("segcam Motion (Rust)").unwrap(),
+            ..Controls::default()
+        };
+        c.flip_toggle("labels");
+        assert!(!c.values().bool("labels"));
+        c.flip_toggle("no such toggle");
+
+        let before = c.values().float("sensitivity");
+        c.step_primary(1.0);
+        assert!((c.values().float("sensitivity") - before - 2.0).abs() < 1e-3);
+
+        c.params[c.effect]
+            .set("detect", ParamValue::Int(1))
+            .unwrap();
+        let level = c.values().int("level");
+        c.step_primary(-1.0);
+        assert_eq!(c.values().int("level"), level - 6);
+
+        // An effect with neither is left alone.
+        c.effect = catalog::find("Flip").unwrap();
+        c.step_primary(1.0);
+        c.flip_toggle("labels");
+    }
+
+    #[test]
+    fn camera_turns_mirror_on_and_file_turns_it_off() {
+        let mut c = Controls::default();
+        let segcam = &c.params[catalog::find("segcam Motion (Rust)").unwrap()];
+        assert!(!segcam.bool("mirror"));
+        c.mirror_for_source(true);
+        let segcam = catalog::find("segcam Motion (Rust)").unwrap();
+        assert!(c.params[segcam].bool("mirror"), "the effect isn't shown");
+        c.mirror_for_source(false);
+        assert!(!c.params[segcam].bool("mirror"));
+    }
 
     #[test]
     fn every_effect_has_its_own_values() {

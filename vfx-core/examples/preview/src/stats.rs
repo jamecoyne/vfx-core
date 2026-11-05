@@ -1,21 +1,31 @@
 //! The bottom bar: frames in from the source, the effect's renders and what they cost, new
-//! frames out to the screen, then this process's and the whole machine's CPU, memory and
-//! GPU load. Sampled about once a second, so the bar costs no frames.
+//! frames out to the screen, then, on the desktop, this process's and the whole machine's CPU,
+//! memory and GPU load, which browsers don't report. Sampled about once a second, so the bar
+//! costs no frames.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use egui::{RichText, Ui};
+use egui::Ui;
+#[cfg(not(target_arch = "wasm32"))]
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use vfx_core::Report;
+use vfx_core::{DeviceFaults, Gpu, Report};
+use web_time::Instant;
 
 const INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long the bar keeps saying an effect ran out of GPU memory. The effect's flag flips within
+/// a frame or two while it drops windows, and a word flashing once a second reads as a fault.
+const OUT_OF_MEMORY_HOLD: Duration = Duration::from_secs(5);
 
 /// Running totals of what the preview did.
 #[derive(Clone, Copy, Default)]
 pub struct Counts {
     /// Renders the effect finished.
     pub rendered: u64,
+    /// Those whose picture was drawn on the GPU rather than uploaded from RAM.
+    pub drawn: u64,
     /// The time those renders took, for a CPU effect.
     pub render_time: Duration,
     /// Pictures presented in the window that differ from the one before.
@@ -28,6 +38,7 @@ impl Counts {
     pub fn since(self, earlier: Self) -> Self {
         Self {
             rendered: self.rendered - earlier.rendered,
+            drawn: self.drawn - earlier.drawn,
             render_time: self.render_time - earlier.render_time,
             screen: self.screen - earlier.screen,
             arrived: self.arrived - earlier.arrived,
@@ -43,7 +54,7 @@ impl Counts {
 
 /// Where the frames come from.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
-pub enum SourceRate {
+pub enum SourceKind {
     /// A test pattern, new every loop.
     #[default]
     Pattern,
@@ -55,22 +66,28 @@ pub enum SourceRate {
 
 /// The effect and source of the moment, which the loop knows and the bar names.
 #[derive(Clone, Copy)]
-pub struct What {
+pub struct ShownEffect {
     pub effect: &'static str,
     /// The effect as `--effect` names it.
     pub slug: &'static str,
     pub on_cpu: bool,
-    pub source: SourceRate,
+    pub source: SourceKind,
     /// The effect output's size, in pixels.
     pub size: (u32, u32),
+    /// The output is drawn on the GPU, so the screen rate counts drawn pictures, not ones
+    /// compared with the last.
+    pub screen_counts_drawn: bool,
 }
 
-/// What the bar shows.
+/// What the bar shows, and on the desktop what `--stats` prints.
 #[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct Snapshot {
     pub counts: Counts,
-    pub what: What,
+    pub shown: ShownEffect,
     pub report: Report,
+    /// A lost device or the errors the shared device has reported, in words.
+    pub device_fault: Option<String>,
     /// Over the last second: frames in, renders and new frames a second, and a render's mean
     /// and longest time in ms (a CPU effect's).
     pub source: f32,
@@ -93,14 +110,16 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             counts: Counts::default(),
-            what: What {
+            shown: ShownEffect {
                 effect: "",
                 slug: "",
                 on_cpu: false,
-                source: SourceRate::default(),
+                source: SourceKind::default(),
                 size: (0, 0),
+                screen_counts_drawn: false,
             },
             report: Report::default(),
+            device_fault: None,
             source: 0.0,
             rendered: 0.0,
             screen: 0.0,
@@ -119,8 +138,17 @@ pub struct Sampler {
     last: Option<Instant>,
     last_counts: Counts,
     /// The longest render since the last sample.
-    worst: Duration,
+    longest_render: Duration,
+    /// When the effect last said it was out of GPU memory.
+    out_of_memory_at: Option<Instant>,
     snapshot: Snapshot,
+    #[cfg(not(target_arch = "wasm32"))]
+    load: MachineLoad,
+}
+
+/// The process's and machine's load, read on threads of their own.
+#[cfg(not(target_arch = "wasm32"))]
+struct MachineLoad {
     /// Written by the GPU thread (macOS only).
     gpu: Arc<Mutex<Option<f32>>>,
     /// Written by the usage thread. None until its first reading, and for good if the OS
@@ -129,19 +157,21 @@ pub struct Sampler {
 }
 
 /// This process's CPU and memory in MB, when the OS lists it, and the whole machine's CPU.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
 struct Usage {
     process: Option<(f32, u64)>,
     system_cpu: f32,
 }
 
-impl Sampler {
-    pub fn new() -> Self {
+#[cfg(not(target_arch = "wasm32"))]
+impl MachineLoad {
+    fn start() -> Self {
         let gpu = Arc::new(Mutex::new(None));
         #[cfg(target_os = "macos")]
         {
             let shared = Arc::clone(&gpu);
-            // Its own thread, since asking the OS for GPU load takes a few milliseconds.
+            // Its own thread, so querying the OS can't hold up the render loop.
             std::thread::spawn(move || {
                 loop {
                     *shared.lock().unwrap() = gpu_percent();
@@ -152,7 +182,7 @@ impl Sampler {
         let usage = Arc::new(Mutex::new(None));
         let shared = Arc::clone(&usage);
         // Its own thread too: where Windows can't open its CPU counters, each CPU reading
-        // loads them again first, which takes a third of a second or more.
+        // reloads them first, which would stall the render loop.
         std::thread::spawn(move || {
             let Ok(mut sys) = System::new() else {
                 return;
@@ -172,59 +202,79 @@ impl Sampler {
                 std::thread::sleep(INTERVAL);
             }
         });
+        Self { gpu, usage }
+    }
+
+    fn read_into(&self, snapshot: &mut Snapshot) {
+        if let Some(usage) = *self.usage.lock().unwrap() {
+            if let Some((cpu, memory_mb)) = usage.process {
+                snapshot.cpu = cpu;
+                snapshot.memory_mb = memory_mb;
+            }
+            snapshot.system_cpu = usage.system_cpu;
+        }
+        snapshot.gpu = *self.gpu.lock().unwrap();
+    }
+}
+
+impl Sampler {
+    pub fn new() -> Self {
         Self {
             last: None,
             last_counts: Counts::default(),
-            worst: Duration::ZERO,
+            longest_render: Duration::ZERO,
+            out_of_memory_at: None,
             snapshot: Snapshot::default(),
-            gpu,
-            usage,
+            #[cfg(not(target_arch = "wasm32"))]
+            load: MachineLoad::start(),
         }
     }
 
     /// The latest numbers, with `counts` as the render loop keeps them and `render` the
-    /// time of the render this loop finished, if any. The rates, CPU and memory are only
-    /// worked out again once a second.
+    /// time of the render this loop finished, if any. The rates, CPU and memory are recomputed
+    /// once a second.
     pub fn sample(
         &mut self,
         counts: Counts,
         render: Option<Duration>,
-        what: What,
+        shown: ShownEffect,
         report: &Report,
     ) -> Snapshot {
         if let Some(render) = render {
-            self.worst = self.worst.max(render);
+            self.longest_render = self.longest_render.max(render);
         }
         let second_passed = self.last.is_none_or(|t| t.elapsed() >= INTERVAL);
-        if second_passed || what.slug != self.snapshot.what.slug {
+        if second_passed || shown.slug != self.snapshot.shown.slug {
             self.snapshot.report.clone_from(report);
             self.snapshot.report.readings.clear(); // the bar has no use for them
         }
+        // Looked at every call, since the flag can last less than the bar's second.
+        if report.out_of_gpu_memory {
+            self.out_of_memory_at = Some(Instant::now());
+        }
+        self.snapshot.report.out_of_gpu_memory = self
+            .out_of_memory_at
+            .is_some_and(|at| at.elapsed() < OUT_OF_MEMORY_HOLD);
         if second_passed {
             if let Some(last) = self.last {
                 let seconds = last.elapsed().as_secs_f32();
-                let done = counts.since(self.last_counts);
-                self.snapshot.source = done.arrived as f32 / seconds;
-                self.snapshot.rendered = done.rendered as f32 / seconds;
-                self.snapshot.screen = done.screen as f32 / seconds;
-                self.snapshot.render_ms = done.render_ms().map(|ms| ms as f32);
-                self.snapshot.worst_ms =
-                    (!self.worst.is_zero()).then_some(self.worst.as_secs_f32() * 1000.0);
-                self.worst = Duration::ZERO;
+                let delta = counts.since(self.last_counts);
+                self.snapshot.source = delta.arrived as f32 / seconds;
+                self.snapshot.rendered = delta.rendered as f32 / seconds;
+                self.snapshot.screen = delta.screen as f32 / seconds;
+                self.snapshot.render_ms = delta.render_ms().map(|ms| ms as f32);
+                self.snapshot.worst_ms = (!self.longest_render.is_zero())
+                    .then_some(self.longest_render.as_secs_f32() * 1000.0);
+                self.longest_render = Duration::ZERO;
             }
             self.last = Some(Instant::now());
+            self.snapshot.device_fault = device_fault_text(&Gpu::shared_faults());
             self.last_counts = counts;
-            if let Some(usage) = *self.usage.lock().unwrap() {
-                if let Some((cpu, memory_mb)) = usage.process {
-                    self.snapshot.cpu = cpu;
-                    self.snapshot.memory_mb = memory_mb;
-                }
-                self.snapshot.system_cpu = usage.system_cpu;
-            }
-            self.snapshot.gpu = *self.gpu.lock().unwrap();
+            #[cfg(not(target_arch = "wasm32"))]
+            self.load.read_into(&mut self.snapshot);
         }
         self.snapshot.counts = counts;
-        self.snapshot.what = what;
+        self.snapshot.shown = shown;
         self.snapshot.last_render = render;
         self.snapshot.clone()
     }
@@ -243,16 +293,31 @@ fn gpu_percent() -> Option<f32> {
     digits.parse().ok()
 }
 
+/// What a host's user should know about the device, if anything: its loss, or how many errors it
+/// has reported and the first line of the last.
+fn device_fault_text(faults: &DeviceFaults) -> Option<String> {
+    if let Some(why) = faults.lost() {
+        return Some(format!("GPU lost: {why}"));
+    }
+    let (count, last) = faults.errors();
+    (count > 0).then(|| {
+        format!(
+            "GPU errors {count}: {}",
+            last.lines().next().unwrap_or_default()
+        )
+    })
+}
+
 /// The source slot's text.
 pub fn source_text(s: &Snapshot) -> String {
-    match s.what.source {
-        SourceRate::Pattern => "source pattern".to_owned(),
-        SourceRate::Still => "source still".to_owned(),
-        SourceRate::Video => format!("source {:.0} fps", s.source),
+    match s.shown.source {
+        SourceKind::Pattern => "source pattern".to_owned(),
+        SourceKind::Still => "source still".to_owned(),
+        SourceKind::Video => format!("source {:.0} fps", s.source),
     }
 }
 
-/// ", draw GPU (RTX 4070), faces DirectML 0".
+/// The effect's report as ", draw ..., faces ...", for the end of the effect slot.
 pub fn report_text(report: &Report) -> String {
     let mut text = String::new();
     if let Some(draw) = &report.draw {
@@ -261,16 +326,19 @@ pub fn report_text(report: &Report) -> String {
     if let Some(faces) = &report.faces {
         text += &format!(", faces {faces}");
     }
+    if report.out_of_gpu_memory {
+        text += ", out of GPU memory";
+    }
     text
 }
 
 /// The effect slot's text: which effect, where it runs, and its renders a second with
 /// their cost when it has one.
 pub fn effect_text(s: &Snapshot) -> String {
-    let where_ = if s.what.on_cpu { "CPU" } else { "GPU" };
+    let device = if s.shown.on_cpu { "CPU" } else { "GPU" };
     let mut text = format!(
-        "{} on {where_}{}: rendered {:.0} fps",
-        s.what.effect,
+        "{} on {device}{}: rendered {:.0} fps",
+        s.shown.effect,
         report_text(&s.report),
         s.rendered
     );
@@ -283,21 +351,99 @@ pub fn effect_text(s: &Snapshot) -> String {
 /// Draws the bar, source to screen, then the machine.
 pub fn bar(ui: &mut Ui, s: &Snapshot) {
     ui.horizontal_wrapped(|ui| {
-        ui.monospace(format!("{} × {}", s.what.size.0, s.what.size.1));
+        if let Some(fault) = &s.device_fault {
+            ui.colored_label(egui::Color32::from_rgb(230, 120, 90), fault);
+            ui.separator();
+        }
+        ui.monospace(format!("{} × {}", s.shown.size.0, s.shown.size.1));
         ui.separator();
         ui.monospace(source_text(s));
         ui.separator();
         ui.monospace(effect_text(s));
         ui.separator();
-        ui.monospace(format!("screen {:.0} fps", s.screen));
-        ui.separator();
-        ui.monospace(format!("CPU {:.0}% (app {:.0}%)", s.system_cpu, s.cpu));
-        ui.separator();
-        ui.monospace(format!("Memory {} MB", s.memory_mb));
-        ui.separator();
-        match s.gpu {
-            Some(gpu) => ui.monospace(format!("GPU {gpu:.0}%")),
-            None => ui.label(RichText::new("GPU n/a").monospace().weak()),
+        let drawn = if s.shown.screen_counts_drawn {
+            " drawn"
+        } else {
+            ""
         };
+        ui.monospace(format!("screen {:.0} fps{drawn}", s.screen));
+        #[cfg(not(target_arch = "wasm32"))]
+        machine_load(ui, s);
     });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn machine_load(ui: &mut Ui, s: &Snapshot) {
+    ui.separator();
+    ui.monospace(format!("CPU {:.0}% (app {:.0}%)", s.system_cpu, s.cpu));
+    ui.separator();
+    ui.monospace(format!("Memory {} MB", s.memory_mb));
+    ui.separator();
+    match s.gpu {
+        Some(gpu) => ui.monospace(format!("GPU {gpu:.0}%")),
+        None => ui.label(egui::RichText::new("GPU n/a").monospace().weak()),
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn out_of_memory_stays_on_the_bar_after_the_flag_clears() {
+        let mut sampler = Sampler::new();
+        let shown = ShownEffect {
+            effect: "",
+            slug: "",
+            on_cpu: true,
+            source: SourceKind::Video,
+            size: (1, 1),
+            screen_counts_drawn: false,
+        };
+        let mut report = Report::default();
+        let quiet = sampler.sample(Counts::default(), None, shown, &report);
+        assert!(!quiet.report.out_of_gpu_memory);
+        report.out_of_gpu_memory = true;
+        sampler.sample(Counts::default(), None, shown, &report);
+        report.out_of_gpu_memory = false;
+        let held = sampler.sample(Counts::default(), None, shown, &report);
+        assert!(held.report.out_of_gpu_memory);
+        sampler.out_of_memory_at = Instant::now().checked_sub(OUT_OF_MEMORY_HOLD);
+        let later = sampler.sample(Counts::default(), None, shown, &report);
+        assert!(!later.report.out_of_gpu_memory);
+    }
+
+    #[test]
+    fn report_text_says_when_out_of_gpu_memory() {
+        let mut report = Report::default();
+        assert_eq!(report_text(&report), "");
+        report.draw = Some("GPU".to_owned());
+        report.out_of_gpu_memory = true;
+        assert_eq!(report_text(&report), ", draw GPU, out of GPU memory");
+    }
+
+    #[test]
+    fn device_error_reaches_the_fault_text() {
+        let (_turn, gpu) = crate::test_gpu();
+        let faults = DeviceFaults::watch(&gpu.device);
+        assert_eq!(device_fault_text(&faults), None);
+        let zero_sized = wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 0,
+                height: 0,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let _ = gpu.device.create_texture(&zero_sized);
+        let text = device_fault_text(&faults).expect("an error");
+        assert!(text.starts_with("GPU errors 1: "), "{text}");
+        assert_eq!(text.lines().count(), 1);
+    }
 }

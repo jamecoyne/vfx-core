@@ -21,17 +21,15 @@ use segcam_face::runtime::{self, Device, OrtYuNet};
 use segcam_face::{Detector as _, Image, Pixels, YUNET_MODEL, d3d12_device_lock};
 use vfx_core::cpu::Argb;
 
+use crate::modulation::{FACE_NONE, FaceValues};
+
 #[cfg(target_os = "macos")]
 const MODEL: &[u8] = include_bytes!("../models/face_detection_yunet_2023mar.onnx");
 /// The model's fixed input size.
 #[cfg(target_os = "macos")]
-const SIDE: usize = 640;
+const MODEL_INPUT_SIDE: usize = 640;
 #[cfg(target_os = "macos")]
 const MIN_SCORE: f32 = 0.6;
-
-/// In the order of the face variables in `modulation::VARIABLES`.
-pub type Values = modulation::Face;
-use crate::modulation::{self, FACE_NONE as NONE};
 
 /// Without a tracker, faces come only from effects' reports.
 pub const HAS_TRACKER: bool = cfg!(any(target_os = "macos", feature = "tracker"));
@@ -59,7 +57,7 @@ impl Detector {
         })
     }
 
-    /// Taking the device lock waits out segcam's own load.
+    /// Moves to the device segcam chose, once. Taking the device lock waits out segcam's own load.
     fn use_chosen_device(&mut self) {
         let Some(chosen) = runtime::chosen_device().filter(|_| !self.device_tried) else {
             return;
@@ -78,7 +76,7 @@ impl Detector {
         }
     }
 
-    pub fn detect(&mut self, pixels: &[Argb<u8>], size: (u32, u32)) -> Option<Values> {
+    pub fn detect(&mut self, pixels: &[Argb<u8>], size: (u32, u32)) -> Option<FaceValues> {
         self.use_chosen_device();
         let (width, height) = (size.0 as usize, size.1 as usize);
         let image = Image {
@@ -130,13 +128,12 @@ impl Detector {
         Err("this build has no face tracker".to_owned())
     }
 
-    pub fn detect(&mut self, _pixels: &[Argb<u8>], _size: (u32, u32)) -> Option<Values> {
+    pub fn detect(&mut self, _pixels: &[Argb<u8>], _size: (u32, u32)) -> Option<FaceValues> {
         None
     }
 }
 
-/// ONNX Runtime allows one environment per process, so the live tracker and an
-/// export's detector share this one.
+/// ONNX Runtime allows one environment per process, so every detector shares this one.
 #[cfg(target_os = "macos")]
 static ENVIRONMENT: OnceLock<Result<Environment, String>> = OnceLock::new();
 
@@ -160,22 +157,22 @@ impl Detector {
             .map_err(err)?;
         Ok(Self {
             session,
-            input: vec![0.0; 3 * SIDE * SIDE],
+            input: vec![0.0; 3 * MODEL_INPUT_SIDE * MODEL_INPUT_SIDE],
         })
     }
 
     /// The best face in `pixels` (at `size`), or None.
-    pub fn detect(&mut self, pixels: &[Argb<u8>], size: (u32, u32)) -> Option<Values> {
+    pub fn detect(&mut self, pixels: &[Argb<u8>], size: (u32, u32)) -> Option<FaceValues> {
         let (w, h) = (size.0 as usize, size.1 as usize);
         // Letterbox into the top-left of the square input, nearest-neighbour; the model
         // wants BGR planes from 0 to 255.
-        let scale = SIDE as f32 / w.max(h) as f32;
-        let plane = SIDE * SIDE;
-        for y in 0..SIDE {
+        let scale = MODEL_INPUT_SIDE as f32 / w.max(h) as f32;
+        let plane = MODEL_INPUT_SIDE * MODEL_INPUT_SIDE;
+        for y in 0..MODEL_INPUT_SIDE {
             let sy = (y as f32 / scale) as usize;
-            for x in 0..SIDE {
+            for x in 0..MODEL_INPUT_SIDE {
                 let sx = (x as f32 / scale) as usize;
-                let i = y * SIDE + x;
+                let i = y * MODEL_INPUT_SIDE + x;
                 let bgr = if sx < w && sy < h {
                     let p = pixels[sy * w + sx];
                     [p.blue, p.green, p.red]
@@ -187,7 +184,11 @@ impl Detector {
                 }
             }
         }
-        let tensor = Tensor::from_array(([1usize, 3, SIDE, SIDE], self.input.clone())).ok()?;
+        let tensor = Tensor::from_array((
+            [1usize, 3, MODEL_INPUT_SIDE, MODEL_INPUT_SIDE],
+            self.input.clone(),
+        ))
+        .ok()?;
         let outputs = self.session.run(ort::inputs!["input" => tensor]).ok()?;
 
         // Best candidate across the three strides: (score, box, five points), in
@@ -201,7 +202,7 @@ impl Detector {
                     .map(|(_, data)| data)
             };
             let (cls, obj, bbox, kps) = (get("cls")?, get("obj")?, get("bbox")?, get("kps")?);
-            let cols = SIDE / stride;
+            let cols = MODEL_INPUT_SIDE / stride;
             for (i, (&c, &o)) in cls.iter().zip(obj).enumerate() {
                 let score = (c.clamp(0.0, 1.0) * o.clamp(0.0, 1.0)).sqrt();
                 if score < MIN_SCORE || best.is_some_and(|(s, ..)| s >= score) {
@@ -249,15 +250,15 @@ impl Detector {
 /// playback never waits for it. Values hold their last position while no face is
 /// found, with `face` at 0.
 pub struct Tracker {
-    shared: Arc<(Mutex<Shared>, Condvar)>,
+    shared: Arc<(Mutex<TrackerState>, Condvar)>,
 }
 
 type SizedFrame = (Vec<Argb<u8>>, (u32, u32));
 
-struct Shared {
+struct TrackerState {
     frame: Option<SizedFrame>,
     spare: Vec<Argb<u8>>,
-    values: Values,
+    values: FaceValues,
     stop: bool,
 }
 
@@ -265,10 +266,10 @@ impl Tracker {
     pub fn start() -> Result<Self, String> {
         let mut detector = Detector::new()?;
         let shared = Arc::new((
-            Mutex::new(Shared {
+            Mutex::new(TrackerState {
                 frame: None,
                 spare: Vec::new(),
-                values: NONE,
+                values: FACE_NONE,
                 stop: false,
             }),
             Condvar::new(),
@@ -313,13 +314,13 @@ impl Tracker {
         wake.notify_one();
     }
 
-    pub fn values(&self) -> Values {
+    pub fn values(&self) -> FaceValues {
         self.shared.0.lock().unwrap().values
     }
 
     /// While an effect's report reads the faces: its positions with `face` at 0, so the variables
     /// carry on from there when the report stops.
-    pub fn hold_positions(&self, values: Values) {
+    pub fn hold_positions(&self, values: FaceValues) {
         let mut s = self.shared.0.lock().unwrap();
         s.values = values;
         s.values[0] = 0.0;

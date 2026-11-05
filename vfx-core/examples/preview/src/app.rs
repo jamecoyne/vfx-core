@@ -1,28 +1,30 @@
 //! The preview window: input, the shown effect, the panel, recording.
 
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use web_time::Instant;
 
 use crate::catalog;
-use crate::controls::{self, Controls, Status};
+use crate::controls::{self, Controls, PanelStatus};
+use crate::effects::Effects;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::effects::Output;
-use crate::effects::{self, Effects};
-use crate::modulation::{self, Expressions, Sources};
+use crate::effects::{self, Output};
+use crate::modulation::{self, Expressions, VariableValues};
+use crate::stats;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{audio, face, script, video};
 #[cfg(target_arch = "wasm32")]
-use crate::web_media;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::{audio, face, script, stats, video};
+use crate::{web_media, web_record};
 use vfx_core::Gpu;
 use winit::application::ApplicationHandler;
-#[cfg(not(target_arch = "wasm32"))]
 use winit::event::ElementState;
 use winit::event::WindowEvent;
 #[cfg(not(target_arch = "wasm32"))]
 use winit::event_loop::ControlFlow;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::keyboard::Key;
 #[cfg(not(target_arch = "wasm32"))]
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::NamedKey;
 use winit::window::{Window, WindowId};
 
 struct Preview {
@@ -35,10 +37,17 @@ struct Preview {
     egui_renderer: egui_wgpu::Renderer,
     effects: Effects,
     /// The effects output, registered with egui; re-registered when its size changes.
-    image: egui::TextureId,
-    image_size: (u32, u32),
+    display_texture: egui::TextureId,
+    display_size: (u32, u32),
     controls: Controls,
     view: View,
+    /// `h`: only the picture shows, for a live show.
+    panel_hidden: bool,
+    /// The shared device's loss has been reported, so nothing draws any more.
+    device_lost_reported: bool,
+    /// Why a scripted run has to end with an error.
+    #[cfg(not(target_arch = "wasm32"))]
+    fatal: Option<String>,
     /// The effect's second input, when it's fed from a video, webcam or image.
     #[cfg(not(target_arch = "wasm32"))]
     layer: Layer,
@@ -46,11 +55,20 @@ struct Preview {
     #[cfg(not(target_arch = "wasm32"))]
     recording: Option<Recording>,
     /// How the last recording ended (saved, discarded or failed), shown in the Record section.
-    #[cfg(not(target_arch = "wasm32"))]
     record_result: Option<String>,
+    /// The output being recorded, while Record is on, and what a recording needs to open its
+    /// canvas.
+    #[cfg(target_arch = "wasm32")]
+    web_recording: Option<web_record::WebRecorder>,
+    #[cfg(target_arch = "wasm32")]
+    web_record_finished: web_record::Finished,
+    #[cfg(target_arch = "wasm32")]
+    instance: wgpu::Instance,
+    #[cfg(target_arch = "wasm32")]
+    adapter: wgpu::Adapter,
     exprs: Expressions,
     /// The expression variables for the frame on screen.
-    sources: Sources,
+    variables: VariableValues,
     #[cfg(not(target_arch = "wasm32"))]
     media: Option<Media>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -60,9 +78,8 @@ struct Preview {
     tracker: Option<face::Tracker>,
     /// Held while no face is found.
     #[cfg(not(target_arch = "wasm32"))]
-    face_values: modulation::Face,
-    #[cfg(not(target_arch = "wasm32"))]
-    report: vfx_core::Report,
+    face_values: modulation::FaceValues,
+    effect_report: vfx_core::Report,
     /// Cameras found at startup.
     #[cfg(not(target_arch = "wasm32"))]
     cameras: Vec<String>,
@@ -72,20 +89,17 @@ struct Preview {
     /// A file pick or camera request the browser hasn't answered yet.
     #[cfg(target_arch = "wasm32")]
     web_pending: web_media::Pending,
-    /// Samples the bottom bar's CPU, memory and GPU numbers.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Samples the bottom bar's numbers.
     stats: stats::Sampler,
-    #[cfg(not(target_arch = "wasm32"))]
     counts: stats::Counts,
     /// A new picture is waiting for the next present.
-    #[cfg(not(target_arch = "wasm32"))]
-    unshown: bool,
+    picture_awaiting_present: bool,
     /// Counts frames for `--stats`, `--frames` and `--seconds`.
     #[cfg(not(target_arch = "wasm32"))]
     meter: Option<script::Meter>,
     /// Set once `--frames` or `--seconds` is reached.
     #[cfg(not(target_arch = "wasm32"))]
-    done: bool,
+    run_finished: bool,
     /// `--quiet`: the window stays hidden and only the effect renders.
     #[cfg(not(target_arch = "wasm32"))]
     quiet: bool,
@@ -94,15 +108,65 @@ struct Preview {
     message: Option<String>,
 }
 
+/// The adapter `--gpu` names: `high` or nothing for the high performance one, `low` for the low
+/// power one, anything else the first that can show the window and has that in its name.
+async fn pick_adapter(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+    choice: Option<&str>,
+) -> Result<wgpu::Adapter, String> {
+    let power_preference = match choice {
+        None | Some("high") => wgpu::PowerPreference::HighPerformance,
+        Some("low") => wgpu::PowerPreference::LowPower,
+        Some(name) => {
+            let wanted = name.to_lowercase();
+            let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+            let names: Vec<String> = adapters.iter().map(|a| a.get_info().name).collect();
+            return adapters
+                .into_iter()
+                .find(|a| {
+                    a.get_info().name.to_lowercase().contains(&wanted)
+                        && a.is_surface_supported(surface)
+                })
+                .ok_or_else(|| {
+                    format!("--gpu {name}: none found; there are {}", names.join(", "))
+                });
+        }
+    };
+    instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference,
+            compatible_surface: Some(surface),
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .map_err(|e| format!("no GPU adapter: {e}"))
+}
+
 /// A video file or webcam and everything that goes with it.
 #[cfg(not(target_arch = "wasm32"))]
 struct Media {
     video: video::Video,
     /// The file's sound, analysed for expressions; None for webcams.
-    audio: Option<audio::Audio>,
-    sound: Option<video::Sound>,
+    audio: Option<audio::AudioAnalysis>,
+    sound: Option<video::SoundPlayer>,
     /// While the position slider is being dragged.
     scrub: Option<Scrub>,
+}
+
+/// Asks for a video or image file.
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_media_file(title: &str) -> Option<std::path::PathBuf> {
+    let extensions: Vec<&str> = video::VIDEO_EXTENSIONS
+        .iter()
+        .chain(&["png", "jpg", "jpeg"])
+        .copied()
+        .collect();
+    rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("Video or image", &extensions)
+        .pick_file()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -123,7 +187,7 @@ impl Media {
         self.sound = None;
         self.video.seek(position, play)?;
         if play && sound_on {
-            self.sound = video::Sound::play(&self.video.info, self.video.position());
+            self.sound = video::SoundPlayer::play(&self.video.info, self.video.position());
         }
         Ok(())
     }
@@ -132,26 +196,40 @@ impl Media {
 impl Preview {
     /// Opens the GPU for `window` and builds everything else. Async because browsers
     /// can't block on the GPU; the native build blocks on it with pollster.
-    async fn new(window: Arc<Window>, instance: wgpu::Instance) -> Result<Self, String> {
+    async fn new(
+        window: Arc<Window>,
+        instance: wgpu::Instance,
+        gpu_choice: Option<String>,
+    ) -> Result<Self, String> {
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| format!("couldn't create a surface: {e}"))?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
-            .await
-            .map_err(|e| format!("no GPU adapter: {e}"))?;
+        let adapter = pick_adapter(&instance, &surface, gpu_choice.as_deref()).await?;
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!(
+            "preview: drawing on {} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
+        // Effects draw on this device, and segcam's atlas grows with the trail: as much of a
+        // binding as the adapter allows, or the atlas stops at wgpu's default.
+        let supported = adapter.limits();
+        let required_limits = wgpu::Limits {
+            max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
+            max_buffer_size: supported.max_buffer_size,
+            ..wgpu::Limits::default()
+        };
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits,
+                ..wgpu::DeviceDescriptor::default()
+            })
             .await
             .map_err(|e| format!("couldn't open the GPU: {e}"))?;
         let gpu = Gpu::from_parts(device, queue);
-        // CPU effects can't open a device of their own in browsers.
-        #[cfg(target_arch = "wasm32")]
+        // Before any effect exists: a CPU effect that opens a device in its first render finds
+        // this one, so its frames stay on the device that shows them. Browsers can't open a
+        // second device at all.
         gpu.share();
 
         let size = window.inner_size();
@@ -193,12 +271,12 @@ impl Preview {
             egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions::default());
 
         let effects = Effects::new(&gpu);
-        let image = egui_renderer.register_native_texture(
+        let display_texture = egui_renderer.register_native_texture(
             &gpu.device,
             effects.display_view(),
             wgpu::FilterMode::Linear,
         );
-        let image_size = effects.size();
+        let display_size = effects.size();
 
         Ok(Self {
             window,
@@ -209,18 +287,29 @@ impl Preview {
             egui_state,
             egui_renderer,
             effects,
-            image,
-            image_size,
+            display_texture,
+            display_size,
             controls: Controls::default(),
             view: View::default(),
+            panel_hidden: false,
+            device_lost_reported: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            fatal: None,
             #[cfg(not(target_arch = "wasm32"))]
             layer: Layer::Off,
             #[cfg(not(target_arch = "wasm32"))]
             recording: None,
-            #[cfg(not(target_arch = "wasm32"))]
             record_result: None,
+            #[cfg(target_arch = "wasm32")]
+            web_recording: None,
+            #[cfg(target_arch = "wasm32")]
+            web_record_finished: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            instance,
+            #[cfg(target_arch = "wasm32")]
+            adapter,
             exprs: Expressions::default(),
-            sources: modulation::sources(0.0, None, [0.0; 5], modulation::FACE_NONE),
+            variables: modulation::variable_values(0.0, None, [0.0; 5], modulation::FACE_NONE),
             #[cfg(not(target_arch = "wasm32"))]
             media: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -229,24 +318,20 @@ impl Preview {
             tracker: None,
             #[cfg(not(target_arch = "wasm32"))]
             face_values: modulation::FACE_NONE,
-            #[cfg(not(target_arch = "wasm32"))]
-            report: vfx_core::Report::default(),
+            effect_report: vfx_core::Report::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cameras: video::cameras(),
             #[cfg(target_arch = "wasm32")]
             web_video: None,
             #[cfg(target_arch = "wasm32")]
             web_pending: Default::default(),
-            #[cfg(not(target_arch = "wasm32"))]
             stats: stats::Sampler::new(),
-            #[cfg(not(target_arch = "wasm32"))]
             counts: stats::Counts::default(),
-            #[cfg(not(target_arch = "wasm32"))]
-            unshown: false,
+            picture_awaiting_present: false,
             #[cfg(not(target_arch = "wasm32"))]
             meter: None,
             #[cfg(not(target_arch = "wasm32"))]
-            done: false,
+            run_finished: false,
             #[cfg(not(target_arch = "wasm32"))]
             quiet: false,
             time: 0.0,
@@ -262,15 +347,15 @@ impl Preview {
     }
 
     /// Points egui at the effects output again after its size (and texture) changed.
-    fn refresh_image(&mut self) {
-        if self.effects.size() != self.image_size {
-            self.egui_renderer.free_texture(&self.image);
-            self.image = self.egui_renderer.register_native_texture(
+    fn refresh_display_texture(&mut self) {
+        if self.effects.size() != self.display_size {
+            self.egui_renderer.free_texture(&self.display_texture);
+            self.display_texture = self.egui_renderer.register_native_texture(
                 &self.gpu.device,
                 self.effects.display_view(),
                 wgpu::FilterMode::Linear,
             );
-            self.image_size = self.effects.size();
+            self.display_size = self.effects.size();
         }
     }
 
@@ -292,10 +377,13 @@ impl Preview {
                     .write_source(&self.gpu, &fit_still(&img.to_rgba8(), size));
             }),
         };
+        if loaded.is_ok() {
+            self.controls.mirror_for_source(false);
+        }
         self.message = loaded
             .err()
             .map(|e| format!("Couldn't open {}: {e}", path.display()));
-        self.refresh_image();
+        self.refresh_display_texture();
     }
 
     /// Starts a video file or webcam as the source, fitted into `size` if given.
@@ -313,12 +401,13 @@ impl Preview {
                 self.effects
                     .start_video(&self.gpu, name, video.info.size, video.info.fps);
                 let file = video.info.file();
+                self.controls.mirror_for_source(file.is_none());
                 self.media = Some(Media {
                     sound: self
                         .sound_on
-                        .then(|| video::Sound::play(&video.info, 0.0))
+                        .then(|| video::SoundPlayer::play(&video.info, 0.0))
                         .flatten(),
-                    audio: file.map(audio::Audio::load),
+                    audio: file.map(audio::AudioAnalysis::load),
                     video,
                     scrub: None,
                 });
@@ -326,7 +415,7 @@ impl Preview {
             }
             Err(e) => Some(format!("Couldn't open {name}: {e}")),
         };
-        self.refresh_image();
+        self.refresh_display_texture();
     }
 
     /// The browser's video file or webcam: takes one the browser has just opened, copies a
@@ -337,6 +426,7 @@ impl Preview {
         if let Some(opened) = self.web_pending.borrow_mut().take() {
             match opened {
                 Ok(video) => {
+                    self.controls.mirror_for_source(video.is_camera());
                     self.web_video = Some(video);
                     self.message = None;
                 }
@@ -344,27 +434,29 @@ impl Preview {
             }
         }
         let Some(video) = &mut self.web_video else {
-            self.sources = modulation::sources(self.time, None, [0.0; 5], modulation::FACE_NONE);
+            self.variables =
+                modulation::variable_values(self.time, None, [0.0; 5], modulation::FACE_NONE);
             return self.time;
         };
         // Until the browser knows its size the previous source stays up.
         if let Some(size) = video.size() {
-            let current = self.effects.image_name() == Some(video.name.as_str())
+            let current = self.effects.source_name() == Some(video.name.as_str())
                 && self.effects.size() == size;
             if !current {
                 self.effects
                     .start_stream(&self.gpu, video.name.clone(), size, None);
-                self.refresh_image();
+                self.refresh_display_texture();
             }
             let video = self.web_video.as_mut().expect("checked above");
-            if let Some(frame) = self.effects.source_frame()
-                && let Err(e) = video.upload(&self.gpu, frame)
-            {
-                self.message = Some(format!("Couldn't read the video: {e}"));
+            if let Some(frame) = self.effects.source_frame() {
+                match video.upload(&self.gpu, frame) {
+                    Ok(copied) => self.counts.arrived += u64::from(copied),
+                    Err(e) => self.message = Some(format!("Couldn't read the video: {e}")),
+                }
             }
         }
         let video = self.web_video.as_ref().expect("checked above");
-        self.sources = modulation::sources(
+        self.variables = modulation::variable_values(
             self.time,
             Some((video.position(), video.duration())),
             [0.0; 5],
@@ -373,9 +465,62 @@ impl Preview {
         video.frame_time()
     }
 
+    /// Starts recording, or stops and saves when the browser has finished the file.
+    #[cfg(target_arch = "wasm32")]
+    fn toggle_web_record(&mut self) {
+        match self.web_recording.take() {
+            None => {
+                let size = self.effects.size();
+                let finished = self.web_record_finished.clone();
+                match web_record::WebRecorder::start(
+                    &self.instance,
+                    &self.adapter,
+                    &self.gpu,
+                    size,
+                    finished,
+                ) {
+                    Ok(recorder) => {
+                        self.web_recording = Some(recorder);
+                        self.record_result = None;
+                    }
+                    Err(e) => self.message = Some(format!("Couldn't start recording: {e}")),
+                }
+            }
+            Some(recorder) => {
+                self.record_result = Some("Finishing the file".into());
+                recorder.finish();
+            }
+        }
+    }
+
+    /// Draws a new picture into the recording. A frame of another size stops it, as on the
+    /// desktop, where the encoder takes one size.
+    #[cfg(target_arch = "wasm32")]
+    fn record_web_frame(&mut self) {
+        if let Some(finished) = self.web_record_finished.borrow_mut().take() {
+            self.record_result = Some(finished);
+        }
+        let Some(recorder) = &self.web_recording else {
+            return;
+        };
+        if recorder.ended() {
+            self.web_recording = None;
+        } else if recorder.size != self.effects.size() {
+            if let Some(recorder) = self.web_recording.take() {
+                recorder.discard();
+            }
+            self.record_result = Some("Recording stopped: the frame size changed".into());
+        } else if self.effects.last_outcome().new_picture {
+            recorder.draw(&self.gpu, self.effects.output_frame());
+        }
+    }
+
     /// The panel's source and transport actions, in the browser.
     #[cfg(target_arch = "wasm32")]
     fn handle_web_actions(&mut self, actions: &controls::Actions) {
+        if actions.toggle_record {
+            self.toggle_web_record();
+        }
         if actions.import {
             web_media::pick_file(&self.web_pending);
         }
@@ -393,7 +538,7 @@ impl Preview {
         }
     }
 
-    /// Works out this frame's expression variables, then renders the live preview.
+    /// Computes this frame's expression variables, then renders the live preview.
     fn render_effects(&mut self, dt: f64) {
         #[cfg(not(target_arch = "wasm32"))]
         self.feed_layer();
@@ -403,6 +548,10 @@ impl Preview {
         let mut frame_time = self.time;
         #[cfg(target_arch = "wasm32")]
         let frame_time = self.feed_web_video();
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.effect_report = self.effects.report();
+        }
         // The face variables: from the effect's report where it gives them, else the tracker's.
         #[cfg(not(target_arch = "wasm32"))]
         let tracker_needed = {
@@ -410,11 +559,11 @@ impl Preview {
                 (Some(tracker), Some(_)) => tracker.values(),
                 _ => modulation::FACE_NONE,
             };
-            self.report = self.effects.report();
+            self.effect_report = self.effects.report();
             let needed = modulation::apply_face_readings(
                 &mut face,
                 &self.face_values,
-                &self.report.readings,
+                &self.effect_report.readings,
             );
             self.face_values = face;
             if let Some(tracker) = self.tracker.as_ref().filter(|_| !needed) {
@@ -449,9 +598,17 @@ impl Preview {
             {
                 tracker.submit(pixels, media.video.info.size);
             }
+            // The picture looped without a seek. The sound is restarted with it, not looped by
+            // ffplay, which would drift from the picture over a show.
+            if media.video.take_looped() {
+                media.sound = None;
+                if self.sound_on {
+                    media.sound = video::SoundPlayer::play(&media.video.info, 0.0);
+                }
+            }
             let position = media.video.position();
             frame_time = position;
-            self.sources = modulation::sources(
+            self.variables = modulation::variable_values(
                 self.time,
                 Some((position, media.video.info.duration)),
                 media
@@ -465,28 +622,34 @@ impl Preview {
             let face = self.face_values;
             #[cfg(target_arch = "wasm32")]
             let face = modulation::FACE_NONE;
-            self.sources = modulation::sources(self.time, None, [0.0; 5], face);
+            self.variables = modulation::variable_values(self.time, None, [0.0; 5], face);
         }
 
         let c = &self.controls;
         let values = self
             .exprs
-            .apply(c.effect, c.values(), &self.sources, dt as f32);
+            .apply(c.effect, c.values(), &self.variables, dt as f32);
+        // Record reads the picture from RAM.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.effects.keep_output_in_ram(self.recording.is_some());
         self.effects.render(&self.gpu, c, &values, frame_time);
         #[cfg(not(target_arch = "wasm32"))]
         self.record_frame();
+        #[cfg(target_arch = "wasm32")]
+        self.record_web_frame();
+    }
+
+    /// Whether a video or camera is the source.
+    fn has_video(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.media.is_some();
+        #[cfg(target_arch = "wasm32")]
+        return self.web_video.is_some();
     }
 
     fn is_quiet(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         return self.quiet;
-        #[cfg(target_arch = "wasm32")]
-        return false;
-    }
-
-    fn is_recording(&self) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        return self.recording.is_some();
         #[cfg(target_arch = "wasm32")]
         return false;
     }
@@ -582,16 +745,7 @@ impl Preview {
             self.toggle_record();
         }
         if actions.import
-            && let Some(path) = rfd::FileDialog::new()
-                .set_title("Import a video or image")
-                .add_filter(
-                    "Video or image",
-                    &[
-                        "mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv", "png", "jpg",
-                        "jpeg",
-                    ],
-                )
-                .pick_file()
+            && let Some(path) = pick_media_file("Import a video or image")
         {
             self.open(&path, None);
         }
@@ -604,16 +758,7 @@ impl Preview {
             self.cameras = video::cameras();
         }
         if actions.import_layer
-            && let Some(path) = rfd::FileDialog::new()
-                .set_title("Import a layer: video or image")
-                .add_filter(
-                    "Video or image",
-                    &[
-                        "mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv", "png", "jpg",
-                        "jpeg",
-                    ],
-                )
-                .pick_file()
+            && let Some(path) = pick_media_file("Import a layer: video or image")
         {
             self.open_layer(&path);
         }
@@ -638,7 +783,7 @@ impl Preview {
             self.sound_on = on;
             if let Some(media) = &mut self.media {
                 media.sound = (on && media.video.playing())
-                    .then(|| video::Sound::play(&media.video.info, media.video.position()))
+                    .then(|| video::SoundPlayer::play(&media.video.info, media.video.position()))
                     .flatten();
             }
         }
@@ -670,7 +815,25 @@ impl Preview {
         }
     }
 
-    /// Plays or pauses a video file (not a webcam, nor during a render).
+    /// A key the panel didn't take, as segcam 1.1's keys where one maps onto a parameter.
+    fn handle_key(&mut self, key: &Key) {
+        let Key::Character(key) = key else {
+            return;
+        };
+        match key.as_str() {
+            "c" => self.effects.clear_history(&self.gpu),
+            "h" => self.panel_hidden = !self.panel_hidden,
+            "m" => self.controls.flip_toggle("mirror"),
+            "l" => self.controls.flip_toggle("labels"),
+            "i" => self.controls.flip_toggle("invert"),
+            "a" => self.controls.flip_toggle("auto_level"),
+            "[" => self.controls.step_primary(-1.0),
+            "]" => self.controls.step_primary(1.0),
+            _ => {}
+        }
+    }
+
+    /// Plays or pauses a video file (not a webcam).
     #[cfg(not(target_arch = "wasm32"))]
     fn toggle_play(&mut self) {
         if let Some(media) = &mut self.media
@@ -683,7 +846,68 @@ impl Preview {
         }
     }
 
+    /// Whether the shared device is lost. Everything shown came through it, so nothing more can
+    /// draw and the picture would freeze with no word why: this says so once, where it can be
+    /// seen, stops the sound, keeps what a recording has so far, and ends a scripted run with an
+    /// error.
+    fn device_lost(&mut self) -> bool {
+        let Some(why) = self.gpu.faults().lost() else {
+            return false;
+        };
+        if !std::mem::replace(&mut self.device_lost_reported, true) {
+            let text = format!("The GPU was lost ({why}).");
+            #[cfg(target_arch = "wasm32")]
+            {
+                let mut message = format!("{text} Reload the page.");
+                if let Some(recorder) = self.web_recording.take() {
+                    recorder.finish();
+                    message += " The recording so far goes to your downloads.";
+                }
+                show_startup_message(&message);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let text = format!("{text} Restart the preview to carry on.");
+                self.window.set_title(&format!("VFX Preview: {text}"));
+                eprintln!("preview: {text}");
+                self.media = None;
+                self.layer = Layer::Off;
+                if self.meter.is_some() || self.quiet {
+                    self.fatal = Some(text);
+                    self.run_finished = true;
+                } else {
+                    rfd::MessageDialog::new()
+                        .set_title("VFX Preview")
+                        .set_description(text)
+                        .set_level(rfd::MessageLevel::Error)
+                        .show();
+                    if let Some(recording) = self.recording.take() {
+                        self.finish_recording(recording);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// A draw that survives what a lost device can panic on after its loss was recorded, such as
+    /// a staging buffer in egui, so the next draw can report it. Other panics go on as panics.
+    fn draw_guarded(&mut self) {
+        let drawn = catch_unwind(AssertUnwindSafe(|| self.draw()));
+        if let Err(panic) = drawn
+            && self.gpu.faults().lost().is_none()
+        {
+            resume_unwind(panic);
+        }
+    }
+
     fn draw(&mut self) {
+        if self.device_lost() {
+            // Nothing paces the loop now that nothing presents.
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            return;
+        }
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64();
         self.last_frame = now;
@@ -694,29 +918,37 @@ impl Preview {
         self.render_effects(dt);
         #[cfg(not(target_arch = "wasm32"))]
         if self.quiet {
-            // Nothing paces a hidden window, so wait for the GPU before the next frame.
-            let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            // Nothing paces a hidden window, so wait for the GPU before the next frame. A device
+            // lost now is reported on the next draw.
+            let _ = vfx_core::poll_device(&self.gpu.device, wgpu::PollType::wait_indefinitely());
         }
-        #[cfg(not(target_arch = "wasm32"))]
         let stats = {
-            let rendered = self.effects.rendered();
+            let rendered = self.effects.last_outcome();
             self.counts.rendered += u64::from(rendered.finished);
+            self.counts.drawn += u64::from(rendered.finished && self.effects.output_drawn_on_gpu());
             self.counts.render_time += rendered.render_time.unwrap_or_default();
-            self.unshown |= rendered.new_picture;
-            let source = match &self.media {
-                Some(_) => stats::SourceRate::Video,
-                None if self.effects.image_name().is_some() => stats::SourceRate::Still,
-                None => stats::SourceRate::Pattern,
+            self.picture_awaiting_present |= rendered.new_picture;
+            let source = if self.has_video() {
+                stats::SourceKind::Video
+            } else if self.effects.source_name().is_some() {
+                stats::SourceKind::Still
+            } else {
+                stats::SourceKind::Pattern
             };
-            let what = stats::What {
+            let shown = stats::ShownEffect {
                 effect: self.effects.name(),
                 slug: self.effects.slug(),
                 on_cpu: self.effects.on_cpu(),
                 source,
                 size: self.effects.size(),
+                screen_counts_drawn: self.effects.output_drawn_on_gpu(),
             };
-            self.stats
-                .sample(self.counts, rendered.render_time, what, &self.report)
+            self.stats.sample(
+                self.counts,
+                rendered.render_time,
+                shown,
+                &self.effect_report,
+            )
         };
         #[cfg(not(target_arch = "wasm32"))]
         self.count_frame(&stats);
@@ -726,15 +958,14 @@ impl Preview {
         }
 
         let input = self.egui_state.take_egui_input(&self.window);
-        let (image, image_size) = (self.image, self.image_size);
+        let (display_texture, display_size) = (self.display_texture, self.display_size);
         #[cfg(not(target_arch = "wasm32"))]
-        let (video, sound_on, cameras, face_tracking) = (
+        let (video, sound_on, cameras) = (
             self.media
                 .as_ref()
                 .is_some_and(|m| m.video.info.file().is_some()),
             self.sound_on,
             self.cameras.as_slice(),
-            self.tracker.is_some(),
         );
         #[cfg(not(target_arch = "wasm32"))]
         let playback = self
@@ -753,8 +984,7 @@ impl Preview {
                     .map_or_else(|| m.video.playing(), |s| s.resume),
             });
         #[cfg(target_arch = "wasm32")]
-        let (video, sound_on, cameras, face_tracking) =
-            (false, false, &web_media::CAMERAS[..], false);
+        let (video, sound_on, cameras) = (false, false, &web_media::CAMERAS[..]);
         #[cfg(target_arch = "wasm32")]
         let playback =
             self.web_video
@@ -765,19 +995,19 @@ impl Preview {
                     duration: v.duration(),
                     playing: v.playing(),
                 });
-        #[cfg(not(target_arch = "wasm32"))]
-        let record_result = self.record_result.as_deref();
-        #[cfg(target_arch = "wasm32")]
-        let record_result: Option<&str> = None;
-        let status = Status {
-            image: self.effects.image_name(),
+        let status = PanelStatus {
+            source_name: self.effects.source_name(),
             message: self.message.as_deref(),
             video,
             sound_on,
-            recording: self.is_recording(),
-            record_result,
+            #[cfg(not(target_arch = "wasm32"))]
+            recording: self.recording.is_some(),
+            #[cfg(target_arch = "wasm32")]
+            recording: self.web_recording.is_some(),
+            record_result: self.record_result.as_deref(),
             cameras,
-            face_tracking,
+            #[cfg(not(target_arch = "wasm32"))]
+            face_tracking: self.tracker.is_some(),
             playback,
             layers: self.effects.layers(),
             layer_name: self.effects.layer_name(),
@@ -785,25 +1015,29 @@ impl Preview {
         let controls = &mut self.controls;
         let view = &mut self.view;
         let exprs = &mut self.exprs;
-        let sources = &self.sources;
+        let variables = &self.variables;
         let mut actions = controls::Actions::default();
+        let panel_hidden = self.panel_hidden;
         let mut output = self.egui.run_ui(input, |ui| {
-            // Added first, so it runs the window's full width under the controls.
-            #[cfg(not(target_arch = "wasm32"))]
-            egui::Panel::bottom("status")
-                .resizable(false)
-                .show(ui, |ui| stats::bar(ui, &stats));
-            egui::Panel::right("controls")
-                .resizable(false)
-                .exact_size(320.0)
-                .show(ui, |ui| {
-                    actions = controls::panel(ui, controls, exprs, sources, &status)
-                });
+            if !panel_hidden {
+                // Added first, so it runs the window's full width under the controls.
+                egui::Panel::bottom("status")
+                    .resizable(false)
+                    .show(ui, |ui| stats::bar(ui, &stats));
+                egui::Panel::right("controls")
+                    .resizable(false)
+                    .exact_size(320.0)
+                    .show(ui, |ui| {
+                        actions = controls::panel(ui, controls, exprs, variables, &status)
+                    });
+            }
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(18)))
-                .show(ui, |ui| show_image(ui, image, image_size, controls, view));
+                .show(ui, |ui| {
+                    show_output(ui, display_texture, display_size, controls, view)
+                });
         });
-        if actions.clear_image {
+        if actions.use_pattern {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 self.media = None;
@@ -812,9 +1046,12 @@ impl Preview {
             {
                 self.web_video = None;
             }
-            self.effects.clear_image(&self.gpu);
+            self.effects.use_pattern_source(&self.gpu);
             self.message = None;
-            self.refresh_image();
+            self.refresh_display_texture();
+        }
+        if actions.clear_history {
+            self.effects.clear_history(&self.gpu);
         }
         #[cfg(not(target_arch = "wasm32"))]
         self.handle_media_actions(&actions);
@@ -885,11 +1122,8 @@ impl Preview {
         self.gpu.queue.submit(commands);
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.counts.screen += u64::from(self.unshown);
-            self.unshown = false;
-        }
+        self.counts.screen += u64::from(self.picture_awaiting_present);
+        self.picture_awaiting_present = false;
     }
 }
 
@@ -917,9 +1151,9 @@ const MAX_ZOOM: f32 = 32.0;
 /// Dragging pans. Two-finger zoom (a touch gesture, or ctrl-scroll) zooms about the pointer.
 /// Right-click resets. A plain click, without a drag, sets the effect's point parameter (the
 /// vignette's centre, say), wherever the image is.
-fn show_image(
+fn show_output(
     ui: &mut egui::Ui,
-    image: egui::TextureId,
+    display_texture: egui::TextureId,
     size: (u32, u32),
     controls: &mut Controls,
     view: &mut View,
@@ -967,7 +1201,7 @@ fn show_image(
 
     let rect = egui::Rect::from_center_size(area.center() + view.pan, fit * view.zoom);
     ui.painter_at(full).image(
-        image,
+        display_texture,
         rect,
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
@@ -982,13 +1216,13 @@ fn show_image(
 }
 
 /// Sent when the (async, on the web) GPU setup finishes.
-enum Ready {
+enum GpuSetup {
     Preview(Box<Preview>),
     Failed(String),
 }
 
 struct App {
-    proxy: EventLoopProxy<Ready>,
+    proxy: EventLoopProxy<GpuSetup>,
     preview: Option<Preview>,
     starting: bool,
     start: StartOptions,
@@ -998,7 +1232,7 @@ struct App {
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<Ready>, start: StartOptions) -> Self {
+    fn new(proxy: EventLoopProxy<GpuSetup>, start: StartOptions) -> Self {
         Self {
             proxy,
             preview: None,
@@ -1026,7 +1260,7 @@ fn window_attributes(start: &StartOptions) -> winit::window::WindowAttributes {
     attributes
 }
 
-fn instance(event_loop: &ActiveEventLoop) -> wgpu::Instance {
+fn new_wgpu_instance(event_loop: &ActiveEventLoop) -> wgpu::Instance {
     #[allow(unused_mut)]
     let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
         event_loop.owned_display_handle(),
@@ -1036,6 +1270,13 @@ fn instance(event_loop: &ActiveEventLoop) -> wgpu::Instance {
     #[cfg(target_arch = "wasm32")]
     {
         descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
+    }
+    // The D3D12 validation layer changes what DirectML finds in the same process, so it is on
+    // only with WGPU_VALIDATION=1. Face models run beside this device.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        descriptor.flags =
+            (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION).with_env();
     }
     wgpu::Instance::new(descriptor)
 }
@@ -1050,6 +1291,7 @@ type StartOptions = script::Options;
 #[derive(Default)]
 struct StartOptions {
     effect: Option<String>,
+    gpu: Option<String>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1062,11 +1304,11 @@ fn start_options() -> StartOptions {
         .split('&')
         .find_map(|pair| pair.strip_prefix("effect="))
         .map(str::to_owned);
-    StartOptions { effect }
+    StartOptions { effect, gpu: None }
 }
 
 /// Shows a message in the page (web) or on stderr (native).
-fn report(message: &str) {
+fn show_startup_message(message: &str) {
     #[cfg(target_arch = "wasm32")]
     if let Some(status) = web_sys::window()
         .and_then(|w| w.document())
@@ -1078,7 +1320,7 @@ fn report(message: &str) {
     eprintln!("{message}");
 }
 
-impl ApplicationHandler<Ready> for App {
+impl ApplicationHandler<GpuSetup> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.preview.is_some() || self.starting {
             return;
@@ -1087,17 +1329,21 @@ impl ApplicationHandler<Ready> for App {
         let window = match event_loop.create_window(window_attributes(&self.start)) {
             Ok(w) => Arc::new(w),
             Err(e) => {
-                report(&format!("Couldn't create a window: {e}"));
+                show_startup_message(&format!("Couldn't create a window: {e}"));
                 event_loop.exit();
                 return;
             }
         };
-        let setup = Preview::new(window, instance(event_loop));
+        let setup = Preview::new(
+            window,
+            new_wgpu_instance(event_loop),
+            self.start.gpu.clone(),
+        );
         let proxy = self.proxy.clone();
         let finish = move |result: Result<Preview, String>| {
             let _ = proxy.send_event(match result {
-                Ok(preview) => Ready::Preview(Box::new(preview)),
-                Err(e) => Ready::Failed(e),
+                Ok(preview) => GpuSetup::Preview(Box::new(preview)),
+                Err(e) => GpuSetup::Failed(e),
             });
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -1106,10 +1352,10 @@ impl ApplicationHandler<Ready> for App {
         wasm_bindgen_futures::spawn_local(async move { finish(setup.await) });
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Ready) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: GpuSetup) {
         match event {
-            Ready::Preview(mut preview) => {
-                report("");
+            GpuSetup::Preview(mut preview) => {
+                show_startup_message("");
                 let start = std::mem::take(&mut self.start);
                 if let Some(name) = &start.effect {
                     match catalog::find_slug(name) {
@@ -1119,7 +1365,7 @@ impl ApplicationHandler<Ready> for App {
                 }
                 // The other flags; `vfx-preview clip.mp4` (or "Open with") starts with that file.
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Err(e) = preview.script(&start) {
+                if let Err(e) = preview.apply_start_options(&start) {
                     self.failed = Some(e);
                     event_loop.exit();
                     return;
@@ -1132,14 +1378,17 @@ impl ApplicationHandler<Ready> for App {
                 preview.window.request_redraw();
                 self.preview = Some(*preview);
             }
-            Ready::Failed(e) => {
-                report(&format!(
+            #[cfg(not(target_arch = "wasm32"))]
+            GpuSetup::Failed(e) => {
+                self.failed = Some(e);
+                event_loop.exit();
+            }
+            #[cfg(target_arch = "wasm32")]
+            GpuSetup::Failed(e) => {
+                show_startup_message(&format!(
                     "VFX Preview needs WebGPU, which this browser didn't provide ({e}). \
                      Try a current Chrome, Edge or Safari."
                 ));
-                #[cfg(not(target_arch = "wasm32"))]
-                event_loop.exit();
-                #[cfg(target_arch = "wasm32")]
                 let _ = event_loop;
             }
         }
@@ -1149,7 +1398,6 @@ impl ApplicationHandler<Ready> for App {
         let Some(preview) = self.preview.as_mut() else {
             return;
         };
-        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
         let consumed = preview
             .egui_state
             .on_window_event(&preview.window, &event)
@@ -1179,10 +1427,20 @@ impl ApplicationHandler<Ready> for App {
             {
                 preview.toggle_play();
             }
+            WindowEvent::KeyboardInput { event, .. }
+                if !consumed
+                    && !preview.egui.egui_wants_keyboard_input()
+                    && event.state == ElementState::Pressed =>
+            {
+                preview.handle_key(&event.logical_key);
+            }
             WindowEvent::RedrawRequested if !preview.is_quiet() => {
-                preview.draw();
+                preview.draw_guarded();
                 #[cfg(not(target_arch = "wasm32"))]
-                if preview.done {
+                if preview.run_finished {
+                    if let Some(why) = preview.fatal.take() {
+                        self.failed = Some(why);
+                    }
                     event_loop.exit();
                     return;
                 }
@@ -1203,8 +1461,12 @@ impl ApplicationHandler<Ready> for App {
         };
         #[cfg(not(target_arch = "wasm32"))]
         if preview.quiet {
-            preview.draw();
-            if preview.done {
+            preview.draw_guarded();
+            if preview.run_finished {
+                // The loop can draw once more after asking to exit, with nothing left to take.
+                if let Some(why) = preview.fatal.take() {
+                    self.failed = Some(why);
+                }
                 event_loop.exit();
             }
             return;
@@ -1227,7 +1489,7 @@ pub fn run(entries: Vec<catalog::Entry>) -> Result<(), Box<dyn std::error::Error
             if start.help {
                 script::USAGE.to_owned()
             } else {
-                script::list()
+                script::effects_listing()
             }
         );
         return Ok(());
@@ -1256,11 +1518,16 @@ fn fail(why: &str) -> ! {
 pub fn run(entries: Vec<catalog::Entry>) {
     use winit::platform::web::EventLoopExtWebSys;
     catalog::set(entries);
-    console_error_panic_hook::set_once();
+    // A panic ends the page's loop, so the page has to say so or the picture just freezes.
+    std::panic::set_hook(Box::new(|info| {
+        console_error_panic_hook::hook(info);
+        show_startup_message(&format!("VFX Preview stopped: {info}. Reload the page."));
+    }));
     let event_loop = EventLoop::with_user_event().build().expect("event loop");
     let app = App::new(event_loop.create_proxy(), start_options());
     event_loop.spawn_app(app);
 }
+
 /// A recording in progress: the output so far, in a temporary file until it's saved.
 #[cfg(not(target_arch = "wasm32"))]
 struct Recording {
@@ -1303,8 +1570,8 @@ fn fit_still(image: &image::RgbaImage, size: (u32, u32)) -> Vec<f32> {
 #[cfg(not(target_arch = "wasm32"))]
 impl Preview {
     /// Applies the command line's flags beyond `--effect`. Mistakes in a scripted run are
-    /// errors; otherwise they show in the panel, as before.
-    fn script(&mut self, start: &script::Options) -> Result<(), String> {
+    /// errors; otherwise they show in the panel.
+    fn apply_start_options(&mut self, start: &script::Options) -> Result<(), String> {
         let scripted = start.scripted();
         if scripted && let Some(message) = self.message.take() {
             return Err(message);
@@ -1318,13 +1585,15 @@ impl Preview {
                 ));
             }
             self.effects.set_pattern_size(&self.gpu, size);
-            self.refresh_image();
+            self.refresh_display_texture();
         }
         match &start.input {
             None => {}
-            Some(script::Source::Pattern(name)) => self.controls.pattern = script::pattern(name)?,
+            Some(script::Source::Pattern(name)) => {
+                self.controls.pattern = script::pattern_index(name)?
+            }
             Some(script::Source::Camera(name)) => {
-                let camera = script::camera(&self.cameras, name)?;
+                let camera = script::camera_name(&self.cameras, name)?;
                 self.open_input(video::Input::Camera(camera, None), start.size);
             }
             Some(script::Source::File(path)) => self.open(path, start.size),
@@ -1333,7 +1602,7 @@ impl Preview {
             return Err(message);
         }
         if let Some(mode) = &start.mode {
-            let (name, value) = script::mode(self.controls.specs(), mode)?;
+            let (name, value) = script::mode_param(self.controls.specs(), mode)?;
             self.set_param(name, value)?;
         }
         for (name, text) in &start.params {
@@ -1344,7 +1613,7 @@ impl Preview {
                 .find(|s| s.name == name)
                 .copied()
                 .ok_or_else(|| format!("--param {name}: no such parameter; --list shows them"))?;
-            self.set_param(name, script::value(&spec, text)?)?;
+            self.set_param(name, script::parse_value(&spec, text)?)?;
         }
         if start.detect_faces {
             self.tracker = Some(face::Tracker::start()?);
@@ -1365,7 +1634,7 @@ impl Preview {
 
     fn count_frame(&mut self, stats: &stats::Snapshot) {
         if let Some(meter) = &mut self.meter {
-            self.done |= meter.frame(stats);
+            self.run_finished |= meter.frame(stats);
         }
     }
 
@@ -1460,7 +1729,7 @@ mod layer_tests {
     use super::fit_still;
 
     #[test]
-    fn a_still_fits_with_transparent_padding() {
+    fn still_fits_with_transparent_padding() {
         // A 4x2 opaque white image in a 4x4 frame: a 4x2 band in the middle, padded above
         // and below with transparent pixels.
         let image = image::RgbaImage::from_pixel(4, 2, image::Rgba([255, 255, 255, 255]));
