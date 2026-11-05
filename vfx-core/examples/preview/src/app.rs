@@ -1441,15 +1441,21 @@ impl ApplicationHandler<GpuSetup> for App {
             .egui_state
             .on_window_event(&preview.window, &event)
             .consumed;
+        // Nothing that makes GPU objects runs during an outage: a new device picks up the window's
+        // size, and a key or a dropped file can wait for it.
+        #[cfg(not(target_arch = "wasm32"))]
+        let device_out = preview.reopening.outage.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let device_out = false;
         match event {
             WindowEvent::CloseRequested => {
                 #[cfg(not(target_arch = "wasm32"))]
                 preview.keep_recording_from_an_outage();
                 event_loop.exit();
             }
-            WindowEvent::Resized(size) => preview.resize(size.width, size.height),
+            WindowEvent::Resized(size) if !device_out => preview.resize(size.width, size.height),
             #[cfg(not(target_arch = "wasm32"))]
-            WindowEvent::DroppedFile(path) => preview.open(&path, None),
+            WindowEvent::DroppedFile(path) if !device_out => preview.open(&path, None),
             // Escape quits the native app; a web page shouldn't close itself.
             #[cfg(not(target_arch = "wasm32"))]
             WindowEvent::KeyboardInput { event, .. }
@@ -1473,6 +1479,7 @@ impl ApplicationHandler<GpuSetup> for App {
             }
             WindowEvent::KeyboardInput { event, .. }
                 if !consumed
+                    && !device_out
                     && !preview.egui.egui_wants_keyboard_input()
                     && event.state == ElementState::Pressed =>
             {
