@@ -88,6 +88,10 @@ pub fn cut_tile<C: Channel>(
         r.y -= (m.min_height - r.h) / 2;
         r.h = m.min_height;
     }
+    // A window's title bar stays on the canvas. macOS holds segcam 1.1's windows under the menu
+    // bar the same way, moved and never resized; a canvas has no menu bar, so the limit is its top
+    // edge. The other edges stay open: macOS lets a window it moves run off them.
+    r.y = r.y.max(m.title_height);
     let mut tile = Tile {
         content_rect: r,
         clipped_rect: intersect(r, PixelRect::new(0, 0, canvas_w, canvas_h)),
