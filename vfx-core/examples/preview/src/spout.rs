@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use vfx_core::{Frame, Gpu};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HMODULE, S_OK, WAIT_ABANDONED, WAIT_OBJECT_0,
+    CloseHandle, HANDLE, HMODULE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
@@ -71,6 +71,9 @@ const COUNTED_INTERVAL: Duration = Duration::from_millis(1);
 const UNCOUNTED_INTERVAL: Duration = Duration::from_millis(4);
 /// How soon a sender that is missing, or can't be read, is looked for again.
 const RETRY: Duration = Duration::from_millis(100);
+/// The longest wait between attempts on a sender that keeps failing: each failure in a row
+/// doubles the wait from [`RETRY`] up to this.
+const MAX_RETRY: Duration = Duration::from_millis(3200);
 /// The longest a copy may take on the GPU. Longer means the device is gone or stuck, and the
 /// worker connects again rather than spin.
 const COPY_DEADLINE: Duration = Duration::from_millis(100);
@@ -322,6 +325,7 @@ impl Receiver {
             connection: None,
             generation: 0,
             reported: None,
+            failures: 0,
         };
         let spawned = std::thread::Builder::new()
             .name("spout receiver".into())
@@ -410,9 +414,10 @@ impl Receiver {
             match import(gpu, link) {
                 Ok(imported) => self.imported = Some(imported),
                 Err(e) => {
-                    eprintln!("preview: Spout sender {}: {e}", self.name);
                     state.import_failed = Some(generation);
+                    drop(state);
                     self.imported = None;
+                    eprintln!("preview: Spout sender {}: {e}", self.name);
                     return None;
                 }
             }
@@ -493,8 +498,10 @@ impl Receiver {
 }
 
 impl Drop for Receiver {
-    /// Stops the worker and waits for it, up to [`STOP_DEADLINE`]: every wait it makes is bounded,
-    /// and past that it finishes on its own.
+    /// Stops the worker and waits for it, up to [`STOP_DEADLINE`]. The worker's waits on the
+    /// sender and on its copies are bounded, but a read back's Map isn't, and a step with the
+    /// probe can pass the deadline. A worker that misses it is left to finish alone, and drops
+    /// the sender's textures when it does.
     fn drop(&mut self) {
         self.stop.stop();
         let Some(worker) = self.worker.take() else {
@@ -681,8 +688,11 @@ struct Worker {
     devices: Vec<(u32, D3d)>,
     connection: Option<Connection>,
     generation: u64,
-    /// The last status logged, so a sender that stays missing logs once.
+    /// The last status logged, so a sender that stays missing, or keeps failing, logs once. Kept
+    /// until a frame arrives.
     reported: Option<String>,
+    /// Failures in a row since the last frame, for the back off.
+    failures: u32,
 }
 
 struct D3d {
@@ -707,8 +717,10 @@ struct Connection {
     access: Option<Handle>,
     count: Option<FrameCount>,
     /// Tells a new picture from the last when the sender doesn't count its frames, or its count
-    /// can't be read.
-    probe: Probe,
+    /// can't be read. Made the first time it's needed.
+    probe: Option<Probe>,
+    /// The sender's size and format as a plain texture, for the probe.
+    plain: D3D11_TEXTURE2D_DESC,
     slots: Vec<Slot>,
     busy: Vec<Arc<AtomicBool>>,
     /// [`Path::Ram`]'s read back.
@@ -734,7 +746,8 @@ impl Worker {
                 Err(why) => {
                     self.disconnect(Some(format!("Spout sender {}: {why}", self.name)));
                     self.forget_removed_devices();
-                    RETRY
+                    self.failures += 1;
+                    retry_after(self.failures)
                 }
             };
             if self.stop.wait(wait.saturating_sub(started.elapsed())) {
@@ -812,7 +825,10 @@ impl Worker {
             None => UNCOUNTED_INTERVAL,
         };
         if let Some(frame) = connection.read(d3d, &self.shared, count)? {
+            self.failures = 0;
+            self.reported = None;
             let mut state = lock(&self.shared);
+            state.status = None;
             state.arrived += 1;
             let replaced = state.ready.replace(Ready {
                 generation: connection.generation,
@@ -843,8 +859,6 @@ impl Worker {
             busy: c.busy.clone(),
         });
         state.ready = None;
-        state.status = None;
-        self.reported = None;
     }
 
     /// The D3D11 device on DXGI adapter `index`, made on first use.
@@ -910,6 +924,13 @@ impl Worker {
         }
         Err("its texture didn't open on any GPU".into())
     }
+}
+
+/// The wait before the next attempt after `failures` in a row.
+fn retry_after(failures: u32) -> Duration {
+    RETRY
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(MAX_RETRY)
 }
 
 /// The size `name`'s frames draw at, fitted into `max_side`, if it is running.
@@ -1127,7 +1148,6 @@ impl Connection {
         }
         let sender = name.to_string_lossy();
         let count = Handle::semaphore(&format!("{sender}_Count_Semaphore")).map(FrameCount::new);
-        let probe = Probe::new(d3d, &plain)?;
         let mut done = None;
         // SAFETY: plain query creation.
         unsafe {
@@ -1152,7 +1172,8 @@ impl Connection {
             format,
             path: setup.path,
             count,
-            probe,
+            probe: None,
+            plain,
             busy: (0..slots.len())
                 .map(|_| Arc::new(AtomicBool::new(true)))
                 .collect(),
@@ -1181,18 +1202,13 @@ impl Connection {
         let probed = match count {
             Some(_) => None,
             None => {
+                if self.probe.is_none() {
+                    self.probe = Some(Probe::new(d3d, &self.plain)?);
+                }
+                let probe = self.probe.as_ref().expect("made above");
                 // SAFETY: same size and format, into mip 0 of the probe.
                 let copy = || unsafe {
-                    context.CopySubresourceRegion(
-                        &self.probe.texture,
-                        0,
-                        0,
-                        0,
-                        0,
-                        &self.shared,
-                        0,
-                        None,
-                    )
+                    context.CopySubresourceRegion(&probe.texture, 0, 0, 0, 0, &self.shared, 0, None)
                 };
                 if !locked(keyed, access, || {
                     copy();
@@ -1200,8 +1216,8 @@ impl Connection {
                 })? {
                     return Ok(None);
                 }
-                let picture = self.probe.picture(context)?;
-                if picture == self.probe.last {
+                let picture = probe.picture(context)?;
+                if picture == probe.last {
                     return Ok(None);
                 }
                 Some(picture)
@@ -1216,9 +1232,9 @@ impl Connection {
             }
             Path::Ram => (self.staging.as_ref().expect("a RAM link has one"), None),
         };
-        let from = match probed {
-            Some(_) => &self.probe.texture,
-            None => &self.shared,
+        let from = match (&probed, &self.probe) {
+            (Some(_), Some(probe)) => &probe.texture,
+            _ => &self.shared,
         };
         // SAFETY: same size and format: the sender's texture, or mip 0 of the probe.
         let copy = || unsafe { context.CopySubresourceRegion(target.0, 0, 0, 0, 0, from, 0, None) };
@@ -1243,7 +1259,11 @@ impl Connection {
             }
         };
         match probed {
-            Some(picture) => self.probe.last = picture,
+            Some(picture) => {
+                if let Some(probe) = &mut self.probe {
+                    probe.last = picture;
+                }
+            }
             None => {
                 if let Some(c) = &mut self.count {
                     c.last = count;
@@ -1267,7 +1287,8 @@ fn ready_slot(shared: &Mutex<State>, generation: u64) -> Option<usize> {
 }
 
 /// Runs `copy` while holding the sender's lock: its keyed mutex or its access mutex, whichever it
-/// has. `Ok(false)` if the sender held it past [`LOCK_TIMEOUT_MS`].
+/// has. `Ok(false)` if the sender held it past [`LOCK_TIMEOUT_MS`]; a lock that fails (a removed
+/// device, a closed handle) is an error, so the worker connects again.
 fn locked(
     keyed: Option<&IDXGIKeyedMutex>,
     access: Option<&Handle>,
@@ -1276,22 +1297,32 @@ fn locked(
     // SAFETY: the sync objects are live; each lock taken is released.
     unsafe {
         if let Some(keyed) = keyed {
-            // The raw call: windows-rs maps WAIT_TIMEOUT, a success code, to Ok.
+            // The raw call: windows-rs maps WAIT_TIMEOUT, a success code, to Ok. WAIT_ABANDONED,
+            // also a success code, leaves the mutex acquired, as for a plain mutex.
             let acquired = (Interface::vtable(keyed).AcquireSync)(
                 Interface::as_raw(keyed),
                 0,
                 LOCK_TIMEOUT_MS,
             );
-            if acquired != S_OK {
+            if acquired.0 == WAIT_TIMEOUT.0 as i32 {
                 return Ok(false);
             }
+            acquired
+                .ok()
+                .map_err(|e| format!("its keyed mutex failed ({e})"))?;
             let copied = copy();
             let _ = keyed.ReleaseSync(0);
             copied?;
         } else if let Some(access) = access {
             let waited = WaitForSingleObject(access.0, LOCK_TIMEOUT_MS);
-            if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
+            if waited == WAIT_TIMEOUT {
                 return Ok(false);
+            }
+            if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
+                return Err(format!(
+                    "its access mutex failed ({})",
+                    windows::core::Error::from_thread()
+                ));
             }
             let copied = copy();
             let _ = ReleaseMutex(access.0);
@@ -1784,6 +1815,13 @@ mod tests {
             }),
             Ok(())
         );
+    }
+
+    #[test]
+    fn retries_back_off_to_a_cap() {
+        let waits: Vec<_> = (1..=8).map(|f| retry_after(f).as_millis()).collect();
+        assert_eq!(waits, [100, 200, 400, 800, 1600, 3200, 3200, 3200]);
+        assert_eq!(retry_after(u32::MAX), MAX_RETRY);
     }
 
     #[test]
