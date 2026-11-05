@@ -2034,6 +2034,11 @@ mod tests {
     /// A first open that overlaps a loss isn't the machine's answer: the slot tries again.
     #[test]
     fn first_open_overlapping_a_loss_tries_again() {
+        let _lock = gpu_test_lock();
+        if open("fallback").is_err() {
+            eprintln!("no adapter: skipped");
+            return;
+        }
         let tries = std::sync::atomic::AtomicU32::new(0);
         let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| match tries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)

@@ -94,25 +94,31 @@ mod models {
 
     /// When models that stopped working are next to load again: none while they work.
     #[derive(Default)]
-    pub(super) struct Reload<P = (bool, bool)> {
+    pub(super) struct Reload {
         backoff: ReopenBackoff,
         next_try: Option<Instant>,
         loaded_at: Option<Instant>,
-        /// What the models that stopped working had, which a new load has to match.
-        had: Option<P>,
+        /// Which optional models the ones that stopped working had, which a new load has to have.
+        had: Option<(bool, bool)>,
+        /// Loads in a row that came up short of `had`.
+        short_loads: u32,
     }
 
-    impl<P: PartialEq> Reload<P> {
+    /// How many short loads to try before keeping what loads. A model that doesn't come back after
+    /// a reset is better missing than a reload of the others every 30 s all show.
+    const SHORT_LOADS_TO_TRY: u32 = 5;
+
+    impl Reload {
         /// Drops models whose runs keep failing and loads new ones on the backoff, since a session
         /// can't outlive its device. The old ones go first: a process has one D3D12 device per
         /// adapter, and a new session would be handed the removed one while they hold it. A load
-        /// with fewer optional models than the old ones had is used and tried again, since that's
-        /// the reset and not the machine.
+        /// missing an optional model the old ones had is used and tried again a few times, since
+        /// that's probably the reset and not the machine.
         pub(super) fn keep_working<T>(
             &mut self,
             models: &mut Option<T>,
             failing: impl Fn(&T) -> bool,
-            optional: impl Fn(&T) -> P,
+            optional: impl Fn(&T) -> (bool, bool),
             release: impl Fn(T),
             load: impl FnOnce() -> Option<T>,
         ) {
@@ -130,15 +136,20 @@ mod models {
                     release(partial);
                 }
                 *models = load();
-                let complete = models
-                    .as_ref()
-                    .is_some_and(|m| self.had.as_ref().is_none_or(|had| optional(m) == *had));
+                let short = models.as_ref().is_some_and(|m| {
+                    let (mesh, bodies) = optional(m);
+                    self.had
+                        .is_some_and(|had| (had.0 && !mesh) || (had.1 && !bodies))
+                });
+                self.short_loads += u32::from(short);
+                let keep = models.is_some() && (!short || self.short_loads >= SHORT_LOADS_TO_TRY);
                 if models.is_some() {
                     self.loaded_at = Some(Instant::now());
                 }
-                self.next_try = (!complete).then(|| Instant::now() + self.backoff.next_delay());
-                if complete {
+                self.next_try = (!keep).then(|| Instant::now() + self.backoff.next_delay());
+                if keep {
                     self.had = None;
+                    self.short_loads = 0;
                 }
             }
         }
@@ -191,19 +202,15 @@ mod models {
 
     #[cfg(test)]
     mod tests {
-        use super::Reload;
+        use super::{Reload, SHORT_LOADS_TO_TRY};
         use std::cell::Cell;
         use std::time::{Duration, Instant};
-
-        fn reload() -> Reload<bool> {
-            Reload::default()
-        }
 
         /// Models that keep failing go at once, and new ones load, retrying until they do.
         #[test]
         fn failing_models_are_replaced() {
-            let optional = |_: &i32| true;
-            let mut reload = reload();
+            let optional = |_: &i32| (true, true);
+            let mut reload = Reload::default();
             let mut models = Some(1);
             reload.keep_working(
                 &mut models,
@@ -234,8 +241,8 @@ mod models {
         /// A load missing what the old models had is used, and replaced by a later full one.
         #[test]
         fn a_partial_load_tries_again() {
-            let optional = |m: &i32| *m >= 10;
-            let mut reload = reload();
+            let optional = |m: &i32| (*m >= 10, true);
+            let mut reload = Reload::default();
             let mut models = Some(10);
             reload.keep_working(&mut models, |_| true, optional, drop, || None);
 
@@ -256,8 +263,8 @@ mod models {
         /// A machine that never had the optional models isn't asked for them after a reset.
         #[test]
         fn a_load_matching_the_old_models_is_complete() {
-            let optional = |_: &i32| false;
-            let mut reload = reload();
+            let optional = |_: &i32| (false, false);
+            let mut reload = Reload::default();
             let mut models = Some(1);
             reload.keep_working(&mut models, |_| true, optional, drop, || None);
             reload.next_try = Some(Instant::now());
@@ -265,11 +272,40 @@ mod models {
             assert!(reload.next_try.is_none());
         }
 
+        /// A load with more than the old models had is complete, and isn't loaded again.
+        #[test]
+        fn a_fuller_load_than_before_is_complete() {
+            let optional = |m: &i32| (*m >= 10, true);
+            let mut reload = Reload::default();
+            let mut models = Some(1);
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, drop, || Some(11));
+            assert_eq!(models, Some(11));
+            assert!(reload.next_try.is_none(), "full models load again");
+        }
+
+        /// A model that never comes back stops the reloads after a few tries.
+        #[test]
+        fn short_loads_stop_after_a_few() {
+            let optional = |m: &i32| (*m >= 10, true);
+            let mut reload = Reload::default();
+            let mut models = Some(10);
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+            for tries in 1..=SHORT_LOADS_TO_TRY {
+                assert!(reload.next_try.is_some(), "stopped before try {tries}");
+                reload.next_try = Some(Instant::now());
+                reload.keep_working(&mut models, |_| false, optional, drop, || Some(1));
+            }
+            assert_eq!(models, Some(1));
+            assert!(reload.next_try.is_none(), "goes on reloading");
+        }
+
         /// Models that lasted start the backoff over, so a reset hours later waits 1 s again.
         #[test]
         fn models_that_lasted_start_the_backoff_over() {
-            let optional = |_: &i32| true;
-            let mut reload = reload();
+            let optional = |_: &i32| (true, true);
+            let mut reload = Reload::default();
             for _ in 0..5 {
                 reload.backoff.next_delay();
             }
