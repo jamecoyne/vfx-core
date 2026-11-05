@@ -790,9 +790,9 @@ static void case_gpu_wait(void) {
 #endif
 
 #if defined(SEGCAM_CHECKS) && defined(_WIN32)
-/* A CPU effect's output on the GPU, with the loss found by the present and the next call a while
- * later, so that it sets up on a new device in that call: nothing kept from the old device may reach
- * the new one. A panic there fails a render and starts the effect over. */
+/* A CPU effect's output on the GPU, with the loss found by the present: frames go through RAM until
+ * a new device is up, and renders go on across it. A panic there fails a render and starts the effect
+ * over. */
 static void segcam_device_reopen(void) {
     _putenv_s("SEGCAM_GPU", "1");
     _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "30");
@@ -813,10 +813,7 @@ static void segcam_device_reopen(void) {
         /* From the loss on: what the host's render thread waits for through a reopen. */
         if (waited && now() - started > worst_render) worst_render = now() - started;
         _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "");
-        if (!waited && logged_message("shared GPU render failed, using RAM")) {
-            waited = 1;
-            Sleep(1300);
-        }
+        if (!waited && logged_message("shared GPU render failed, using RAM")) waited = 1;
         if (logged_message("shared frames back on a new device")) {
             back_frames++;
             for (int i = 0; i < w * h; i++) if (f.out[i * 4 + 3] > 0) { picture = 1; break; }
