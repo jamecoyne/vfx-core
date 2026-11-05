@@ -21,6 +21,9 @@ static OfxPropertySetHandle temporal(OfxImageClipHandle c, OfxTime t) {
 static OfxImageEffectHandle instance(int mode, int premult) {
     OfxImageEffectHandle e = make_instance(kOfxImageEffectContextFilter);
     set_param(e, "output", mode, 0);
+    set_param(e, "detect", 0, 0);
+    set_param(e, "eyes", 0, 0);
+    set_param(e, "mouth", 0, 0);
     ClipRec *src = clip_find(e, "Source");
     setDouble(src->props, kOfxImageEffectPropFrameRange, 0, 0);
     setDouble(src->props, kOfxImageEffectPropFrameRange, 1, 31);
@@ -206,7 +209,7 @@ int main(int argc, char **argv) {
         int window[4]={0,0,320,180}; setIntN(args,kOfxImageEffectPropRenderWindow,4,window);
         CHECK(action(kOfxImageEffectActionGetFramesNeeded,e,args,needed)==kOfxStatOK,"frames needed failed");
         Prop *range=find(needed,"OfxImageClipPropFrameRange_Source",0);
-        int back=mode==3?75:19;
+        int back=mode==3?75:16;
         CHECK(range && range->dbl[0]==t-back && range->dbl[1]==t,"wrong frame range");
         reads=0;
         CHECK(action(kOfxImageEffectActionRender,e,args,NULL)==kOfxStatOK,"render failed at %d",t);

@@ -1,10 +1,13 @@
-//! Analysis at about 30 a second, as in segcam 1.1: which frames are analysed at a frame rate,
+//! Analysis at about segcam 1.1's rate: which frames are analysed at a frame rate,
 //! what the frames between show, and that a seek back starts the count again.
 
+mod motion_only;
+
+use motion_only::motion_only;
 use segcam_motion::motion::{self, LumaGrid};
 use segcam_motion::render::{copy_scaled, downsample, draw_overlay};
 use segcam_motion::{
-    Argb, Cadence, Detect, OutputMode, RenderSettings, SegcamMotion, SwarmBackground, View,
+    AnalysisStep, Argb, Detect, OutputMode, RenderSettings, SegcamMotion, SwarmBackground, View,
     ViewMut, previous_frames_needed, render,
 };
 use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
@@ -58,24 +61,31 @@ fn cold(s: &RenderSettings, frames: &[Frame], number: usize) -> Frame {
 }
 
 #[test]
-fn about_30_analyses_a_second() {
-    let stride = |rate| Cadence::at(rate).stride;
-    assert_eq!(stride(None), 1);
-    for rate in [23.976, 24.0, 25.0, 29.97, 30.0] {
-        assert_eq!(stride(Some(rate)), 1, "{rate}");
+fn step_at_each_frame_rate() {
+    let every = |rate| AnalysisStep::at(rate).every;
+    assert_eq!(every(None), 1);
+    for rate in [
+        23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 72.0,
+    ] {
+        assert_eq!(every(Some(rate)), 1, "{rate}");
     }
-    for rate in [48.0, 50.0, 59.94, 60.0] {
-        assert_eq!(stride(Some(rate)), 2, "{rate}");
+    for rate in [89.9, 90.0, 96.0, 100.0, 119.88, 120.0, 149.9] {
+        let want = if rate < 90.0 { 1 } else { 2 };
+        assert_eq!(every(Some(rate)), want, "{rate}");
     }
-    assert_eq!(stride(Some(120.0)), 4);
-    assert_eq!(stride(Some(240.0)), Cadence::MAX_STRIDE);
-    assert_eq!(stride(Some(0.0)), 1);
+    for rate in [150.0, 180.0, 209.9] {
+        assert_eq!(every(Some(rate)), 3, "{rate}");
+    }
+    assert_eq!(every(Some(210.0)), AnalysisStep::MAX_EVERY);
+    assert_eq!(every(Some(240.0)), AnalysisStep::MAX_EVERY);
+    assert_eq!(every(Some(480.0)), AnalysisStep::MAX_EVERY);
+    assert_eq!(every(Some(0.0)), 1);
 
-    let at_60 = Cadence::at(Some(60.0));
-    assert_eq!(at_60.analysis(10, 0), 10);
-    assert_eq!(at_60.analysis(11, 0), 10);
+    let at_120 = AnalysisStep::at(Some(120.0));
+    assert_eq!(at_120.analysis_frame(10, 0), 10);
+    assert_eq!(at_120.analysis_frame(11, 0), 10);
     // A clip starting on an odd frame analyses its first.
-    assert_eq!(at_60.analysis(11, 11), 11);
+    assert_eq!(at_120.analysis_frame(11, 11), 11);
 }
 
 /// Between analyses no window spawns, so the swarm holds still.
@@ -88,13 +98,13 @@ fn the_swarm_holds_between_analyses() {
         swarm_background: SwarmBackground::Black,
         ..RenderSettings::default()
     };
-    let at_60 = RenderSettings {
-        cadence: Cadence::at(Some(60.0)),
+    let at_120 = RenderSettings {
+        analysis_step: AnalysisStep::at(Some(120.0)),
         ..s
     };
     for n in [10, 16, 22] {
         assert!(
-            cold(&at_60, &frames, n + 1) == cold(&at_60, &frames, n),
+            cold(&at_120, &frames, n + 1) == cold(&at_120, &frames, n),
             "{n}"
         );
         assert!(cold(&s, &frames, n + 1) != cold(&s, &frames, n), "{n}");
@@ -122,14 +132,14 @@ fn the_oldest_trail_frame_waits_for_its_analysis() {
         swarm_background: SwarmBackground::Black,
         ..RenderSettings::default()
     };
-    let trail = |trail_frames, cadence| RenderSettings {
+    let trail = |trail_frames, analysis_step| RenderSettings {
         trail_frames,
-        cadence,
+        analysis_step,
         ..s
     };
-    let at_60 = Cadence::at(Some(60.0));
-    assert!(as_host(&trail(11, at_60), &frames, n) == as_host(&trail(10, at_60), &frames, n));
-    let every = Cadence::EVERY_FRAME;
+    let at_120 = AnalysisStep::at(Some(120.0));
+    assert!(as_host(&trail(11, at_120), &frames, n) == as_host(&trail(10, at_120), &frames, n));
+    let every = AnalysisStep::EVERY_FRAME;
     assert!(as_host(&trail(11, every), &frames, n) != as_host(&trail(10, every), &frames, n));
 }
 
@@ -140,7 +150,7 @@ fn overlay_shows_the_last_analysis() {
     let frames = crossing(24);
     let s = RenderSettings {
         background_frames: 6,
-        cadence: Cadence::at(Some(59.94)),
+        analysis_step: AnalysisStep::at(Some(119.88)),
         ..RenderSettings::default()
     };
     let grids: Vec<LumaGrid> = frames
@@ -181,9 +191,9 @@ impl FrameSource for Gappy<'_> {
 fn a_missing_analysis_is_stood_in_for() {
     let frames = crossing(24);
     let n = 15;
-    let at = |cadence| RenderSettings {
+    let at = |analysis_step| RenderSettings {
         background_frames: 6,
-        cadence,
+        analysis_step,
         ..RenderSettings::default()
     };
     let without_analysis = |s: &RenderSettings| {
@@ -196,29 +206,29 @@ fn a_missing_analysis_is_stood_in_for() {
         render(s, &mut source, n + 1, n as i64, view);
         out
     };
-    let at_60 = at(Cadence::at(Some(60.0)));
-    let stood_in = without_analysis(&at_60);
+    let at_120 = at(AnalysisStep::at(Some(120.0)));
+    let stood_in = without_analysis(&at_120);
     let grids: Vec<LumaGrid> = frames
         .iter()
-        .map(|f| downsample(&View::from_pixels(f, W, H), at_60.grid_width))
+        .map(|f| downsample(&View::from_pixels(f, W, H), at_120.grid_width))
         .collect();
     // The analyses before it, without the missing one.
     let background: Vec<LumaGrid> = (1..6).rev().map(|k| grids[n - 1 - 2 * k].clone()).collect();
-    let found = motion::detect(&background, &grids[n], &at_60.motion);
+    let found = motion::detect(&background, &grids[n], &at_120.motion);
     let mut want = vec![Argb::default(); (W * H) as usize];
     let mut view = ViewMut::from_pixels(&mut want, W, H);
     copy_scaled(&View::from_pixels(&frames[n], W, H), &mut view, false);
-    draw_overlay(&mut view, &found.blobs, n as i64, &at_60);
+    draw_overlay(&mut view, &found.blobs, n as i64, &at_120);
     assert!(stood_in == want);
-    assert!(stood_in != cold(&at_60, &frames, n));
+    assert!(stood_in != cold(&at_120, &frames, n));
 }
 
-/// Background counts analyses, so the same setting covers the same time: every 2nd frame of a
-/// clip at 60 fps finds what the clip of those frames finds at 30.
+/// Background counts analyses: every 2nd frame of a clip at 120 fps finds what the clip of those
+/// frames finds at 60.
 #[test]
-fn background_covers_the_same_time_at_any_frame_rate() {
+fn background_counts_analyses() {
     let frames = crossing(40);
-    let at_30: Vec<Frame> = frames.iter().step_by(2).cloned().collect();
+    let at_60: Vec<Frame> = frames.iter().step_by(2).cloned().collect();
     let boxes = |s: &RenderSettings, frames: &[Frame], number: usize| {
         let s = RenderSettings {
             labels: false,
@@ -231,25 +241,23 @@ fn background_covers_the_same_time_at_any_frame_rate() {
         ..RenderSettings::default()
     };
     let doubled = RenderSettings {
-        cadence: Cadence::at(Some(60.0)),
+        analysis_step: AnalysisStep::at(Some(120.0)),
         ..s
     };
     for n in [8, 12, 16] {
         assert!(
-            boxes(&doubled, &frames, 2 * n) == boxes(&s, &at_30, n),
+            boxes(&doubled, &frames, 2 * n) == boxes(&s, &at_60, n),
             "{n}"
         );
     }
-    assert_eq!(
-        previous_frames_needed(&doubled) - previous_frames_needed(&s),
-        6
-    );
+    assert_eq!(previous_frames_needed(&s), 6);
+    assert_eq!(previous_frames_needed(&doubled), 13);
 }
 
 /// Renders `frames` through `effect` one at a time, as Resolume and the preview hand them
-/// over, at 60 frames a second.
+/// over, at 120 frames a second.
 fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]) -> Vec<Frame> {
-    let mut values = ParamValues::new(effect.params());
+    let mut values = motion_only(effect.params());
     values
         .set("output", ParamValue::Int(3))
         .expect("output is a choice");
@@ -259,12 +267,12 @@ fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]
     frames
         .iter()
         .map(|frame| {
-            let before = effect.frames_before(&values, Some(60.0));
-            let held = effect.frames_held(&values, Some(60.0));
+            let before = effect.frames_before(&values, Some(120.0));
+            let held = effect.frames_held(&values, Some(120.0));
             history.next(before, held).copy_from_slice(frame);
             let ctx = Context {
                 frame: history.frame_number(),
-                frame_rate: Some(60.0),
+                frame_rate: Some(120.0),
                 ..Context::at(0.0)
             };
             let mut out = vec![Argb::default(); (W * H) as usize];
@@ -279,7 +287,7 @@ fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]
 /// A seek back starts the frame count over, so the analyses fall on the new frames as they
 /// would for a fresh effect.
 #[test]
-fn a_seek_back_starts_the_cadence_again() {
+fn seek_back_restarts_count() {
     let frames = crossing(30);
     let mut effect = SegcamMotion::default();
     let mut history = History::default();
@@ -337,7 +345,7 @@ fn holding_only_the_current_frame_changes_nothing() {
     let frames = crossing(40);
     for output in 0..4 {
         for (trail, max_tiles) in [(60, 100), (12, 3)] {
-            let mut values = ParamValues::new(SegcamMotion::with_gpu(false).params());
+            let mut values = motion_only(SegcamMotion::with_gpu(false).params());
             for (name, value) in [
                 ("output", output),
                 ("background", 4),
@@ -366,7 +374,7 @@ fn holding_only_the_current_frame_changes_nothing() {
 fn a_setting_changed_live_leaves_the_windows_up() {
     let frames = crossing(24);
     let mut effect = SegcamMotion::with_gpu(false);
-    let mut values = ParamValues::new(effect.params());
+    let mut values = motion_only(effect.params());
     values.set("output", ParamValue::Int(3)).expect("a choice");
     values
         .set("background", ParamValue::Int(4))

@@ -1,14 +1,15 @@
 //! Faces run on every 2nd analysis, and the analysis between reuses the faces of the one
-//! before: at 30 fps, even frames run them and odd frames reuse them. Checked on a real portrait
+//! before: below 90 fps, even frames run them and odd frames reuse them. Checked on a real portrait
 //! the face models find, read from the file `SEGCAM_FACE_PORTRAIT` names (a binary PPM, P6, at
 //! most 180 pixels tall); the tests pass with a note when it isn't set.
 #![cfg(not(target_arch = "wasm32"))]
 
+mod motion_only;
 mod portrait;
 
 use portrait::{H, W, drifting, frame, portrait};
 use segcam_motion::{
-    Argb, Cadence, Detect, FaceParts, OutputMode, RenderSettings, SegcamMotion, View, ViewMut,
+    AnalysisStep, Argb, Detect, FaceParts, OutputMode, RenderSettings, SegcamMotion, View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamValue, ParamValues, Processor};
@@ -20,7 +21,7 @@ fn make() -> Processor {
 
 /// Face, eyes and mouth on, with `changes`.
 fn faces_with(changes: &[(&str, ParamValue)]) -> ParamValues {
-    let mut values = ParamValues::new(SegcamMotion::default().params());
+    let mut values = motion_only::motion_only(SegcamMotion::default().params());
     for name in ["face", "eyes", "mouth"] {
         values.set(name, ParamValue::Bool(true)).expect("a toggle");
     }
@@ -47,7 +48,7 @@ fn faces_keep_the_contract() {
         ]),
     ];
     let Some(p) = portrait() else { return };
-    for frame_rate in [None, Some(60.0)] {
+    for frame_rate in [None, Some(120.0)] {
         check(
             make,
             &Clip {
@@ -80,7 +81,7 @@ fn faces_from_a_live_history_match_fresh_renders() {
     ];
     for (params, frame_rate) in sets
         .iter()
-        .flat_map(|p| [(p, None), (p, Some(30.0)), (p, Some(60.0))])
+        .flat_map(|p| [(p, None), (p, Some(60.0)), (p, Some(120.0))])
     {
         let mut kept = SegcamMotion::default();
         let mut history = History::<u8>::default();
@@ -189,12 +190,16 @@ impl FrameSource for Frames<'_> {
 
 /// Faces only, as a box matte: the frame shows through the face boxes alone.
 fn boxes_at(frames: Vec<Option<&[Argb<u8>]>>, number: i64) -> Vec<Argb<u8>> {
-    boxes_every(Cadence::EVERY_FRAME, frames, number)
+    boxes_every(AnalysisStep::EVERY_FRAME, frames, number)
 }
 
-fn boxes_every(cadence: Cadence, frames: Vec<Option<&[Argb<u8>]>>, number: i64) -> Vec<Argb<u8>> {
+fn boxes_every(
+    analysis_step: AnalysisStep,
+    frames: Vec<Option<&[Argb<u8>]>>,
+    number: i64,
+) -> Vec<Argb<u8>> {
     let s = RenderSettings {
-        cadence,
+        analysis_step,
         mode: OutputMode::BoxMatte,
         detect: Detect::FacesOnly,
         faces: FaceParts {
@@ -234,11 +239,11 @@ fn odd_frames_show_the_faces_of_the_frame_before() {
 }
 
 #[test]
-fn at_60_fps_faces_run_on_every_2nd_analysis() {
+fn at_120_fps_faces_run_on_every_2nd_analysis() {
     let Some(p) = portrait() else { return };
     let (left, right) = (frame(&p, 90, 80, None), frame(&p, 230, 80, None));
     let shown = |out: &[Argb<u8>], x: i32| out[(80 * W + x) as usize].alpha == 255;
-    let every_2nd = Cadence { stride: 2 };
+    let every_2nd = AnalysisStep { every: 2 };
     let (l, r) = (Some(left.as_slice()), Some(right.as_slice()));
 
     let own = boxes_every(every_2nd, vec![l, l, r], 8);

@@ -38,8 +38,8 @@ The keys follow the frames: `source` is the rate they arrive from the decoder, w
 are taken or dropped (or `pattern` and `still`), `rendered` the renders the effect finished each second, and
 `screen` the new frames presented in the window each second, where a CPU effect's render
 counts only if its output differs from the last one, and a GPU effect's only if its time or
-parameters changed. segcam's Swarm on a transparent canvas only changes when it analyses,
-every 2nd frame of a 60 fps clip, so there `screen` tops out at 30. `on` says whether the
+parameters changed. segcam's Swarm on a transparent canvas only changes when it analyses.
+`on` says whether the
 effect renders on the CPU or in GPU passes; it can't see what a CPU effect does inside its
 render. For a CPU effect `rendered_ms` and `worst_ms` are a render's mean and longest time
 over the second (the run, on the `done` line); a GPU effect's work ends on the GPU, so it has

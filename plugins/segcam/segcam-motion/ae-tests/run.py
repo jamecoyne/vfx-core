@@ -132,6 +132,9 @@ function build(depth) {
             var layer = comp.layers.add(footage);
             var fx = layer.property("ADBE Effect Parade").addProperty(SPEC.effects[e].match);
             fx.property("Output").setValue(m + 1);
+            fx.property("Detect").setValue(1);
+            fx.property("Eyes").setValue(0);
+            fx.property("Mouth").setValue(0);
             var rq = p.renderQueue.items.add(comp);
             rq.timeSpanStart = 0;
             rq.timeSpanDuration = duration;

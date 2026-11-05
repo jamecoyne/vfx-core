@@ -48,8 +48,8 @@ only** shows just the face and body segments. On Windows the models take about 3
 load the first time, on a thread of their own, then add about 12 ms to a 1080p frame, and the
 plugin ships its own `DirectML.dll`. Once they're up, a line on stderr says which device they
 run on. Resolume and the preview draw without faces until they are
-up; other hosts may be exporting, so their renders wait for the models. As in segcam 1.1, faces run on every 2nd analysis, the even frame numbers at
-30 fps: the analysis between shows the faces of the one before, with their IDs, or finds its
+up; other hosts may be exporting, so their renders wait for the models. As in segcam 1.1, faces run on every 2nd analysis, the even frame numbers
+below 90 fps: the analysis between shows the faces of the one before, with their IDs, or finds its
 own when the host doesn't hand that frame over. The face modes don't run in the web build yet.
 
 ## Parameters
@@ -57,7 +57,7 @@ own when the host doesn't hand that frame over. The face modes don't run in the 
 | | Choices or range | Default |
 | --- | --- | --- |
 | Output | Overlay, Motion matte, Box matte, Swarm | Overlay |
-| Detect | Motion, Threshold, Faces only | Motion |
+| Detect | Motion, Threshold, Faces only | Faces only |
 | Mirror | on or off | off |
 | Sensitivity (Motion) | 0 to 100 percent | 86.4 |
 | Adaptation (Motion) | 0.1 to 50 percent | 6 |
@@ -68,7 +68,8 @@ own when the host doesn't hand that frame over. The face modes don't run in the 
 | Level (Threshold) | 0 to 255 | 170 |
 | Auto level (Threshold) | on or off | off |
 | Invert (Threshold) | on or off | off |
-| Face, Eyes, Mouth, Body (Faces) | on or off each | off |
+| Face, Body (Faces) | on or off each | off |
+| Eyes, Mouth (Faces) | on or off each | on |
 | Boxes (Overlay) | on or off | on |
 | Labels (Overlay) | on or off | on |
 | Box color (Overlay) | red, green, blue | 0.25, 1.0, 0.4 |
@@ -82,7 +83,8 @@ The group is in brackets. Some sliders show a narrower range than the limit.
 ## How it renders
 
 It asks for the frames of the **Background** analyses before the current one, plus **Trail
-frames** - 1 in Swarm mode and 3 in the others (see below), through `CpuEffect::frames_before`.
+frames** - 1 in Swarm mode and what the analysis adds (see below), through
+`CpuEffect::frames_before`.
 It keeps each frame's grid, motion and tiles
 until they age out (`src/incremental.rs`), with a hash of the frame's pixels. A render
 reads each frame it depends on, so an edit upstream reaches it however far back it is, and
@@ -93,14 +95,14 @@ after a pause or a jump. A frame the host couldn't hand over counts as empty for
 and is read again next time. The output is the same in any render order. After Effects still makes
 a new effect per render, so its cache and Multi-Frame Rendering are unchanged.
 
-Like segcam 1.1 it analyses about 30 frames a second. Where the host says the frame rate
-(OpenFX, After Effects, a video in the preview), it analyses every 2nd frame by number at 50
-to 60 fps and every 4th at 120, and the frames between show the last analysis: its boxes and
-IDs, and no new windows. Background counts these analyses, so it covers the same time at any
-frame rate. Resolume says no frame rate, so there every frame is analysed. Outside
-Swarm the 3 extra frames mean the analysis a frame shows is always handed over; when the host
-can't hand it over, the frame analyses itself. With faces on, a render reads 4 frames more, so
-the analysis whose faces it reuses is handed over too.
+Like segcam 1.1 playing a file it comes down to about 60 analyses a second at high frame rates.
+Where the host says the frame rate (OpenFX, After Effects, a video in the preview), it analyses
+the frames whose number divides by round(rate / 60), at most 4: every frame below 90 fps, every
+2nd below 150, every 3rd below 210, every 4th from there. The frames between show the last
+analysis: its boxes and IDs, and no new windows. Background counts these analyses. Resolume says
+no frame rate, so there every frame is analysed. Outside Swarm a render reads back to the
+analysis the frame shows; when the host can't hand it over, the frame analyses itself. With faces
+on, a render reads one analysis more, so the analysis whose faces it reuses is handed over too.
 
 Resolume and the preview hand frames over one at a time and hold only the current one in full
 (`CpuEffect::frames_held`). Earlier frames live on as their grids, segments and the tiles the
@@ -180,8 +182,8 @@ one level apart. The CLI's `--straight-alpha` selects the straight-alpha convent
 `--float` renders the same 8-bit stream with the float core, for the host comparisons.
 
 Three options aren't in segcam's CLI. `--preset 1.1` renders segcam 1.1's look (the
-benchmark's "1.1 look"), `--fps` gives the clip's frame rate, so it analyses about 30 frames a
-second as the plugins do, and `--keep` keeps work between frames as Resolume does, with the
+benchmark's "1.1 look"), `--fps` gives the clip's frame rate, so it analyses as often as the
+plugins do, and `--keep` keeps work between frames as Resolume does, with the
 same output. On the GPU the CLI always keeps it; with `--cpu` and without `--keep` every frame
 is rendered from scratch, as After Effects does.
 

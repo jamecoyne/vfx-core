@@ -3,6 +3,8 @@
 //! binary, since the host's device has to be shared before segcam opens one. Skipped where
 //! there is no hardware adapter.
 
+mod motion_only;
+
 use std::sync::OnceLock;
 
 use segcam_motion::{Argb, SegcamMotion, View};
@@ -68,7 +70,7 @@ impl FrameSource for Frames<'_> {
 }
 
 fn values(pairs: &[(&str, ParamValue)]) -> ParamValues {
-    let mut values = ParamValues::new(SegcamMotion::with_gpu(false).params());
+    let mut values = motion_only::motion_only(SegcamMotion::with_gpu(false).params());
     for &(name, value) in pairs {
         values.set(name, value).expect(name);
     }

@@ -1,6 +1,9 @@
 /* segcam Motion's sequence and timing checks, using the host above. */
 static void segcam_options(void *inst, int mode, int custom) {
     set(inst, "Output", (float)mode);
+    set(inst, "Detect", 0.0f);
+    set(inst, "Eyes", 0.0f);
+    set(inst, "Mouth", 0.0f);
     if (custom) {
         set(inst, "Sensitivity", 90);
         set(inst, "Adaptation", 12.5f);

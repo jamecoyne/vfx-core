@@ -16,7 +16,8 @@ use std::process::ExitCode;
 
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
-    Argb, Cadence, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View, ViewMut,
+    AnalysisStep, Argb, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View,
+    ViewMut,
 };
 use vfx_core::cpu::{FrameSource, Image};
 
@@ -30,7 +31,7 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --grid columns                        (192)
   --trail frames  --max-tiles n         (60, 100)
   --preset 1.1                          (segcam 1.1's look; later options change it)
-  --fps rate                            (the clip's; analyses about 30 a second)
+  --fps rate                            (the clip's; sets how often it analyses)
   --keep                                (keep work between frames on the CPU too)
   --detect motion|threshold|faces       (motion)
   --face  --eyes  --mouth  --body       (off; segcam-face's models)
@@ -114,13 +115,13 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
             "--preset" => {
                 s = match value()? {
                     "1.1" => RenderSettings {
-                        cadence: s.cadence,
+                        analysis_step: s.analysis_step,
                         ..RenderSettings::look_1_1(None)
                     },
                     _ => return None,
                 }
             }
-            "--fps" => s.cadence = Cadence::at(Some(value()?.parse().ok()?)),
+            "--fps" => s.analysis_step = AnalysisStep::at(Some(value()?.parse().ok()?)),
             "--max-tiles" => s.max_tiles = value()?.parse().ok()?,
             "--straight-alpha" => s.straight_alpha = true,
             "--mirror" => s.mirror = true,
