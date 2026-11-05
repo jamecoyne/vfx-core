@@ -100,13 +100,14 @@ pub fn senders() -> Vec<String> {
     SharedView::open(SENDER_NAMES, 0).map_or_else(Vec::new, |view| names_in(view.bytes()))
 }
 
-/// The names in a [`SENDER_NAMES`] section, up to its first empty slot.
+/// The names in a [`SENDER_NAMES`] section. Every slot is read, as Spout's own receivers do: a
+/// sender that isn't Spout's SDK may leave empty slots between names.
 fn names_in(section: &[u8]) -> Vec<String> {
     section
         .as_chunks::<NAME_SLOT>()
         .0
         .iter()
-        .map_while(|slot| {
+        .filter_map(|slot| {
             let name = CStr::from_bytes_until_nul(slot).ok()?;
             (!name.is_empty()).then(|| name.to_string_lossy().into_owned())
         })
@@ -398,9 +399,14 @@ impl Receiver {
             imported.busy[slot].store(false, Ordering::Release);
         }
         // Runs the callbacks that free shared textures whose conversion has finished.
-        let _ = gpu.device.poll(wgpu::PollType::Poll);
+        // Through poll_device: wgpu panics on a poll of a lost device.
+        let _ = vfx_core::poll_device(&gpu.device, wgpu::PollType::Poll);
         let mut state = lock(&self.shared);
-        let link = state.link.as_ref()?;
+        let Some(link) = state.link.as_ref() else {
+            // The sender closed: its shared textures go now, not at the next link.
+            self.imported = None;
+            return None;
+        };
         // A link from before a device change, or one whose import failed: the worker replaces it.
         if link.device_epoch != state.device_epoch || state.import_failed == Some(link.generation) {
             return None;
@@ -795,6 +801,15 @@ impl Worker {
             self.disconnect(Some(format!("Waiting for the Spout sender {}", self.name)));
             return Ok(RETRY);
         };
+        // Spout's CPU share mode publishes no texture and puts the pixels in another section.
+        if info.share_handle == 0 {
+            self.disconnect(Some(format!(
+                "Spout sender {} shares through CPU memory, which the preview doesn't read; set \
+                 the sender to share textures",
+                self.name
+            )));
+            return Ok(RETRY);
+        }
         let published = (info.share_handle, info.width, info.height, info.format);
         let (adapter, device_epoch, import_failed) = {
             let state = lock(&self.shared);
@@ -939,7 +954,8 @@ pub fn sender_size(name: &str, max_side: u32) -> Option<(u32, u32)> {
     Some(fit((info.width, info.height), max_side))
 }
 
-/// The sender's published texture, if it is running.
+/// The sender's published texture, if it is running. A share handle of 0 is Spout's CPU share
+/// mode.
 fn sender_info(name: &CStr) -> Option<SharedTextureInfo> {
     let view = SharedView::open(name, size_of::<SharedTextureInfo>())?;
     // SAFETY: the view maps at least one SharedTextureInfo, which the sender wrote; any bit
@@ -950,7 +966,7 @@ fn sender_info(name: &CStr) -> Option<SharedTextureInfo> {
             .cast::<SharedTextureInfo>()
             .read_unaligned()
     };
-    (info.share_handle != 0 && info.width > 0 && info.height > 0).then_some(info)
+    (info.width > 0 && info.height > 0).then_some(info)
 }
 
 /// DXGI's adapters with their indices.
@@ -1562,19 +1578,19 @@ mod tests {
     }
 
     #[test]
-    fn names_stop_at_the_first_empty_slot() {
-        let bytes = section(&[b"TDSyphonSpoutOut", b"Resolume Arena", b"", b"stale"], 10);
+    fn names_skip_empty_slots() {
+        let bytes = section(&[b"TDSyphonSpoutOut", b"", b"Resolume Arena"], 10);
         assert_eq!(names_in(&bytes), ["TDSyphonSpoutOut", "Resolume Arena"]);
         assert!(names_in(&section(&[], 10)).is_empty());
         assert!(names_in(&[]).is_empty());
     }
 
-    /// A slot with no terminating zero ends the list rather than running into the next slot, and
-    /// bytes that aren't UTF-8 (a sender named in a code page) still give a name.
+    /// A slot with no terminating zero is skipped rather than run into the next slot, and bytes
+    /// that aren't UTF-8 (a sender named in a code page) still give a name.
     #[test]
     fn malformed_slots_are_read_safely() {
         let full = [b'x'; NAME_SLOT];
-        assert!(names_in(&section(&[&full, b"after"], 4)).is_empty());
+        assert_eq!(names_in(&section(&[&full, b"after"], 4)), ["after"]);
         assert_eq!(names_in(&section(&[b"caf\xe9"], 1)), ["caf\u{fffd}"]);
         // A section that ends inside a slot: the partial slot isn't read.
         let mut short = section(&[b"one"], 1);
@@ -1743,7 +1759,7 @@ mod tests {
 
         /// Stops publishing, as a sender that closes does.
         fn close(self) {
-            self.info[..4].fill(0);
+            self.info[..12].fill(0);
         }
     }
 
@@ -1788,6 +1804,29 @@ mod tests {
             [120, 40, 250, 128]
         );
         second.close();
+    }
+
+    /// A sender in Spout's CPU share mode publishes its size with no texture: the panel says so
+    /// rather than waiting for it.
+    #[test]
+    fn cpu_share_mode_is_named() {
+        let (_turn, gpu) = crate::test_gpu();
+        let id = AdapterId::of(&gpu.device.adapter_info());
+        let name = format!("vfx-preview cpu share {}", std::process::id());
+        let sender = TestSender::publish(&name, id, (64, 36), [0, 0, 0, 255]);
+        sender.info[..4].fill(0);
+        let mut receiver = Receiver::start(name, id, 1920);
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(Some(status)) = receiver.status_change()
+                && status.contains("CPU memory")
+            {
+                break;
+            }
+            assert!(Instant::now() < until, "no CPU share status");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        sender.close();
     }
 
     /// A failing GetData, as after a driver reset, ends the wait with an error; a copy that never
