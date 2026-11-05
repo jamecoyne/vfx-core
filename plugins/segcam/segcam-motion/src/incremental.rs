@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
 use vfx_core::cpu::FrameSource;
-use vfx_core::wgpu;
 use vfx_core::{Reading, Report};
 use vfx_plugin::vfx_host::by_rows;
 
@@ -98,12 +97,15 @@ pub struct IncrementalRenderer {
     face_detection_calls: u32,
     /// A host's GPU frame the render may draw into instead of its output.
     target: Option<TargetOffer>,
+    /// The slot this instance draws from, where it isn't the process's.
+    #[cfg(test)]
+    test_slot: Option<&'static gpu::DeviceSlot>,
 }
 
-/// A host's frame on `device`, offered to one render ([`vfx_core::CpuEffect::render_to`]), and
-/// whether the render drew into it.
+/// A host's frame, offered to one render ([`vfx_core::CpuEffect::render_to`]), the record of
+/// the device it's on, and whether the render drew into it.
 struct TargetOffer {
-    device: wgpu::Device,
+    faults: vfx_core::DeviceFaults,
     frame: vfx_core::Frame,
     drawn_into: bool,
 }
@@ -136,6 +138,14 @@ impl IncrementalRenderer {
         if !on {
             self.set_drawer(None);
         }
+    }
+
+    fn device_slot(&self) -> &'static gpu::DeviceSlot {
+        #[cfg(test)]
+        if let Some(slot) = self.test_slot {
+            return slot;
+        }
+        &gpu::SHARED_SLOT
     }
 
     /// Whether Swarm is to draw on the GPU where there is one (see [`Self::use_gpu`]).
@@ -189,7 +199,7 @@ impl IncrementalRenderer {
     pub fn offer_target(&mut self, target: vfx_core::Target<'_>) {
         let f = target.frame;
         self.target = Some(TargetOffer {
-            device: target.gpu.device.clone(),
+            faults: target.gpu.faults(),
             frame: vfx_core::Frame {
                 texture: f.texture.clone(),
                 view: f.view.clone(),
@@ -211,7 +221,7 @@ impl IncrementalRenderer {
     fn can_draw_into_target<C: Channel>(&self, drawer: &Drawer, (w, h): (i32, i32)) -> bool {
         let fits = self.target.as_ref().is_some_and(|offer| {
             (offer.frame.width, offer.frame.height) == (w as u32, h as u32)
-                && drawer.draws_on(&offer.device)
+                && drawer.draws_on(&offer.faults)
         });
         size_of::<C>() == 1 && fits
     }
@@ -251,11 +261,22 @@ impl IncrementalRenderer {
         }
         let mode_uses_gpu =
             s.mode == OutputMode::Swarm || s.mode == OutputMode::Overlay && self.gpu_overlay;
-        // While the device opens, renders draw on the CPU.
-        if self.gpu_wanted && self.drawer.is_none() && mode_uses_gpu && !gpu::opening() {
-            let drawer = gpu::device().and_then(Drawer::new).map(Box::new);
-            self.gpu_wanted = drawer.is_some();
-            self.set_drawer(drawer);
+        // Read first, so a frame offered on a new device doesn't meet a drawer on the lost one.
+        if let Some(why) = self.drawer.as_ref().and_then(|drawer| drawer.loss()) {
+            self.fall_back(&Fault(why));
+        }
+        // While a device opens, or until a lost one's replaced, renders draw on the CPU.
+        if self.gpu_wanted && self.drawer.is_none() && mode_uses_gpu {
+            match self.device_slot().now() {
+                gpu::DeviceNow::Ready(device) => {
+                    if let Some(drawer) = Drawer::new(device) {
+                        self.last_reported_fault = None;
+                        self.set_drawer(Some(Box::new(drawer)));
+                    }
+                }
+                gpu::DeviceNow::Waiting => {}
+                gpu::DeviceNow::Never => self.gpu_wanted = false,
+            }
         }
         let (w, h) = (out.width, out.height);
         let history_format = HistoryFormat {
@@ -646,8 +667,9 @@ impl IncrementalRenderer {
         drawn
     }
 
-    /// Device loss disables the GPU for this instance. Any other fault retries on the next
-    /// render, unless [`gpu::MAX_RECENT_FAULTS`] is reached (cooldown).
+    /// Device loss leaves this instance on the CPU until the slot has another device, whose drawer
+    /// starts with an empty atlas: tiles are in RAM, so the trail goes on. Any other fault retries
+    /// on the next render, unless [`gpu::MAX_RECENT_FAULTS`] is reached (cooldown).
     fn fall_back(&mut self, fault: &Fault) {
         if self.last_reported_fault.as_ref() != Some(&fault.0) {
             eprintln!(
@@ -657,10 +679,7 @@ impl IncrementalRenderer {
             self.last_reported_fault = Some(fault.0.clone());
         }
         match &mut self.drawer {
-            Some(drawer) if drawer.lost() => {
-                self.gpu_wanted = false;
-                self.set_drawer(None);
-            }
+            Some(drawer) if drawer.lost() => self.set_drawer(None),
             Some(drawer) => drawer.record_fault(),
             None => {}
         }
@@ -1066,9 +1085,9 @@ mod tests {
     use super::gpu::gpu_test_lock;
     use std::sync::Arc;
     use std::time::Duration;
+    use vfx_core::wgpu;
 
     use vfx_core::cpu::Image;
-    use vfx_core::wgpu;
 
     use super::*;
     use crate::gpu;
@@ -1611,40 +1630,104 @@ mod tests {
         })
     }
 
-    /// A device lost between renders, as when a driver resets, leaves the instance drawing
-    /// what the CPU draws, and no new instance draws on that device.
+    /// A device lost between renders, as when a driver resets: renders are what the CPU draws
+    /// until the slot has another device, then the GPU's again, on a fresh atlas with the trail
+    /// still there. This loses it by `destroy()`, which goes another way through wgpu than a real
+    /// loss: it shows this code's states, not what a driver does.
     #[test]
-    fn lost_gpu_falls_back_to_the_cpu() {
+    fn lost_gpu_draws_on_the_cpu_and_reopens() {
         let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+        if gpu::open(&choice).is_err() && gpu::open("fallback").is_err() {
+            eprintln!("no adapter: skipped");
+            return;
+        }
+        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(move || {
+            gpu::open(&choice).or_else(|_| gpu::open("fallback"))
+        })));
+        let device = |slot: &'static gpu::DeviceSlot| loop {
+            match slot.now() {
+                gpu::DeviceNow::Ready(dev) => return dev,
+                gpu::DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+                gpu::DeviceNow::Never => panic!("the slot gave up"),
+            }
+        };
+        let first = device(slot);
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
-        let mut on_gpu = on_device(&dev);
-        for n in 0..frames.len() {
-            if n == 7 {
-                assert!(drawn(&on_gpu) > 0, "drawing on the GPU before the loss");
-                let draw = on_gpu.report().draw.expect("a render");
-                assert_eq!(draw, format!("GPU ({})", dev.info.name));
-                dev.device.destroy();
-            }
-            let (a, b) = (
-                render(&mut cpu, &frames, n),
-                render(&mut on_gpu, &frames, n),
-            );
-            assert!(n < 7 || a == b, "frame {n} isn't the CPU's after the loss");
+        let mut on_gpu = IncrementalRenderer {
+            test_slot: Some(slot),
+            ..Default::default()
+        };
+        on_gpu.use_gpu(true);
+        on_gpu.set_gpu_min_coverage(0.0);
+        for n in 0..7 {
+            render(&mut cpu, &frames, n);
+            render(&mut on_gpu, &frames, n);
         }
-        assert_eq!(cpu.report().draw.as_deref(), Some("CPU"));
+        assert!(drawn(&on_gpu) > 0, "drawing on the GPU before the loss");
+        assert_eq!(
+            on_gpu.report().draw,
+            Some(format!("GPU ({})", first.info.name))
+        );
+        first.device.destroy();
+
+        // Right after the loss, and for as long as the slot has no device.
+        let (a, b) = (
+            render(&mut cpu, &frames, 7),
+            render(&mut on_gpu, &frames, 7),
+        );
+        assert!(a == b, "the render after the loss isn't the CPU's");
         assert_eq!(on_gpu.report().draw.as_deref(), Some("CPU"));
-        assert!(dev.lost().is_some(), "the loss went unnoticed");
+        assert!(first.lost().is_some(), "the loss went unnoticed");
         assert!(
             on_gpu.drawer().is_none(),
-            "the instance is still on the GPU"
+            "still drawing on the lost device"
         );
-        assert!(!on_gpu.gpu_wanted, "the instance still looks for a GPU");
+        assert!(gpu::Drawer::new(first.clone()).is_none(), "a drawer on it");
+        assert!(on_gpu.gpu_wanted, "the instance gave up on the GPU");
+
+        let second = device(slot);
         assert!(
-            gpu::Drawer::new(dev).is_none(),
-            "a new instance draws on the lost device"
+            !Arc::ptr_eq(&first, &second),
+            "the slot kept the lost device"
         );
+        assert!(second.lost().is_none());
+        // An instance that was on the GPU comes back to it, and draws the whole trail again.
+        let (a, b) = (
+            render(&mut cpu, &frames, 8),
+            render(&mut on_gpu, &frames, 8),
+        );
+        assert!(drawn(&on_gpu) > 0, "the instance stayed on the CPU");
+        assert_eq!(
+            on_gpu.report().draw,
+            Some(format!("GPU ({})", second.info.name))
+        );
+        assert!(
+            on_gpu.report().gpu_fault.is_none(),
+            "the old fault still shows"
+        );
+        assert!(within_a_level(&a, &b), "the picture after the reopen");
+    }
+
+    /// A first open that fails stays failed: with no adapter the CPU is the machine's path.
+    #[test]
+    fn failed_first_open_leaves_the_cpu_for_good() {
+        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(|| {
+            Err(gpu::NoGpu::NoAdapter("none here".into()))
+        })));
+        let mut on_cpu = IncrementalRenderer {
+            test_slot: Some(slot),
+            ..Default::default()
+        };
+        on_cpu.use_gpu(true);
+        let frames = crossing();
+        for n in 0..3 {
+            render(&mut on_cpu, &frames, n);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        render(&mut on_cpu, &frames, 3);
+        assert!(!on_cpu.gpu_wanted);
     }
 
     /// Hashes from both paths are compared when a host stops streaming.
