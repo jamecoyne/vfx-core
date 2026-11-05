@@ -7,7 +7,7 @@ p=argparse.ArgumentParser()
 p.add_argument("host"); p.add_argument("plugin"); p.add_argument("cli"); p.add_argument("scratch")
 p.add_argument("--quick",action="store_true",help="8 bit only: every mode, row order, alpha and render order")
 a=p.parse_args(); scratch=Path(a.scratch); scratch.mkdir(parents=True,exist_ok=True)
-subprocess.run([a.host,a.plugin,"deliver"],check=True)
+subprocess.run([a.host,a.plugin,"export"],check=True)
 cases=0
 for premult in (0,1):
     raw=bytearray()

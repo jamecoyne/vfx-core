@@ -33,14 +33,14 @@ Status: done (on `main`), PR (written, in review), todo.
 
 | ID | Requirement | Acceptance | Status |
 |---|---|---|---|
-| F1 | Detection finds motion, threshold, faces, eyes, mouths and bodies as the reference does | the CLI renders byte for byte what jamecoyne's C++ CLI renders, in every mode (effect README, "Checking it"); `tests/core.rs` passes | done |
+| F1 | Detection finds motion, threshold, faces, eyes, mouths and bodies as the reference does | the CLI renders byte for byte what jamecoyne's C++ CLI renders, in every mode (`segcam-motion/DEVELOPING.md`, "Checking it"); `tests/core.rs` passes | done |
 | F2 | Output modes Overlay, Motion matte, Box matte and Swarm, with every control in the effect README | each mode renders in all three hosts; Overlay and Swarm compared with the CLI by the mini hosts | done |
 | F3 | In editing hosts a kept render equals a fresh render, in any order, after earlier frames change, with frames missing | `vfx_host::contract::check` passes; OpenFX mini host 144 comparisons identical | done |
 | F4 | While an editing host streams, earlier frames are taken as unchanged; the first render after a pause or jump and the one after it check them. Resolve playback that skips frames doesn't read them | Resolve export of frames 0 to 299 identical to stepping frame by frame ([ADR 3](decisions/0003-editing-promise.md)) | done |
 | F5 | An export's first renders check earlier frames | an edit followed by an immediate export renders the edited frames | done: Resolve 21 sends a one frame begin around every render, so how it starts an export does the check: a step back or a repeat isn't a stream, and the render after that checks too. On Windows (i7-12700K, H.264) and macOS (M4, H.264), one run each, an edit a few seconds before an export matched a fresh start; the replay in `ofx-tests/host.c` covers the orders seen |
 | F6 | A clip keeps its start: frames before the clip's first are never requested or used | Resolve render of a trimmed clip identical to the same frames rendered alone | done |
 | F7 | Faces run on every 2nd analysis, the even host frame numbers (`ctx.frame`) below 90 fps; the analysis between reuses the faces and window IDs of the one before, or runs faces if it isn't available ([ADR 2](decisions/0002-faces-every-2nd-frame.md)). A live source never waits for them: it takes the newest faces finished so far, so they can arrive late | F3 still passes on a face fixture at 60 and 120 fps, with the analysis before missing, shuffled and backwards, for sources that aren't live; a live render returns with the models locked; face cost halved in Resolve and Resolume in the benchmark | done |
-| F8 | Swarm draws on the GPU by default where a hardware GPU exists; each render picks CPU or GPU by the window pixels it draws ([ADR 4](decisions/0004-gpu-by-default.md)) | GPU output within one level of the CPU path, at most 1 pixel in 10,000 off by over half a level, in the 30 offline cases and a lossless Resolve Deliver | done |
+| F8 | Swarm draws on the GPU by default where a hardware GPU exists; each render picks CPU or GPU by the window pixels it draws ([ADR 4](decisions/0004-gpu-by-default.md)) | GPU output within one level of the CPU path, at most 1 pixel in 10,000 off by over half a level, in the 30 offline cases and a lossless Resolve export | done |
 | F9 | No GPU, a failing GPU, or one lost mid render falls back to the CPU path without a wrong frame | the lost device test: every frame after the loss equals the CPU path byte for byte | done |
 | F10 | Overlay draws on the CPU | Overlay output byte for byte with the CLI | done |
 | F11 | Parameter `name`s are frozen from 1.0 | a test listing the shipped `name`s fails if one changes (to add with the tag) | done |
@@ -74,9 +74,9 @@ first full benchmark table. The tiers include the CPU, since faces, decoding and
 | N1 | Resolume, Overlay | 60 fps | 60 fps |
 | N2 | Resolume, Swarm | 30 fps | 60 fps |
 | N3 | Resolume, Swarm with all face parts | 15 fps | 30 fps |
-| N4 | Resolve Deliver, Overlay | 30 renders/s | real time |
-| N5 | Resolve Deliver, Swarm | 15 renders/s | real time |
-| N6 | Resolve Deliver, Swarm with all face parts | 10 renders/s | 24 renders/s |
+| N4 | Resolve export, Overlay | 30 renders/s | real time |
+| N5 | Resolve export, Swarm | 15 renders/s | real time |
+| N6 | Resolve export, Swarm with all face parts | 10 renders/s | 24 renders/s |
 | N7 | Resolve playback | no freeze over 1 s | smooth at half playback resolution |
 | N8 | Resolume over 30 minutes | memory flat, no stall over 100 ms after the first 40 frames | same |
 | N9 | After Effects, `aerender` of the show preset at 8 bit | no slower than 3x jamecoyne's C++ effect on the same machine; MFR on no slower per frame than off | same |

@@ -6,19 +6,27 @@ the subject.
 
 ## Install
 
-Download it from the [releases](https://github.com/jamecoyne/vfx-core/releases), then restart the
-host.
+No release is out yet. To try segcam without installing anything, open the
+[browser build](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion). To use a plugin, build
+it from a clone of this repository, as the
+[developer guide](../../docs/DEVELOPING.md#building-and-running) describes:
 
-| Host | macOS | Windows: copy from the zip | Find it under |
+```bash
+cargo vfx build -p segcam-motion
+```
+
+The plugins land in `target/vfx-plugin`. Install each one as below, then restart the host. On macOS,
+`cargo vfx package -p segcam-motion` makes the two installers first.
+
+| Host | Windows: copy | macOS | Find it under |
 |---|---|---|---|
-| After Effects | `SegcamMotionRust-<version>-macOS-AfterEffects.pkg` | `SegcamMotionRust.aex` to `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore` | Effect, LO.FI.SCI.FI |
-| DaVinci Resolve | `SegcamMotionRust-<version>-macOS-OpenFX.pkg` | `SegcamMotionRust.ofx.bundle` to `C:\Program Files\Common Files\OFX\Plugins` | OpenFX, LO.FI.SCI.FI |
-| Resolume | unzip `SegcamMotionRust-<version>-macOS-Resolume.zip` into `~/Documents/Resolume Avenue/Extra Effects` | `SegcamMotionRust.dll` to `Documents\Resolume Avenue\Extra Effects` | segcam Motion |
+| After Effects | `SegcamMotionRust.aex` to `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore` | open `SegcamMotionRust-adobe.pkg` | Effect, LO.FI.SCI.FI |
+| DaVinci Resolve | `SegcamMotionRust.ofx.bundle` to `C:\Program Files\Common Files\OFX\Plugins` | open `SegcamMotionRust-ofx.pkg` | OpenFX, LO.FI.SCI.FI |
+| Resolume | `SegcamMotionRust.dll` to `Documents\Resolume Avenue\Extra Effects` | `cargo vfx install -p segcam-motion --hosts ffgl` copies it, on Windows too | segcam Motion |
 
 For Resolume Arena, use `Resolume Arena` in the folder name. On Windows, keep `DirectML.dll` next
 to the plugin: faces use it to run on the GPU. The two Program Files folders ask for an
-administrator once. If Windows blocks the zip, right click it, open Properties, tick Unblock and
-press OK before unpacking.
+administrator once.
 
 ## Using it
 
@@ -32,8 +40,8 @@ Add segcam Motion to a clip or layer and pick an **Output**:
 | Swarm | the window collage, newest on top |
 
 **Detect** picks what counts as a section: Motion, Threshold (brighter than **Level**, or darker
-with **Invert**) or Faces only. **Face**, **Eyes**, **Mouth** and **Body** add those. **Mirror**
-flips the picture for a selfie camera. Every control is listed in the
+with **Invert**) or Faces only. **Face**, **Eyes**, **Mouth** and **Body** enable detection of
+those. **Mirror** flips the picture for a selfie camera. Every control is listed in the
 [segcam Motion README](segcam-motion/README.md).
 
 In After Effects, and in Resolve when paused or exporting at normal speed, a frame renders the same
@@ -45,13 +53,13 @@ you pause or jump, and when an export starts.
 
 Integrated graphics from 2020 or later (Intel UHD 770 or Iris Xe, AMD Radeon 680M, any Apple M1 or
 newer) with a 6 core CPU. A discrete GPU from 2019 or later (AMD RX 5700 XT, NVIDIA RTX 2060) or an
-Apple M1 Pro and up runs it comfortably. Swarm draws on the GPU when there is one.
+Apple M1 Pro and up runs it comfortably. Segcam draws on the GPU when there is one.
 
 ## Known limits
 
-- After Effects renders every frame from scratch, so segcam is slower there than in Resolve or
-  Resolume.
-- On Windows, if `DirectML.dll` isn't next to the plugin, faces run on the CPU: still right, just
+- After Effects renders every frame from scratch, which makes segcam slower there than in Resolve
+  or Resolume.
+- On Windows, if `DirectML.dll` isn't next to the plugin, faces run on the CPU. Still works, just
   slower.
 - The browser preview has no faces yet.
 - We recommend keeping Resolve's render cache off for segcam. An export can contain wrong pictures
@@ -67,5 +75,7 @@ Apple M1 Pro and up runs it comfortably. Swarm draws on the GPU when there is on
 
 ## For developers
 
-What segcam 1.0 promises and how it's checked: [SPEC.md](SPEC.md). The work order:
-[ROADMAP.md](ROADMAP.md). How to time it: [BENCHMARK.md](BENCHMARK.md).
+- [segcam spec](SPEC.md)
+- [Roadmap](ROADMAP.md)
+- [Testing performance](BENCHMARK.md)
+- [segcam Motion internals](segcam-motion/DEVELOPING.md)

@@ -34,7 +34,7 @@ How a host hands over frames changes the cost, so each run names its source.
 | Run | Source | Gives |
 |---|---|---|
 | Offline | fixed frames, forward | segcam's own cost |
-| Resolve Deliver | Resolve streaming forward | the editing number |
+| Resolve export | Resolve streaming forward | the editing number |
 | Resolve playback | Resolve, from frame 0, whole clip | renders seen while Resolve skips frames |
 | Resolume | the composition looping the clip, `VFX_FFGL_TIMING=1` | the live number |
 | After Effects | `aerender` with multi frame rendering on | correctness; time is reported, not a target |

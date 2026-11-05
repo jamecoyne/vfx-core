@@ -89,7 +89,7 @@ static void replay_order(int mode, const char *name, const int *order, int n, in
     }
     edit_frames(from,to);
 }
-static int deliver_after_edit(void) {
+static int export_after_edit(void) {
     as_resolve=1;
     setString(host.host,kOfxPropName,0,"DaVinci Resolve");
     for(int t=0;t<32;t++) {
@@ -159,12 +159,12 @@ static int deliver_after_edit(void) {
         REPLAY(late_step_back,0,13);
         REPLAY(late_step_back,15,15);
     }
-    printf("deliver after edit: %d failures\n",failures);
+    printf("export after edit: %d failures\n",failures);
     return failures?1:0;
 }
 /* argv: plugin input output mode depth top premult order, where order is 0 forwards, 1 backwards,
    2 shuffled, 3 every frame cold on a fresh instance. Frames are written in frame order.
-   Or argv: plugin deliver, for deliver_after_edit. */
+   Or argv: plugin export, for export_after_edit. */
 int main(int argc, char **argv) {
     if (argc != 9 && argc != 3) return 2;
     void *lib = open_plugin(argv[1]);
@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
     CHECK(!strcmp(plugin->pluginIdentifier,"com.lofiscifi.SegcamMotionRust"),"wrong identity");
     host.host=props_new(); host.fetchSuite=fetchSuite; plugin->setHost(&host);
     CHECK(action(kOfxActionLoad,NULL,NULL,NULL)==kOfxStatOK,"load failed");
-    if (argc == 3) return deliver_after_edit();
+    if (argc == 3) return export_after_edit();
     int mode=atoi(argv[4]), top=atoi(argv[6]), premult=atoi(argv[7]), order=atoi(argv[8]);
     const char *depth=atoi(argv[5])==8?kOfxBitDepthByte:atoi(argv[5])==16?kOfxBitDepthShort:kOfxBitDepthFloat;
     FILE *in=fopen(argv[2],"rb"), *out=fopen(argv[3],"wb");
