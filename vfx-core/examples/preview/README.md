@@ -1,11 +1,24 @@
 # vfx-preview
 
-The repository's preview: one effect at a time, on a test pattern, an image, a video file
-or a webcam. [docs/DEVELOPING.md](../../../docs/DEVELOPING.md#the-preview) describes it.
+The repository's preview: one effect at a time, on a test pattern, an image, a video file, a
+webcam or, on Windows, a Spout sender. [docs/DEVELOPING.md](../../../docs/DEVELOPING.md#the-preview)
+describes it.
 
 A file dropped on the window opens as the source. In a browser, a drop goes the way of the file
 picker: video only, the first of several files, and anything else leaves the source as it is and
 shows a message.
+
+## Spout
+
+On Windows the input menu lists the Spout senders running, such as TouchDesigner's Spout Out,
+beside the webcams, and the list follows senders as they start and stop. Picking one plays its
+frames through the effect as they arrive. They stay on the GPU when the sender draws on the same
+GPU as the preview. A sender on another GPU still plays: its frames are copied through RAM, and
+the log says so. A sender that closes is waited for, and when it starts again, even at another
+size, it plays again by itself. The sender's texture can be 8 bit RGBA or BGRA, 10 bit RGB, or 16
+or 32 bit float. Frames larger than 1920 pixels across are scaled down to fit, as videos are.
+The Expressions panel's Detect faces box doesn't read a Spout sender yet; an effect that finds
+faces itself, as segcam does, still gives the face variables.
 
 ## Record
 
@@ -40,7 +53,7 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 | `--effect SLUG` | the effect, as `--list` names it |
 | `--mode NAME` | an option of the effect's menu: segcam Motion's Overlay, Motion matte, Box matte or Swarm |
 | `--param NAME=VALUE` | a parameter by its `name`; repeatable. A number, `true` or `false`, an option's name or index, `r,g,b,a`, or `x,y` |
-| `--input SOURCE` | `pattern[:NAME\|N]`, `camera[:NAME\|N]` (part of a webcam's name), or a video or image path |
+| `--input SOURCE` | `pattern[:NAME\|N]`, `camera[:NAME\|N]` (part of a webcam's name), `spout[:NAME]` (a Spout sender by its name or part of it, on Windows; one named in full may start later), or a video or image path |
 | `--size WxH` | the frame size; videos, webcams and stills are fitted into it |
 | `--gpu GPU` | `high`, `low`, or part of an adapter's name; the default is `high`. Effects draw on this device too |
 | `--stats` | the stats bar on stdout, once a second |

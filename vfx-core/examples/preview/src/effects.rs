@@ -667,9 +667,9 @@ impl Effects {
         let _ = video.take_newest(&mut self.layer_pixels);
     }
 
-    /// The source made by [`Effects::start_stream`], for the browser to copy video frames
-    /// into on the GPU.
-    #[cfg(target_arch = "wasm32")]
+    /// The source made by [`Effects::start_stream`], for frames copied in on the GPU: the
+    /// browser's video, a Spout sender's.
+    #[cfg(any(target_arch = "wasm32", windows))]
     pub fn source_frame(&self) -> Option<&Frame> {
         self.loaded_source.as_ref().map(|(_, frame)| frame)
     }

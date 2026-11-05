@@ -143,6 +143,9 @@ pub struct Actions {
     pub import: bool,
     /// Start the camera at this index of `PanelStatus::cameras`.
     pub start_camera: Option<usize>,
+    /// Read the Spout sender at this index of `PanelStatus::senders`.
+    #[cfg(windows)]
+    pub start_sender: Option<usize>,
     #[cfg(not(target_arch = "wasm32"))]
     pub refresh_cameras: bool,
     /// Face tracking was switched on or off.
@@ -174,6 +177,9 @@ pub struct PanelStatus<'a> {
     /// How the last recording ended: saved, discarded or failed.
     pub record_result: Option<&'a str>,
     pub cameras: &'a [String],
+    /// The Spout senders running, on Windows.
+    #[cfg(windows)]
+    pub senders: &'a [String],
     #[cfg(not(target_arch = "wasm32"))]
     pub face_tracking: bool,
     /// Set for video files.
@@ -395,6 +401,8 @@ fn input_box(ui: &mut Ui, c: &mut Controls, status: &PanelStatus, actions: &mut 
                     }
                 }
                 source_items(ui, status, &mut actions.import, &mut actions.start_camera);
+                #[cfg(windows)]
+                sender_items(ui, status, &mut actions.start_sender);
             });
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -454,6 +462,22 @@ fn source_items(ui: &mut Ui, status: &PanelStatus, import: &mut bool, camera: &m
     for (i, name) in status.cameras.iter().enumerate() {
         if ui.selectable_label(false, name.as_str()).clicked() {
             *camera = Some(i);
+        }
+    }
+}
+
+/// The Spout senders' rows of the source menu. A click sets `sender` for the caller to act on.
+#[cfg(windows)]
+fn sender_items(ui: &mut Ui, status: &PanelStatus, sender: &mut Option<usize>) {
+    ui.separator();
+    ui.label(RichText::new("Spout senders").weak());
+    if status.senders.is_empty() {
+        ui.label(RichText::new("No sender running").weak());
+    }
+    for (i, name) in status.senders.iter().enumerate() {
+        let current = status.source_name.and_then(|s| s.strip_prefix("Spout: ")) == Some(name);
+        if ui.selectable_label(current, name.as_str()).clicked() {
+            *sender = Some(i);
         }
     }
 }

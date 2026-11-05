@@ -51,8 +51,13 @@ segcam-face = { path = "../../../plugins/segcam/segcam-face", optional = true }
 [target.'cfg(windows)'.dependencies]
 # A job object, so ffmpeg and ffplay close with the app.
 windows-sys = { version = "0.61.2", features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
-# `--lose-gpu SECONDS:removed`: wgpu's own version, whose D3D12 device it casts.
-windows = { version = "0.62.2", features = ["Win32_Graphics_Direct3D12"] }
+# wgpu's own version. `--lose-gpu SECONDS:removed` casts its D3D12 device, and Spout input
+# (spout.rs) opens senders' textures with D3D11 and shares them with wgpu's device.
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common",
+    "Win32_Security", "Win32_System_Memory", "Win32_System_Threading",
+] }
 
 # The web build (GitHub Pages): WebGPU in the browser, started from JavaScript.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
