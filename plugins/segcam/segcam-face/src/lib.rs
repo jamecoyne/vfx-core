@@ -305,14 +305,16 @@ const LIP_OUTLINE_SCALE: f64 = 1.27;
 /// Finds bodies beside the faces. One thread kept for the process, so finding starts none: see
 /// `on_workers` in vfx-host for why a thread per frame is a problem in a show. It isn't one of the
 /// frame workers, since a detection takes far longer than a band of pixels.
-static BODY_WORKER: std::sync::LazyLock<Option<rayon::ThreadPool>> =
-    std::sync::LazyLock::new(|| {
+static BODY_WORKER: std::sync::LazyLock<Option<rayon::ThreadPool>> = std::sync::LazyLock::new(
+    || {
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "segcam body detection".to_owned())
             .build()
+            .inspect_err(|e| eprintln!("segcam-face: no body detection thread, bodies are found in turn with faces: {e}"))
             .ok()
-    });
+    },
+);
 
 impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
     pub fn new(detector: D, mesh: Option<M>, bodies: Option<B>) -> Self {
@@ -336,28 +338,35 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
                 }
             }
         };
-        match bodies.as_mut().filter(|_| parts.body) {
-            Some(bodies) => {
-                // A body detector's panic costs this frame's bodies, never the faces, and the
-                // detector is kept for the next frame.
-                let mut detect = || {
-                    let detect = std::panic::AssertUnwindSafe(|| bodies.detect(image));
-                    found = std::panic::catch_unwind(detect).unwrap_or_default();
-                };
-                match &*BODY_WORKER {
-                    Some(worker) => worker.in_place_scope(|scope| {
-                        scope.spawn(|_| detect());
-                        find_faces();
-                    }),
-                    None => {
-                        detect();
-                        find_faces();
+        let finding = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match bodies.as_mut().filter(|_| parts.body) {
+                Some(bodies) => {
+                    // A body detector's panic costs this frame's bodies, never the faces, and the
+                    // detector is kept for the next frame.
+                    let mut detect = || {
+                        let detect = std::panic::AssertUnwindSafe(|| bodies.detect(image));
+                        found = std::panic::catch_unwind(detect).unwrap_or_default();
+                    };
+                    match &*BODY_WORKER {
+                        Some(worker) => worker.in_place_scope(|scope| {
+                            scope.spawn(|_| detect());
+                            find_faces();
+                        }),
+                        None => {
+                            detect();
+                            find_faces();
+                        }
                     }
                 }
+                None => find_faces(),
             }
-            None => find_faces(),
-        }
+        }));
+        // The body detector goes back before a face detector's panic carries on to the caller,
+        // which would otherwise lose it for the rest of the process.
         self.bodies = bodies;
+        if let Err(panic) = finding {
+            std::panic::resume_unwind(panic);
+        }
         for body in found {
             self.push(Kind::Body, body.rect);
         }
@@ -550,6 +559,38 @@ mod tests {
         assert_eq!(kinds(segmenter.find(&image, all)), [Kind::Face]);
         assert!(segmenter.bodies.is_some());
         assert_eq!(kinds(segmenter.find(&image, all)), [Kind::Face, Kind::Body]);
+    }
+
+    /// Panics on every run.
+    struct PanickingFaces;
+    impl Detector for PanickingFaces {
+        fn detect(&mut self, _: &Image) -> Vec<Face> {
+            panic!("face detector failed")
+        }
+    }
+
+    #[test]
+    fn a_face_detector_panic_keeps_the_body_detector() {
+        let pixels = [0u8; 4 * 4 * 4];
+        let image = Image {
+            pixels: Pixels::Argb8(&pixels),
+            width: 4,
+            height: 4,
+            stride: 4,
+        };
+        let all = Parts {
+            face: true,
+            eyes: false,
+            mouth: false,
+            body: true,
+        };
+        let mut segmenter =
+            FaceSegmenter::new(PanickingFaces, None::<NoMesh>, Some(PanicsOnce(true)));
+        let finding = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            segmenter.find(&image, all);
+        }));
+        assert!(finding.is_err(), "the face detector's panic was swallowed");
+        assert!(segmenter.bodies.is_some(), "the body detector was lost");
     }
 
     #[test]

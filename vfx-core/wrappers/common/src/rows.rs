@@ -21,22 +21,26 @@ pub fn worker_threads() -> usize {
 /// Threads kept for the life of the process, so that frame work starts none. A thread started per
 /// frame costs a call into every loaded DLL, and NVIDIA's D3D driver keeps a record of each thread
 /// ever started, which adds up over a show. The caller takes a share of the work, so one fewer is
-/// enough. They outlive an effect instance, which pins its plugin binary before its first render.
+/// enough. They outlive any effect instance, so the plugin binary is pinned before they start.
 #[cfg(not(target_arch = "wasm32"))]
 static WORKERS: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
+    crate::pin::pin_module();
     rayon::ThreadPoolBuilder::new()
         .num_threads(worker_threads().saturating_sub(1).max(1))
         .thread_name(|index| format!("vfx-host frame worker {index}"))
         .build()
+        .inspect_err(|e| {
+            eprintln!("vfx-host: no frame workers, frame work runs on one thread: {e}")
+        })
         .ok()
 });
 
 /// Runs `work` on `threads` threads at once, the caller's among them, and returns when all have
 /// finished. `work` takes what's left from a queue of its own, which makes it safe to run in any
 /// number of copies: a busy worker's share falls to the others, and if the workers can't start, the
-/// caller does it all. A band of pixels at a time is the size of work meant here, since instances
-/// share the workers and a caller that's done waits for the copies it queued. On one core, and in
-/// browsers, it runs once on the calling thread.
+/// caller does it all. Every instance in the process shares the workers, and a caller that's done
+/// waits for the copies it queued, so each item `work` takes should be short: a band of rows, or a
+/// tile. On one core, and in browsers, it runs once on the calling thread.
 pub fn on_workers(threads: usize, work: impl Fn() + Sync) {
     #[cfg(not(target_arch = "wasm32"))]
     if threads > 1
