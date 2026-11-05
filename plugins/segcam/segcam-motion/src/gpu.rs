@@ -773,6 +773,12 @@ impl GrowableBuffer {
     }
 }
 
+/// What the tables buffer starts at, ahead of the atlas growing: 46 KB at 1080p with 100 tiles, and
+/// about 100 KB at 4K. Grown later, it would land in the allocator's newest block, the one the
+/// atlas has just taken, and hold that block once the atlas outgrows it (see
+/// [`vfx_core::Gpu::memory_hints`]).
+const TABLE_BUFFER_BYTES: u64 = 256 << 10;
+
 /// Per effect instance GPU state: buffers, atlas, timeouts, fault history.
 pub struct Drawer {
     dev: Arc<GpuContext>,
@@ -839,6 +845,13 @@ impl Drawer {
             .lock()
             .ok()
             .and_then(|mut s| s.take());
+        let mut table_buffer = GrowableBuffer::new("segcam tables", U::STORAGE | U::COPY_DST);
+        let table_bytes = TABLE_BUFFER_BYTES
+            .min(dev.max_binding)
+            .min(dev.device.limits().max_buffer_size);
+        table_buffer
+            .ensure_size(&dev, dev.max_binding, table_bytes)
+            .ok()?;
         let drawer = Self {
             globals: dev.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("segcam globals"),
@@ -855,7 +868,7 @@ impl Drawer {
             frame_buffer: GrowableBuffer::new("segcam frame", U::STORAGE | U::COPY_DST),
             output_buffer: GrowableBuffer::new("segcam output", U::STORAGE | U::COPY_SRC),
             readback_buffer: GrowableBuffer::new("segcam readback", U::MAP_READ | U::COPY_DST),
-            table_buffer: GrowableBuffer::new("segcam tables", U::STORAGE | U::COPY_DST),
+            table_buffer,
             atlas: Arc::new(Mutex::new(
                 preallocated_atlas.unwrap_or_else(|| Atlas::new(&dev)),
             )),
@@ -951,6 +964,12 @@ impl Drawer {
     #[cfg(test)]
     pub(crate) fn small_atlas(&mut self, words: u64) {
         self.atlas = Arc::new(Mutex::new(Atlas::with_words(&self.dev, words)));
+    }
+
+    /// The tables buffer's size.
+    #[cfg(test)]
+    pub(crate) fn table_buffer_bytes(&self) -> u64 {
+        self.table_buffer.buffer.as_ref().map_or(0, |b| b.size())
     }
 
     /// The atlas's size and its free space, in words.

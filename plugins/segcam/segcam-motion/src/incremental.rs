@@ -1597,6 +1597,23 @@ mod tests {
         state.drawer().map_or(0, |d| d.faults)
     }
 
+    /// The tables buffer never moves once made, so it can't land in a block the atlas has just
+    /// taken and hold that block when the atlas outgrows it.
+    #[test]
+    fn renders_leave_the_tables_buffer_as_made() {
+        let _lock = gpu_test_lock();
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut on_gpu = on_device(&dev);
+        let made = on_gpu.drawer().unwrap().table_buffer_bytes();
+        assert!(made > 0);
+        for n in 0..frames.len() {
+            render(&mut on_gpu, &frames, n);
+        }
+        assert!(drawn(&on_gpu) > 0);
+        assert_eq!(on_gpu.drawer().unwrap().table_buffer_bytes(), made);
+    }
+
     /// Whether every channel of `b` is within a level of `a`'s: what the GPU's drawing promises.
     fn within_a_level(a: &[Argb<u8>], b: &[Argb<u8>]) -> bool {
         a.iter().zip(b).all(|(p, q)| {
