@@ -1721,12 +1721,8 @@ mod tests {
             ..Default::default()
         };
         on_cpu.use_gpu(true);
-        let frames = crossing();
-        for n in 0..3 {
-            render(&mut on_cpu, &frames, n);
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        render(&mut on_cpu, &frames, 3);
+        assert!(slot.status().is_err());
+        render(&mut on_cpu, &crossing(), 0);
         assert!(!on_cpu.gpu_wanted);
     }
 

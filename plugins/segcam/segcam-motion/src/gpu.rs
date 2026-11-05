@@ -346,7 +346,7 @@ impl DeviceSlot {
         }
     }
 
-    fn status(&'static self) -> Result<(), NoGpu> {
+    pub(crate) fn status(&'static self) -> Result<(), NoGpu> {
         self.start();
         let mut state = self.state();
         while matches!(*state, SlotState::Opening { replaces: None }) {
