@@ -1553,7 +1553,63 @@ mod tests {
             .iter()
             .map(|t| bytemuck::cast_slice::<_, u8>(&t.pixels)[1])
             .collect();
-        assert_eq!(reds, [50, 200]);
+        assert_eq!(
+            reds,
+            [200, 50],
+            "the face first, cut from the frame it was found in"
+        );
+    }
+
+    /// As segcam 1.1 stacks one analysis, bottom to top: faces and parts, bodies, then motion. The
+    /// labels keep each blob's number, and a reused face has its window already.
+    #[test]
+    fn one_analysis_stacks_as_in_segcam() {
+        use motion::SegmentKind::{Body, EyeLeft, Face, Motion, Mouth};
+        let pixels = vec![Argb::<u8>::default(); (W * H) as usize];
+        let view = View::from_pixels(&pixels, W, H);
+        let blob = |kind, reused_from| motion::Blob {
+            bounds: crate::NormRect {
+                x: 0.1,
+                y: 0.1,
+                w: 0.2,
+                h: 0.2,
+            },
+            kind,
+            reused_from,
+            ..motion::Blob::default()
+        };
+        let motion = Segmentation {
+            blobs: vec![
+                blob(Motion, None),
+                blob(Motion, None),
+                blob(Face, None),
+                blob(EyeLeft, None),
+                blob(Mouth, None),
+                blob(Body, None),
+                blob(Face, Some((3, 0))),
+            ],
+            ..Segmentation::default()
+        };
+        let titles = |reused| {
+            cut_frame_tiles(&motion, Some(&view), None, 4, (W, H), false, reused)
+                .iter()
+                .map(|t| t.title.strip_prefix("LO.FI.SCI.FI ").unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let stack = [
+            "face#4.3",
+            "eye.L#4.4",
+            "mouth#4.5",
+            "body#4.6",
+            "motion#4.1",
+            "motion#4.2",
+        ];
+        assert_eq!(titles(false), stack);
+        assert_eq!(
+            titles(true)[4],
+            "face#3.1",
+            "a reused face stays with the faces"
+        );
     }
 
     /// A render that may be exported doesn't draw without faces: it waits for the models.
