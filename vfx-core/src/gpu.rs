@@ -76,7 +76,7 @@ impl ReopenBackoff {
         delay
     }
 
-    /// Whether the next try should wait for the adapter that was lost, for about 15 s. A reset can
+    /// Whether the next try should wait for the adapter that was lost, for about 30 s. A reset can
     /// hide an adapter for seconds, and a machine with another GPU would otherwise land there and
     /// stay for the night. After that any adapter beats none.
     pub fn same_adapter_only(&self) -> bool {

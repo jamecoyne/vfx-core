@@ -51,6 +51,8 @@ segcam-face = { path = "../../../plugins/segcam/segcam-face", optional = true }
 [target.'cfg(windows)'.dependencies]
 # A job object, so ffmpeg and ffplay close with the app.
 windows-sys = { version = "0.61.2", features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# `--lose-gpu SECONDS:removed`: wgpu's own version, whose D3D12 device it casts.
+windows = { version = "0.62.2", features = ["Win32_Graphics_Direct3D12"] }
 
 # The web build (GitHub Pages): WebGPU in the browser, started from JavaScript.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

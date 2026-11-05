@@ -44,7 +44,11 @@ struct Preview {
     /// `h`: only the picture shows, for a live show.
     panel_hidden: bool,
     /// The shared device's loss has been reported, so nothing draws any more.
+    #[cfg(target_arch = "wasm32")]
     device_lost_reported: bool,
+    /// What opens a new device after a loss, and the outage in progress.
+    #[cfg(not(target_arch = "wasm32"))]
+    reopening: Reopening,
     /// Why a scripted run has to end with an error.
     #[cfg(not(target_arch = "wasm32"))]
     fatal: Option<String>,
@@ -54,6 +58,11 @@ struct Preview {
     /// The output being recorded, while Record is on.
     #[cfg(not(target_arch = "wasm32"))]
     recording: Option<Recording>,
+    /// `--lose-gpu`'s losses still to come, the soonest last, and when they count from.
+    #[cfg(not(target_arch = "wasm32"))]
+    forced_losses: Vec<script::ForcedLoss>,
+    #[cfg(not(target_arch = "wasm32"))]
+    started: Instant,
     /// How the last recording ended (saved, discarded or failed), shown in the Record section.
     record_result: Option<String>,
     /// The output being recorded, while Record is on, and what a recording needs to open its
@@ -144,6 +153,73 @@ async fn pick_adapter(
         .map_err(|e| format!("no GPU adapter: {e}"))
 }
 
+/// The adapter `choice` names and a device on it, with what effects need of it.
+async fn open_device(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+    choice: Option<&str>,
+) -> Result<(wgpu::Adapter, Gpu), String> {
+    let adapter = pick_adapter(instance, surface, choice).await?;
+    // Effects draw on this device, and segcam's atlas grows with the trail: as much of a binding
+    // as the adapter allows, or the atlas stops at wgpu's default.
+    let supported = adapter.limits();
+    let required_limits = wgpu::Limits {
+        max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
+        max_buffer_size: supported.max_buffer_size,
+        ..wgpu::Limits::default()
+    };
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            required_limits,
+            ..wgpu::DeviceDescriptor::default()
+        })
+        .await
+        .map_err(|e| format!("couldn't open the GPU: {e}"))?;
+    Ok((adapter, Gpu::from_parts(device, queue)))
+}
+
+fn surface_config(
+    surface: &wgpu::Surface<'_>,
+    adapter: &wgpu::Adapter,
+    size: winit::dpi::PhysicalSize<u32>,
+) -> wgpu::SurfaceConfiguration {
+    let caps = surface.get_capabilities(adapter);
+    // Browsers offer only non-sRGB canvas formats; egui handles either.
+    let format = caps
+        .formats
+        .iter()
+        .copied()
+        .find(|f| f.is_srgb())
+        .unwrap_or(caps.formats[0]);
+    wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: wgpu::PresentMode::AutoVsync,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: caps.alpha_modes[0],
+        view_formats: vec![],
+        color_space: Default::default(),
+    }
+}
+
+fn new_egui_state(egui: &egui::Context, window: &Window, gpu: &Gpu) -> egui_winit::State {
+    let mut state = egui_winit::State::new(
+        egui.clone(),
+        egui::ViewportId::ROOT,
+        window,
+        Some(window.scale_factor() as f32),
+        None,
+        Some(gpu.device.limits().max_texture_dimension_2d as usize),
+    );
+    // The window's first "focused" event arrives while the GPU is still being set up, before
+    // there's anything to pass it to. Without this egui thinks the window is unfocused, and hides
+    // the text cursor until focus changes again.
+    state.egui_input_mut().focused = window.has_focus();
+    state
+}
+
 /// A video file or webcam and everything that goes with it.
 #[cfg(not(target_arch = "wasm32"))]
 struct Media {
@@ -191,6 +267,25 @@ impl Media {
         }
         Ok(())
     }
+
+    /// Plays again from the start at the end.
+    fn loop_at_end(&mut self, sound_on: bool) -> Result<(), String> {
+        if self.video.ended() {
+            self.seek(0.0, true, sound_on)?;
+        }
+        Ok(())
+    }
+
+    /// The picture looped without a seek. The sound is restarted with it, not looped by ffplay,
+    /// which would drift from the picture over a show.
+    fn restart_sound_after_loop(&mut self, sound_on: bool) {
+        if self.video.take_looped() {
+            self.sound = None;
+            if sound_on {
+                self.sound = video::SoundPlayer::play(&self.video.info, 0.0);
+            }
+        }
+    }
 }
 
 impl Preview {
@@ -200,73 +295,29 @@ impl Preview {
         window: Arc<Window>,
         instance: wgpu::Instance,
         gpu_choice: Option<String>,
+        #[cfg(not(target_arch = "wasm32"))] display: winit::event_loop::OwnedDisplayHandle,
     ) -> Result<Self, String> {
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| format!("couldn't create a surface: {e}"))?;
-        let adapter = pick_adapter(&instance, &surface, gpu_choice.as_deref()).await?;
+        let (adapter, gpu) = open_device(&instance, &surface, gpu_choice.as_deref()).await?;
         #[cfg(not(target_arch = "wasm32"))]
         eprintln!(
             "preview: drawing on {} ({:?})",
             adapter.get_info().name,
             adapter.get_info().backend
         );
-        // Effects draw on this device, and segcam's atlas grows with the trail: as much of a
-        // binding as the adapter allows, or the atlas stops at wgpu's default.
-        let supported = adapter.limits();
-        let required_limits = wgpu::Limits {
-            max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
-            max_buffer_size: supported.max_buffer_size,
-            ..wgpu::Limits::default()
-        };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                required_limits,
-                ..wgpu::DeviceDescriptor::default()
-            })
-            .await
-            .map_err(|e| format!("couldn't open the GPU: {e}"))?;
-        let gpu = Gpu::from_parts(device, queue);
         // Before any effect exists: a CPU effect that opens a device in its first render finds
         // this one, so its frames stay on the device that shows them. Browsers can't open a
         // second device at all.
         gpu.share();
 
-        let size = window.inner_size();
-        let caps = surface.get_capabilities(&adapter);
-        // Browsers offer only non-sRGB canvas formats; egui handles either.
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            color_space: Default::default(),
-        };
+        let config = surface_config(&surface, &adapter, window.inner_size());
+        let format = config.format;
         surface.configure(&gpu.device, &config);
 
         let egui = egui::Context::default();
-        let mut egui_state = egui_winit::State::new(
-            egui.clone(),
-            egui::ViewportId::ROOT,
-            &window,
-            Some(window.scale_factor() as f32),
-            None,
-            Some(gpu.device.limits().max_texture_dimension_2d as usize),
-        );
-        // The window's first "focused" event arrives while the GPU is still being set
-        // up, before there's anything to pass it to. Without this egui thinks the
-        // window is unfocused, and hides the text cursor until focus changes again.
-        egui_state.egui_input_mut().focused = window.has_focus();
+        let egui_state = new_egui_state(&egui, &window, &gpu);
         let mut egui_renderer =
             egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions::default());
 
@@ -292,13 +343,20 @@ impl Preview {
             controls: Controls::default(),
             view: View::default(),
             panel_hidden: false,
+            #[cfg(target_arch = "wasm32")]
             device_lost_reported: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            reopening: Reopening::new(display, gpu_choice),
             #[cfg(not(target_arch = "wasm32"))]
             fatal: None,
             #[cfg(not(target_arch = "wasm32"))]
             layer: Layer::Off,
             #[cfg(not(target_arch = "wasm32"))]
             recording: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            forced_losses: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            started: Instant::now(),
             record_result: None,
             #[cfg(target_arch = "wasm32")]
             web_recording: None,
@@ -585,10 +643,7 @@ impl Preview {
                     self.message = Some(e);
                 }
             }
-            // Loop at the end.
-            if media.video.ended()
-                && let Err(e) = media.seek(0.0, true, self.sound_on)
-            {
+            if let Err(e) = media.loop_at_end(self.sound_on) {
                 self.message = Some(e);
             }
 
@@ -598,14 +653,7 @@ impl Preview {
             {
                 tracker.submit(pixels, media.video.info.size);
             }
-            // The picture looped without a seek. The sound is restarted with it, not looped by
-            // ffplay, which would drift from the picture over a show.
-            if media.video.take_looped() {
-                media.sound = None;
-                if self.sound_on {
-                    media.sound = video::SoundPlayer::play(&media.video.info, 0.0);
-                }
-            }
+            media.restart_sound_after_loop(self.sound_on);
             let position = media.video.position();
             frame_time = position;
             self.variables = modulation::variable_values(
@@ -689,24 +737,32 @@ impl Preview {
     #[cfg(not(target_arch = "wasm32"))]
     fn toggle_record(&mut self) {
         match self.recording.take() {
-            None => {
-                // Per process, so two windows don't share a file.
-                let path = std::env::temp_dir()
-                    .join(format!("vfx-preview-recording-{}.mp4", std::process::id()));
-                let size = self.effects.size();
-                match video::Encoder::record(size, &path) {
-                    Ok(encoder) => {
-                        self.recording = Some(Recording {
-                            encoder,
-                            path,
-                            size,
-                        });
-                        self.record_result = None;
-                    }
-                    Err(e) => self.message = Some(format!("Couldn't start recording: {e}")),
-                }
-            }
+            // Per process, so two windows don't share a file.
+            None => self.start_recording(
+                std::env::temp_dir()
+                    .join(format!("vfx-preview-recording-{}.mp4", std::process::id())),
+                false,
+            ),
             Some(recording) => self.finish_recording(recording),
+        }
+    }
+
+    /// Starts recording into `path`, which is the file itself with `final_path`, or a temporary one
+    /// until the save prompt.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_recording(&mut self, path: std::path::PathBuf, final_path: bool) {
+        let size = self.effects.size();
+        match video::Encoder::record(size, &path) {
+            Ok(encoder) => {
+                self.recording = Some(Recording {
+                    encoder,
+                    path,
+                    size,
+                    final_path,
+                });
+                self.record_result = None;
+            }
+            Err(e) => self.message = Some(format!("Couldn't start recording: {e}")),
         }
     }
 
@@ -716,6 +772,9 @@ impl Preview {
         if let Err(e) = recording.encoder.finish() {
             let _ = std::fs::remove_file(&recording.path);
             self.record_result = Some(format!("Recording failed: {e}"));
+            return;
+        }
+        if recording.final_path {
             return;
         }
         let Some(out) = rfd::FileDialog::new()
@@ -848,50 +907,25 @@ impl Preview {
 
     /// Whether the shared device is lost. Everything shown came through it, so nothing more can
     /// draw and the picture would freeze with no word why: this says so once, where it can be
-    /// seen, stops the sound, keeps what a recording has so far, and ends a scripted run with an
-    /// error.
+    /// seen, and keeps what a recording has so far.
+    #[cfg(target_arch = "wasm32")]
     fn device_lost(&mut self) -> bool {
         let Some(why) = self.gpu.faults().lost() else {
             return false;
         };
         if !std::mem::replace(&mut self.device_lost_reported, true) {
-            let text = format!("The GPU was lost ({why}).");
-            #[cfg(target_arch = "wasm32")]
-            {
-                let mut message = format!("{text} Reload the page.");
-                if let Some(recorder) = self.web_recording.take() {
-                    recorder.finish();
-                    message += " The recording so far goes to your downloads.";
-                }
-                show_startup_message(&message);
+            let mut message = format!("The GPU was lost ({why}). Reload the page.");
+            if let Some(recorder) = self.web_recording.take() {
+                recorder.finish();
+                message += " The recording so far goes to your downloads.";
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let text = format!("{text} Restart the preview to carry on.");
-                self.window.set_title(&format!("VFX Preview: {text}"));
-                eprintln!("preview: {text}");
-                self.media = None;
-                self.layer = Layer::Off;
-                if self.meter.is_some() || self.quiet {
-                    self.fatal = Some(text);
-                    self.run_finished = true;
-                } else {
-                    rfd::MessageDialog::new()
-                        .set_title("VFX Preview")
-                        .set_description(text)
-                        .set_level(rfd::MessageLevel::Error)
-                        .show();
-                    if let Some(recording) = self.recording.take() {
-                        self.finish_recording(recording);
-                    }
-                }
-            }
+            show_startup_message(&message);
         }
         true
     }
 
     /// A draw that survives what a lost device can panic on after its loss was recorded, such as
-    /// a staging buffer in egui, so the next draw can report it. Other panics go on as panics.
+    /// a staging buffer in egui, so the next draw can act on it. Other panics go on as panics.
     fn draw_guarded(&mut self) {
         let drawn = catch_unwind(AssertUnwindSafe(|| self.draw()));
         if let Err(panic) = drawn
@@ -902,10 +936,14 @@ impl Preview {
     }
 
     fn draw(&mut self) {
+        #[cfg(target_arch = "wasm32")]
         if self.device_lost() {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.device_out() {
             // Nothing paces the loop now that nothing presents.
-            #[cfg(not(target_arch = "wasm32"))]
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(OUTAGE_LOOP_WAIT);
             return;
         }
         let now = Instant::now();
@@ -1260,11 +1298,9 @@ fn window_attributes(start: &StartOptions) -> winit::window::WindowAttributes {
     attributes
 }
 
-fn new_wgpu_instance(event_loop: &ActiveEventLoop) -> wgpu::Instance {
+fn new_wgpu_instance(display: winit::event_loop::OwnedDisplayHandle) -> wgpu::Instance {
     #[allow(unused_mut)]
-    let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
-        event_loop.owned_display_handle(),
-    ));
+    let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(display));
     // The pipeline renders to RGBA32F textures, which WebGL can't, so the web build
     // needs WebGPU.
     #[cfg(target_arch = "wasm32")]
@@ -1277,6 +1313,7 @@ fn new_wgpu_instance(event_loop: &ActiveEventLoop) -> wgpu::Instance {
     {
         descriptor.flags =
             (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION).with_env();
+        descriptor.backends = wgpu::Backends::from_env().unwrap_or(descriptor.backends);
     }
     wgpu::Instance::new(descriptor)
 }
@@ -1336,8 +1373,10 @@ impl ApplicationHandler<GpuSetup> for App {
         };
         let setup = Preview::new(
             window,
-            new_wgpu_instance(event_loop),
+            new_wgpu_instance(event_loop.owned_display_handle()),
             self.start.gpu.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            event_loop.owned_display_handle(),
         );
         let proxy = self.proxy.clone();
         let finish = move |result: Result<Preview, String>| {
@@ -1403,7 +1442,11 @@ impl ApplicationHandler<GpuSetup> for App {
             .on_window_event(&preview.window, &event)
             .consumed;
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                #[cfg(not(target_arch = "wasm32"))]
+                preview.keep_recording_from_an_outage();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => preview.resize(size.width, size.height),
             #[cfg(not(target_arch = "wasm32"))]
             WindowEvent::DroppedFile(path) => preview.open(&path, None),
@@ -1414,6 +1457,7 @@ impl ApplicationHandler<GpuSetup> for App {
                     && event.state == ElementState::Pressed
                     && event.logical_key == Key::Named(NamedKey::Escape) =>
             {
+                preview.keep_recording_from_an_outage();
                 event_loop.exit();
             }
             // Space plays and pauses a video, unless a text box has the keyboard.
@@ -1438,6 +1482,7 @@ impl ApplicationHandler<GpuSetup> for App {
                 preview.draw_guarded();
                 #[cfg(not(target_arch = "wasm32"))]
                 if preview.run_finished {
+                    preview.finish_scripted_run();
                     if let Some(why) = preview.fatal.take() {
                         self.failed = Some(why);
                     }
@@ -1463,6 +1508,7 @@ impl ApplicationHandler<GpuSetup> for App {
         if preview.quiet {
             preview.draw_guarded();
             if preview.run_finished {
+                preview.finish_scripted_run();
                 // The loop can draw once more after asking to exit, with nothing left to take.
                 if let Some(why) = preview.fatal.take() {
                     self.failed = Some(why);
@@ -1535,6 +1581,8 @@ struct Recording {
     path: std::path::PathBuf,
     /// The frame size it was started at; ffmpeg needs every frame to be this size.
     size: (u32, u32),
+    /// `--record`: `path` is where it stays, with no save prompt.
+    final_path: bool,
 }
 
 /// A second input for effects that read a layer: a video or webcam fitted to the frame, or
@@ -1621,7 +1669,17 @@ impl Preview {
         if start.stats || start.stop.is_some() {
             self.meter = Some(script::Meter::new(start.stats, start.stop));
         }
+        if let Some(path) = &start.record {
+            self.start_recording(path.clone(), true);
+            if let Some(message) = self.message.take() {
+                return Err(message);
+            }
+        }
         self.quiet = start.quiet;
+        self.forced_losses = start.forced_losses.clone();
+        self.forced_losses
+            .sort_by(|a, b| b.after_seconds.total_cmp(&a.after_seconds));
+        self.started = Instant::now();
         Ok(())
     }
 
@@ -1722,6 +1780,386 @@ impl Preview {
             }
         }
     }
+}
+
+/// How long the loop waits between looks at a device that's out, which is how often it answers
+/// the window's events meanwhile.
+#[cfg(not(target_arch = "wasm32"))]
+const OUTAGE_LOOP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a scripted run waits for a new device: its `--frames` would otherwise never come.
+#[cfg(not(target_arch = "wasm32"))]
+const SCRIPTED_OUTAGE_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What opens a new device after a loss, and how many losses there have been.
+#[cfg(not(target_arch = "wasm32"))]
+struct Reopening {
+    display: winit::event_loop::OwnedDisplayHandle,
+    gpu_choice: Option<String>,
+    backoff: vfx_core::ReopenBackoff,
+    device_opened_at: Instant,
+    /// Whether the device lost was a software one, which is all a new one has to be then too.
+    lost_adapter_info: Option<wgpu::AdapterInfo>,
+    outage: Option<Outage>,
+    losses: u32,
+    forced_losses_fired: u32,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Reopening {
+    fn new(display: winit::event_loop::OwnedDisplayHandle, gpu_choice: Option<String>) -> Self {
+        Self {
+            display,
+            gpu_choice,
+            backoff: Default::default(),
+            device_opened_at: Instant::now(),
+            lost_adapter_info: None,
+            outage: None,
+            losses: 0,
+            forced_losses_fired: 0,
+        }
+    }
+}
+
+/// From a device's loss until the next one opens.
+#[cfg(not(target_arch = "wasm32"))]
+struct Outage {
+    why: String,
+    since: Instant,
+    tries: u32,
+    next_try: Instant,
+    /// The try under way, on its own thread: a driver coming back from a reset can take seconds to
+    /// answer, and the window's events go on meanwhile.
+    opening: Option<std::sync::mpsc::Receiver<Result<OpenedDevice, String>>>,
+}
+
+/// A new device for the window.
+#[cfg(not(target_arch = "wasm32"))]
+struct OpenedDevice {
+    surface: wgpu::Surface<'static>,
+    adapter: wgpu::Adapter,
+    gpu: Gpu,
+}
+
+/// Held while making or releasing a D3D12 device, which can deadlock against another thread doing
+/// the same (see [`segcam_face::d3d12_device_lock`]).
+#[cfg(all(
+    not(any(target_os = "macos", target_arch = "wasm32")),
+    feature = "tracker"
+))]
+fn d3d12_device_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+    Some(segcam_face::d3d12_device_lock())
+}
+
+#[cfg(not(all(
+    not(any(target_os = "macos", target_arch = "wasm32")),
+    feature = "tracker"
+)))]
+fn d3d12_device_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+    None
+}
+
+/// Removes this device, and every other D3D12 user's of the adapter in this process, as a driver
+/// reset would. It touches nothing outside the process.
+#[cfg(windows)]
+fn remove_d3d12_device(device: &wgpu::Device) -> Result<(), String> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Device5;
+    use windows::core::Interface;
+    // SAFETY: the raw device is only used here, to ask for its removal, which every later call on
+    // it has to cope with anyway.
+    unsafe {
+        let hal = device
+            .as_hal::<wgpu::hal::api::Dx12>()
+            .ok_or("--lose-gpu removed: not on D3D12; WGPU_BACKEND=dx12 asks for it")?;
+        let device = hal.raw_device().cast::<ID3D12Device5>();
+        device.map_err(|e| e.to_string())?.RemoveDevice();
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn remove_d3d12_device(_device: &wgpu::Device) -> Result<(), String> {
+    Err("--lose-gpu removed: D3D12 only".into())
+}
+
+/// Reopening the device in place. Native only: a browser's device takes async calls and its canvas
+/// has rules of its own, so the web build says to reload.
+#[cfg(not(target_arch = "wasm32"))]
+impl Preview {
+    /// Whether the device is out, moving the outage on if it is: starts one on a loss, tries for a
+    /// new device on the backoff, and puts a new device in place.
+    fn device_out(&mut self) -> bool {
+        self.force_due_loss();
+        // Some losses only show up in a poll, and the frame's readbacks don't always poll.
+        let _ = vfx_core::poll_device(&self.gpu.device, wgpu::PollType::Poll);
+        if self.reopening.outage.is_none() {
+            let Some(why) = self.gpu.faults().lost() else {
+                return false;
+            };
+            self.start_outage(why);
+        }
+        self.keep_sources_moving();
+        self.try_to_reopen();
+        self.reopening.outage.is_some()
+    }
+
+    /// Fires the next `--lose-gpu` loss once it's due.
+    fn force_due_loss(&mut self) {
+        let due = (self.forced_losses.last())
+            .filter(|loss| self.started.elapsed().as_secs_f64() >= loss.after_seconds)
+            .filter(|_| self.reopening.outage.is_none())
+            .copied();
+        let Some(loss) = due else {
+            return;
+        };
+        self.forced_losses.pop();
+        self.reopening.forced_losses_fired += 1;
+        eprintln!("preview: losing the GPU: {:?}", loss.kind);
+        match loss.kind {
+            script::LossKind::Destroy => self.gpu.device.destroy(),
+            script::LossKind::Removed => {
+                if let Err(e) = remove_d3d12_device(&self.gpu.device) {
+                    self.reopening.forced_losses_fired -= 1;
+                    eprintln!("preview: {e}");
+                }
+            }
+        }
+    }
+
+    /// Says so where it can be seen. Nothing asks anyone anything: a show has nobody to answer.
+    fn start_outage(&mut self, why: String) {
+        self.reopening.losses += 1;
+        let reopening = &mut self.reopening;
+        reopening.backoff.lost(reopening.device_opened_at.elapsed());
+        reopening.lost_adapter_info = Some(self.gpu.device.adapter_info());
+        let delay = reopening.backoff.next_delay();
+        eprintln!("preview: the GPU was lost ({why}); reopening in {delay:?}");
+        self.window
+            .set_title(&format!("VFX Preview: the GPU was lost ({why}), reopening"));
+        let now = Instant::now();
+        reopening.outage = Some(Outage {
+            why,
+            since: now,
+            tries: 0,
+            next_try: now + delay,
+            opening: None,
+        });
+    }
+
+    /// Nothing can show frames, but a file stays in step with its sound and a camera doesn't back
+    /// up. A CPU effect isn't run on them: its input and output are on the device, and rendering on
+    /// a lost device is where the panics are.
+    fn keep_sources_moving(&mut self) {
+        if let Some(media) = &mut self.media {
+            if let Err(e) = media.loop_at_end(self.sound_on) {
+                self.message = Some(e);
+            }
+            self.counts.arrived += media.video.take_arrived_count();
+            let _ = self.effects.take_video_frame(&media.video);
+            media.restart_sound_after_loop(self.sound_on);
+        }
+        if let Layer::Video(video) = &mut self.layer {
+            if video.ended()
+                && let Err(e) = video.seek(0.0, true)
+            {
+                self.message = Some(e);
+            }
+            self.effects.discard_layer_frame(video);
+        }
+    }
+
+    fn try_to_reopen(&mut self) {
+        let Some(outage) = &mut self.reopening.outage else {
+            return;
+        };
+        if let Some(opening) = &outage.opening {
+            use std::sync::mpsc::TryRecvError;
+            let answer = match opening.try_recv() {
+                Ok(answer) => answer,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => Err("opening the device panicked".into()),
+            };
+            outage.opening = None;
+            match answer {
+                Ok(opened) => self.use_new_device(opened),
+                Err(e) => {
+                    let delay = self.reopening.backoff.next_delay();
+                    outage.next_try = Instant::now() + delay;
+                    eprintln!("preview: no new device yet ({e}); next try in {delay:?}");
+                    self.window.set_title(&format!(
+                        "VFX Preview: the GPU was lost ({}), reopening, tried {} times",
+                        outage.why, outage.tries,
+                    ));
+                }
+            }
+        } else if Instant::now() >= outage.next_try {
+            outage.tries += 1;
+            self.start_opening_device();
+        }
+        if (self.meter.is_some() || self.quiet)
+            && let Some(outage) = &self.reopening.outage
+            && outage.since.elapsed() >= SCRIPTED_OUTAGE_LIMIT
+        {
+            self.fatal = Some(format!(
+                "The GPU was lost ({}) and didn't come back in {SCRIPTED_OUTAGE_LIMIT:?}.",
+                outage.why
+            ));
+            self.run_finished = true;
+        }
+    }
+
+    /// A new instance as well as a new device: after a reset the old instance's adapters may be
+    /// stale. The surface is made here, on the window's thread, as macOS requires.
+    fn start_opening_device(&mut self) {
+        let instance = new_wgpu_instance(self.reopening.display.clone());
+        let surface = match instance.create_surface(self.window.clone()) {
+            Ok(surface) => surface,
+            Err(e) => {
+                let delay = self.reopening.backoff.next_delay();
+                eprintln!("preview: no surface yet ({e}); next try in {delay:?}");
+                if let Some(outage) = &mut self.reopening.outage {
+                    outage.next_try = Instant::now() + delay;
+                }
+                return;
+            }
+        };
+        let lost = self.reopening.lost_adapter_info.clone();
+        let choice = (lost.as_ref())
+            .filter(|_| self.reopening.backoff.same_adapter_only())
+            .map(|lost| lost.name.clone())
+            .or_else(|| self.reopening.gpu_choice.clone());
+        let lost_on_hardware = lost.is_none_or(|lost| lost.device_type != wgpu::DeviceType::Cpu);
+        let (answer, opening) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("preview GPU".into())
+            .spawn(move || {
+                let _device_lock = d3d12_device_lock();
+                let opened =
+                    pollster::block_on(open_device(&instance, &surface, choice.as_deref()))
+                        .and_then(|(adapter, gpu)| {
+                            // A reset can hide every other adapter for a moment, and a software one
+                            // would stay for the night.
+                            let info = adapter.get_info();
+                            match lost_on_hardware && info.device_type == wgpu::DeviceType::Cpu {
+                                true => Err(format!("{} draws in software", info.name)),
+                                false => Ok(OpenedDevice {
+                                    surface,
+                                    adapter,
+                                    gpu,
+                                }),
+                            }
+                        });
+                let _ = answer.send(opened);
+            });
+        if let (Ok(_), Some(outage)) = (spawned, &mut self.reopening.outage) {
+            outage.opening = Some(opening);
+        }
+    }
+
+    /// Puts a new device under everything drawn, keeping the source, the settings, the view and the
+    /// recording. The size stays, so Record goes on: ffmpeg's wall clock timestamps hold the last
+    /// picture over the gap.
+    fn use_new_device(&mut self, opened: OpenedDevice) {
+        let OpenedDevice {
+            surface,
+            adapter,
+            gpu,
+        } = opened;
+        let info = adapter.get_info();
+        let old_gpu = std::mem::replace(&mut self.gpu, gpu);
+        // Later readers, as a CPU effect that looks for its next device, find this one.
+        self.gpu.share();
+        // The old surface first: it gives up the window's swap chain, which D3D12 allows one of.
+        self.surface = surface;
+        self.config = surface_config(&self.surface, &adapter, self.window.inner_size());
+        self.surface.configure(&self.gpu.device, &self.config);
+        // egui sends its font atlas once, and the renderer that had it is going. A new context
+        // sends it again, and the old one's memory keeps the panel as it was.
+        let memory = self.egui.memory(|memory| memory.clone());
+        self.egui = egui::Context::default();
+        self.egui.memory_mut(|m| *m = memory);
+        self.egui_state = new_egui_state(&self.egui, &self.window, &self.gpu);
+        let old_renderer = std::mem::replace(
+            &mut self.egui_renderer,
+            egui_wgpu::Renderer::new(
+                &self.gpu.device,
+                self.config.format,
+                egui_wgpu::RendererOptions::default(),
+            ),
+        );
+        self.effects.move_to_device(&self.gpu);
+        self.display_texture = self.egui_renderer.register_native_texture(
+            &self.gpu.device,
+            self.effects.display_view(),
+            wgpu::FilterMode::Linear,
+        );
+        self.display_size = self.effects.size();
+        if let Layer::Still { fed, .. } = &mut self.layer {
+            *fed = None;
+        }
+        drop(old_renderer);
+        retire_device(old_gpu);
+        self.window.set_title("VFX Preview");
+        self.last_frame = Instant::now();
+        self.reopening.device_opened_at = Instant::now();
+        if let Some(outage) = self.reopening.outage.take() {
+            let gap = outage.since.elapsed();
+            let text = format!(
+                "The GPU was lost and came back after {:.1} s.",
+                gap.as_secs_f64()
+            );
+            eprintln!(
+                "preview: reopened on {} ({:?}) after {} ms, {} tries",
+                info.name,
+                info.backend,
+                gap.as_millis(),
+                outage.tries
+            );
+            self.message = Some(text);
+        }
+    }
+
+    /// Quitting while the device is out is the only way out if it never comes back, and the panel
+    /// that stops Record is gone: so the file is finished here. Asks where to keep it as Stop does.
+    fn keep_recording_from_an_outage(&mut self) {
+        if self.reopening.outage.is_some()
+            && let Some(recording) = self.recording.take()
+        {
+            self.finish_recording(recording);
+        }
+    }
+
+    /// Ends a scripted run: finishes its `--record` file, and makes it an error if it lost a device
+    /// nobody asked it to.
+    fn finish_scripted_run(&mut self) {
+        if let Some(recording) = self.recording.take() {
+            self.finish_recording(recording);
+        }
+        let unasked = self
+            .reopening
+            .losses
+            .saturating_sub(self.reopening.forced_losses_fired);
+        if unasked > 0 && (self.meter.is_some() || self.quiet) && self.fatal.is_none() {
+            self.fatal = Some(format!(
+                "The GPU was lost {unasked} times in this run, so its numbers aren't clean."
+            ));
+        }
+    }
+}
+
+/// Drops a lost device off the window's thread: wgpu's queue waits when it drops and panics on
+/// anything but a loss from that wait. If it panics, what's left of the device leaks.
+#[cfg(not(target_arch = "wasm32"))]
+fn retire_device(gpu: Gpu) {
+    let spawned = std::thread::Builder::new()
+        .name("preview GPU retire".into())
+        .spawn(move || {
+            let _device_lock = d3d12_device_lock();
+            if catch_unwind(AssertUnwindSafe(move || drop(gpu))).is_err() {
+                eprintln!("preview: dropping a lost device panicked; it stays allocated");
+            }
+        });
+    drop(spawned);
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
