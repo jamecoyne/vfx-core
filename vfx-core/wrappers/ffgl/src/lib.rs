@@ -169,6 +169,8 @@ struct Instance {
     /// The frame a CPU effect may draw its output into, on the interop's device.
     #[cfg(target_os = "windows")]
     gpu_output_frame: Option<shared::OutputFrame>,
+    /// RAM path renders until the plugin's own device is destroyed, for tests.
+    renders_until_own_device_loss: Option<u32>,
 }
 
 /// `VFX_FFGL_PATH=ram`: every frame through RAM, the zero-copy paths off.
@@ -206,6 +208,28 @@ impl Instance {
             interop_disabled: ram_path_forced(),
             #[cfg(target_os = "windows")]
             gpu_output_frame: None,
+            renders_until_own_device_loss: std::env::var("VFX_FFGL_LOSE_OWN_DEVICE_AFTER")
+                .ok()
+                .and_then(|count| count.parse().ok()),
+        }
+    }
+
+    /// Destroys the plugin's own device once `VFX_FFGL_LOSE_OWN_DEVICE_AFTER`, read when the
+    /// instance is made, has counted down its RAM path renders. A test of the way back from a
+    /// loss: the device's loss callback runs, and this render fails and passes its frame through.
+    fn force_own_device_loss_for_tests(
+        renders_until_loss: &mut Option<u32>,
+        device: &vfx_host::OwnDevice,
+    ) {
+        let Some(renders) = renders_until_loss else {
+            return;
+        };
+        *renders = renders.saturating_sub(1);
+        if *renders == 0 {
+            *renders_until_loss = None;
+            let device = &device.gpu().device;
+            device.destroy();
+            let _ = vfx_core::poll_device(device, vfx_core::wgpu::PollType::wait_indefinitely());
         }
     }
 
@@ -738,7 +762,7 @@ unsafe fn process_gpu(
     // Never waits for a device: until one is open, and while a lost one is replaced, frames pass
     // through.
     let Some(device) = vfx_host::gpu_now(&LOG) else {
-        LOG.note("render path: passing frames through until the plugin's own device is open");
+        LOG.note("render path: passing frames through: no device for the RAM path");
         return pass_through(blit);
     };
 
@@ -752,6 +776,13 @@ unsafe fn process_gpu(
             }
             match unsafe { surface::Interop::new(device.clone(), (w, h)) } {
                 Ok(interop) => instance.interop = Some(interop),
+                // A device lost again since it opened: the next replacement builds the interop.
+                Err(e) if device.lost().is_some() => {
+                    LOG.note(&format!(
+                        "warning: zero-copy path not set up on a lost device, passing frames through: {e}"
+                    ));
+                    return pass_through(blit);
+                }
                 Err(e) => {
                     LOG.note(&format!(
                         "warning: zero-copy path unavailable, using RAM: {e}"
@@ -828,6 +859,7 @@ unsafe fn process_gpu(
         layer: None,
     };
     LOG.note("render path: GPU through RAM (texture readback)");
+    Instance::force_own_device_loss_for_tests(&mut instance.renders_until_own_device_loss, &device);
     let Ok(result) = catch_unwind(AssertUnwindSafe(|| {
         pipeline::run(device.gpu(), device.pool_key, &job)
     })) else {

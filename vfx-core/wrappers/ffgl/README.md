@@ -57,6 +57,9 @@ such as a device short of memory, is tried again after 60 s.
 A GPU effect's RAM path renders on a device of the plugin's own, opened on a background thread:
 until it is open, and while a lost one is replaced, frames pass through unchanged. A failed open
 or a lost device is tried again after 1, 2, 4, 8 and 16 s, then every 30 s.
+On Windows, where frames normally stay on the device shared with OpenGL, a device of the plugin's
+own that opened while sharing was out stays open, with what was prepared on it, after shared
+frames come back.
 
 A frame waits at most 1 s for the GPU (`VFX_FFGL_GPU_WAIT_MS` changes it, for tests). After that
 the instance goes through RAM and tries the shared path again 60 s later, once the GPU has
