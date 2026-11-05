@@ -12,13 +12,14 @@ use crate::render::FaceParts;
 #[cfg(not(target_arch = "wasm32"))]
 mod models {
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{Mutex, MutexGuard, Once, OnceLock};
+    use std::sync::{LazyLock, Mutex, MutexGuard, Once, OnceLock};
     use std::time::Instant;
 
     use segcam_face::{Image, Parts, Pixels, Segmenter};
+    use vfx_core::ReopenBackoff;
 
     pub(super) static MODELS: OnceLock<Mutex<Option<Segmenter>>> = OnceLock::new();
-    static RUNS_ON: OnceLock<String> = OnceLock::new();
+    static RUNS_ON: Mutex<Option<&'static str>> = Mutex::new(None);
 
     /// The models, once they have loaded or failed to. A panic while they ran leaves them usable:
     /// each find starts over, so only that detection's faces are lost, where staying poisoned would
@@ -62,6 +63,11 @@ mod models {
     /// A panic in a broken runtime counts as no models, so [`wait`] and [`ready`] still get an answer.
     fn load() {
         let _device_lock = segcam_face::d3d12_device_lock();
+        let _ = MODELS.set(Mutex::new(new_segmenter()));
+    }
+
+    /// The caller holds the D3D12 device lock.
+    fn new_segmenter() -> Option<Segmenter> {
         let started = Instant::now();
         let segmenter = catch_unwind(AssertUnwindSafe(load_warmed_segmenter)).unwrap_or(None);
         match &segmenter {
@@ -72,16 +78,71 @@ mod models {
                     started.elapsed().as_millis()
                 );
                 let device_name = device.split(" (").next().unwrap_or_default();
-                let _ = RUNS_ON.set(device_name.to_owned());
+                // Once per load, and models load again only after a driver reset.
+                *RUNS_ON.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Box::leak(device_name.to_owned().into_boxed_str()));
             }
             None => eprintln!("segcam Motion: no face models"),
         }
-        let _ = MODELS.set(Mutex::new(segmenter));
+        segmenter
     }
 
     /// "DirectML 0", "CPU" or "Vision", once the models have loaded.
     pub fn runs_on() -> Option<&'static str> {
-        RUNS_ON.get().map(String::as_str)
+        *RUNS_ON.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// When models that stopped working are next to load again: none while they work.
+    #[derive(Default)]
+    pub(super) struct Reload {
+        backoff: ReopenBackoff,
+        next_try: Option<Instant>,
+    }
+
+    impl Reload {
+        /// Drops models whose runs keep failing and loads new ones on the backoff, since a session
+        /// can't outlive its device. The old ones go first: a process has one D3D12 device per
+        /// adapter, and a new session would be handed the removed one while they hold it.
+        pub(super) fn keep_working<T>(
+            &mut self,
+            models: &mut Option<T>,
+            failing: impl Fn(&T) -> bool,
+            release: impl FnOnce(T),
+            load: impl FnOnce() -> Option<T>,
+        ) {
+            if let Some(old) = models.take_if(|m| failing(m)) {
+                eprintln!("segcam Motion: the face models stopped working");
+                release(old);
+                self.next_try = Some(Instant::now() + self.backoff.next_delay());
+            }
+            if self.next_try.is_some_and(|at| Instant::now() >= at) {
+                *models = load();
+                self.next_try = match models {
+                    Some(_) => None,
+                    None => Some(Instant::now() + self.backoff.next_delay()),
+                };
+            }
+        }
+    }
+
+    /// See [`Reload::keep_working`]. The caller holds the models' lock.
+    pub(super) fn keep_working(models: &mut Option<Segmenter>) {
+        static RELOAD: LazyLock<Mutex<Reload>> = LazyLock::new(Default::default);
+        RELOAD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keep_working(
+                models,
+                Segmenter::failing,
+                |old| {
+                    let _device_lock = segcam_face::d3d12_device_lock();
+                    let _ = catch_unwind(AssertUnwindSafe(move || drop(old)));
+                },
+                || {
+                    let _device_lock = segcam_face::d3d12_device_lock();
+                    new_segmenter()
+                },
+            );
     }
 
     /// The best segmenter after a first run, since Vision loads its own models on its first
@@ -106,6 +167,35 @@ mod models {
             segmenter.find(&image, all);
         }
         Some(segmenter)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Reload;
+
+        /// Models that keep failing go at once, and new ones load, retrying until they do.
+        #[test]
+        fn failing_models_are_replaced() {
+            let mut reload = Reload::default();
+            let mut models = Some(1);
+            reload.keep_working(&mut models, |_| false, drop, || panic!("models work"));
+            assert_eq!(models, Some(1));
+
+            let mut released = None;
+            reload.keep_working(&mut models, |_| true, |old| released = Some(old), || None);
+            assert_eq!(released, Some(1));
+            assert_eq!(models, None, "loaded before the backoff");
+
+            reload.next_try = Some(std::time::Instant::now());
+            reload.keep_working(&mut models, |_| true, drop, || None);
+            assert_eq!(models, None);
+            assert!(reload.next_try.is_some(), "a failed load gave up");
+
+            reload.next_try = Some(std::time::Instant::now());
+            reload.keep_working(&mut models, |_| true, drop, || Some(2));
+            assert_eq!(models, Some(2));
+            assert!(reload.next_try.is_none());
+        }
     }
 }
 
@@ -418,6 +508,7 @@ fn find_in<C: Channel>(
     let Some(mut slot) = models::lock() else {
         return Vec::new();
     };
+    models::keep_working(&mut slot);
     let Some(segmenter) = slot.as_mut() else {
         return Vec::new();
     };

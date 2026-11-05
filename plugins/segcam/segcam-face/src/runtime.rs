@@ -277,6 +277,9 @@ fn time_runs(
 /// and compete with the render for its cores. Detection runs no less often with these.
 const CPU_THREADS: usize = 2;
 
+/// Failed runs in a row that mean a session has stopped working, not that one frame went wrong.
+const FAILED_RUNS_IN_A_ROW: u32 = 3;
+
 fn session(model: &[u8], device: Device) -> ort::Result<Session> {
     // ONNX Runtime allows one environment per process, and threads load models side by side.
     static ENVIRONMENT: OnceLock<Result<Environment, String>> = OnceLock::new();
@@ -312,6 +315,7 @@ pub struct OrtYuNet {
     pub score_threshold: f32,
     pub nms_threshold: f32,
     pub max_faces: usize,
+    failed_runs: u32,
 }
 
 const YUNET_MAPS: [&str; 12] = [
@@ -338,6 +342,7 @@ impl OrtYuNet {
             score_threshold: 0.6,
             nms_threshold: 0.3,
             max_faces: 4,
+            failed_runs: 0,
         };
         detector.run()?;
         Ok(detector)
@@ -361,11 +366,17 @@ impl Detector for OrtYuNet {
             return Vec::new();
         };
         let Ok(outputs) = self.run() else {
+            self.failed_runs += 1;
             return Vec::new();
         };
+        self.failed_runs = 0;
         let maps: [&[f32]; 12] = std::array::from_fn(|i| outputs[i].as_slice());
         let (score, nms, max) = (self.score_threshold, self.nms_threshold, self.max_faces);
         yunet::faces(&maps, image, scale, score, nms, max)
+    }
+
+    fn failing(&self) -> bool {
+        self.failed_runs >= FAILED_RUNS_IN_A_ROW
     }
 }
 
@@ -377,6 +388,7 @@ pub struct OrtPicoDet {
     pub nms_threshold: f32,
     /// People covering more of the frame than this are left out as close-ups.
     pub max_area: f64,
+    failed_runs: u32,
 }
 
 impl OrtPicoDet {
@@ -388,6 +400,7 @@ impl OrtPicoDet {
             score_threshold: 0.4,
             nms_threshold: 0.5,
             max_area: 0.6,
+            failed_runs: 0,
         };
         detector.run()?;
         Ok(detector)
@@ -412,8 +425,10 @@ impl BodyDetector for OrtPicoDet {
             return Vec::new();
         }
         let Ok(outputs) = self.run() else {
+            self.failed_runs += 1;
             return Vec::new();
         };
+        self.failed_runs = 0;
         let maps: [&[f32]; 8] = std::array::from_fn(|i| outputs[i].as_slice());
         picodet::bodies(
             &maps,
@@ -421,6 +436,10 @@ impl BodyDetector for OrtPicoDet {
             self.nms_threshold,
             self.max_area,
         )
+    }
+
+    fn failing(&self) -> bool {
+        self.failed_runs >= FAILED_RUNS_IN_A_ROW
     }
 }
 
