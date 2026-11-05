@@ -76,6 +76,13 @@ impl ReopenBackoff {
         delay
     }
 
+    /// Whether the next try should wait for the adapter that was lost, for about 15 s. A reset can
+    /// hide an adapter for seconds, and a machine with another GPU would otherwise land there and
+    /// stay for the night. After that any adapter beats none.
+    pub fn same_adapter_only(&self) -> bool {
+        self.tries <= 4
+    }
+
     /// A device was lost after `lived`.
     pub fn lost(&mut self, lived: Duration) {
         if lived >= Self::STABLE_AFTER {
@@ -235,6 +242,18 @@ mod tests {
         let mut backoff = ReopenBackoff::default();
         let delays: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
         assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
+    }
+
+    #[test]
+    fn backoff_waits_for_the_same_adapter_through_the_short_delays() {
+        let mut backoff = ReopenBackoff::default();
+        let same: Vec<bool> = (0..7)
+            .map(|_| {
+                backoff.next_delay();
+                backoff.same_adapter_only()
+            })
+            .collect();
+        assert_eq!(same, [true, true, true, true, false, false, false]);
     }
 
     #[test]

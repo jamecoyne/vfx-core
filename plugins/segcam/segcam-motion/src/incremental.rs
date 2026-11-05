@@ -1642,7 +1642,7 @@ mod tests {
             eprintln!("no adapter: skipped");
             return;
         }
-        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(move || {
+        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(move |_| {
             gpu::open(&choice).or_else(|_| gpu::open("fallback"))
         })));
         let device = |slot: &'static gpu::DeviceSlot| loop {
@@ -1713,7 +1713,7 @@ mod tests {
     /// A first open that fails stays failed: with no adapter the CPU is the machine's path.
     #[test]
     fn failed_first_open_leaves_the_cpu_for_good() {
-        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(|| {
+        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(|_| {
             Err(gpu::NoGpu::NoAdapter("none here".into()))
         })));
         let mut on_cpu = IncrementalRenderer {

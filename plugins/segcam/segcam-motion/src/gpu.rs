@@ -235,7 +235,7 @@ pub enum DeviceNow {
 
 /// The device every instance draws with.
 pub(crate) static SHARED_SLOT: LazyLock<DeviceSlot> =
-    LazyLock::new(|| DeviceSlot::new(|| open(&adapter_choice())));
+    LazyLock::new(|| DeviceSlot::new(|adapter| open_on(&adapter_choice(), adapter)));
 
 enum SlotState {
     Unopened,
@@ -260,20 +260,26 @@ enum SlotState {
 /// One device for every instance, replaced after a loss. Opening goes on a background thread:
 /// making a device and compiling its pipelines would stall a render.
 pub(crate) struct DeviceSlot {
-    open: Box<dyn Fn() -> Result<GpuContext, NoGpu> + Send + Sync>,
+    /// Opens a device, on the adapter with this name if one is given.
+    open: OpenDevice,
     state: Mutex<SlotState>,
     backoff: Mutex<ReopenBackoff>,
+    /// The name of the adapter of the last device of segcam's own that was lost.
+    lost_adapter: Mutex<Option<String>>,
     answered: Condvar,
 }
 
+type OpenDevice = Box<dyn Fn(Option<&str>) -> Result<GpuContext, NoGpu> + Send + Sync>;
+
 impl DeviceSlot {
     pub(crate) fn new(
-        open: impl Fn() -> Result<GpuContext, NoGpu> + Send + Sync + 'static,
+        open: impl Fn(Option<&str>) -> Result<GpuContext, NoGpu> + Send + Sync + 'static,
     ) -> Self {
         Self {
             open: Box::new(open),
             state: Mutex::new(SlotState::Unopened),
             backoff: Mutex::new(ReopenBackoff::default()),
+            lost_adapter: Mutex::new(None),
             answered: Condvar::new(),
         }
     }
@@ -284,6 +290,10 @@ impl DeviceSlot {
 
     fn backoff(&self) -> std::sync::MutexGuard<'_, ReopenBackoff> {
         self.backoff.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lost_adapter(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.lost_adapter.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// What to draw on now; moves the slot on when a device is lost or a try is due.
@@ -301,7 +311,10 @@ impl DeviceSlot {
                 // A host's replacement is taken as soon as there is one.
                 let delay = match device.host_shared {
                     true => Duration::ZERO,
-                    false => self.backoff().next_delay(),
+                    false => {
+                        *self.lost_adapter() = Some(device.info.name.clone());
+                        self.backoff().next_delay()
+                    }
                 };
                 retire(device.clone());
                 *state = SlotState::Lost {
@@ -365,7 +378,10 @@ impl DeviceSlot {
             #[cfg(not(target_arch = "wasm32"))]
             let _device_lock = (!adapter_choice().is_empty() || vfx_core::Gpu::shared().is_none())
                 .then(segcam_face::d3d12_device_lock);
-            self.publish(open_with_atlas(&self.open));
+            let adapter = (self.backoff().same_adapter_only())
+                .then(|| self.lost_adapter().clone())
+                .flatten();
+            self.publish(open_with_atlas(&self.open, adapter.as_deref()));
         };
         #[cfg(not(target_arch = "wasm32"))]
         let spawned = std::thread::Builder::new()
@@ -420,11 +436,9 @@ fn host_device_usable() -> bool {
 
 /// Opens a device with `open` and builds its first atlas. A driver panic counts as a failed GPU, so
 /// waiters aren't left blocked.
-fn open_with_atlas(
-    open: &(dyn Fn() -> Result<GpuContext, NoGpu> + Send + Sync),
-) -> Result<Arc<GpuContext>, NoGpu> {
+fn open_with_atlas(open: &OpenDevice, adapter: Option<&str>) -> Result<Arc<GpuContext>, NoGpu> {
     catch_unwind(AssertUnwindSafe(|| {
-        let dev = Arc::new(open()?);
+        let dev = Arc::new(open(adapter)?);
         if let Ok(mut preallocated_atlas) = dev.preallocated_atlas.lock() {
             *preallocated_atlas = Some(Atlas::new(&dev));
         }
@@ -463,8 +477,14 @@ fn retire(device: Arc<GpuContext>) {
 #[cfg(target_arch = "wasm32")]
 fn retire(_device: Arc<GpuContext>) {}
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
+    open_on(choice, None)
+}
+
+/// A device, on the adapter named `lost_adapter` where there is one to go back to.
+#[cfg(not(target_arch = "wasm32"))]
+fn open_on(choice: &str, lost_adapter: Option<&str>) -> Result<GpuContext, NoGpu> {
     // A host that shows frames from the GPU shares the device they're on, so the swarm can draw
     // its output there. An adapter asked for by name still gets a device of its own.
     if choice.is_empty()
@@ -483,7 +503,10 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
             _ => Ok(dev),
         };
     }
-    let adapter = pick_adapter(choice)?;
+    let adapter = match lost_adapter {
+        Some(name) => adapter_named(name)?,
+        None => pick_adapter(choice)?,
+    };
     let info = adapter.get_info();
     // The atlas grows with the trail: take as much of a binding as the adapter allows.
     let supported = adapter.limits();
@@ -510,15 +533,30 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn pick_adapter(choice: &str) -> Result<wgpu::Adapter, NoGpu> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+fn new_instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         // The D3D12 validation layer changes what DirectML finds in the same process, so it
         // is on only with WGPU_VALIDATION=1.
         flags: (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION)
             .with_env(),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
+    })
+}
+
+/// The adapter called `name`, if it's back.
+#[cfg(not(target_arch = "wasm32"))]
+fn adapter_named(name: &str) -> Result<wgpu::Adapter, NoGpu> {
+    let instance = new_instance();
+    pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY))
+        .into_iter()
+        .find(|adapter| adapter.get_info().name == name)
+        .ok_or_else(|| NoGpu::NoAdapter(format!("{name} isn't back")))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_adapter(choice: &str) -> Result<wgpu::Adapter, NoGpu> {
+    let instance = new_instance();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: match choice {
             "low" => wgpu::PowerPreference::LowPower,
@@ -600,7 +638,7 @@ fn on_shared(gpu: vfx_core::Gpu) -> GpuContext {
 
 // Browsers can't wait for a device inside a render, so this draws on the one the host shared.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn open(_choice: &str) -> Result<GpuContext, NoGpu> {
+fn open_on(_choice: &str, _lost_adapter: Option<&str>) -> Result<GpuContext, NoGpu> {
     let gpu =
         vfx_core::Gpu::shared().ok_or_else(|| NoGpu::NoAdapter("the host shared no GPU".into()))?;
     Ok(on_shared(gpu))
@@ -1935,12 +1973,43 @@ mod tests {
         assert!(atlas_accepts_writes(&atlas, &dev), "the atlas is invalid");
     }
 
+    /// A try after a loss asks for the adapter that was lost.
+    #[test]
+    fn a_new_device_is_asked_for_on_the_lost_adapter() {
+        let _lock = gpu_test_lock();
+        let choice = adapter_choice();
+        if open(&choice).is_err() && open("fallback").is_err() {
+            eprintln!("no adapter: skipped");
+            return;
+        }
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let told = asked.clone();
+        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |adapter| {
+            told.lock().unwrap().push(adapter.map(str::to_owned));
+            open(&choice).or_else(|_| open("fallback"))
+        })));
+        let device = || loop {
+            match slot.now() {
+                DeviceNow::Ready(dev) => return dev,
+                DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+                DeviceNow::Never => panic!("the slot gave up"),
+            }
+        };
+        let first = device();
+        first.device.destroy();
+        let _ = vfx_core::poll_device(&first.device, wgpu::PollType::wait_indefinitely());
+        let name = first.info.name.clone();
+        let second = device();
+        assert!(second.lost().is_none());
+        assert_eq!(*asked.lock().unwrap(), [None, Some(name)]);
+    }
+
     /// A panic while the device opens, as a broken driver can cause, answers that the GPU
     /// failed instead of leaving every caller waiting.
     #[test]
     fn panic_while_opening_is_a_failed_gpu() {
         let slot: &'static DeviceSlot =
-            Box::leak(Box::new(DeviceSlot::new(|| panic!("a broken driver"))));
+            Box::leak(Box::new(DeviceSlot::new(|_| panic!("a broken driver"))));
         match slot.status() {
             Err(NoGpu::Failed(e)) => assert!(e.contains("a broken driver"), "{e}"),
             other => panic!("not a failed GPU: {other:?}"),
