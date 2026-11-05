@@ -150,7 +150,7 @@ impl Default for RenderSettings {
             motion: MotionSettings::default(),
             threshold: ThresholdSettings::default(),
             faces: FaceParts::default(),
-            background_frames: 16,
+            background_frames: 64,
             grid_width: 192,
             mirror: false,
             boxes: true,

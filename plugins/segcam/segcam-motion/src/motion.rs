@@ -308,8 +308,8 @@ pub struct Motion {
 /// segcam's segmenter adapts its background frame by frame forever, which a renderer that can
 /// be asked for any frame in any order cannot do. Here the background is rebuilt for every
 /// frame from the `history` grids before it (oldest first): seeded with the oldest, then
-/// adapted through the rest exactly as segcam does. Only what came before the window is lost:
-/// at adaptation 0.06 segcam's background still holds 0.94^16 ≈ 37% of 16 frames ago.
+/// adapted through the rest exactly as segcam does. The seed keeps the weight of everything
+/// older, so at adaptation 0.06 that one frame holds 39% after 16 grids and 2% after 64.
 ///
 /// Grids that are not the current grid's shape are skipped. With no usable history there is
 /// nothing to compare against and nothing moves: segcam's "first frame is only a reference".

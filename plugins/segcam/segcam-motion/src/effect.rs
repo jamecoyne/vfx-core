@@ -26,10 +26,10 @@ pub const PARAMS: &[ParamSpec] = &[
         .group("Motion")
         .unit(Unit::Percent)
         .slider(0.1, 25.0),
-    ParamSpec::int("background", 1, 120, 16)
+    ParamSpec::int("background", 1, 120, 64)
         .label("Background")
         .group("Motion")
-        .slider(1.0, 60.0),
+        .slider(1.0, 120.0),
     ParamSpec::float("min_size", 0.0, 25.0, 0.25)
         .label("Minimum size")
         .group("Motion")
