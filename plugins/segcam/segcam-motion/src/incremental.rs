@@ -1188,6 +1188,39 @@ mod tests {
         assert!(render(&mut kept, &frames, 13) == fresh);
     }
 
+    /// A host handing over a picture again makes no new windows: the picture after repeats is the
+    /// one without them, and rendering a repeat shows what the frame before it showed.
+    #[test]
+    fn repeated_frames_add_nothing() {
+        let frames = crossing();
+        let s = swarm_settings();
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let play = |repeats: usize| {
+            let mut state = IncrementalRenderer::default();
+            let mut history = vfx_core::cpu::History::<u8>::default();
+            history.resize(W, H);
+            let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+            for frame in &frames {
+                let mut shown = None;
+                for _ in 0..=repeats {
+                    history.next(needed, 0).copy_from_slice(frame);
+                    history.drop_repeat();
+                    let count = history.len();
+                    let number = history.frame_number();
+                    let view = &mut ViewMut::from_pixels(&mut out, W, H);
+                    state.render_frame(&s, &mut history, count, number, view);
+                    assert!(
+                        shown.is_none_or(|shown| shown == out),
+                        "a repeat changed the picture"
+                    );
+                    shown = Some(out.clone());
+                }
+            }
+            out
+        };
+        assert!(play(3) == play(0));
+    }
+
     /// A frame whose faces would come from the one before looks for itself if that was dropped.
     #[test]
     fn dropped_face_source_leaves_frame_to_detect() {

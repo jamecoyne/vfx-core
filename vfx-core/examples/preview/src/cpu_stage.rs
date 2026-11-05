@@ -160,6 +160,7 @@ impl CpuStage {
                             };
                         }
                     });
+                    self.history.drop_repeat();
                 });
                 self.reader = Some(reader);
             }
@@ -168,6 +169,7 @@ impl CpuStage {
                 if !pixels.is_empty() && self.last_time != Some(time) {
                     self.next_history_frame(time, values, frame_rate)
                         .copy_from_slice(pixels);
+                    self.history.drop_repeat();
                 }
             }
         }

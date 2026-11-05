@@ -543,6 +543,7 @@ unsafe fn process_cpu(
             cpu.history.next(frames_before, frames_held),
         )
     };
+    cpu.history.drop_repeat();
     let read_time = started.elapsed();
     let ctx = Context {
         frame: cpu.history.frame_number(),
