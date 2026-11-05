@@ -249,8 +249,8 @@ fn open_shared_device() {
             let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
             // Wrapping a host's device creates none, so it needn't wait behind the face trial.
             #[cfg(not(target_arch = "wasm32"))]
-            let _turn = (!choice.is_empty() || vfx_core::Gpu::shared().is_none())
-                .then(segcam_face::device_turn);
+            let _device_lock = (!choice.is_empty() || vfx_core::Gpu::shared().is_none())
+                .then(segcam_face::d3d12_device_lock);
             open_and_publish(&DEVICE, || open(&choice));
         };
         #[cfg(not(target_arch = "wasm32"))]

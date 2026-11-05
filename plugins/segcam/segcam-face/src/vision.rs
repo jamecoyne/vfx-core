@@ -90,7 +90,6 @@ unsafe extern "C" {
 /// Turns Vision's faces, landmarks and people into segments.
 #[derive(Default)]
 pub struct VisionSegmenter {
-    next_number: u64,
     segments: Vec<Segment>,
     bgra: Vec<u8>,
 }
@@ -101,12 +100,7 @@ impl VisionSegmenter {
         AnyClass::get(c"VNDetectFaceLandmarksRequest").is_some()
     }
 
-    /// Numbers faces after `last` from now on, so numbers stay unique across segmenters.
-    pub fn continue_after(&mut self, last: u64) {
-        self.next_number = self.next_number.max(last);
-    }
-
-    /// The `parts` in `image`: each face and then its parts, then the bodies, each with a new number.
+    /// The `parts` in `image`: each face and then its parts, then the bodies.
     pub fn find(&mut self, image: &Image, parts: Parts) -> &[Segment] {
         self.segments.clear();
         let faces = parts.face || parts.eyes || parts.mouth;
@@ -118,9 +112,8 @@ impl VisionSegmenter {
         for face in &found.faces {
             self.push_face(face, parts);
         }
-        for &(rect, score) in &found.bodies {
-            self.next_number += 1;
-            self.push(Kind::Body, rect, score);
+        for &rect in &found.bodies {
+            self.push(Kind::Body, rect);
         }
         &self.segments
     }
@@ -140,9 +133,8 @@ impl VisionSegmenter {
     }
 
     fn push_face(&mut self, face: &VisionFace, parts: Parts) {
-        self.next_number += 1;
         if parts.face {
-            self.push(Kind::Face, padded(face.rect, FACE_PADDING), face.score);
+            self.push(Kind::Face, padded(face.rect, FACE_PADDING));
             if let Some(pushed) = self.segments.last_mut() {
                 pushed.detected = Some(face.rect);
             }
@@ -154,17 +146,15 @@ impl VisionSegmenter {
         ];
         for (wanted, kind, points, padding) in regions {
             if wanted && !points.is_empty() {
-                self.push(kind, padded_part(points, padding), face.score);
+                self.push(kind, padded_part(points, padding));
             }
         }
     }
 
-    fn push(&mut self, kind: Kind, rect: Rect, score: f32) {
+    fn push(&mut self, kind: Kind, rect: Rect) {
         self.segments.push(Segment {
             kind,
-            number: self.next_number,
             rect,
-            score,
             detected: None,
             landmarks: None,
         });
@@ -184,18 +174,7 @@ fn padded(r: Rect, padding: f64) -> Rect {
 
 /// The bounding box of `points`, padded, then grown to the minimum part size about its centre.
 fn padded_part(points: &[(f64, f64)], padding: f64) -> Rect {
-    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    for &(x, y) in points {
-        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
-    }
-    let bounds = Rect {
-        x: x0,
-        y: y0,
-        w: x1 - x0,
-        h: y1 - y0,
-    }
-    .clamped();
-    let r = padded(bounds, padding);
+    let r = padded(Rect::bounding(points.iter().copied()).clamped(), padding);
     let (w, h) = (r.w.max(MIN_PART), r.h.max(MIN_PART));
     Rect {
         x: r.x - (w - r.w) / 2.0,
@@ -208,7 +187,6 @@ fn padded_part(points: &[(f64, f64)], padding: f64) -> Rect {
 
 struct VisionFace {
     rect: Rect,
-    score: f32,
     left_eye: Vec<(f64, f64)>,
     right_eye: Vec<(f64, f64)>,
     outer_lips: Vec<(f64, f64)>,
@@ -217,7 +195,7 @@ struct VisionFace {
 #[derive(Default)]
 struct Found {
     faces: Vec<VisionFace>,
-    bodies: Vec<(Rect, f32)>,
+    bodies: Vec<Rect>,
 }
 
 /// Vision's box, flipped to a top-left origin.
@@ -302,7 +280,7 @@ fn detect(bgra: &mut [u8], width: usize, height: usize, faces: bool, bodies: boo
     })
 }
 
-unsafe fn read_bodies(request: &AnyObject) -> Vec<(Rect, f32)> {
+unsafe fn read_bodies(request: &AnyObject) -> Vec<Rect> {
     // SAFETY: results is an NSArray of VNHumanObservation.
     unsafe {
         let results: Option<Retained<AnyObject>> = msg_send![request, results];
@@ -315,8 +293,7 @@ unsafe fn read_bodies(request: &AnyObject) -> Vec<(Rect, f32)> {
                 let body: Option<Retained<AnyObject>> = msg_send![&results, objectAtIndex: i];
                 let body = body?;
                 let b: CGRect = msg_send![&body, boundingBox];
-                let score: f32 = msg_send![&body, confidence];
-                Some((flipped(b), score))
+                Some(flipped(b))
             })
             .collect()
     }
@@ -336,7 +313,6 @@ unsafe fn read_faces(request: &AnyObject, width: f64, height: f64) -> Vec<Vision
                 let face: Option<Retained<AnyObject>> = msg_send![&results, objectAtIndex: i];
                 let face = face?;
                 let b: CGRect = msg_send![&face, boundingBox];
-                let score: f32 = msg_send![&face, confidence];
                 let landmarks: Option<Retained<AnyObject>> = msg_send![&face, landmarks];
                 let region = |name: &str| -> Vec<(f64, f64)> {
                     let Some(landmarks) = &landmarks else {
@@ -366,7 +342,6 @@ unsafe fn read_faces(request: &AnyObject, width: f64, height: f64) -> Vec<Vision
                 };
                 Some(VisionFace {
                     rect: flipped(b),
-                    score,
                     left_eye: region("leftEye"),
                     right_eye: region("rightEye"),
                     outer_lips: region("outerLips"),
