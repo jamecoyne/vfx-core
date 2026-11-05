@@ -276,7 +276,7 @@ impl Incremental {
             grid_width: s.grid_width,
         };
         if self.canvas != Some(canvas) {
-            self.reset();
+            self.clear_history();
             self.canvas = Some(canvas);
         }
         let swarm = s.mode == OutputMode::Swarm;
@@ -301,7 +301,7 @@ impl Incremental {
                 current = image.and_then(C::view).map(|v| fingerprint(&v));
             });
             if current.is_none_or(|print| self.prints.get(&number).is_some_and(|k| *k != print)) {
-                self.reset();
+                self.clear_history();
             }
         }
         // The frames before this one whose pixels the source no longer has.
@@ -713,12 +713,18 @@ impl Incremental {
         Ok(())
     }
 
-    pub fn reset(&mut self) {
+    /// Forgets every frame. Dropping the cuts returns their atlas space; the drawer stays, with
+    /// its buffers, its atlas at the size it grew to, and its record of GPU faults and refusals.
+    pub fn clear_history(&mut self) {
         self.grids.clear();
         self.prints.clear();
         self.motion.clear();
         self.tiles.clear();
         self.cuts.clear();
+        self.unfinished = false;
+        if let Some(gpu) = &mut self.gpu {
+            gpu.drop_unfinished_draw();
+        }
     }
 
     /// Whether `frame` has its motion and, for the swarm, its tiles.
@@ -1400,6 +1406,43 @@ mod tests {
         let with_pixels = tiles.iter().filter(|t| !t.pixels.is_empty()).count();
         assert!(tiles.len() > 2, "the clip spawned too few tiles");
         assert!(with_pixels <= 2, "{with_pixels} tiles keep their pixels");
+    }
+
+    /// A clip loop must not cost the atlas it grew or the drawer's buffers.
+    #[test]
+    fn clear_history_keeps_drawer_and_frees_atlas() {
+        let _lock = gpu_test_lock();
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut drawer = gpu::Drawer::on(dev.clone()).expect("a drawer on a working device");
+        let first_words = 1024;
+        drawer.small_atlas(first_words);
+        let mut on_gpu = Incremental::default();
+        on_gpu.use_drawer(drawer);
+        on_gpu.gpu_threshold(0.0);
+        for n in 0..frames.len() {
+            render(&mut on_gpu, &frames, n);
+        }
+        let drawer = on_gpu.gpu().expect("a drawer");
+        let (drawer_address, grown_words) = (drawer as *const gpu::Drawer, drawer.atlas_words().0);
+        assert!(grown_words > first_words, "the atlas never grew");
+
+        on_gpu.clear_history();
+        let drawer = on_gpu.gpu().expect("a drawer");
+        assert_eq!(drawer as *const gpu::Drawer, drawer_address);
+        assert_eq!(drawer.atlas_words(), (grown_words, grown_words));
+
+        let drawn_before = drawn(&on_gpu);
+        let mut cpu = Incremental::default();
+        for n in 0..frames.len() {
+            let (a, b) = (
+                render(&mut cpu, &frames, n),
+                render(&mut on_gpu, &frames, n),
+            );
+            assert!(within_a_level(&a, &b), "frame {n} is off the CPU's");
+        }
+        assert_eq!(drawn(&on_gpu), drawn_before + frames.len() as u64);
+        assert_eq!(on_gpu.gpu().expect("a drawer").atlas_words().0, grown_words);
     }
 
     /// An atlas too small for the trail draws the renders it can't hold on the CPU, and the

@@ -63,9 +63,23 @@ impl CpuStage {
     /// Starts over for a new source, whose first frame may have the time of the last one here.
     pub fn restart(&mut self) {
         self.history.clear();
-        self.effect.reset();
+        self.effect.clear_history();
         self.last_time = None;
         self.rendered_with = None;
+    }
+
+    /// Follows a new frame size, keeping the effect and its GPU resources.
+    pub fn resize(&mut self, gpu: &Gpu, size: (u32, u32)) {
+        self.restart();
+        let pixels = size.0 as usize * size.1 as usize;
+        self.history.resize(size.0 as i32, size.1 as i32);
+        self.size = size;
+        self.rendered = vec![Argb::default(); pixels];
+        self.rendering = Duration::ZERO;
+        self.shown = Vec::new();
+        self.upload = vec![0; pixels * 4];
+        self.output = Frame::new(gpu, size.0, size.1, wgpu::TextureFormat::Rgba8Unorm);
+        self.reader = None;
     }
 
     pub fn output(&self) -> &Frame {
@@ -85,8 +99,7 @@ impl CpuStage {
         frame_rate: Option<f64>,
     ) -> &mut [Argb<u8>] {
         if self.last_time.is_some_and(|last| time < last) {
-            self.history.clear();
-            self.effect.reset();
+            self.restart();
         }
         self.last_time = Some(time);
         self.rendered_with = None;

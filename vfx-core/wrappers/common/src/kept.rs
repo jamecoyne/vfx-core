@@ -4,9 +4,9 @@
 //! instance by a host that can keep one (OpenFX, FFGL, the preview), and made fresh for every
 //! render otherwise, as After Effects must for its cache and Multi-Frame Rendering. Either way
 //! the output must be what a fresh effect renders from the same frames; [`crate::contract`]
-//! checks that for an effect. A kept effect is made again after a render that panicked, which
-//! can leave it half updated, and on [`CpuInstance::reset`], which a host calls when its frames
-//! stop following on (a seek back, a new size).
+//! checks that for an effect. A host calls [`CpuInstance::clear_history`] when its frames stop
+//! following on (a seek back, a clip loop, a new size), which keeps the effect's GPU resources.
+//! A render that panicked can leave the effect half updated, so the effect is made again.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
@@ -88,7 +88,7 @@ impl CpuInstance {
             self.with(|e| e.render(frames, count, output, values, ctx))
         }));
         rendered.map_err(|_| {
-            self.reset();
+            self.rebuild();
             Panicked
         })
     }
@@ -109,7 +109,7 @@ impl CpuInstance {
             self.with(|e| e.render_to(frames, count, output, target, values, ctx))
         }));
         rendered.map_err(|_| {
-            self.reset();
+            self.rebuild();
             Panicked
         })
     }
@@ -127,8 +127,15 @@ impl CpuInstance {
         }
     }
 
-    /// Drops what the kept effect worked out.
-    pub fn reset(&self) {
+    /// Makes the kept effect forget earlier frames (see [`CpuEffect::clear_history`]), rebuilding
+    /// it only if it can't.
+    pub fn clear_history(&self) {
+        if self.kept.is_some() && !self.with(|e| e.clear_history()) {
+            self.rebuild();
+        }
+    }
+
+    fn rebuild(&self) {
         if let Some(kept) = &self.kept {
             let mut effect = kept.lock().unwrap_or_else(|poisoned| {
                 kept.clear_poison();
@@ -214,10 +221,10 @@ mod tests {
         let kept = CpuInstance::new(make, true).expect("a CPU effect");
         assert!(kept.is_kept());
         assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
-        // A panic starts over, and so does a reset.
+        // A panic rebuilds, and so does clearing history for an effect that can't do it in place.
         assert_eq!(render(&kept), Err(Panicked));
         assert_eq!(render(&kept), Ok(1));
-        kept.reset();
+        kept.clear_history();
         assert_eq!(render(&kept), Ok(1));
 
         let fresh = CpuInstance::new(make, false).expect("a CPU effect");
@@ -225,5 +232,53 @@ mod tests {
         let before = MADE.load(Ordering::SeqCst);
         assert_eq!((render(&fresh), render(&fresh)), (Ok(1), Ok(1)));
         assert!(MADE.load(Ordering::SeqCst) >= before + 2, "made per render");
+    }
+
+    #[derive(Default)]
+    struct ClearsInPlace {
+        renders: u8,
+    }
+
+    static MADE_CLEARS_IN_PLACE: AtomicUsize = AtomicUsize::new(0);
+
+    impl CpuEffect for ClearsInPlace {
+        fn params(&self) -> &[ParamSpec] {
+            &[]
+        }
+        fn keeps_state(&self) -> bool {
+            true
+        }
+        fn clear_history(&mut self) -> bool {
+            self.renders = 0;
+            true
+        }
+        fn render(
+            &mut self,
+            _frames: &mut dyn FrameSource,
+            _count: usize,
+            output: ImageMut<'_>,
+            _values: &ParamValues,
+            _ctx: &Context,
+        ) {
+            self.renders += 1;
+            if let ImageMut::U8(mut out) = output {
+                out.row_mut(0)[0].alpha = self.renders;
+            }
+        }
+    }
+
+    fn make_clears_in_place() -> Processor {
+        MADE_CLEARS_IN_PLACE.fetch_add(1, Ordering::SeqCst);
+        Processor::Cpu(Box::new(ClearsInPlace::default()))
+    }
+
+    #[test]
+    fn clear_history_keeps_effect_that_clears_in_place() {
+        let kept = CpuInstance::new(make_clears_in_place, true).expect("a CPU effect");
+        assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
+        let made = MADE_CLEARS_IN_PLACE.load(Ordering::SeqCst);
+        kept.clear_history();
+        assert_eq!(render(&kept), Ok(1));
+        assert_eq!(MADE_CLEARS_IN_PLACE.load(Ordering::SeqCst), made);
     }
 }

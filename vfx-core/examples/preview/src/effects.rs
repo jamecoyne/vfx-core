@@ -406,12 +406,6 @@ impl Effects {
         }
     }
 
-    /// Starts the effect afresh, forgetting anything it carries between frames (a
-    /// feedback trail, segcam's history). Also done on every size or effect change.
-    pub fn reset(&mut self, gpu: &Gpu) {
-        self.stage = Stage::new(gpu, self.stage.effect, self.frames.size);
-    }
-
     /// How many extra layers the shown effect reads.
     pub fn layers(&self) -> usize {
         self.stage.layers
@@ -451,7 +445,10 @@ impl Effects {
             {
                 self.readback = None;
             }
-            self.reset(gpu);
+            match &mut self.stage.run {
+                Run::Cpu(stage) => stage.resize(gpu, size),
+                Run::Gpu { .. } => self.stage = Stage::new(gpu, self.stage.effect, size),
+            }
         }
     }
 
