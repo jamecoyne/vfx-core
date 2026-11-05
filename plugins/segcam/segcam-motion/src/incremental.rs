@@ -2126,7 +2126,7 @@ mod tests {
         assert!(slot.status().is_err());
         render(&mut on_cpu, &crossing(), 0);
         assert!(on_cpu.gpu_wanted, "the first failure was final");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + gpu::FIRST_OPEN_TEST_DEADLINE;
         while !matches!(slot.next_first_open_try(), gpu::DeviceNow::Never) {
             assert!(
                 std::time::Instant::now() < deadline,

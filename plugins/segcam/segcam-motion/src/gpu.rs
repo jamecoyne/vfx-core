@@ -197,7 +197,8 @@ pub fn adapter_choice() -> String {
 /// Why there is no GPU to draw on.
 #[derive(Clone, Debug)]
 pub enum NoGpu {
-    /// No adapter, software ones left out: the CPU is the path for this machine.
+    /// No adapter, software ones left out. Once a first open's retries are spent, the CPU is the
+    /// path for this machine.
     NoAdapter(String),
     /// There is one, but making its device or drawing on it failed.
     Failed(String),
@@ -216,8 +217,9 @@ impl std::fmt::Display for NoGpu {
     }
 }
 
-/// Whether there is a working GPU, or why not. Waits for the first open. After a loss it answers
-/// that the GPU failed, without waiting for another device.
+/// Whether there is a working GPU, or why not. Waits for the first open. A first open that fails
+/// answers its reason at once, and a later call can answer `Ok` once a retry opens a device. After
+/// a loss it answers that the GPU failed, without waiting for another device.
 pub fn status() -> Result<(), NoGpu> {
     SHARED_SLOT.status()
 }
@@ -249,6 +251,12 @@ pub(crate) static SHARED_SLOT: LazyLock<DeviceSlot> =
 /// and the last answer after these tries is final. A browser's tries would run inside a render,
 /// and its device is the host's, which the host replaces itself: there the first answer is final.
 const FIRST_OPEN_RETRIES: u32 = if cfg!(target_arch = "wasm32") { 0 } else { 5 };
+
+/// How long a test waits on first open tries with a mock open. A try takes the D3D12 device lock
+/// before it opens anything, and a face test in the same process can hold that lock while its
+/// models load.
+#[cfg(test)]
+pub(crate) const FIRST_OPEN_TEST_DEADLINE: Duration = Duration::from_secs(60);
 
 enum SlotState {
     Unopened,
@@ -417,7 +425,7 @@ impl DeviceSlot {
     /// answers what `now` says then. Waits for a try in flight to answer first.
     #[cfg(test)]
     pub(crate) fn next_first_open_try(&'static self) -> DeviceNow {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + FIRST_OPEN_TEST_DEADLINE;
         loop {
             match &mut *self.state() {
                 SlotState::RetryingFirstOpen { .. } | SlotState::Opening { .. } => {}
@@ -2164,7 +2172,7 @@ mod tests {
             panic!("a driver reset")
         })));
         assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + FIRST_OPEN_TEST_DEADLINE;
         while !matches!(slot.next_first_open_try(), DeviceNow::Never) {
             assert!(Instant::now() < deadline, "the slot never gave up");
         }
