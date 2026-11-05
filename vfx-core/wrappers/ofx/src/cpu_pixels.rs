@@ -121,21 +121,27 @@ pub unsafe fn decode<C: Channel>(image: &Image, canvas: Rect) -> Vec<Argb<C>> {
 /// `image` must describe a live host image.
 pub unsafe fn decode_into<C: Channel>(image: &Image, canvas: Rect, out: &mut Vec<Argb<C>>) {
     let r = canvas.intersect(&image.bounds);
-    out.clear();
+    // Whatever `out` held stays until its row runs: only pixels off the image need clearing, and
+    // clearing a whole frame first costs about as much as converting it.
     out.resize(canvas.width() * canvas.height(), Argb::default());
     let byte_lut: [C; 256] = std::array::from_fn(|v| C::from_unit(v as f32 / 255.0));
     let shared = SharedRows(image);
     let skip = (r.x1 - canvas.x1).max(0) as usize;
     by_rows(out, canvas.width(), |row, pixels| {
         let y = canvas.y2 - 1 - row as i32;
-        if (r.y1..r.y2).contains(&y) {
-            let pixels = &mut pixels[skip..skip + r.width()];
-            let image = shared.image();
-            // SAFETY: the intersection confines the row to the host image, read by this
-            // thread alone.
-            let src = unsafe { row_bytes(image, r.x1, y, pixels.len()) };
-            decode_row(src, image.depth, pixels, &byte_lut);
+        if r.is_empty() || !(r.y1..r.y2).contains(&y) {
+            pixels.fill(Argb::default());
+            return;
         }
+        let (before, rest) = pixels.split_at_mut(skip);
+        let (pixels, after) = rest.split_at_mut(r.width());
+        before.fill(Argb::default());
+        after.fill(Argb::default());
+        let image = shared.image();
+        // SAFETY: the intersection confines the row to the host image, read by this
+        // thread alone.
+        let src = unsafe { row_bytes(image, r.x1, y, pixels.len()) };
+        decode_row(src, image.depth, pixels, &byte_lut);
     });
 }
 
@@ -225,6 +231,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A host image of `depth`, all zero but for `bytes`, on `bounds`.
+    fn host_image(bytes: &mut [u8], bounds: Rect, depth: Depth) -> Image {
+        Image {
+            data: bytes.as_mut_ptr(),
+            bounds,
+            row_bytes: (bounds.width() * 4 * depth.bytes_per_channel()) as isize,
+            depth,
+            premultiplied: true,
+        }
+    }
+
+    /// A reused buffer holds the last frame: pixels off this image come out clear all the same.
+    #[test]
+    fn decode_into_clears_what_the_image_does_not_cover() {
+        let canvas = Rect {
+            x1: 0,
+            y1: 0,
+            x2: 6,
+            y2: 4,
+        };
+        let bounds = Rect {
+            x1: 2,
+            y1: 1,
+            x2: 4,
+            y2: 3,
+        };
+        let mut host = vec![200u8; 2 * 2 * 4];
+        let image = host_image(&mut host, bounds, Depth::Byte);
+        let dirty = Argb {
+            alpha: 9u8,
+            red: 9,
+            green: 9,
+            blue: 9,
+        };
+        for leftover in [0, 3, 24, 40] {
+            let mut out = vec![dirty; leftover];
+            // SAFETY: the image is live.
+            unsafe { decode_into(&image, canvas, &mut out) };
+            // SAFETY: the image is live.
+            assert_eq!(out, unsafe { decode_reference::<u8>(&image, canvas) });
+        }
+        let away = host_image(
+            &mut host,
+            Rect {
+                x1: 20,
+                y1: 1,
+                x2: 22,
+                y2: 3,
+            },
+            Depth::Byte,
+        );
+        let mut out = vec![dirty; 24];
+        // SAFETY: the image is live.
+        unsafe { decode_into(&away, canvas, &mut out) };
+        assert_eq!(out, vec![Argb::default(); 24]);
     }
 
     /// The conversions themselves, on bytes alone.
