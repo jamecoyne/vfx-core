@@ -54,6 +54,10 @@ A Windows shared render error also disables sharing for that instance and uses R
 if RAM rendering fails, the plugin draws the input unchanged. Setup that may succeed later,
 such as a device short of memory, is tried again after 60 s.
 
+A GPU effect's RAM path renders on a device of the plugin's own, opened on a background thread:
+until it is open, and while a lost one is replaced, frames pass through unchanged. A failed open
+or a lost device is tried again after 1, 2, 4, 8 and 16 s, then every 30 s.
+
 A frame waits at most 1 s for the GPU (`VFX_FFGL_GPU_WAIT_MS` changes it, for tests). After that
 the instance goes through RAM and tries the shared path again 60 s later, once the GPU has
 finished with the old images; if it never does, they are leaked rather than waited on.

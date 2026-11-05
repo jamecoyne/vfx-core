@@ -738,6 +738,7 @@ unsafe fn process_gpu(
     // Never waits for a device: until one is open, and while a lost one is replaced, frames pass
     // through.
     let Some(device) = vfx_host::gpu_now(&LOG) else {
+        LOG.note("render path: passing frames through until the plugin's own device is open");
         return pass_through(blit);
     };
 
