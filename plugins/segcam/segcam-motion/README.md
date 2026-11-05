@@ -101,6 +101,14 @@ after a pause or a jump. A frame the host couldn't hand over counts as empty for
 and is read again next time. The output is the same in any render order. After Effects still makes
 a new effect per render, so its cache and Multi-Frame Rendering are unchanged.
 
+Resolve playback is the exception. After 8 single steps in a row, a stream that skips a frame counts
+as playback and doesn't go back for the frames Resolve dropped, so it keeps up and its pictures can
+differ from an export. A step over 16 frames out of a run renders exact, since that frame stays on
+screen at a stop. Nothing a plugin can read separates playback from a render Resolve will save, so
+its render cache can carry playback pictures into an export (the limit is in the
+[segcam README](../README.md#known-limits), the reasoning in
+[ADR 3](../decisions/0003-editing-promise.md)).
+
 Like segcam 1.1 playing a file it comes down to about 60 analyses a second at high frame rates.
 Where the host says the frame rate (OpenFX, After Effects, a video in the preview), it analyses
 the frames whose number divides by round(rate / 60), at most 4: every frame below 90 fps, every
@@ -226,7 +234,7 @@ images are converted to top-down ARGB, with either sign of row stride; 8-bit ren
 u8, 16-bit (white 65535) and float render in float. The host's alpha convention is kept.
 Natron 2.5 on Windows rendered the overlay with temporal input (with the earlier
 per-effect OpenFX crate). Resolve 21 on Windows plays a 1080p clip at 37 renders a
-second in Overlay and 4.5 in Swarm, and it runs in Resolve 21 on macOS too. Nuke validation
+second in Overlay and 24 to 36 in Swarm on an RTX 4070, and it runs in Resolve 21 on macOS too. Nuke validation
 is pending.
 
 ### Resolume (FFGL)
