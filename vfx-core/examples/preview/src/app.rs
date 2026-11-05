@@ -222,6 +222,7 @@ impl Preview {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 required_limits,
+                memory_hints: Gpu::memory_hints(),
                 ..wgpu::DeviceDescriptor::default()
             })
             .await

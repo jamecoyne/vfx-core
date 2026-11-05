@@ -126,6 +126,7 @@ impl SharedDevice {
                 max_buffer_size: supported.max_buffer_size,
                 ..wgpu::Limits::default()
             },
+            memory_hints: Gpu::memory_hints(),
             ..Default::default()
         };
         // SAFETY: this HAL adapter is the selected wgpu adapter. The callback only adds

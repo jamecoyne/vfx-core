@@ -119,6 +119,7 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `FrameSource::live` (true for `History`) | vfx-core | #59 |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core | from the start |
 | `Gpu::share`, `Gpu::shared` | vfx-core | #47 in browsers; native since #70 |
+| `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core | this PR |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core | from the start; `ViewMut::bands` since #11, `Argb` as bytemuck `Pod` since #39 |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core | from the start |
 | `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host | #16; the frame rate since #50 |

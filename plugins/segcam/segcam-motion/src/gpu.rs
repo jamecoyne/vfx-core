@@ -328,6 +328,7 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("segcam Motion"),
         required_limits,
+        memory_hints: vfx_core::Gpu::memory_hints(),
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| NoGpu::Failed(e.to_string()))?;

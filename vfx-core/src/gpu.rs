@@ -111,10 +111,30 @@ impl Gpu {
             .await
             .map_err(|e| GpuError(e.to_string()))?;
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                memory_hints: Self::memory_hints(),
+                ..wgpu::DeviceDescriptor::default()
+            })
             .await
             .map_err(|e| GpuError(e.to_string()))?;
         Ok(Self::from_parts(device, queue))
+    }
+
+    /// Allocator block sizes for a device that stays open for a whole show, in place of wgpu's
+    /// default of 128 to 256 MiB. Vulkan and D3D12 reserve memory in blocks and place a new
+    /// allocation in the newest block with room, so one small buffer made beside a large one holds
+    /// the whole block once the large one has gone, and on integrated GPUs a reserved block is
+    /// system memory. A buffer larger than the current block gets memory of its own, which it
+    /// returns when it goes.
+    ///
+    /// Host blocks are half these sizes, and staging comes from them. A fixed 64 MiB would make
+    /// those 32 MiB, which a 4K frame's staging all but fills: blocks were then made and freed
+    /// about twice a second. The range lets the host blocks reach 64 MiB.
+    pub fn memory_hints() -> wgpu::MemoryHints {
+        const MIB: u64 = 1 << 20;
+        wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: 64 * MIB..128 * MIB,
+        }
     }
 
     /// Lets CPU effects draw on this device: in browsers, where they can't open their own, and
