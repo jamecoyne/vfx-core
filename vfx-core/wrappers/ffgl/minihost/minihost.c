@@ -710,12 +710,18 @@ static void case_device_reopen(void) {
     memcpy(reference, f.out, (size_t)f.w * f.h * 4 * sizeof(float));
     _putenv_s("VFX_FFGL_LOSE_DEVICE_AFTER", "20");
     void *lost = instantiate(63, 37);
+    /* An instance made while the device is out, which mustn't wait for it. */
+    void *during = NULL;
     /* Read when the first render sets up the shared images; the new device stays. The first try
      * is a second after the loss. */
     int rendered = 0;
     for (; rendered < 2000 && !logged_message("shared frames back on a new device"); rendered++) {
         CHECK(render(lost, &f), "render %d", rendered);
         _putenv_s("VFX_FFGL_LOSE_DEVICE_AFTER", "");
+        if (!during && logged_message("warning: GPU device lost")) {
+            during = instantiate(63, 37);
+            CHECK(render(during, &f), "render of an instance made in the gap");
+        }
         float worst = 0;
         for (int k = 0; k < f.w * f.h * 4; k++) {
             float diff = fabsf(reference[k] - f.out[k]);
@@ -737,6 +743,7 @@ static void case_device_reopen(void) {
     free(reference);
     free_frame(&f);
     CHECK(call(DEINSTANTIATE_GL, u(0), lost).u == 0, "delete after the new device");
+    if (during) CHECK(call(DEINSTANTIATE_GL, u(0), during).u == 0, "delete the gap's instance");
     call(DEINSTANTIATE_GL, u(0), ram);
     if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
         CHECK(logged_message("shared frames back on a new device"), "no new device after the loss");
@@ -789,18 +796,22 @@ static void case_gpu_wait(void) {
 static void segcam_device_reopen(void) {
     _putenv_s("SEGCAM_GPU", "1");
     _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "30");
-    int w = 320, h = 180;
+    int w = 1920, h = 1080;
     void *inst = instantiate(w, h);
     segcam_options(inst, 3, 0);
     Frame f = frame(w, h, w, h);
     GLuint textures[2] = {segcam_texture(w, h, 0), segcam_texture(w, h, 1)};
     GLuint original = f.input;
     int waited = 0, back_frames = 0, picture = 0;
+    double worst_render = 0;
     for (int n = 0; n < 3000 && back_frames < 60; n++) {
         f.input = textures[n & 1];
         double time = n / 30.0;
         CHECK(call(SET_TIME, ptr(&time), inst).u == 0, "set time failed");
+        double started = now();
         CHECK(render(inst, &f), "render %d failed", n);
+        /* From the loss on: what the host's render thread waits for through a reopen. */
+        if (waited && now() - started > worst_render) worst_render = now() - started;
         _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "");
         if (!waited && logged_message("shared GPU render failed, using RAM")) {
             waited = 1;
@@ -812,6 +823,7 @@ static void segcam_device_reopen(void) {
         }
         Sleep(2);
     }
+    printf("  worst render from the loss on: %.1f ms\n", worst_render * 1000);
     CHECK(waited, "the present never found the loss");
     CHECK(back_frames >= 60, "no new device after the loss");
     CHECK(picture, "no picture on the new device");
