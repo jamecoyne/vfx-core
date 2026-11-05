@@ -94,33 +94,52 @@ mod models {
 
     /// When models that stopped working are next to load again: none while they work.
     #[derive(Default)]
-    pub(super) struct Reload {
+    pub(super) struct Reload<P = (bool, bool)> {
         backoff: ReopenBackoff,
         next_try: Option<Instant>,
+        loaded_at: Option<Instant>,
+        /// What the models that stopped working had, which a new load has to match.
+        had: Option<P>,
     }
 
-    impl Reload {
+    impl<P: PartialEq> Reload<P> {
         /// Drops models whose runs keep failing and loads new ones on the backoff, since a session
         /// can't outlive its device. The old ones go first: a process has one D3D12 device per
-        /// adapter, and a new session would be handed the removed one while they hold it.
+        /// adapter, and a new session would be handed the removed one while they hold it. A load
+        /// with fewer optional models than the old ones had is used and tried again, since that's
+        /// the reset and not the machine.
         pub(super) fn keep_working<T>(
             &mut self,
             models: &mut Option<T>,
             failing: impl Fn(&T) -> bool,
-            release: impl FnOnce(T),
+            optional: impl Fn(&T) -> P,
+            release: impl Fn(T),
             load: impl FnOnce() -> Option<T>,
         ) {
             if let Some(old) = models.take_if(|m| failing(m)) {
                 eprintln!("segcam Motion: the face models stopped working");
+                if let Some(loaded_at) = self.loaded_at.take() {
+                    self.backoff.lost(loaded_at.elapsed());
+                }
+                self.had.get_or_insert(optional(&old));
                 release(old);
                 self.next_try = Some(Instant::now() + self.backoff.next_delay());
             }
             if self.next_try.is_some_and(|at| Instant::now() >= at) {
+                if let Some(partial) = models.take() {
+                    release(partial);
+                }
                 *models = load();
-                self.next_try = match models {
-                    Some(_) => None,
-                    None => Some(Instant::now() + self.backoff.next_delay()),
-                };
+                let complete = models
+                    .as_ref()
+                    .is_some_and(|m| self.had.as_ref().is_none_or(|had| optional(m) == *had));
+                if models.is_some() {
+                    self.loaded_at = Some(Instant::now());
+                }
+                self.next_try = (!complete).then(|| Instant::now() + self.backoff.next_delay());
+                if complete {
+                    self.had = None;
+                }
             }
         }
     }
@@ -134,6 +153,7 @@ mod models {
             .keep_working(
                 models,
                 Segmenter::failing,
+                Segmenter::optional_models,
                 |old| {
                     let _device_lock = segcam_face::d3d12_device_lock();
                     let _ = catch_unwind(AssertUnwindSafe(move || drop(old)));
@@ -172,29 +192,92 @@ mod models {
     #[cfg(test)]
     mod tests {
         use super::Reload;
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        fn reload() -> Reload<bool> {
+            Reload::default()
+        }
 
         /// Models that keep failing go at once, and new ones load, retrying until they do.
         #[test]
         fn failing_models_are_replaced() {
-            let mut reload = Reload::default();
+            let optional = |_: &i32| true;
+            let mut reload = reload();
             let mut models = Some(1);
-            reload.keep_working(&mut models, |_| false, drop, || panic!("models work"));
+            reload.keep_working(
+                &mut models,
+                |_| false,
+                optional,
+                drop,
+                || panic!("models work"),
+            );
             assert_eq!(models, Some(1));
 
-            let mut released = None;
-            reload.keep_working(&mut models, |_| true, |old| released = Some(old), || None);
-            assert_eq!(released, Some(1));
+            let released = Cell::new(None);
+            let release = |old| released.set(Some(old));
+            reload.keep_working(&mut models, |_| true, optional, release, || None);
+            assert_eq!(released.get(), Some(1));
             assert_eq!(models, None, "loaded before the backoff");
 
-            reload.next_try = Some(std::time::Instant::now());
-            reload.keep_working(&mut models, |_| true, drop, || None);
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
             assert_eq!(models, None);
             assert!(reload.next_try.is_some(), "a failed load gave up");
 
-            reload.next_try = Some(std::time::Instant::now());
-            reload.keep_working(&mut models, |_| true, drop, || Some(2));
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, drop, || Some(2));
             assert_eq!(models, Some(2));
             assert!(reload.next_try.is_none());
+        }
+
+        /// A load missing what the old models had is used, and replaced by a later full one.
+        #[test]
+        fn a_partial_load_tries_again() {
+            let optional = |m: &i32| *m >= 10;
+            let mut reload = reload();
+            let mut models = Some(10);
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, drop, || Some(1));
+            assert_eq!(models, Some(1), "a partial load is better than none");
+            assert!(reload.next_try.is_some(), "a partial load stayed");
+
+            let released = Cell::new(None);
+            let release = |old| released.set(Some(old));
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, release, || Some(11));
+            assert_eq!(released.get(), Some(1), "the partial models were held");
+            assert_eq!(models, Some(11));
+            assert!(reload.next_try.is_none());
+        }
+
+        /// A machine that never had the optional models isn't asked for them after a reset.
+        #[test]
+        fn a_load_matching_the_old_models_is_complete() {
+            let optional = |_: &i32| false;
+            let mut reload = reload();
+            let mut models = Some(1);
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, drop, || Some(2));
+            assert!(reload.next_try.is_none());
+        }
+
+        /// Models that lasted start the backoff over, so a reset hours later waits 1 s again.
+        #[test]
+        fn models_that_lasted_start_the_backoff_over() {
+            let optional = |_: &i32| true;
+            let mut reload = reload();
+            for _ in 0..5 {
+                reload.backoff.next_delay();
+            }
+            let mut models = Some(1);
+            reload.loaded_at = Instant::now().checked_sub(Duration::from_secs(120));
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+            let wait = reload.next_try.expect("a time to try") - Instant::now();
+            assert!(wait <= Duration::from_secs(1), "waits {wait:?}");
         }
     }
 }

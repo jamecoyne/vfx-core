@@ -212,6 +212,19 @@ impl Segmenter {
         }
     }
 
+    /// Which of the optional models loaded: the mesh, for eyes and mouths, and bodies. A load during
+    /// a reset can get the detector and miss these, which a later load puts right.
+    pub fn optional_models(&self) -> (bool, bool) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Vision(_) => (true, true),
+            #[cfg(feature = "onnx")]
+            Self::Ort(segmenter, _) => (segmenter.mesh.is_some(), segmenter.bodies.is_some()),
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => (false, false),
+        }
+    }
+
     /// Whether the models' runs keep failing, as they do once a driver reset takes their device.
     pub fn failing(&self) -> bool {
         match self {
