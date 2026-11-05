@@ -16,11 +16,14 @@
 
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use vfx_core::{Frame, Gpu};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HMODULE, S_OK, WAIT_ABANDONED, WAIT_OBJECT_0,
+};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
@@ -68,6 +71,11 @@ const COUNTED_INTERVAL: Duration = Duration::from_millis(1);
 const UNCOUNTED_INTERVAL: Duration = Duration::from_millis(4);
 /// How soon a sender that is missing, or can't be read, is looked for again.
 const RETRY: Duration = Duration::from_millis(100);
+/// The longest a copy may take on the GPU. Longer means the device is gone or stuck, and the
+/// worker connects again rather than spin.
+const COPY_DEADLINE: Duration = Duration::from_millis(100);
+/// How long dropping a receiver waits for its worker to let go of the sender and its textures.
+const STOP_DEADLINE: Duration = Duration::from_millis(250);
 /// The change check of an uncounted sender reads back the smallest mip level at least this wide.
 const PROBE_WIDTH: u32 = 64;
 
@@ -185,7 +193,6 @@ fn fit(size: (u32, u32), max_side: u32) -> (u32, u32) {
 
 /// What the worker and the render loop share.
 struct State {
-    stop: bool,
     adapter: AdapterId,
     /// Bumped when the preview's device changes: the worker connects again, with new textures.
     device_epoch: u64,
@@ -234,12 +241,37 @@ fn lock(shared: &Mutex<State>) -> MutexGuard<'_, State> {
     shared.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Tells the worker to stop, waking it from its wait between polls.
+#[derive(Default)]
+struct Stop {
+    stopped: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl Stop {
+    fn stop(&self) {
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.wake.notify_all();
+    }
+
+    /// Waits up to `wait`; true once stopped.
+    fn wait(&self, wait: Duration) -> bool {
+        let stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        let (stopped, _) = (self.wake)
+            .wait_timeout_while(stopped, wait, |stopped| !*stopped)
+            .unwrap_or_else(|e| e.into_inner());
+        *stopped
+    }
+}
+
 /// A Spout sender as the source: a worker thread reads it, the render loop draws its newest frame.
 /// A sender that closes is waited for, and one that restarts, or changes size or GPU, is connected
 /// again, with no action needed.
 pub struct Receiver {
     name: String,
     shared: Shared,
+    stop: Arc<Stop>,
+    worker: Option<JoinHandle<()>>,
     started: Instant,
     max_side: u32,
     /// The textures imported for the current link, on the current device.
@@ -272,7 +304,6 @@ impl Receiver {
     /// fitted into `max_side`.
     pub fn start(name: String, adapter: AdapterId, max_side: u32) -> Self {
         let shared = Arc::new(Mutex::new(State {
-            stop: false,
             adapter,
             device_epoch: 0,
             link: None,
@@ -282,9 +313,11 @@ impl Receiver {
             spare: Vec::new(),
             arrived: 0,
         }));
+        let stop = Arc::new(Stop::default());
         let worker = Worker {
             name: name.clone(),
             shared: Arc::clone(&shared),
+            stop: Arc::clone(&stop),
             devices: Vec::new(),
             connection: None,
             generation: 0,
@@ -293,12 +326,18 @@ impl Receiver {
         let spawned = std::thread::Builder::new()
             .name("spout receiver".into())
             .spawn(move || worker.run());
-        if let Err(e) = spawned {
-            lock(&shared).status = Some(format!("Couldn't start reading Spout: {e}"));
-        }
+        let worker = match spawned {
+            Ok(worker) => Some(worker),
+            Err(e) => {
+                lock(&shared).status = Some(format!("Couldn't start reading Spout: {e}"));
+                None
+            }
+        };
         Self {
             name,
             shared,
+            stop,
+            worker,
             started: Instant::now(),
             max_side,
             imported: None,
@@ -454,9 +493,20 @@ impl Receiver {
 }
 
 impl Drop for Receiver {
-    /// Tells the worker to stop and doesn't wait for it: it may be inside a wait on the sender.
+    /// Stops the worker and waits for it, up to [`STOP_DEADLINE`]: every wait it makes is bounded,
+    /// and past that it finishes on its own.
     fn drop(&mut self) {
-        lock(&self.shared).stop = true;
+        self.stop.stop();
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let until = Instant::now() + STOP_DEADLINE;
+        while !worker.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if worker.is_finished() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -625,7 +675,9 @@ fn import_shared(
 struct Worker {
     name: String,
     shared: Shared,
-    /// D3D11 devices made so far, one per adapter, by DXGI's adapter index.
+    stop: Arc<Stop>,
+    /// D3D11 devices made so far, one per adapter, by DXGI's adapter index. A removed one is
+    /// dropped after an error, and made again on the next connect.
     devices: Vec<(u32, D3d)>,
     connection: Option<Connection>,
     generation: u64,
@@ -654,8 +706,9 @@ struct Connection {
     keyed: Option<IDXGIKeyedMutex>,
     access: Option<Handle>,
     count: Option<FrameCount>,
-    /// Uncounted senders only.
-    probe: Option<Probe>,
+    /// Tells a new picture from the last when the sender doesn't count its frames, or its count
+    /// can't be read.
+    probe: Probe,
     slots: Vec<Slot>,
     busy: Vec<Arc<AtomicBool>>,
     /// [`Path::Ram`]'s read back.
@@ -675,34 +728,52 @@ impl Worker {
             return;
         };
         loop {
-            if lock(&self.shared).stop {
-                return;
-            }
             let started = Instant::now();
             let wait = match self.step(&name) {
                 Ok(wait) => wait,
                 Err(why) => {
                     self.disconnect(Some(format!("Spout sender {}: {why}", self.name)));
+                    self.forget_removed_devices();
                     RETRY
                 }
             };
-            std::thread::sleep(wait.saturating_sub(started.elapsed()));
+            if self.stop.wait(wait.saturating_sub(started.elapsed())) {
+                return;
+            }
         }
+    }
+
+    /// Unpublishes the link, then drops the connection, which closes the shared textures' handles:
+    /// in that order, the render loop (which imports under the same lock) never opens a closed
+    /// handle.
+    fn drop_connection(&mut self) {
+        {
+            let mut state = lock(&self.shared);
+            state.link = None;
+            state.ready = None;
+        }
+        self.connection = None;
     }
 
     /// Drops the connection and says why nothing plays, in the panel and, once, in the log.
     fn disconnect(&mut self, why: Option<String>) {
-        self.connection = None;
-        let mut state = lock(&self.shared);
-        state.link = None;
-        state.ready = None;
+        self.drop_connection();
+        lock(&self.shared).status.clone_from(&why);
         if why != self.reported {
             if let Some(why) = &why {
                 eprintln!("preview: {why}");
             }
-            self.reported.clone_from(&why);
+            self.reported = why;
         }
-        state.status = why;
+    }
+
+    /// Drops the D3D11 devices a driver reset removed. Only called with no connection, whose
+    /// device index would move.
+    fn forget_removed_devices(&mut self) {
+        debug_assert!(self.connection.is_none());
+        // SAFETY: GetDeviceRemovedReason only reads the device's state.
+        self.devices
+            .retain(|(_, d3d)| unsafe { d3d.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// Connects if needed and delivers a new frame if there is one; returns how long to wait.
@@ -722,24 +793,25 @@ impl Worker {
                 && !(import_failed == Some(c.generation) && c.path == Path::Gpu)
         });
         if !current {
-            let fell_back = (self.connection.as_ref())
-                .is_some_and(|c| import_failed == Some(c.generation) && c.published == published);
-            self.connection = None;
+            // RAM again only for the same texture on the same device: a new device may import.
+            let fell_back = self.connection.as_ref().is_some_and(|c| {
+                import_failed == Some(c.generation)
+                    && c.published == published
+                    && c.device_epoch == device_epoch
+            });
+            self.drop_connection();
             let connection = self.connect(name, &info, adapter, device_epoch, fell_back)?;
             self.publish_link(&connection);
             self.connection = Some(connection);
         }
         let connection = self.connection.as_mut().expect("connected above");
         let d3d = &self.devices[connection.device].1;
-        let counted = connection.count.as_mut().map(FrameCount::new_frame);
-        if counted == Some(Some(false)) {
-            return Ok(COUNTED_INTERVAL);
-        }
-        let interval = match counted {
-            Some(Some(true)) => COUNTED_INTERVAL,
-            _ => UNCOUNTED_INTERVAL,
+        let count = connection.count.as_ref().and_then(FrameCount::read);
+        let interval = match count {
+            Some(_) => COUNTED_INTERVAL,
+            None => UNCOUNTED_INTERVAL,
         };
-        if let Some(frame) = connection.read(d3d, &self.shared)? {
+        if let Some(frame) = connection.read(d3d, &self.shared, count)? {
             let mut state = lock(&self.shared);
             state.arrived += 1;
             let replaced = state.ready.replace(Ready {
@@ -801,7 +873,9 @@ impl Worker {
         adapters.sort_by_key(|(_, adapter)| adapter_id(adapter) != Some(preview));
         let handle = HANDLE(info.share_handle as usize as _);
         for (index, adapter) in adapters {
-            let device = self.device(index, &adapter)?;
+            let Ok(device) = self.device(index, &adapter) else {
+                continue;
+            };
             let d3d = &self.devices[device].1;
             let Ok(shared) = d3d.open(handle) else {
                 continue;
@@ -931,27 +1005,46 @@ impl D3d {
         texture.ok_or_else(|| "couldn't make a texture".into())
     }
 
-    /// Blocks until the GPU has done everything submitted before `query` was ended.
-    fn wait(&self, query: &ID3D11Query) {
-        // SAFETY: an event query writes one BOOL; the first GetData call flushes the context.
-        unsafe {
-            self.context.End(query);
-            let mut flags = 0;
-            loop {
-                let mut done = windows::core::BOOL(0);
-                let _ = self.context.GetData(
+    /// Blocks until the GPU has done everything submitted before `query` was ended. Fails when
+    /// the device was removed (a driver reset), or the copy takes past [`COPY_DEADLINE`].
+    fn wait(&self, query: &ID3D11Query) -> Result<(), String> {
+        // SAFETY: End and GetData on our own query; an event query writes one BOOL.
+        unsafe { self.context.End(query) };
+        let mut flags = 0;
+        let finished = wait_until(Instant::now() + COPY_DEADLINE, || {
+            let mut done = windows::core::BOOL(0);
+            // SAFETY: as above; the first call flushes the context, later ones don't.
+            let read = unsafe {
+                self.context.GetData(
                     query,
                     Some((&raw mut done).cast()),
                     size_of::<windows::core::BOOL>() as u32,
                     flags,
-                );
-                if done.as_bool() {
-                    return;
-                }
-                flags =
-                    windows::Win32::Graphics::Direct3D11::D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32;
-                std::thread::yield_now();
-            }
+                )
+            };
+            flags = windows::Win32::Graphics::Direct3D11::D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32;
+            read.map(|()| done.as_bool())
+        });
+        // SAFETY: GetDeviceRemovedReason only reads the device's state.
+        match (finished, unsafe { self.device.GetDeviceRemovedReason() }) {
+            (_, Err(removed)) => Err(format!("its GPU was reset ({removed})")),
+            (Err(why), Ok(())) => Err(why),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+}
+
+/// Polls `done` until it says so, fails, or `until` passes.
+fn wait_until(
+    until: Instant,
+    mut done: impl FnMut() -> windows::core::Result<bool>,
+) -> Result<(), String> {
+    loop {
+        match done() {
+            Ok(true) => return Ok(()),
+            Ok(false) if Instant::now() < until => std::thread::yield_now(),
+            Ok(false) => return Err("the GPU didn't finish a copy in time".into()),
+            Err(e) => return Err(format!("the GPU failed a copy ({e})")),
         }
     }
 }
@@ -1034,10 +1127,7 @@ impl Connection {
         }
         let sender = name.to_string_lossy();
         let count = Handle::semaphore(&format!("{sender}_Count_Semaphore")).map(FrameCount::new);
-        let probe = match count {
-            Some(_) => None,
-            None => Some(Probe::new(d3d, &plain)?),
-        };
+        let probe = Probe::new(d3d, &plain)?;
         let mut done = None;
         // SAFETY: plain query creation.
         unsafe {
@@ -1072,29 +1162,50 @@ impl Connection {
         })
     }
 
-    /// Copies the sender's picture for the render loop, unless it is the one copied last (an
-    /// uncounted sender), the sender held its lock too long, or no shared texture is free.
-    fn read(&mut self, d3d: &D3d, shared: &Mutex<State>) -> Result<Option<ReadyFrame>, String> {
+    /// Copies the sender's picture for the render loop, unless it is the one copied last, the
+    /// sender held its lock too long, or no shared texture is free. `count` is the sender's frame
+    /// count when it keeps a usable one; without it, the probe compares the picture with the last.
+    /// The last count or picture moves on only once a frame is delivered, so a frame missed here
+    /// is copied on the next poll even if the sender then stands still.
+    fn read(
+        &mut self,
+        d3d: &D3d,
+        shared: &Mutex<State>,
+        count: Option<i32>,
+    ) -> Result<Option<ReadyFrame>, String> {
         let context = &d3d.context;
         let (keyed, access) = (self.keyed.as_ref(), self.access.as_ref());
-        // An uncounted sender's picture goes through the probe, which says whether it changed.
-        // The copy from the probe needs no lock: only this thread touches the probe.
-        let source = match &mut self.probe {
-            Some(probe) => {
+        if count.is_some() && count == self.count.as_ref().and_then(|c| c.last) {
+            return Ok(None);
+        }
+        let probed = match count {
+            Some(_) => None,
+            None => {
                 // SAFETY: same size and format, into mip 0 of the probe.
                 let copy = || unsafe {
-                    context.CopySubresourceRegion(&probe.texture, 0, 0, 0, 0, &self.shared, 0, None)
+                    context.CopySubresourceRegion(
+                        &self.probe.texture,
+                        0,
+                        0,
+                        0,
+                        0,
+                        &self.shared,
+                        0,
+                        None,
+                    )
                 };
-                if !locked(keyed, access, copy) || !probe.changed(context)? {
+                if !locked(keyed, access, || {
+                    copy();
+                    d3d.wait(&self.done)
+                })? {
                     return Ok(None);
                 }
-                None
+                let picture = self.probe.picture(context)?;
+                if picture == self.probe.last {
+                    return Ok(None);
+                }
+                Some(picture)
             }
-            None => Some((keyed, access)),
-        };
-        let from = match &self.probe {
-            Some(probe) => &probe.texture,
-            None => &self.shared,
         };
         let target = match self.path {
             Path::Gpu => {
@@ -1105,26 +1216,41 @@ impl Connection {
             }
             Path::Ram => (self.staging.as_ref().expect("a RAM link has one"), None),
         };
+        let from = match probed {
+            Some(_) => &self.probe.texture,
+            None => &self.shared,
+        };
         // SAFETY: same size and format: the sender's texture, or mip 0 of the probe.
         let copy = || unsafe { context.CopySubresourceRegion(target.0, 0, 0, 0, 0, from, 0, None) };
-        match source {
-            Some((keyed, access)) => {
-                if !locked(keyed, access, copy) {
-                    return Ok(None);
-                }
+        // The sender's lock is held until the copy has run, not only until it was queued: a
+        // sender may draw its next frame the moment it gets the lock back.
+        let copy_and_wait = || {
+            copy();
+            d3d.wait(&self.done)
+        };
+        if probed.is_none() {
+            if !locked(keyed, access, copy_and_wait)? {
+                return Ok(None);
             }
-            None => copy(),
+        } else {
+            copy_and_wait()?;
         }
-        match target.1 {
-            Some(slot) => {
-                d3d.wait(&self.done);
-                Ok(Some(ReadyFrame::Slot(slot)))
-            }
+        let frame = match target.1 {
+            Some(slot) => ReadyFrame::Slot(slot),
             None => {
                 let bytes = lock(shared).spare.pop().unwrap_or_default();
-                read_back(context, target.0, self.size, bytes).map(|b| Some(ReadyFrame::Bytes(b)))
+                ReadyFrame::Bytes(read_back(context, target.0, self.size, bytes)?)
+            }
+        };
+        match probed {
+            Some(picture) => self.probe.last = picture,
+            None => {
+                if let Some(c) = &mut self.count {
+                    c.last = count;
+                }
             }
         }
+        Ok(Some(frame))
     }
 }
 
@@ -1141,28 +1267,40 @@ fn ready_slot(shared: &Mutex<State>, generation: u64) -> Option<usize> {
 }
 
 /// Runs `copy` while holding the sender's lock: its keyed mutex or its access mutex, whichever it
-/// has. False if the sender held it past [`LOCK_TIMEOUT_MS`].
-fn locked(keyed: Option<&IDXGIKeyedMutex>, access: Option<&Handle>, copy: impl FnOnce()) -> bool {
+/// has. `Ok(false)` if the sender held it past [`LOCK_TIMEOUT_MS`].
+fn locked(
+    keyed: Option<&IDXGIKeyedMutex>,
+    access: Option<&Handle>,
+    copy: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
     // SAFETY: the sync objects are live; each lock taken is released.
     unsafe {
         if let Some(keyed) = keyed {
-            if keyed.AcquireSync(0, LOCK_TIMEOUT_MS).is_err() {
-                return false;
+            // The raw call: windows-rs maps WAIT_TIMEOUT, a success code, to Ok.
+            let acquired = (Interface::vtable(keyed).AcquireSync)(
+                Interface::as_raw(keyed),
+                0,
+                LOCK_TIMEOUT_MS,
+            );
+            if acquired != S_OK {
+                return Ok(false);
             }
-            copy();
+            let copied = copy();
             let _ = keyed.ReleaseSync(0);
+            copied?;
         } else if let Some(access) = access {
             let waited = WaitForSingleObject(access.0, LOCK_TIMEOUT_MS);
             if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
-                return false;
+                return Ok(false);
             }
-            copy();
+            let copied = copy();
             let _ = ReleaseMutex(access.0);
+            copied?;
         } else {
-            copy();
+            copy()?;
         }
     }
-    true
+    Ok(true)
 }
 
 /// Reads a staging texture's rows into `bytes`, tightly packed.
@@ -1203,6 +1341,7 @@ struct Probe {
     view: ID3D11ShaderResourceView,
     level: u32,
     staging: ID3D11Texture2D,
+    /// The smallest level of the last picture delivered.
     last: Vec<u8>,
 }
 
@@ -1240,8 +1379,8 @@ impl Probe {
         })
     }
 
-    /// Whether the picture now in mip 0 differs from the last one checked.
-    fn changed(&mut self, context: &ID3D11DeviceContext) -> Result<bool, String> {
+    /// The picture now in mip 0 at the smallest level, to compare with `last`.
+    fn picture(&self, context: &ID3D11DeviceContext) -> Result<Vec<u8>, String> {
         // SAFETY: our own textures; the smallest level and the staging texture match.
         unsafe {
             context.GenerateMips(&self.view);
@@ -1259,21 +1398,19 @@ impl Probe {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: GetDesc fills a plain struct.
         unsafe { self.staging.GetDesc(&mut desc) };
-        let now = read_back(
+        read_back(
             context,
             &self.staging,
             (desc.Width, desc.Height),
             Vec::with_capacity(self.last.len()),
-        )?;
-        let changed = now != self.last;
-        self.last = now;
-        Ok(changed)
+        )
     }
 }
 
 /// The sender's frame number, which Spout keeps as the count of a named semaphore.
 struct FrameCount {
     semaphore: Handle,
+    /// The count of the last frame delivered.
     last: Option<i32>,
 }
 
@@ -1285,8 +1422,9 @@ impl FrameCount {
         }
     }
 
-    /// Whether the sender drew since the last call; `None` when it doesn't count after all.
-    fn new_frame(&mut self) -> Option<bool> {
+    /// The count now, or `None` when it can't be read or the sender doesn't count (it stays at
+    /// 0), and the probe has to tell.
+    fn read(&self) -> Option<i32> {
         let mut count = 0;
         // SAFETY: Spout's read of the count: take one and give it back, which reports the count
         // and leaves it as it was.
@@ -1296,12 +1434,7 @@ impl FrameCount {
             }
             ReleaseSemaphore(self.semaphore.0, 1, Some(&mut count)).ok()?;
         }
-        if count == 0 {
-            return None;
-        }
-        let new = self.last != Some(count);
-        self.last = Some(count);
-        Some(new)
+        (count > 0).then_some(count)
     }
 }
 
@@ -1624,6 +1757,33 @@ mod tests {
             [120, 40, 250, 128]
         );
         second.close();
+    }
+
+    /// A failing GetData, as after a driver reset, ends the wait with an error; a copy that never
+    /// finishes ends it at the deadline. Neither spins on.
+    #[test]
+    fn copy_waits_end_on_failure_and_at_the_deadline() {
+        let removed = || {
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+            ))
+        };
+        let far = Instant::now() + Duration::from_secs(60);
+        assert!(wait_until(far, removed).unwrap_err().contains("failed"));
+
+        let started = Instant::now();
+        let never = wait_until(started + Duration::from_millis(20), || Ok(false));
+        assert!(never.unwrap_err().contains("in time"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let mut polls = 0;
+        assert_eq!(
+            wait_until(far, || {
+                polls += 1;
+                Ok(polls == 3)
+            }),
+            Ok(())
+        );
     }
 
     #[test]
