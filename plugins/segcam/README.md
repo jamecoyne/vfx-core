@@ -55,11 +55,14 @@ Apple M1 Pro and up runs it comfortably. Swarm draws on the GPU when there is on
 - On Windows, if `DirectML.dll` isn't next to the plugin, faces run on the CPU: still right, just
   slower.
 - The browser preview has no faces yet.
-- A Resolve export can contain wrong pictures when all three of these are on: Playback, Render Cache,
-  User; the clip's Render Cache OFX Filter, segcam Motion; and Use render cached images in the
-  Deliver page's Advanced Settings. Resolve's cache can then hold pictures from playback, and a
-  plugin can't tell a render that will be saved from playback. New projects have all three off. With
-  Render Cache on None, a normal speed export is exact.
+- A Resolve export can contain wrong pictures when all three of these are on:
+  - Playback, Render Cache, User
+  - The clip's Render Cache OFX Filter, segcam Motion
+  - Use render cached images in the Deliver page's Advanced Settings
+
+  Resolve's cache can then hold pictures from playback, and a plugin can't tell a render that will
+  be saved from playback. New projects have all three off. With Render Cache on None, a normal speed
+  export is exact.
 - Under a constant retime, a Resolve export depends on the order Resolve opens frames in, so two
   exports can differ.
 
