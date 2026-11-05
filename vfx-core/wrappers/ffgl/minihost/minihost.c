@@ -1062,9 +1062,10 @@ static void segcam_device_reopen(void) {
         if (logged_message("shared frames back on a new device")) back_frames++;
         Sleep(2);
     }
-    /* A render that waited for the new device to open would take a RAM render plus the open. The
-     * bound is three RAM renders, plus the time the reopen's log line gives for the one render
-     * that finishes the setup on the render thread. */
+    /* A render that waited for the new device to open would take a RAM render plus what was left
+     * of the open. The bound is three RAM renders, at least 100 ms as in device_reopen, since a
+     * render that overlaps the open on its thread can take tens of ms with nothing waiting. The
+     * one render that finishes the setup on the render thread adds the time the log line gives. */
     double open_ms = 0, finish_ms = 0;
     int timed = logged_entry("shared frames back on a new device: ", &open_ms)
                 && logged_entry(" ms on a thread, ", &finish_ms);
@@ -1075,7 +1076,7 @@ static void segcam_device_reopen(void) {
     CHECK(waited_at, "the present never found the loss");
     CHECK(back_frames >= 60, "no new device after the loss");
     CHECK(timed, "no time for the open in the log");
-    double render_bound_ms = 3 * ram_worst * 1000 + finish_ms;
+    double render_bound_ms = (3 * ram_worst > 0.1 ? 3 * ram_worst : 0.1) * 1000 + finish_ms;
     CHECK(worst_render * 1000 < render_bound_ms, "a render waited %.1f ms, over %.0f ms",
           worst_render * 1000, render_bound_ms);
     /* The interop being back isn't enough: the swarm must be drawn on the new device again. The
