@@ -86,7 +86,7 @@ struct Preview {
     /// A video file or the webcam, in the browser.
     #[cfg(target_arch = "wasm32")]
     web_video: Option<web_media::WebVideo>,
-    /// A file pick or camera request the browser hasn't answered yet.
+    /// A file pick, dropped file or camera request the browser hasn't answered yet.
     #[cfg(target_arch = "wasm32")]
     web_pending: web_media::Pending,
     /// Samples the bottom bar's numbers.
@@ -201,6 +201,11 @@ impl Preview {
         instance: wgpu::Instance,
         gpu_choice: Option<String>,
     ) -> Result<Self, String> {
+        // Before the first wait on the GPU, so a drop while it opens is kept for the first frame.
+        #[cfg(target_arch = "wasm32")]
+        let web_pending = web_media::Pending::default();
+        #[cfg(target_arch = "wasm32")]
+        web_media::listen_for_dropped_files(&web_pending);
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| format!("couldn't create a surface: {e}"))?;
@@ -324,7 +329,7 @@ impl Preview {
             #[cfg(target_arch = "wasm32")]
             web_video: None,
             #[cfg(target_arch = "wasm32")]
-            web_pending: Default::default(),
+            web_pending,
             stats: stats::Sampler::new(),
             counts: stats::Counts::default(),
             picture_awaiting_present: false,

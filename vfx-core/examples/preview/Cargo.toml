@@ -62,7 +62,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 # The DOM, plus a <video> for video files and the webcam (web_media.rs).
 web-sys = { version = "0.3", features = [
-    "Document", "Element", "HtmlElement", "Location", "Window",
+    "DataTransfer", "Document", "DragEvent", "Element", "HtmlElement", "Location", "Window",
     "HtmlInputElement", "HtmlMediaElement", "HtmlVideoElement", "File", "FileList", "Blob", "Url",
     "Navigator", "MediaDevices", "MediaStream", "MediaStreamTrack", "MediaStreamConstraints",
     "OffscreenCanvas", "OffscreenCanvasRenderingContext2d",

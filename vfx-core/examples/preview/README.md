@@ -3,6 +3,10 @@
 The repository's preview: one effect at a time, on a test pattern, an image, a video file
 or a webcam. [docs/DEVELOPING.md](../../../docs/DEVELOPING.md#the-preview) describes it.
 
+A file dropped on the window opens as the source. In a browser, a drop goes the way of the file
+picker: video only, the first of several files, and anything else leaves the source as it is and
+shows a message.
+
 ## Record
 
 Record saves the effect's output as a video file, without the panel: an H.264 MP4 through ffmpeg
