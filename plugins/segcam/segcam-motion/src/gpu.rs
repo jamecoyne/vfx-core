@@ -201,6 +201,9 @@ pub enum NoGpu {
     NoAdapter(String),
     /// There is one, but making its device or drawing on it failed.
     Failed(String),
+    /// The device was lost while it was being set up. This says nothing about the machine, so
+    /// even a first open tries again.
+    Lost(String),
 }
 
 impl std::fmt::Display for NoGpu {
@@ -208,6 +211,7 @@ impl std::fmt::Display for NoGpu {
         match self {
             NoGpu::NoAdapter(e) => write!(f, "no GPU: {e}"),
             NoGpu::Failed(e) => write!(f, "the GPU failed: {e}"),
+            NoGpu::Lost(e) => write!(f, "the GPU was lost: {e}"),
         }
     }
 }
@@ -409,6 +413,16 @@ impl DeviceSlot {
                     opened_at: Instant::now(),
                 }
             }
+            (Err(NoGpu::Lost(why)), None) => {
+                let delay = self.backoff().next_delay();
+                eprintln!(
+                    "segcam Motion: the GPU was lost as it opened ({why}); next try in {delay:?}"
+                );
+                SlotState::Lost {
+                    why,
+                    next_try: Instant::now() + delay,
+                }
+            }
             (Err(e), None) => {
                 eprintln!("segcam Motion: drawing on the CPU ({e})");
                 SlotState::Refused(e)
@@ -498,7 +512,7 @@ fn open_on(choice: &str, lost_adapter: Option<&str>) -> Result<GpuContext, NoGpu
         let errors_before = gpu.faults().errors().0;
         let dev = on_shared(gpu);
         return match (dev.lost(), dev.errors()) {
-            (Some(e), _) => Err(NoGpu::Failed(e)),
+            (Some(e), _) => Err(NoGpu::Lost(e)),
             (None, (count, e)) if count != errors_before => Err(NoGpu::Failed(e)),
             _ => Ok(dev),
         };
@@ -527,7 +541,8 @@ fn open_on(choice: &str, lost_adapter: Option<&str>) -> Result<GpuContext, NoGpu
         .min(supported.max_buffer_size);
     let dev = GpuContext::build(device, queue, info, max_binding, faults, false);
     match (dev.lost(), dev.errors()) {
-        (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
+        (Some(e), _) => Err(NoGpu::Lost(e)),
+        (None, (1.., e)) => Err(NoGpu::Failed(e)),
         _ => Ok(dev),
     }
 }
@@ -2013,6 +2028,28 @@ mod tests {
         match slot.status() {
             Err(NoGpu::Failed(e)) => assert!(e.contains("a broken driver"), "{e}"),
             other => panic!("not a failed GPU: {other:?}"),
+        }
+    }
+
+    /// A first open that overlaps a loss isn't the machine's answer: the slot tries again.
+    #[test]
+    fn first_open_overlapping_a_loss_tries_again() {
+        let tries = std::sync::atomic::AtomicU32::new(0);
+        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| match tries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => Err(NoGpu::Lost("mid open".into())),
+            _ => open("fallback"),
+        })));
+        assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match slot.now() {
+                DeviceNow::Ready(_) => return,
+                DeviceNow::Never => panic!("the first open's loss was final"),
+                DeviceNow::Waiting if Instant::now() > deadline => panic!("no second try"),
+                DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+            }
         }
     }
 }
