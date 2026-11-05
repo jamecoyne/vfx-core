@@ -46,6 +46,11 @@ const AFTER_ERROR_MS: i32 = 250;
 /// time recorded.
 const REPEAT_STILL_PICTURE: Duration = Duration::from_millis(100);
 
+/// How many pictures are drawn before the recorder starts, about 0.1 s at 60 fps. Safari's stream
+/// gives black for the first 3 draws of a new canvas, however far apart they are, and those would
+/// open the file. The rest is margin, as this can't read the stream's pictures to see them change.
+const DRAWS_BEFORE_RECORDING: u32 = 6;
+
 const OPAQUE_COPY_WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
 
@@ -74,6 +79,7 @@ pub struct WebRecorder {
     recorder: MediaRecorder,
     file: Rc<PendingFile>,
     last_draw: Cell<Instant>,
+    draws_left_before_recording: Cell<u32>,
     pub size: (u32, u32),
 }
 
@@ -89,7 +95,8 @@ struct PendingFile {
     mime_type: String,
     extension: &'static str,
     finished: Finished,
-    started: Instant,
+    /// When the recorder started, so this reads the file's length.
+    started: Cell<Instant>,
 }
 
 fn error(e: JsValue) -> String {
@@ -162,7 +169,7 @@ impl WebRecorder {
             mime_type: mime_type.to_owned(),
             extension,
             finished,
-            started: Instant::now(),
+            started: Cell::new(Instant::now()),
         });
         let on_data = {
             let file = file.clone();
@@ -183,26 +190,30 @@ impl WebRecorder {
             Closure::<dyn FnMut(Event)>::new(move |event: Event| file.recorder_failed(&event))
         };
         recorder.set_onerror(Some(on_error.into_js_value().unchecked_ref()));
-        // Handed over a second at a time, so a long recording isn't one huge buffer to the end.
-        recorder.start_with_time_slice(1000).map_err(error)?;
         Ok(Self {
             surface,
             pass,
             recorder,
             file,
             last_draw: Cell::new(Instant::now()),
+            draws_left_before_recording: Cell::new(DRAWS_BEFORE_RECORDING),
             size,
         })
     }
 
     /// How long this has been recording.
     pub fn elapsed(&self) -> Duration {
-        self.file.started.elapsed()
+        if self.draws_left_before_recording.get() > 0 {
+            return Duration::ZERO;
+        }
+        self.file.started.get().elapsed()
     }
 
-    /// Whether a picture that hasn't changed should be drawn again to keep the recording going.
+    /// Whether a picture that hasn't changed should be drawn again, to get the recorder started
+    /// or to keep the recording going.
     pub fn still_picture_due(&self) -> bool {
-        self.last_draw.get().elapsed() >= REPEAT_STILL_PICTURE
+        self.draws_left_before_recording.get() > 0
+            || self.last_draw.get().elapsed() >= REPEAT_STILL_PICTURE
     }
 
     /// Draws a picture into the recorded canvas.
@@ -226,6 +237,24 @@ impl WebRecorder {
         self.pass.draw(&mut encoder, &bind, &view);
         gpu.queue.submit(Some(encoder.finish()));
         gpu.queue.present(frame);
+        self.count_draw_before_recording();
+    }
+
+    /// Starts the recorder on the last of the draws it waits for.
+    fn count_draw_before_recording(&self) {
+        let left = self.draws_left_before_recording.get();
+        if left == 0 {
+            return;
+        }
+        self.draws_left_before_recording.set(left - 1);
+        if left == 1 {
+            self.file.started.set(Instant::now());
+            // Handed over a second at a time, so a long recording isn't one huge buffer to the end.
+            if let Err(e) = self.recorder.start_with_time_slice(1000) {
+                *self.file.failure.borrow_mut() = Some(error(e));
+                self.file.save_once();
+            }
+        }
     }
 
     /// Stops, then saves the file once the browser has handed over the last of it. A recorder
@@ -287,7 +316,7 @@ impl PendingFile {
         recorder.set_onstop(None);
         recorder.set_onerror(None);
         let failure = self.failure.borrow_mut().take();
-        let length = final_recording_length(self.started.elapsed());
+        let length = final_recording_length(self.started.get().elapsed());
         let outcome = if self.chunks.borrow().is_empty() {
             match failure {
                 Some(why) => format!("Recording failed: {why}"),

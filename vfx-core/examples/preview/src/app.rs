@@ -485,7 +485,8 @@ impl Preview {
                     finished,
                 ) {
                     Ok(recorder) => {
-                        // A paused source brings no new picture, and the file should start now.
+                        // A paused source brings no new picture, and this draw is the first of
+                        // those the recorder waits for.
                         recorder.draw(&self.gpu, self.effects.output_frame());
                         self.web_recording = Some(recorder);
                         self.record_result = None;
