@@ -958,10 +958,9 @@ mod tests {
         assert!(!again.finished && !again.new_picture);
         assert_eq!(picture, same);
 
-        // The same input as new frames settles on one picture.
-        render(&mut effects, 1.0);
-        let (settled, before) = render(&mut effects, 2.0);
-        let (repeat, same) = render(&mut effects, 3.0);
+        // A host handing over the same input again adds no frame, and no new picture.
+        let (settled, before) = render(&mut effects, 1.0);
+        let (repeat, same) = render(&mut effects, 2.0);
         assert!(settled.finished && repeat.finished && !repeat.new_picture);
         assert_eq!(before, same);
 

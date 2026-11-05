@@ -716,6 +716,8 @@ mod tests {
         stage.push_input(&gpu, Input::Gpu(&input), 0.0, &values, None);
         assert_eq!(stage.history.len(), 1);
 
+        // Another picture, so only the failed read keeps it from counting as a frame.
+        input.write(&gpu, bytemuck::cast_slice(&vec![0.75f32; 32 * 32 * 4]));
         gpu.device.destroy();
         stage.push_input(&gpu, Input::Gpu(&input), 1.0, &values, None);
         assert_eq!(
