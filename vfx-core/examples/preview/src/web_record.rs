@@ -5,8 +5,9 @@
 //! The page's canvas holds the panel as well, so it can't be the one recorded. Nothing here reads
 //! the picture back, so recording leaves an effect drawing straight into its output frame.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use js_sys::{Array, Reflect};
 use vfx_core::{Frame, Gpu};
@@ -16,6 +17,7 @@ use web_sys::{
     Blob, BlobEvent, BlobPropertyBag, Event, HtmlAnchorElement, HtmlCanvasElement, MediaRecorder,
     MediaRecorderOptions, RecordingState, Url,
 };
+use web_time::Instant;
 
 use crate::effects::FullscreenPass;
 
@@ -37,6 +39,11 @@ const URL_LIFETIME_MS: i32 = 60_000;
 
 /// How long a recorder that reported an error gets to hand over its last data and stop.
 const AFTER_ERROR_MS: i32 = 250;
+
+/// How often a picture that stands still is drawn again. The browser records a canvas only when
+/// it is drawn, so without this a paused source makes a file of one frame, far shorter than the
+/// time recorded.
+const REPEAT_STILL_PICTURE: Duration = Duration::from_millis(100);
 
 const OPAQUE_COPY_WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -65,6 +72,7 @@ pub struct WebRecorder {
     pass: FullscreenPass,
     recorder: MediaRecorder,
     file: Rc<PendingFile>,
+    last_draw: Cell<Instant>,
     pub size: (u32, u32),
 }
 
@@ -179,12 +187,19 @@ impl WebRecorder {
             pass,
             recorder,
             file,
+            last_draw: Cell::new(Instant::now()),
             size,
         })
     }
 
-    /// Draws a new picture into the recorded canvas.
+    /// Whether a picture that hasn't changed should be drawn again to keep the recording going.
+    pub fn still_picture_due(&self) -> bool {
+        self.last_draw.get().elapsed() >= REPEAT_STILL_PICTURE
+    }
+
+    /// Draws a picture into the recorded canvas.
     pub fn draw(&self, gpu: &Gpu, picture: &Frame) {
+        self.last_draw.set(Instant::now());
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,

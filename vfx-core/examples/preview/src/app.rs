@@ -480,6 +480,8 @@ impl Preview {
                     finished,
                 ) {
                     Ok(recorder) => {
+                        // A paused source brings no new picture, and the file should start now.
+                        recorder.draw(&self.gpu, self.effects.output_frame());
                         self.web_recording = Some(recorder);
                         self.record_result = None;
                     }
@@ -493,8 +495,8 @@ impl Preview {
         }
     }
 
-    /// Draws a new picture into the recording. A frame of another size stops it, as on the
-    /// desktop, where the encoder takes one size.
+    /// Draws a new picture into the recording, or the same one again when it stands still. A
+    /// frame of another size stops it, as on the desktop, where the encoder takes one size.
     #[cfg(target_arch = "wasm32")]
     fn record_web_frame(&mut self) {
         if let Some(finished) = self.web_record_finished.borrow_mut().take() {
@@ -510,7 +512,7 @@ impl Preview {
                 recorder.discard();
             }
             self.record_result = Some("Recording stopped: the frame size changed".into());
-        } else if self.effects.last_outcome().new_picture {
+        } else if self.effects.last_outcome().new_picture || recorder.still_picture_due() {
             recorder.draw(&self.gpu, self.effects.output_frame());
         }
     }
