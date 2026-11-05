@@ -1,6 +1,7 @@
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// What a device reported through its error and loss callbacks. wgpu holds one of each per device
 /// and its default error handler panics, so one place installs them and everyone reads this.
@@ -45,6 +46,41 @@ impl DeviceFaults {
     /// Why the device was lost, once it is.
     pub fn lost(&self) -> Option<String> {
         self.lost.lock().ok().and_then(|lost| lost.clone())
+    }
+
+    /// Whether both are the record of one device. `wgpu::Device`'s own equality holds only within
+    /// one `Instance`, so it can call a device reopened from a new instance the old one.
+    pub fn same_device(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lost, &other.lost)
+    }
+}
+
+/// When to try for a new device after a loss: 1, 2, 4, 8 and 16 s, then every 30 s for as long as
+/// it takes, since a show lasts hours and a device may come back late. A device that lived
+/// [`Self::STABLE_AFTER`] starts the schedule over; one that dies sooner goes on from where it
+/// was, so a GPU that opens and dies isn't reopened every second all night.
+#[derive(Clone, Debug, Default)]
+pub struct ReopenBackoff {
+    tries: u32,
+}
+
+impl ReopenBackoff {
+    const LONGEST: Duration = Duration::from_secs(30);
+    /// How long a device has to last to count as back.
+    pub const STABLE_AFTER: Duration = Duration::from_secs(60);
+
+    /// The wait before the next try, which this counts.
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = Duration::from_secs(1 << self.tries.min(5)).min(Self::LONGEST);
+        self.tries += 1;
+        delay
+    }
+
+    /// A device was lost after `lived`.
+    pub fn lost(&mut self, lived: Duration) {
+        if lived >= Self::STABLE_AFTER {
+            self.tries = 0;
+        }
     }
 }
 
@@ -189,3 +225,33 @@ impl fmt::Display for GpuError {
 }
 
 impl std::error::Error for GpuError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_up_to_the_longest_wait() {
+        let mut backoff = ReopenBackoff::default();
+        let delays: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
+    }
+
+    #[test]
+    fn backoff_starts_over_only_after_a_device_that_lasted() {
+        let mut backoff = ReopenBackoff::default();
+        backoff.next_delay();
+        backoff.next_delay();
+        backoff.lost(Duration::from_secs(5));
+        assert_eq!(backoff.next_delay().as_secs(), 4, "a device that died soon");
+        backoff.lost(ReopenBackoff::STABLE_AFTER);
+        assert_eq!(backoff.next_delay().as_secs(), 1, "a device that lasted");
+    }
+
+    #[test]
+    fn same_device_follows_the_record_and_not_the_clone() {
+        let (one, other) = (DeviceFaults::default(), DeviceFaults::default());
+        assert!(one.same_device(&one.clone()));
+        assert!(!one.same_device(&other));
+    }
+}

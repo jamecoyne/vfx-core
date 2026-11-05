@@ -15,6 +15,10 @@ use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, Gpu, ParamValues, Target};
 use vfx_host::{CpuInstance, by_rows};
 
+/// How long a frame read back may take once the poll has returned.
+#[cfg(not(target_arch = "wasm32"))]
+const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub enum Input<'a> {
     Gpu(&'a Frame),
     /// A decoded frame in RAM; empty until the first arrives.
@@ -443,8 +447,12 @@ impl GpuFrameReader {
         if vfx_core::poll_device(&gpu.device, wgpu::PollType::wait_indefinitely()).is_err() {
             return;
         }
-        if let Ok(Ok(())) = rx.recv() {
-            self.with_mapped_rows(&self.buffer, time, f);
+        // D3D12 finishes a poll on a removed device without having found the loss, so the map may
+        // never answer. A frame that doesn't arrive is skipped; a buffer still being mapped can't
+        // be mapped again, so the next read needs a new one.
+        match rx.recv_timeout(READBACK_TIMEOUT) {
+            Ok(Ok(())) => self.with_mapped_rows(&self.buffer, time, f),
+            _ => self.buffer = new_readback_buffer(gpu, self.pitch, input.height),
         }
     }
 
