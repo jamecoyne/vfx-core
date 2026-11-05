@@ -982,6 +982,48 @@ mod tests {
         assert!(first.iter().all(|v| (v - 0.75).abs() < 0.01));
     }
 
+    /// A CPU effect goes on after a loss with its source and its history, by `destroy()`.
+    #[test]
+    fn new_device_keeps_the_source_and_the_history() {
+        let (_turn, lost) = crate::test_gpu();
+        let mut effects = Effects::new(&lost);
+        effects.keep_output_in_ram(true);
+        let (controls, values) = shown("segcam Motion (Rust)");
+        effects.start_stream(&lost, "still".into(), (64, 64), None);
+        effects.write_source(&lost, &vec![0.25; 64 * 64 * 4]);
+        let picture = render_to_float(&mut effects, &lost, &controls, &values, 0.0);
+        lost.device.destroy();
+
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        effects.move_to_device(&gpu);
+        assert_eq!(effects.source_name(), Some("still"));
+        assert_eq!(effects.size(), (64, 64));
+        // The same time, so no new frame: this draws what the history holds on the new device.
+        let same = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
+        assert!(effects.last_outcome().finished, "nothing rendered");
+        assert_eq!(picture, same);
+        // A new frame reads the still, whose pixels were only on the lost device.
+        render_to_float(&mut effects, &gpu, &controls, &values, 1.0);
+        let settled = render_to_float(&mut effects, &gpu, &controls, &values, 2.0);
+        assert_eq!(picture, settled, "the still didn't reach the new device");
+    }
+
+    /// A GPU effect's state was on the device, so it's rebuilt and draws the same frame again.
+    #[test]
+    fn gpu_effect_starts_over_on_a_new_device() {
+        let (_turn, lost) = crate::test_gpu();
+        let mut effects = Effects::new(&lost);
+        let (mut controls, values) = shown("Gaussian Blur");
+        controls.pattern = 1;
+        let picture = render_to_float(&mut effects, &lost, &controls, &values, 0.0);
+        lost.device.destroy();
+
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        effects.move_to_device(&gpu);
+        let same = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
+        assert_eq!(picture, same);
+    }
+
     /// A render that draws the same picture again is finished but not new, and a new one
     /// still reaches the output.
     #[test]
