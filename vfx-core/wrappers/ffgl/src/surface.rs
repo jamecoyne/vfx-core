@@ -223,7 +223,7 @@ impl Interop {
     /// # Safety
     /// The host's GL context must be current.
     pub unsafe fn new(device: Arc<OwnDevice>, size: (u32, u32)) -> Result<Self, String> {
-        let gpu = &device.gpu;
+        let gpu = device.gpu();
         // SAFETY: the caller has the context current. Each step cleans up after the
         // ones before it if it fails.
         unsafe {
@@ -279,7 +279,7 @@ impl Interop {
         hardware: (u32, u32),
         host_fbo: gl::GLuint,
     ) {
-        let gpu = &self.device.gpu;
+        let gpu = self.device.gpu();
         let (w, h) = self.size;
         // 1. Host texture -> input surface (straight, top-down).
         // SAFETY: the caller has the context current.

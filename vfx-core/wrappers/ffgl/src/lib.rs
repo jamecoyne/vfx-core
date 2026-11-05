@@ -829,7 +829,7 @@ unsafe fn process_gpu(
     };
     LOG.note("render path: GPU through RAM (texture readback)");
     let Ok(result) = catch_unwind(AssertUnwindSafe(|| {
-        pipeline::run(&device.gpu, device.pool_key, &job)
+        pipeline::run(device.gpu(), device.pool_key, &job)
     })) else {
         LOG.note("warning: GPU render failed, passing frames through");
         return pass_through(blit);

@@ -185,7 +185,7 @@ fn run(frame: &Frame) -> Result<(), String> {
             input: &pixels,
             layer: layer.as_deref(),
         };
-        pixels = pipeline::run(&device.gpu, device.pool_key, &job);
+        pixels = pipeline::run(device.gpu(), device.pool_key, &job);
     }
     // Unclamped f32, so the harness can quantise the way each bit depth does: integer
     // depths clip before premultiplying, 32 bpc keeps values above 1.0 until output.

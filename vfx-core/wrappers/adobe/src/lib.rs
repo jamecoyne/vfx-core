@@ -597,7 +597,7 @@ fn render_frame(
     // image through, and say why once in the log.
     let result = match vfx_host::gpu(&LOG) {
         Some(device) => catch_unwind(AssertUnwindSafe(|| {
-            pipeline::run(&device.gpu, device.pool_key, &job)
+            pipeline::run(device.gpu(), device.pool_key, &job)
         }))
         .unwrap_or_else(|_| {
             warn_once("GPU render failed, passing frames through");
