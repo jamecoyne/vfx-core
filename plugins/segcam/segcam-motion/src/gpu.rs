@@ -1759,14 +1759,13 @@ impl Drawer {
             let mapped: &[u8] = &mapped;
             let threads =
                 vfx_plugin::vfx_host::worker_threads().clamp(1, out.height.max(1) as usize);
-            std::thread::scope(|scope| {
-                for mut band in out.bands(threads) {
-                    scope.spawn(move || {
-                        for y in band.rows() {
-                            let at = y as usize * row;
-                            pixel_bytes_mut(band.row_mut(y)).copy_from_slice(&mapped[at..at + row]);
-                        }
-                    });
+            let bands = std::sync::Mutex::new(out.bands(threads));
+            vfx_plugin::vfx_host::on_workers(threads, || {
+                while let Some(mut band) = bands.lock().ok().and_then(|mut bands| bands.pop()) {
+                    for y in band.rows() {
+                        let at = y as usize * row;
+                        pixel_bytes_mut(band.row_mut(y)).copy_from_slice(&mapped[at..at + row]);
+                    }
                 }
             });
         }

@@ -302,6 +302,18 @@ const MOUTH_OFFSET_Y: f64 = 0.1;
 const EYE_OUTLINE_SCALE: f64 = 1.7;
 const LIP_OUTLINE_SCALE: f64 = 1.27;
 
+/// Finds bodies beside the faces. One thread kept for the process, so finding starts none: see
+/// `on_workers` in vfx-host for why a thread per frame is a problem in a show. It isn't one of the
+/// frame workers, since a detection takes far longer than a band of pixels.
+static BODY_WORKER: std::sync::LazyLock<Option<rayon::ThreadPool>> =
+    std::sync::LazyLock::new(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "segcam body detection".to_owned())
+            .build()
+            .ok()
+    });
+
 impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
     pub fn new(detector: D, mesh: Option<M>, bodies: Option<B>) -> Self {
         Self {
@@ -316,20 +328,29 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
     pub fn find(&mut self, image: &Image, parts: Parts) -> &[Segment] {
         self.segments.clear();
         let mut bodies = self.bodies.take();
-        let found = std::thread::scope(|scope| {
-            let finding = bodies
-                .as_mut()
-                .filter(|_| parts.body)
-                .map(|b| scope.spawn(|| b.detect(image)));
+        let mut found = Vec::new();
+        let mut find_faces = || {
             if parts.face || parts.eyes || parts.mouth {
                 for face in &self.detector.detect(image) {
                     self.push_face(image, face, parts);
                 }
             }
-            finding
-                .map(|f| f.join().unwrap_or_default())
-                .unwrap_or_default()
-        });
+        };
+        match (bodies.as_mut().filter(|_| parts.body), &*BODY_WORKER) {
+            (Some(bodies), Some(worker)) => worker.in_place_scope(|scope| {
+                // As before this worker: a body detector's panic costs its bodies, not the faces.
+                scope.spawn(|_| {
+                    let detect = std::panic::AssertUnwindSafe(|| bodies.detect(image));
+                    found = std::panic::catch_unwind(detect).unwrap_or_default();
+                });
+                find_faces();
+            }),
+            (Some(bodies), None) => {
+                find_faces();
+                found = bodies.detect(image);
+            }
+            (None, _) => find_faces(),
+        }
         self.bodies = bodies;
         for body in found {
             self.push(Kind::Body, body.rect);

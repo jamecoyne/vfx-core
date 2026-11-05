@@ -18,6 +18,42 @@ pub fn worker_threads() -> usize {
     (*CORES).min(THREADS)
 }
 
+/// Threads kept for the life of the process, so that frame work starts none. A thread started per
+/// frame costs a call into every loaded DLL, and NVIDIA's D3D driver keeps a record of each thread
+/// ever started, which adds up over a show. The caller takes a share of the work, so one fewer is
+/// enough. They outlive an effect instance, which is safe since an instance pins its module.
+#[cfg(not(target_arch = "wasm32"))]
+static WORKERS: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads().saturating_sub(1).max(1))
+        .thread_name(|index| format!("vfx-host frame worker {index}"))
+        .build()
+        .ok()
+});
+
+/// Runs `work` on `threads` threads at once, the caller's among them, and returns when all have
+/// finished. `work` takes what's left from a queue of its own, which makes it safe to run in any
+/// number of copies: a busy worker's share falls to the others, and if the workers can't start, the
+/// caller does it all. A band of pixels at a time is the size of work meant here, since instances
+/// share the workers and a caller that's done waits for the copies it queued. On one core, and in
+/// browsers, it runs once on the calling thread.
+pub fn on_workers(threads: usize, work: impl Fn() + Sync) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if threads > 1
+        && let Some(workers) = WORKERS.as_ref()
+    {
+        workers.in_place_scope(|scope| {
+            for _ in 1..threads {
+                scope.spawn(|_| work());
+            }
+            work();
+        });
+        return;
+    }
+    let _ = threads;
+    work();
+}
+
 /// Runs `f` on each row of `rows` (`width` items each) with its row number, a band of rows
 /// at a time on up to six threads. On one core, and in browsers, on the calling thread.
 pub fn by_rows<T: Send>(rows: &mut [T], width: usize, f: impl Fn(usize, &mut [T]) + Sync) {
@@ -47,15 +83,11 @@ fn on_threads<T: Send>(
     let band = height.div_ceil(threads * BANDS_PER_THREAD).max(1);
     let bands = Mutex::new(rows.chunks_mut(band * width).enumerate());
     let next = || bands.lock().ok().and_then(|mut bands| bands.next());
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                while let Some((i, chunk)) = next() {
-                    for (j, row) in chunk.chunks_mut(width).enumerate() {
-                        f(i * band + j, row);
-                    }
-                }
-            });
+    on_workers(threads, || {
+        while let Some((i, chunk)) = next() {
+            for (j, row) in chunk.chunks_mut(width).enumerate() {
+                f(i * band + j, row);
+            }
         }
     });
 }
