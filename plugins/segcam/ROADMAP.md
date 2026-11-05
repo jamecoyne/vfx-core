@@ -7,7 +7,7 @@ an announcement. Requirements and their status are in [SPEC.md](SPEC.md).
 
 1. Land the work as small PRs: Windows fixes, Resolve speed (F4, F6), faster Swarm, Swarm on the
    GPU (F8, F9).
-2. Faces every 2nd frame (F7) and the Deliver check (F5).
+2. Faces every 2nd frame (F7) and the export check (F5).
 3. Reliability: long runs with no stalls, the 30 minute Resolume run (N8), After Effects on
    Windows.
 4. The shared benchmark, with an offline bench in the repo, run on every contributor's machine.
