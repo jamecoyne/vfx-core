@@ -586,15 +586,32 @@ static void case_timing(void) {
 }
 
 #ifdef _WIN32
+static int log_path(char *name, size_t size) {
+    DWORD n = GetTempPathA((DWORD)size, name);
+    if (!n || n + strlen(PLUGIN_LOG) >= size) return 0;
+    strcat(name, PLUGIN_LOG);
+    return 1;
+}
+
+/* The log's length before the plugin loads: this process's entries all come after it. */
+static long log_start = 0;
+
+static void mark_log_start(void) {
+    char name[MAX_PATH];
+    FILE *log = log_path(name, sizeof name) ? fopen(name, "rb") : NULL;
+    if (!log) return;
+    if (!fseek(log, 0, SEEK_END)) log_start = ftell(log);
+    fclose(log);
+}
+
 /* Check only this process's log entries, never a successful path from an earlier run. With
  * `number`, it takes the number right after `message` in the latest entry that has one. */
 static int logged_entry(const char *message, double *number) {
     char name[MAX_PATH], prefix[64], line[2048];
-    DWORD n = GetTempPathA(sizeof name, name);
-    if (!n || n + strlen(PLUGIN_LOG) >= sizeof name) return 0;
-    strcat(name, PLUGIN_LOG);
-    FILE *log = fopen(name, "r");
+    if (!log_path(name, sizeof name)) return 0;
+    FILE *log = fopen(name, "rb");
     if (!log) return 0;
+    if (log_start > 0) fseek(log, log_start, SEEK_SET);
     snprintf(prefix, sizeof prefix, "[pid %lu] ", GetCurrentProcessId());
     int found = 0;
     while (fgets(line, sizeof line, log)) {
@@ -611,6 +628,18 @@ static int logged_entry(const char *message, double *number) {
 
 static int logged_message(const char *message) { return logged_entry(message, NULL); }
 
+/* A GPU effect's RAM path renders on a device of the plugin's own, opened on a thread of its own,
+ * and passes frames through until it is open. Renders `ram` until its log says frames go through
+ * RAM, so the frame it renders next is a RAM reference. */
+static void wait_for_ram_device(void *ram, Frame *f) {
+    double started = now();
+    while (!logged_message("render path: GPU through RAM") && now() - started < 10) {
+        CHECK(render(ram, f), "render while the RAM path's device opens");
+        Sleep(5);
+    }
+    CHECK(logged_message("render path: GPU through RAM"), "the RAM path's device never opened");
+}
+
 static void case_sharing(void) {
     const char *original = getenv("VFX_FFGL_PATH");
     char *saved = original ? strdup(original) : NULL;
@@ -620,6 +649,26 @@ static void case_sharing(void) {
     void *ram = instantiate(63, 37);
     _putenv_s("VFX_FFGL_PATH", saved ? saved : "");
     free(saved);
+    /* The first RAM frames of a process come before the device opens: they pass through unchanged,
+     * with no wait on the open. The effect changes the image, so its output can't be mistaken for
+     * the input. A device that opened before this render leaves nothing to check. */
+    if (!logged_message("render path: GPU through RAM")) {
+        Frame f = frame(63, 37, 80, 48);
+        set(ram, "Brightness", 0.2f);
+        double started = now();
+        CHECK(render(ram, &f), "first RAM render");
+        double took = now() - started;
+        if (!logged_message("render path: GPU through RAM")) {
+            CHECK(logged_message("passing frames through until the plugin's own device is open"),
+                  "the first RAM frame didn't say it passed through");
+            CHECK(max_diff(&f) < 1e-4f, "the first RAM frame wasn't the input: %g", max_diff(&f));
+            CHECK(took < 0.1, "the first RAM frame took %.1f ms", took * 1000);
+        } else {
+            printf("  the RAM path's device opened before the first RAM frame\n");
+        }
+        wait_for_ram_device(ram, &f);
+        free_frame(&f);
+    }
     /* Reuse instances across sizes, settings, padding, transparent and HDR pixels. */
     int sizes[][2] = {{63, 37}, {17, 13}, {63, 37}};
     for (int s = 0; s < 3; s++) {
@@ -683,6 +732,7 @@ static void case_pending_gl_error(void) {
     _putenv_s("VFX_FFGL_PATH", "");
     Frame f = frame(63, 37, 80, 48);
     float *reference = malloc((size_t)f.w * f.h * 4 * sizeof(float));
+    wait_for_ram_device(ram, &f);
     CHECK(render(ram, &f), "forced RAM reference render");
     memcpy(reference, f.out, (size_t)f.w * f.h * 4 * sizeof(float));
     glBindTexture(0xFFFF, 0);
@@ -716,8 +766,16 @@ static void case_device_reopen(void) {
     _putenv_s("VFX_FFGL_PATH", "");
     Frame f = frame(63, 37, 80, 48);
     float *reference = malloc((size_t)f.w * f.h * 4 * sizeof(float));
+    wait_for_ram_device(ram, &f);
     CHECK(render(ram, &f), "forced RAM reference render");
     memcpy(reference, f.out, (size_t)f.w * f.h * 4 * sizeof(float));
+    /* A new instance's setup and first render on a healthy device: GL objects and shaders of its
+     * own, which a slow machine can take long over and which no device open is part of. */
+    double setup_started = now();
+    void *healthy = instantiate(63, 37);
+    CHECK(render(healthy, &f), "render of an instance on the healthy device");
+    double setup = now() - setup_started;
+    call(DEINSTANTIATE_GL, u(0), healthy);
     _putenv_s("VFX_FFGL_LOSE_DEVICE_AFTER", "20");
     void *lost = instantiate(63, 37);
     /* Instances made while the device is out, which mustn't wait for it: one as soon as the loss
@@ -726,29 +784,39 @@ static void case_device_reopen(void) {
     /* No call that a device open could reach may wait for one: the gap's instances setting up, and
      * the lost instance's renders from shortly before its first try on. The renders right after
      * the loss are left out, since the RAM path has one-off costs of its own there. The bound is
-     * far above a frame this small through RAM and below the time a device takes to open. */
+     * far above a frame this small through RAM and below the time a device takes to open. A gap
+     * instance's setup and first render get three times a healthy one's, at least the bound. */
     const double bound = 0.1;
-    double lost_at = 0, worst = 0;
+    const double setup_bound = 3 * setup > bound ? 3 * setup : bound;
+    double lost_at = 0, worst = 0, worst_setup = 0, worst_early = 0;
     /* Read when the first render sets up the shared images; the new device stays. The first try
      * is a second after the loss. */
     int rendered = 0;
     for (; rendered < 2000 && !logged_message("shared frames back on a new device"); rendered++) {
         double started = now();
         CHECK(render(lost, &f), "render %d", rendered);
+        double took = now() - started;
         int try_due = lost_at && now() - lost_at >= 0.9;
-        if (try_due && now() - started > worst) worst = now() - started;
+        if (try_due && took > worst) worst = took;
+        if (lost_at && !try_due && took > worst_early) worst_early = took;
         _putenv_s("VFX_FFGL_LOSE_DEVICE_AFTER", "");
         if (!lost_at && logged_message("warning: GPU device lost")) lost_at = now();
         if (lost_at && !during) {
             started = now();
             during = instantiate(63, 37);
             CHECK(render(during, &f), "render of an instance made in the gap");
+            if (now() - started > worst_setup) worst_setup = now() - started;
+            started = now();
+            CHECK(render(during, &f), "second render of an instance made in the gap");
             if (now() - started > worst) worst = now() - started;
         }
         if (lost_at && !during_try && now() - lost_at >= 1.0) {
             started = now();
             during_try = instantiate(63, 37);
             CHECK(render(during_try, &f), "render of an instance made during the first try");
+            if (now() - started > worst_setup) worst_setup = now() - started;
+            started = now();
+            CHECK(render(during_try, &f), "second render of an instance made during the first try");
             if (now() - started > worst) worst = now() - started;
         }
         float diff_worst = 0;
@@ -772,8 +840,12 @@ static void case_device_reopen(void) {
         CHECK(diff_worst < 1e-4f, "render %d on the new device differs from RAM: %g", i, diff_worst);
     }
     if (lost_at) {
-        printf("  worst call a device open could reach: %.1f ms\n", worst * 1000);
+        printf("  worst call a device open could reach: %.1f ms, a gap instance's setup %.1f ms "
+               "(healthy %.1f ms), a render in the 0.9 s after the loss %.1f ms\n",
+               worst * 1000, worst_setup * 1000, setup * 1000, worst_early * 1000);
         CHECK(worst < bound, "a call waited %.1f ms, over the %.0f ms bound", worst * 1000, bound * 1000);
+        CHECK(worst_setup < setup_bound, "a gap instance's setup took %.1f ms, over %.0f ms",
+              worst_setup * 1000, setup_bound * 1000);
     }
     free(reference);
     free_frame(&f);
@@ -796,6 +868,7 @@ static void case_gpu_wait(void) {
     _putenv_s("VFX_FFGL_PATH", "");
     Frame f = frame(63, 37, 80, 48);
     float *reference = malloc((size_t)f.w * f.h * 4 * sizeof(float));
+    wait_for_ram_device(ram, &f);
     CHECK(render(ram, &f), "forced RAM reference render");
     memcpy(reference, f.out, (size_t)f.w * f.h * 4 * sizeof(float));
     /* A strict run requires one shared frame in the process, and the frames below may have none. */
@@ -840,7 +913,7 @@ static void segcam_device_reopen(void) {
     GLuint textures[2] = {segcam_texture(w, h, 0), segcam_texture(w, h, 1)};
     GLuint original = f.input;
     int back_frames = 0;
-    double waited_at = 0, worst_render = 0;
+    double waited_at = 0, worst_render = 0, worst_early = 0;
     for (int n = 0; n < 3000 && back_frames < 60; n++) {
         f.input = textures[n & 1];
         double time = n / 30.0;
@@ -848,28 +921,34 @@ static void segcam_device_reopen(void) {
         double started = now();
         CHECK(render(inst, &f), "render %d failed", n);
         /* What the host's render thread waits for through the reopen, from shortly before the
-         * first try, a second after the loss, on. The renders right after the loss are left out,
-         * since the RAM path has one-off costs of its own there. */
-        if (waited_at && now() - waited_at >= 0.9 && now() - started > worst_render) {
-            worst_render = now() - started;
-        }
+         * first try, a second after the loss, on. The 0.9 s count from the render after the one
+         * whose failure the log shows, a little after the loss itself. The renders before are left
+         * out, since the RAM path has one-off costs of its own there. */
+        double took = now() - started;
+        if (waited_at && now() - waited_at >= 0.9 && took > worst_render) worst_render = took;
+        if (waited_at && now() - waited_at < 0.9 && took > worst_early) worst_early = took;
         _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "");
         if (!waited_at && logged_message("shared GPU render failed, using RAM")) waited_at = now();
         if (logged_message("shared frames back on a new device")) back_frames++;
         Sleep(2);
     }
     /* A render that waited for the new device to open would take about as long as the open, which
-     * the reopen's own log line gives, measured on its thread on this machine and load. */
-    double open_ms = 0;
-    int timed = logged_entry("shared frames back on a new device: ", &open_ms);
-    printf("  worst render through the reopen: %.1f ms, the open on its thread: %.0f ms\n",
-           worst_render * 1000, open_ms);
+     * the reopen's own log line gives, measured on its thread on this machine and load. The one
+     * render that finishes the setup on the render thread adds the time the line gives for that. */
+    double open_ms = 0, finish_ms = 0;
+    int timed = logged_entry("shared frames back on a new device: ", &open_ms)
+                && logged_entry(" ms on a thread, ", &finish_ms);
+    printf("  worst render through the reopen: %.1f ms, the open on its thread: %.0f ms, finishing "
+           "it on the render thread: %.0f ms, a render in the 0.9 s after the loss: %.1f ms\n",
+           worst_render * 1000, open_ms, finish_ms, worst_early * 1000);
     CHECK(waited_at, "the present never found the loss");
     CHECK(back_frames >= 60, "no new device after the loss");
     CHECK(timed, "no time for the open in the log");
-    CHECK(worst_render * 1000 < open_ms, "a render waited %.1f ms, as long as the %.0f ms open",
-          worst_render * 1000, open_ms);
-    /* The interop being back isn't enough: the swarm must be drawn on the new device again. */
+    CHECK(worst_render * 1000 < open_ms + finish_ms,
+          "a render waited %.1f ms, as long as the %.0f ms open", worst_render * 1000, open_ms);
+    /* The interop being back isn't enough: the swarm must be drawn on the new device again. The
+     * note is written once per process, which holds here since this check runs alone in its own
+     * process (`segcam-device-reopen` in main). */
     CHECK(logged_message("a CPU effect's frame drawn on a new device reached the host"),
           "the effect didn't draw on the new device");
     CHECK(!logged_message("CPU render failed"), "a render panicked after the new device");
@@ -926,6 +1005,9 @@ int main(int argc, char **argv) {
 #endif
     printf("GL %s on %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
 
+#ifdef _WIN32
+    mark_log_start();
+#endif
     void *lib = open_plugin(argv[1]);
     if (!lib) { open_failed(); return 2; }
     plug = (PlugMain)plugin_symbol(lib, "plugMain");
