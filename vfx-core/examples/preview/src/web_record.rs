@@ -19,6 +19,7 @@ use web_sys::{
 };
 use web_time::Instant;
 
+use crate::controls::final_recording_length;
 use crate::effects::FullscreenPass;
 
 /// In order of preference, with the extension each saves as. H.264 in MP4 first: it plays
@@ -88,6 +89,7 @@ struct PendingFile {
     mime_type: String,
     extension: &'static str,
     finished: Finished,
+    started: Instant,
 }
 
 fn error(e: JsValue) -> String {
@@ -160,6 +162,7 @@ impl WebRecorder {
             mime_type: mime_type.to_owned(),
             extension,
             finished,
+            started: Instant::now(),
         });
         let on_data = {
             let file = file.clone();
@@ -190,6 +193,11 @@ impl WebRecorder {
             last_draw: Cell::new(Instant::now()),
             size,
         })
+    }
+
+    /// How long this has been recording.
+    pub fn elapsed(&self) -> Duration {
+        self.file.started.elapsed()
     }
 
     /// Whether a picture that hasn't changed should be drawn again to keep the recording going.
@@ -279,6 +287,7 @@ impl PendingFile {
         recorder.set_onstop(None);
         recorder.set_onerror(None);
         let failure = self.failure.borrow_mut().take();
+        let length = final_recording_length(self.started.elapsed());
         let outcome = if self.chunks.borrow().is_empty() {
             match failure {
                 Some(why) => format!("Recording failed: {why}"),
@@ -286,9 +295,11 @@ impl PendingFile {
             }
         } else {
             match (self.save(), failure) {
-                (Ok(name), None) => format!("Saved {name} to your downloads"),
+                (Ok(name), None) => format!("Saved {name} to your downloads, {length} long"),
                 (Ok(name), Some(why)) => {
-                    format!("Recording stopped: {why}. Saved {name} to your downloads")
+                    format!(
+                        "Recording stopped: {why}. Saved {name} to your downloads, {length} long"
+                    )
                 }
                 (Err(e), _) => format!("Couldn't save the recording: {e}"),
             }

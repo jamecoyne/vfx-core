@@ -702,6 +702,7 @@ impl Preview {
                             encoder,
                             path,
                             size,
+                            started: Instant::now(),
                         });
                         self.record_result = None;
                     }
@@ -715,6 +716,8 @@ impl Preview {
     /// Finishes the file, then asks where to keep it. Cancelling the save discards it.
     #[cfg(not(target_arch = "wasm32"))]
     fn finish_recording(&mut self, recording: Recording) {
+        // Measured here, since the save dialog can stay open for any time.
+        let length = controls::final_recording_length(recording.started.elapsed());
         if let Err(e) = recording.encoder.finish() {
             let _ = std::fs::remove_file(&recording.path);
             self.record_result = Some(format!("Recording failed: {e}"));
@@ -735,7 +738,7 @@ impl Preview {
             match std::fs::copy(&recording.path, &out)
                 .and_then(|_| std::fs::remove_file(&recording.path))
             {
-                Ok(()) => format!("Saved {}", out.display()),
+                Ok(()) => format!("Saved {}, {length} long", out.display()),
                 Err(e) => format!("Couldn't save {}: {e}", out.display()),
             },
         );
@@ -1003,9 +1006,9 @@ impl Preview {
             video,
             sound_on,
             #[cfg(not(target_arch = "wasm32"))]
-            recording: self.recording.is_some(),
+            recording: self.recording.as_ref().map(|r| r.started.elapsed()),
             #[cfg(target_arch = "wasm32")]
-            recording: self.web_recording.is_some(),
+            recording: self.web_recording.as_ref().map(|r| r.elapsed()),
             record_result: self.record_result.as_deref(),
             cameras,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1537,6 +1540,7 @@ struct Recording {
     path: std::path::PathBuf,
     /// The frame size it was started at; ffmpeg needs every frame to be this size.
     size: (u32, u32),
+    started: Instant,
 }
 
 /// A second input for effects that read a layer: a video or webcam fitted to the frame, or
