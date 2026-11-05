@@ -202,7 +202,7 @@ pub enum NoGpu {
     /// There is one, but making its device or drawing on it failed.
     Failed(String),
     /// The device was lost while it was being set up. This says nothing about the machine, so
-    /// even a first open tries again.
+    /// even a first open tries again for as long as a lost device would.
     Lost(String),
 }
 
@@ -241,9 +241,18 @@ pub enum DeviceNow {
 pub(crate) static SHARED_SLOT: LazyLock<DeviceSlot> =
     LazyLock::new(|| DeviceSlot::new(|adapter| open_on(&adapter_choice(), adapter)));
 
+/// Tries after a first open that failed, on the reopen backoff: 1, 2, 4, 8 and 16 s, about as long
+/// as a reset can hide an adapter. A reset can make the first open fail in ways that look like the
+/// machine's answer: the device is lost inside `request_device`, the driver panics while the
+/// pipelines build, or the hardware adapter is hidden so that none is found or only a software one.
+/// None of these can be told apart from a machine without a usable GPU, so all are tried again,
+/// and the last answer after these tries is final. A browser's tries would run inside a render,
+/// and its device is the host's, which the host replaces itself: there the first answer is final.
+const FIRST_OPEN_RETRIES: u32 = if cfg!(target_arch = "wasm32") { 0 } else { 5 };
+
 enum SlotState {
     Unopened,
-    /// With why the last device was lost, where this replaces one.
+    /// With why the last device was lost, where this replaces one. Without, the first open.
     Opening {
         replaces: Option<String>,
     },
@@ -251,7 +260,20 @@ enum SlotState {
         device: Arc<GpuContext>,
         opened_at: Instant,
     },
-    /// The first open failed, which is final.
+    /// No device has opened yet: the last of `failures` tries answered `why`, and the next isn't
+    /// before `next_try`.
+    FirstOpenFailed {
+        why: NoGpu,
+        failures: u32,
+        next_try: Instant,
+    },
+    /// Another try after [`SlotState::FirstOpenFailed`] is in flight. Unlike the first open,
+    /// [`DeviceSlot::status`] doesn't wait for it.
+    RetryingFirstOpen {
+        why: NoGpu,
+        failures: u32,
+    },
+    /// No device opened in [`FIRST_OPEN_RETRIES`] tries after the first, which is final.
     Refused(NoGpu),
     /// Lost, and the next try isn't before `next_try`. Any failure on the way back is retried,
     /// since adapters can be missing during a driver reset.
@@ -305,8 +327,26 @@ impl DeviceSlot {
         let mut state = self.state();
         let replaces = match &*state {
             SlotState::Unopened => None,
-            SlotState::Opening { .. } => return DeviceNow::Waiting,
+            SlotState::Opening { .. } | SlotState::RetryingFirstOpen { .. } => {
+                return DeviceNow::Waiting;
+            }
             SlotState::Refused(_) => return DeviceNow::Never,
+            SlotState::FirstOpenFailed {
+                why,
+                failures,
+                next_try,
+            } => {
+                if !host_device_usable() || Instant::now() < *next_try {
+                    return DeviceNow::Waiting;
+                }
+                *state = SlotState::RetryingFirstOpen {
+                    why: why.clone(),
+                    failures: *failures,
+                };
+                drop(state);
+                self.open_in_background();
+                return DeviceNow::Waiting;
+            }
             SlotState::Open { device, opened_at } => {
                 let Some(why) = device.lost() else {
                     return DeviceNow::Ready(device.clone());
@@ -360,7 +400,9 @@ impl DeviceSlot {
             SlotState::Open { device, .. } => {
                 device.lost().map_or(Ok(()), |e| Err(NoGpu::Failed(e)))
             }
-            SlotState::Refused(e) => Err(e.clone()),
+            SlotState::Refused(e)
+            | SlotState::FirstOpenFailed { why: e, .. }
+            | SlotState::RetryingFirstOpen { why: e, .. } => Err(e.clone()),
             SlotState::Lost { why, .. } => Err(NoGpu::Failed(why.clone())),
             SlotState::Opening {
                 replaces: Some(why),
@@ -369,6 +411,26 @@ impl DeviceSlot {
                 unreachable!("started above and waited for")
             }
         }
+    }
+
+    /// Moves a slot whose first open failed to its next try without waiting out the backoff, and
+    /// answers what `now` says then. Waits for a try in flight to answer first.
+    #[cfg(test)]
+    pub(crate) fn next_first_open_try(&'static self) -> DeviceNow {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match &mut *self.state() {
+                SlotState::RetryingFirstOpen { .. } | SlotState::Opening { .. } => {}
+                SlotState::FirstOpenFailed { next_try, .. } => {
+                    *next_try = Instant::now();
+                    break;
+                }
+                _ => break,
+            }
+            assert!(Instant::now() < deadline, "a try never answered");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.now()
     }
 
     fn first_open_pending(&'static self) -> bool {
@@ -401,13 +463,19 @@ impl DeviceSlot {
 
     fn publish(&self, opened: Result<Arc<GpuContext>, NoGpu>) {
         let mut state = self.state();
-        let replaces = match &*state {
-            SlotState::Opening { replaces } => replaces.clone(),
-            _ => None,
+        // Tries so far that opened nothing, where no device has opened yet.
+        let (replaces, failures) = match &*state {
+            SlotState::Opening { replaces } => (replaces.clone(), 0),
+            SlotState::RetryingFirstOpen { failures, .. } => (None, *failures),
+            _ => (None, 0),
         };
         *state = match (opened, replaces) {
-            (Ok(device), _) => {
+            (Ok(device), replaces) => {
                 eprintln!("segcam Motion: drawing on the GPU ({})", device.info.name);
+                // The first device starts the backoff afresh, whatever its tries counted.
+                if replaces.is_none() {
+                    *self.backoff() = ReopenBackoff::default();
+                }
                 SlotState::Open {
                     device,
                     opened_at: Instant::now(),
@@ -420,6 +488,15 @@ impl DeviceSlot {
                 );
                 SlotState::Lost {
                     why,
+                    next_try: Instant::now() + delay,
+                }
+            }
+            (Err(e), None) if failures < FIRST_OPEN_RETRIES => {
+                let delay = self.backoff().next_delay();
+                eprintln!("segcam Motion: no GPU yet ({e}); next try in {delay:?}");
+                SlotState::FirstOpenFailed {
+                    why: e,
+                    failures: failures + 1,
                     next_try: Instant::now() + delay,
                 }
             }
@@ -2047,6 +2124,56 @@ mod tests {
             Box::leak(Box::new(DeviceSlot::new(|_| panic!("a broken driver"))));
         match slot.status() {
             Err(NoGpu::Failed(e)) => assert!(e.contains("a broken driver"), "{e}"),
+            other => panic!("not a failed GPU: {other:?}"),
+        }
+    }
+
+    /// An adapter hidden by a reset during the first open isn't the machine's answer: `status`
+    /// reports it without waiting for another try, renders keep asking, and the next try opens.
+    #[test]
+    fn first_open_without_an_adapter_tries_again() {
+        let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = tries.clone();
+        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(NoGpu::NoAdapter("hidden by a reset".into()))
+        })));
+        assert!(matches!(slot.status(), Err(NoGpu::NoAdapter(_))));
+        assert!(!slot.first_open_pending(), "status waits for retries");
+        assert!(
+            matches!(slot.now(), DeviceNow::Waiting),
+            "the first answer was final"
+        );
+        assert!(matches!(slot.next_first_open_try(), DeviceNow::Waiting));
+        // Wait for the try just started to answer.
+        let _ = slot.next_first_open_try();
+        assert!(
+            tries.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "no second try"
+        );
+    }
+
+    /// A first open that keeps failing, here with a driver panic, becomes final after
+    /// [`FIRST_OPEN_RETRIES`] more tries and keeps its reason.
+    #[test]
+    fn first_open_failures_are_final_after_the_retries() {
+        let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = tries.clone();
+        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            panic!("a driver reset")
+        })));
+        assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(slot.next_first_open_try(), DeviceNow::Never) {
+            assert!(Instant::now() < deadline, "the slot never gave up");
+        }
+        assert_eq!(
+            tries.load(std::sync::atomic::Ordering::Relaxed),
+            1 + FIRST_OPEN_RETRIES
+        );
+        match slot.status() {
+            Err(NoGpu::Failed(e)) => assert!(e.contains("a driver reset"), "{e}"),
             other => panic!("not a failed GPU: {other:?}"),
         }
     }

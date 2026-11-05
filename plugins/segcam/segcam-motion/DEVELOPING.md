@@ -76,7 +76,9 @@ the CPU was set by the cost of the copy back. The output is byte for byte the sw
 frame drawn on the CPU (while the device opens, or after a fault) goes through RAM as before.
 
 A lost GPU device is replaced. Renders draw on the CPU meanwhile, and a new device opens on a backoff
-of 1, 2, 4, 8, 16 and then every 30 s, on the same adapter for about 30 s and then on any. Face models
+of 1, 2, 4, 8, 16 and then every 30 s, on the same adapter for about 30 s and then on any. A first open
+that fails, finding no adapter or only a software one included, tries again at 1, 2, 4, 8 and 16 s,
+since a driver reset can look like any of these, and draws on the CPU for good after that. Face models
 that keep failing reload on the same backoff. In Resolume on Windows the plugin opens the new shared
 device off the render thread.
 

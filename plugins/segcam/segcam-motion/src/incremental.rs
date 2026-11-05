@@ -2111,7 +2111,8 @@ mod tests {
         assert!(within_a_level(&a, &b), "the picture after the reopen");
     }
 
-    /// A first open that fails stays failed: with no adapter the CPU is the machine's path.
+    /// A first open that keeps failing leaves the CPU for good once its retries are spent: with no
+    /// adapter the CPU is the machine's path. Until then renders draw on the CPU and keep asking.
     #[test]
     fn failed_first_open_leaves_the_cpu_for_good() {
         let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(|_| {
@@ -2123,6 +2124,15 @@ mod tests {
         };
         on_cpu.use_gpu(true);
         assert!(slot.status().is_err());
+        render(&mut on_cpu, &crossing(), 0);
+        assert!(on_cpu.gpu_wanted, "the first failure was final");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(slot.next_first_open_try(), gpu::DeviceNow::Never) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slot never gave up"
+            );
+        }
         render(&mut on_cpu, &crossing(), 0);
         assert!(!on_cpu.gpu_wanted);
     }
