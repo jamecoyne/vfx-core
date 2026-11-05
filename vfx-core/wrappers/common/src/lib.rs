@@ -5,6 +5,7 @@
 
 pub mod contract;
 pub mod controls;
+mod device;
 pub mod diag;
 mod kept;
 mod pin;
@@ -12,8 +13,9 @@ pub mod pipeline;
 mod plugin;
 mod rows;
 
+pub use device::{OwnDevice, gpu, gpu_now};
 pub use kept::{CpuInstance, Panicked};
-pub use plugin::{Info, Kind, Outline, Plugin, gpu, map_points, plugin, register, same, served};
+pub use plugin::{Info, Kind, Outline, Plugin, map_points, plugin, register, same, served};
 pub use rows::{by_rows, worker_threads};
 
 /// The plugin's identity, from the effect crate's `[package.metadata.vfx]`, which its

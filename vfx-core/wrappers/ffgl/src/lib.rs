@@ -348,6 +348,14 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
                     LOG.note(&format!("warning: no shared device for GPU output: {e}"));
                 }
             }
+            // A GPU effect that renders through RAM opens the plugin's own device; start that now
+            // so it's ready by the first frames. On Windows those normally go through the device
+            // shared with OpenGL, and the plugin's own is opened only when they can't.
+            if vfx_host::plugin().kind == Kind::Gpu
+                && (!cfg!(target_os = "windows") || ram_path_forced())
+            {
+                let _ = vfx_host::gpu_now(&LOG);
+            }
             let mut instance = Instance::new();
             match unsafe { gl::Blit::new(gl::PASS) } {
                 Ok(blit) => instance.pass_through_blit = Some(blit),
@@ -727,18 +735,21 @@ unsafe fn process_gpu(
         }
     }
 
-    let Some(gpu) = vfx_host::gpu(&LOG) else {
+    // Never waits for a device: until one is open, and while a lost one is replaced, frames pass
+    // through.
+    let Some(device) = vfx_host::gpu_now(&LOG) else {
         return pass_through(blit);
     };
 
     #[cfg(target_os = "macos")]
     if !instance.interop_disabled {
-        if instance.interop.as_ref().is_none_or(|i| i.size() != (w, h)) {
+        if (instance.interop.as_ref()).is_none_or(|i| i.size() != (w, h) || !i.renders_on(&device))
+        {
             // SAFETY: the context is current; the old interop belongs to it.
             if let Some(old) = instance.interop.take() {
                 unsafe { old.delete() };
             }
-            match unsafe { surface::Interop::new(gpu, (w, h)) } {
+            match unsafe { surface::Interop::new(device.clone(), (w, h)) } {
                 Ok(interop) => instance.interop = Some(interop),
                 Err(e) => {
                     LOG.note(&format!(
@@ -753,14 +764,7 @@ unsafe fn process_gpu(
             let hardware = (input_texture.hardware_width, input_texture.hardware_height);
             // SAFETY: the context is current; the texture is the host's input.
             let rendered = catch_unwind(AssertUnwindSafe(|| unsafe {
-                interop.render(
-                    gpu,
-                    &values,
-                    ctx,
-                    input_texture.handle,
-                    hardware,
-                    args.host_fbo,
-                )
+                interop.render(&values, ctx, input_texture.handle, hardware, args.host_fbo)
             }));
             if rendered.is_err() {
                 LOG.note("warning: GPU render failed, passing frames through");
@@ -823,7 +827,9 @@ unsafe fn process_gpu(
         layer: None,
     };
     LOG.note("render path: GPU through RAM (texture readback)");
-    let Ok(result) = catch_unwind(AssertUnwindSafe(|| pipeline::run(gpu, &job))) else {
+    let Ok(result) = catch_unwind(AssertUnwindSafe(|| {
+        pipeline::run(&device.gpu, device.pool_key, &job)
+    })) else {
         LOG.note("warning: GPU render failed, passing frames through");
         return pass_through(blit);
     };

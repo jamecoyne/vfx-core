@@ -2,9 +2,7 @@
 
 use std::sync::OnceLock;
 
-use vfx_core::{Gpu, ParamKind, ParamSpec, ParamValue, ParamValues, Processor, Requires};
-
-use crate::diag::Log;
+use vfx_core::{ParamKind, ParamSpec, ParamValue, ParamValues, Processor, Requires};
 
 /// Who a plugin is in every host, from `[package.metadata.vfx]`.
 #[derive(Clone, Copy, Debug)]
@@ -99,22 +97,6 @@ pub fn plugin() -> &'static Plugin {
 
 pub(crate) fn registered() -> Option<&'static Plugin> {
     PLUGIN.get().copied()
-}
-
-/// One device for the whole plugin, created on first use. `None` if no GPU adapter could
-/// be opened; renders then pass the image through rather than fail.
-pub fn gpu(log: &Log) -> Option<&'static Gpu> {
-    static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
-    GPU.get_or_init(|| match pollster::block_on(Gpu::headless()) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            log.note(&format!(
-                "warning: no GPU available, passing frames through: {e}"
-            ));
-            None
-        }
-    })
-    .as_ref()
 }
 
 /// Whether a host can serve a parameter: one that needs a second layer only where there

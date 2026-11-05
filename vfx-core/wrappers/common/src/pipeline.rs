@@ -16,9 +16,6 @@ pub const FRAME_FORMAT: vfx_core::wgpu::TextureFormat = vfx_core::wgpu::TextureF
 /// Prepared instances kept for reuse. Enough for a few sizes × concurrent renders.
 const POOL_LIMIT: usize = 8;
 
-/// Device key for the plugin's own headless device (the CPU path).
-pub const HEADLESS_DEVICE: usize = 0;
-
 static POOL: Mutex<Vec<Prepared>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,8 +111,9 @@ pub struct Job<'a> {
     pub layer: Option<&'a [f32]>,
 }
 
-pub fn run(gpu: &Gpu, job: &Job) -> Vec<f32> {
-    let mut lease = Lease::new(gpu, HEADLESS_DEVICE, &job.spec);
+/// Renders `job` on `gpu`, with what was prepared under the pool key `device`.
+pub fn run(gpu: &Gpu, device: usize, job: &Job) -> Vec<f32> {
+    let mut lease = Lease::new(gpu, device, &job.spec);
     lease.input().write(gpu, bytemuck::cast_slice(job.input));
     if let Some(layer) = job.layer {
         lease.layer().write(gpu, bytemuck::cast_slice(layer));

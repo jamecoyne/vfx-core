@@ -14,6 +14,7 @@
 //! and Metal finishes before GL reads.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -29,7 +30,8 @@ use objc2_metal::{
 use vfx_core::Gpu;
 use vfx_core::wgpu::{self, hal};
 use vfx_core::{Context, ParamValues};
-use vfx_host::pipeline::{FRAME_FORMAT, HEADLESS_DEVICE, Lease, Spec};
+use vfx_host::OwnDevice;
+use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
 use crate::gl;
 
@@ -207,6 +209,8 @@ unsafe fn metal_texture(
 
 /// The zero-copy path for one plugin instance.
 pub struct Interop {
+    /// The device the surfaces' textures were made on, kept open for as long as they are used.
+    device: Arc<OwnDevice>,
     size: (u32, u32),
     input: Shared,
     output: Shared,
@@ -218,7 +222,8 @@ pub struct Interop {
 impl Interop {
     /// # Safety
     /// The host's GL context must be current.
-    pub unsafe fn new(gpu: &Gpu, size: (u32, u32)) -> Result<Self, String> {
+    pub unsafe fn new(device: Arc<OwnDevice>, size: (u32, u32)) -> Result<Self, String> {
+        let gpu = &device.gpu;
         // SAFETY: the caller has the context current. Each step cleans up after the
         // ones before it if it fails.
         unsafe {
@@ -241,6 +246,7 @@ impl Interop {
                 cleanup();
             })?;
             Ok(Self {
+                device,
                 size,
                 input,
                 output,
@@ -255,6 +261,11 @@ impl Interop {
         self.size
     }
 
+    /// Whether this was made on `device`. One made on a device since replaced must be rebuilt.
+    pub fn renders_on(&self, device: &Arc<OwnDevice>) -> bool {
+        Arc::ptr_eq(&self.device, device)
+    }
+
     /// Renders one frame from the host's texture into its bound framebuffer.
     ///
     /// # Safety
@@ -262,13 +273,13 @@ impl Interop {
     /// with image size `self.size()` and allocated size `hardware`.
     pub unsafe fn render(
         &self,
-        gpu: &Gpu,
         values: &ParamValues,
         ctx: Context,
         texture: gl::GLuint,
         hardware: (u32, u32),
         host_fbo: gl::GLuint,
     ) {
+        let gpu = &self.device.gpu;
         let (w, h) = self.size;
         // 1. Host texture -> input surface (straight, top-down).
         // SAFETY: the caller has the context current.
@@ -291,7 +302,7 @@ impl Interop {
             height: h,
             has_layer: false,
         };
-        let mut lease = Lease::new(gpu, HEADLESS_DEVICE, &spec);
+        let mut lease = Lease::new(gpu, self.device.pool_key, &spec);
         let extent = wgpu::Extent3d {
             width: w,
             height: h,
