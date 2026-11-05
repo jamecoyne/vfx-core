@@ -111,7 +111,7 @@ mod models {
 
 /// Detection for one instance's live renders, on the one worker thread instances share, so a render
 /// never waits for the models or for another instance's detection. A slow device lowers the rate
-/// of face detections instead of the rate of renders, as in segcam-port's `FaceWorker`.
+/// of face detections instead of the rate of renders.
 #[cfg(not(target_arch = "wasm32"))]
 mod live {
     use std::any::Any;
