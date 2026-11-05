@@ -6,19 +6,27 @@ the subject.
 
 ## Install
 
-Download it from the [releases](https://github.com/jamecoyne/vfx-core/releases), then restart the
-host.
+No release is out yet. To try segcam without installing anything, open the
+[browser build](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion). To use a plugin, build
+it from a clone of this repository, as the
+[developer guide](../../docs/DEVELOPING.md#building-and-running) describes:
 
-| Host | macOS | Windows: copy from the zip | Find it under |
+```bash
+cargo vfx build -p segcam-motion
+```
+
+The plugins land in `target/vfx-plugin`. Install each one as below, then restart the host. On macOS,
+`cargo vfx package -p segcam-motion` makes the two installers first.
+
+| Host | Windows: copy | macOS | Find it under |
 |---|---|---|---|
-| After Effects | `SegcamMotionRust-<version>-macOS-AfterEffects.pkg` | `SegcamMotionRust.aex` to `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore` | Effect, LO.FI.SCI.FI |
-| DaVinci Resolve | `SegcamMotionRust-<version>-macOS-OpenFX.pkg` | `SegcamMotionRust.ofx.bundle` to `C:\Program Files\Common Files\OFX\Plugins` | OpenFX, LO.FI.SCI.FI |
-| Resolume | unzip `SegcamMotionRust-<version>-macOS-Resolume.zip` into `~/Documents/Resolume Avenue/Extra Effects` | `SegcamMotionRust.dll` to `Documents\Resolume Avenue\Extra Effects` | segcam Motion |
+| After Effects | `SegcamMotionRust.aex` to `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore` | open `SegcamMotionRust-adobe.pkg` | Effect, LO.FI.SCI.FI |
+| DaVinci Resolve | `SegcamMotionRust.ofx.bundle` to `C:\Program Files\Common Files\OFX\Plugins` | open `SegcamMotionRust-ofx.pkg` | OpenFX, LO.FI.SCI.FI |
+| Resolume | `SegcamMotionRust.dll` to `Documents\Resolume Avenue\Extra Effects` | `cargo vfx install -p segcam-motion --hosts ffgl` copies it, on Windows too | segcam Motion |
 
 For Resolume Arena, use `Resolume Arena` in the folder name. On Windows, keep `DirectML.dll` next
 to the plugin: faces use it to run on the GPU. The two Program Files folders ask for an
-administrator once. If Windows blocks the zip, right click it, open Properties, tick Unblock and
-press OK before unpacking.
+administrator once.
 
 ## Using it
 
