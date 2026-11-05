@@ -475,12 +475,15 @@ impl DeviceSlot {
         let (replaces, failures) = match &*state {
             SlotState::Opening { replaces } => (replaces.clone(), 0),
             SlotState::RetryingFirstOpen { failures, .. } => (None, *failures),
-            _ => (None, 0),
+            // Only a try in flight publishes, and nothing else leaves these two states.
+            _ => return,
         };
         *state = match (opened, replaces) {
             (Ok(device), replaces) => {
                 eprintln!("segcam Motion: drawing on the GPU ({})", device.info.name);
-                // The first device starts the backoff afresh, whatever its tries counted.
+                // A first device that opened without a loss starts the backoff afresh, whatever
+                // its failed tries counted. One that follows a loss keeps counting, as any
+                // replacement does until it lasts.
                 if replaces.is_none() {
                     *self.backoff() = ReopenBackoff::default();
                 }
