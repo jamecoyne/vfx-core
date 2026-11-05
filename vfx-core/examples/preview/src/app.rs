@@ -1441,8 +1441,8 @@ impl ApplicationHandler<GpuSetup> for App {
             .egui_state
             .on_window_event(&preview.window, &event)
             .consumed;
-        // Nothing that makes GPU objects runs during an outage: a new device picks up the window's
-        // size, and a key or a dropped file can wait for it.
+        // Nothing that makes GPU objects runs during an outage. A new device picks up the window's
+        // size, and a key or a dropped file in the gap is dropped.
         #[cfg(not(target_arch = "wasm32"))]
         let device_out = preview.reopening.outage.is_some();
         #[cfg(target_arch = "wasm32")]
@@ -1450,7 +1450,7 @@ impl ApplicationHandler<GpuSetup> for App {
         match event {
             WindowEvent::CloseRequested => {
                 #[cfg(not(target_arch = "wasm32"))]
-                preview.keep_recording_from_an_outage();
+                preview.finish_recording_on_quit();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) if !device_out => preview.resize(size.width, size.height),
@@ -1463,7 +1463,7 @@ impl ApplicationHandler<GpuSetup> for App {
                     && event.state == ElementState::Pressed
                     && event.logical_key == Key::Named(NamedKey::Escape) =>
             {
-                preview.keep_recording_from_an_outage();
+                preview.finish_recording_on_quit();
                 event_loop.exit();
             }
             // Space plays and pauses a video, unless a text box has the keyboard.
@@ -1897,9 +1897,10 @@ impl Preview {
     /// new device on the backoff, and puts a new device in place.
     fn device_out(&mut self) -> bool {
         self.force_due_loss();
-        // Some losses only show up in a poll, and the frame's readbacks don't always poll.
-        let _ = vfx_core::poll_device(&self.gpu.device, wgpu::PollType::Poll);
         if self.reopening.outage.is_none() {
+            // Some losses only show up in a poll, and the frame's readbacks don't always poll. Not
+            // during an outage: on Vulkan a poll of the lost device panics, each with a log line.
+            let _ = vfx_core::poll_device(&self.gpu.device, wgpu::PollType::Poll);
             let Some(why) = self.gpu.faults().lost() else {
                 return false;
             };
@@ -1976,6 +1977,18 @@ impl Preview {
     }
 
     fn try_to_reopen(&mut self) {
+        // First: a driver that never answers leaves a try in flight for good.
+        if (self.meter.is_some() || self.quiet)
+            && let Some(outage) = &self.reopening.outage
+            && outage.since.elapsed() >= SCRIPTED_OUTAGE_LIMIT
+        {
+            self.fatal = Some(format!(
+                "The GPU was lost ({}) and didn't come back in {SCRIPTED_OUTAGE_LIMIT:?}.",
+                outage.why
+            ));
+            self.run_finished = true;
+            return;
+        }
         let Some(outage) = &mut self.reopening.outage else {
             return;
         };
@@ -2002,16 +2015,6 @@ impl Preview {
         } else if Instant::now() >= outage.next_try {
             outage.tries += 1;
             self.start_opening_device();
-        }
-        if (self.meter.is_some() || self.quiet)
-            && let Some(outage) = &self.reopening.outage
-            && outage.since.elapsed() >= SCRIPTED_OUTAGE_LIMIT
-        {
-            self.fatal = Some(format!(
-                "The GPU was lost ({}) and didn't come back in {SCRIPTED_OUTAGE_LIMIT:?}.",
-                outage.why
-            ));
-            self.run_finished = true;
         }
     }
 
@@ -2126,12 +2129,13 @@ impl Preview {
         }
     }
 
-    /// Quitting while the device is out is the only way out if it never comes back, and the panel
-    /// that stops Record is gone: so the file is finished here. Asks where to keep it as Stop does.
-    fn keep_recording_from_an_outage(&mut self) {
-        if self.reopening.outage.is_some()
-            && let Some(recording) = self.recording.take()
-        {
+    /// Finishes the file where quitting would otherwise cut it off with no index: a `--record` file,
+    /// which records until the run ends, and any recording while the device is out, when the panel
+    /// that stops Record is gone. Asks where to keep the latter as Stop does.
+    fn finish_recording_on_quit(&mut self) {
+        let finish = self.reopening.outage.is_some()
+            || self.recording.as_ref().is_some_and(|r| r.final_path);
+        if finish && let Some(recording) = self.recording.take() {
             self.finish_recording(recording);
         }
     }
