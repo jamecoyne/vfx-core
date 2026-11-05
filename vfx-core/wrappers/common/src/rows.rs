@@ -13,6 +13,11 @@ const ROWS_PER_THREAD: usize = 32;
 static CORES: LazyLock<usize> =
     LazyLock::new(|| std::thread::available_parallelism().map_or(1, usize::from));
 
+/// How many threads CPU frame work uses at most: all the cores, up to six.
+pub fn worker_threads() -> usize {
+    (*CORES).min(THREADS)
+}
+
 /// Runs `f` on each row of `rows` (`width` items each) with its row number, a band of rows
 /// at a time on up to six threads. On one core, and in browsers, on the calling thread.
 pub fn by_rows<T: Send>(rows: &mut [T], width: usize, f: impl Fn(usize, &mut [T]) + Sync) {
@@ -20,8 +25,7 @@ pub fn by_rows<T: Send>(rows: &mut [T], width: usize, f: impl Fn(usize, &mut [T]
         return;
     }
     let height = rows.len() / width;
-    let threads = (*CORES)
-        .min(THREADS)
+    let threads = worker_threads()
         .min(height.div_ceil(ROWS_PER_THREAD))
         .max(1);
     on_threads(threads, rows, width, f);

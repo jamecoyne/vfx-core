@@ -1,11 +1,11 @@
-//! The contract a CPU effect that keeps state signs: whatever it keeps, every render gives
-//! what a fresh effect renders from the same frames. Hosts rely on it (see [`crate::kept`]);
-//! an effect crate checks itself with [`check`] in its tests, on a clip that moves. A render
-//! left [unfinished](CpuEffect::unfinished) counts only once the same frame renders again and
+//! The contract for a stateful CPU effect: every render equals a fresh effect's render of the
+//! same frames. Hosts rely on it (see [`crate::kept`]); an effect crate checks itself with
+//! [`check`] in its tests, on a clip that moves. A render left
+//! [unfinished](CpuEffect::unfinished) counts only once the same frame renders again and
 //! finishes, as a host must show it.
 
 use vfx_core::cpu::{Argb, FrameSource, Image, ImageMut, View, ViewMut};
-use vfx_core::{Context, CpuEffect, ParamValues, Processor};
+use vfx_core::{Context, CpuEffect, Frame, Gpu, ParamValues, Processor, Target};
 
 /// Frames of one size, oldest first, as 8-bit ARGB, at `frame_rate` frames a second where
 /// the host would say.
@@ -58,7 +58,7 @@ impl FrameSource for Source<'_> {
 }
 
 /// How often a frame is rendered again while the effect says it is unfinished.
-const TRIES: usize = 8;
+const MAX_UNFINISHED_RERENDERS: usize = 8;
 
 fn render(
     effect: &mut dyn CpuEffect,
@@ -73,7 +73,7 @@ fn render(
         frame_rate: clip.frame_rate,
         ..Context::at(number as f64 / clip.frame_rate.unwrap_or(30.0))
     };
-    for _ in 0..TRIES {
+    for _ in 0..MAX_UNFINISHED_RERENDERS {
         let mut source = Source {
             clip,
             first: number - count + 1,
@@ -94,7 +94,7 @@ fn render(
         }
     }
     Err(format!(
-        "frame {number} is still unfinished after {TRIES} renders"
+        "frame {number} is still unfinished after {MAX_UNFINISHED_RERENDERS} renders"
     ))
 }
 
@@ -215,6 +215,83 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
     Ok(())
 }
 
+/// What a render offered `target` gave: the frame's bytes when it drew there, the output's when not.
+fn render_offering(
+    effect: &mut dyn CpuEffect,
+    clip: &Clip,
+    number: i64,
+    values: &ParamValues,
+    gpu: &Gpu,
+    target: &Frame,
+) -> (bool, Vec<u8>) {
+    let count = (effect.frames_before(values, clip.frame_rate) as i64 + 1).min(number + 1);
+    let ctx = Context {
+        frame: number,
+        frame_rate: clip.frame_rate,
+        ..Context::at(number as f64 / clip.frame_rate.unwrap_or(30.0))
+    };
+    let mut source = Source {
+        clip,
+        first: number - count + 1,
+        missing: &[],
+    };
+    let mut out = vec![Argb::<u8>::default(); clip.frames[0].len()];
+    let view = ViewMut::from_pixels(&mut out, clip.width, clip.height);
+    let drawn = effect.render_to(
+        &mut source,
+        count as usize,
+        ImageMut::U8(view),
+        Target::new(gpu, target),
+        values,
+        &ctx,
+    );
+    match drawn {
+        true => (true, target.read(gpu)),
+        false => (false, bytemuck::cast_slice(&out).to_vec()),
+    }
+}
+
+/// [`check`] for a host offering a GPU frame on `gpu`, the device it shared: through one kept
+/// effect forwards, backwards, and after clearing history for other pixels under the same frame
+/// numbers, every render matches a fresh effect's, whether or not it drew into the frame. Returns
+/// how many kept renders drew into it, so a caller can tell the check wasn't empty.
+pub fn check_target(
+    make: fn() -> Processor,
+    clip: &Clip,
+    values: &ParamValues,
+    gpu: &Gpu,
+    format: vfx_core::wgpu::TextureFormat,
+) -> Result<usize, String> {
+    let target = Frame::new(gpu, clip.width as u32, clip.height as u32, format);
+    let n = clip.len();
+    let edited = clip.edited_before(n - 1);
+    let mut kept = cpu(make);
+    let compare = |kept: &mut dyn CpuEffect, clip: &Clip, number: i64, what: &str| {
+        let got = render_offering(kept, clip, number, values, gpu, &target);
+        let want = render_offering(&mut *cpu(make), clip, number, values, gpu, &target);
+        match got == want {
+            true => Ok(usize::from(got.0)),
+            false => Err(format!(
+                "{what}: frame {number} differs from a fresh render (drawn {}, fresh {})",
+                got.0, want.0
+            )),
+        }
+    };
+    let mut drawn = 0;
+    for number in 0..n {
+        drawn += compare(&mut *kept, clip, number, "forwards")?;
+    }
+    for number in (0..n).rev() {
+        drawn += compare(&mut *kept, clip, number, "backwards")?;
+    }
+    if kept.clear_history() {
+        for number in 0..n {
+            drawn += compare(&mut *kept, &edited, number, "after clearing history")?;
+        }
+    }
+    Ok(drawn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,13 +367,13 @@ mod tests {
     }
 
     #[test]
-    fn an_effect_that_reads_its_frames_keeps_the_contract() {
+    fn effect_rereading_frames_passes_contract() {
         let make = || Processor::Cpu(Box::new(Sums::default()));
         assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
     }
 
     #[test]
-    fn an_effect_that_trusts_what_it_kept_breaks_it() {
+    fn effect_trusting_cached_frames_fails_contract() {
         let make = || {
             Processor::Cpu(Box::new(Sums {
                 trust: true,
@@ -389,13 +466,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unfinished_render_counts_once_finished() {
+    fn unfinished_render_compared_after_it_finishes() {
         let make = || Processor::Cpu(Box::new(Late::default()));
         assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
     }
 
     #[test]
-    fn a_render_that_never_finishes_breaks_it() {
+    fn never_finishing_render_fails_contract() {
         let make = || {
             Processor::Cpu(Box::new(Late {
                 never: true,

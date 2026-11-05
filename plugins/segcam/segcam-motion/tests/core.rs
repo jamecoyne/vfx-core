@@ -7,11 +7,11 @@ use segcam_motion::motion::{self, LumaGrid};
 use segcam_motion::pixel::Depth;
 use segcam_motion::pixel::make_pixel;
 use segcam_motion::render::{PixelRect, blob_label, downsample, fit_text, text_width};
-use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, draw_window, make_tile};
+use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, cut_tile, draw_window};
 use segcam_motion::{
-    Argb, Blob, Channel, Color, Detect, FaceParts, Incremental, MotionSettings, NormRect,
-    OutputMode, RenderSettings, SegmentKind, SwarmBackground, ThresholdSettings, View, ViewMut,
-    font, previous_frames_needed, render, segment_label,
+    Argb, Blob, Channel, Color, DetectionMode, FaceParts, IncrementalRenderer, MotionSettings,
+    NormRect, OutputMode, RenderSettings, SegmentKind, SwarmBackground, ThresholdSettings, View,
+    ViewMut, font, previous_frames_needed, render, segment_label,
 };
 use vfx_core::cpu::{FrameSource, Image as CpuImage};
 
@@ -116,7 +116,7 @@ fn blobs_for_moving_square<C: Channel>() -> Vec<Blob> {
         })
         .collect();
     let now = downsample(&frame_with_square::<C>(384, 216, 200, 60, 40).view(), 96);
-    motion::detect(&history, &now, &MotionSettings::default()).blobs
+    motion::detect_motion(&history, &now, &MotionSettings::default()).blobs
 }
 
 /// A square that sits for six frames, then jumps.
@@ -136,35 +136,35 @@ fn grid_keeps_aspect_and_orientation() {
 }
 
 #[test]
-fn first_frame_is_only_a_reference() {
+fn first_frame_detects_no_motion() {
     let g = downsample(&frame_with_square::<u8>(W, H, 100, 50, 40).view(), 192);
     assert!(
-        motion::detect(&[], &g, &MotionSettings::default())
+        motion::detect_motion(&[], &g, &MotionSettings::default())
             .blobs
             .is_empty()
     );
 }
 
 #[test]
-fn still_frame_never_moves() {
+fn static_frames_detect_no_motion() {
     let history: Vec<LumaGrid> = (0..10)
         .map(|_| downsample(&frame_with_square::<u8>(W, H, 100, 50, 40).view(), 192))
         .collect();
     let now = history.last().unwrap();
     assert!(
-        motion::detect(&history, now, &MotionSettings::default())
+        motion::detect_motion(&history, now, &MotionSettings::default())
             .blobs
             .is_empty()
     );
 }
 
 #[test]
-fn jumping_square_is_found_where_it_lands_and_where_it_left() {
+fn jump_yields_blobs_at_old_and_new_positions() {
     let history: Vec<LumaGrid> = (0..10)
         .map(|_| downsample(&frame_with_square::<u8>(W, H, 40, 60, 48).view(), 192))
         .collect();
     let now = downsample(&frame_with_square::<u8>(W, H, 260, 120, 48).view(), 192);
-    let m = motion::detect(&history, &now, &MotionSettings::default());
+    let m = motion::detect_motion(&history, &now, &MotionSettings::default());
     assert_eq!(m.blobs.len(), 2);
     let centred = |b: &Blob, x: i32, y: i32| {
         let (cx, cy) = (b.bounds.x + b.bounds.w / 2.0, b.bounds.y + b.bounds.h / 2.0);
@@ -174,7 +174,9 @@ fn jumping_square_is_found_where_it_lands_and_where_it_left() {
     assert!(m.blobs.iter().any(|b| centred(b, 260, 120)), "new place");
     assert!(m.blobs.iter().any(|b| centred(b, 40, 60)), "old place");
     assert!(
-        m.blobs.windows(2).all(|p| p[0].pixels >= p[1].pixels),
+        m.blobs
+            .windows(2)
+            .all(|p| p[0].cell_count >= p[1].cell_count),
         "biggest first"
     );
 
@@ -184,13 +186,17 @@ fn jumping_square_is_found_where_it_lands_and_where_it_left() {
         sensitivity: 0.0,
         ..MotionSettings::default()
     };
-    assert_eq!(motion::detect(&history, &now, &dull).blobs.len(), 2);
+    assert_eq!(motion::detect_motion(&history, &now, &dull).blobs.len(), 2);
     // A min size bigger than the square drops both.
     let picky = MotionSettings {
         min_area_fraction: 0.2,
         ..MotionSettings::default()
     };
-    assert!(motion::detect(&history, &now, &picky).blobs.is_empty());
+    assert!(
+        motion::detect_motion(&history, &now, &picky)
+            .blobs
+            .is_empty()
+    );
 }
 
 #[test]
@@ -205,7 +211,7 @@ fn sensitivity_maps_onto_segcams_threshold() {
 }
 
 #[test]
-fn depths_see_the_same_thing() {
+fn all_depths_detect_same_blobs() {
     let (a, b, c) = (
         blobs_for_moving_square::<u8>(),
         blobs_for_moving_square::<u16>(),
@@ -290,7 +296,7 @@ fn crossing<C: Channel>() -> Vec<Image<C>> {
 }
 
 #[test]
-fn swarm_piles_frozen_tiles_on_a_clear_canvas() {
+fn swarm_draws_frozen_tiles_on_transparent_canvas() {
     let s = swarm_settings();
     assert_eq!(previous_frames_needed(&s), 23);
     let frames = crossing::<u8>();
@@ -352,11 +358,11 @@ fn live_windows_show_the_current_frame() {
             .0
             .pixels
     };
-    let mut state = Incremental::default();
+    let mut state = IncrementalRenderer::default();
     for n in [20, 3, 29, 28, 4, 12, 29] {
         let mut out = Image::new(W, H);
         let mut source = MemoryFrames::new(&frames[..=n]);
-        state.advance(
+        state.render_frame(
             &live_settings,
             &mut source,
             n + 1,
@@ -368,7 +374,7 @@ fn live_windows_show_the_current_frame() {
 }
 
 #[test]
-fn swarm_trail_survives_frame_sized_segments() {
+fn frame_sized_segments_keep_trail_windows() {
     // A band flashing black and white over most of each frame is one huge blob every frame;
     // its top edge creeps down 2 px a frame, so every older tile's title bar peeks out above
     // the newer one: two rows each, the bar's bright hairline over its darker second row.
@@ -439,10 +445,10 @@ fn tile_enforces_its_minimum_size() {
             w: 0.01,
             h: 0.01,
         },
-        pixels: 1,
+        cell_count: 1,
         ..Blob::default()
     };
-    let tile = make_tile(
+    let tile = cut_tile(
         &tiny,
         Some(&frames[0].view()),
         "t".into(),
@@ -450,28 +456,28 @@ fn tile_enforces_its_minimum_size() {
         1080,
         false,
     );
-    assert_eq!((tile.video.w, tile.video.h), (120, 28));
+    assert_eq!((tile.content_rect.w, tile.content_rect.h), (120, 28));
 }
 
-fn window_tile(video: PixelRect) -> Tile {
+fn window_tile(content_rect: PixelRect) -> Tile {
     Tile {
         title: "LO.FI.SCI.FI motion#412.1".into(),
-        video,
-        stored: video,
+        content_rect,
+        clipped_rect: content_rect,
         pixels: vec![
             TilePixel {
                 alpha: 255,
                 ..TilePixel::default()
             };
-            (video.w * video.h) as usize
+            (content_rect.w * content_rect.h) as usize
         ],
         hidden: false,
-        bar: None,
+        title_bar: None,
     }
 }
 
 #[test]
-fn window_chrome_matches_the_bake() {
+fn window_chrome_matches_baked_pixels() {
     // 1080 lines: the chrome at 1x. Grey behind, so the shadow shows.
     let mut canvas = Image::<u8>::new(720, 1080);
     canvas.pixels.fill(Argb {
@@ -526,21 +532,32 @@ fn window_chrome_matches_the_bake() {
 }
 
 #[test]
-fn labels_and_font() {
+fn segment_label_formats_kind_frame_index() {
     assert_eq!(segment_label(SegmentKind::Motion, 412, 0), "motion#412.1");
-    assert_eq!(segment_label(SegmentKind::Blob, 7, 1), "blob#7.2");
+    assert_eq!(
+        segment_label(SegmentKind::ThresholdRegion, 7, 1),
+        "blob#7.2"
+    );
+}
+
+#[test]
+fn reused_face_label_keeps_original_id() {
     let face = Blob {
         kind: SegmentKind::Face,
-        reused: Some((6, 2)),
+        reused_from: Some((6, 2)),
         ..Blob::default()
     };
-    assert_eq!(
-        blob_label(&face, 7, 0),
-        "face#6.3",
-        "a reused face keeps its ID"
-    );
+    assert_eq!(blob_label(&face, 7, 0), "face#6.3");
+}
+
+#[test]
+fn unknown_glyph_falls_back_to_question_mark() {
     assert!(font::glyph('m')[2] != 0 && font::glyph('#')[0] != 0);
     assert_eq!(font::glyph('~'), font::glyph('?'));
+}
+
+#[test]
+fn fit_text_truncates_with_dots() {
     assert_eq!(
         fit_text("LO.FI.SCI.FI motion#1.1", text_width("LO.FI", 1), 1),
         "LO..."
@@ -549,7 +566,7 @@ fn labels_and_font() {
 
 fn threshold_settings(t: ThresholdSettings) -> RenderSettings {
     RenderSettings {
-        detect: Detect::Threshold,
+        detection_mode: DetectionMode::Threshold,
         threshold: t,
         ..RenderSettings::default()
     }
@@ -563,9 +580,9 @@ fn threshold_finds_bright_regions_in_a_single_frame() {
     // No background, and every frame analysed.
     assert_eq!(previous_frames_needed(&s), 0);
 
-    let found = motion::threshold(&grid, &s.threshold, &s.motion);
+    let found = motion::detect_threshold(&grid, &s.threshold, &s.motion);
     assert_eq!(found.blobs.len(), 1);
-    assert_eq!(found.blobs[0].kind, SegmentKind::Blob);
+    assert_eq!(found.blobs[0].kind, SegmentKind::ThresholdRegion);
     let b = found.blobs[0].bounds;
     assert!((b.x - 100.0 / f64::from(W)).abs() < 0.02 && (b.w - 48.0 / f64::from(W)).abs() < 0.02);
 
@@ -574,14 +591,17 @@ fn threshold_finds_bright_regions_in_a_single_frame() {
         invert: true,
         ..s.threshold
     };
-    assert!(motion::threshold(&grid, &inverted, &s.motion).blobs[0].pixels > found.blobs[0].pixels);
+    assert!(
+        motion::detect_threshold(&grid, &inverted, &s.motion).blobs[0].cell_count
+            > found.blobs[0].cell_count
+    );
     let white = i32::from(*grid.pixels.iter().max().unwrap());
     let at_white = ThresholdSettings {
         level: white,
         ..s.threshold
     };
     assert!(
-        motion::threshold(&grid, &at_white, &s.motion)
+        motion::detect_threshold(&grid, &at_white, &s.motion)
             .blobs
             .is_empty()
     );
@@ -591,7 +611,12 @@ fn threshold_finds_bright_regions_in_a_single_frame() {
         auto: true,
         invert: false,
     };
-    assert_eq!(motion::threshold(&grid, &auto, &s.motion).blobs.len(), 1);
+    assert_eq!(
+        motion::detect_threshold(&grid, &auto, &s.motion)
+            .blobs
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -604,11 +629,11 @@ fn threshold_swarm_renders_the_same_in_any_order() {
         ..threshold_settings(ThresholdSettings::default())
     };
     let cold = |n: usize| render_frames(&s, &frames[..=n], n as i64).0.pixels;
-    let mut state = Incremental::default();
+    let mut state = IncrementalRenderer::default();
     for n in [20, 3, 29, 28, 4, 12, 29] {
         let mut out = Image::new(W, H);
         let mut source = MemoryFrames::new(&frames[..=n]);
-        state.advance(&s, &mut source, n + 1, n as i64, &mut out.view_mut());
+        state.render_frame(&s, &mut source, n + 1, n as i64, &mut out.view_mut());
         assert!(out.pixels == cold(n), "frame {n}");
     }
 }
@@ -638,7 +663,7 @@ fn first_window_shown(s: &RenderSettings, frames: &[Image<u8>], number: i64) -> 
 }
 
 #[test]
-fn a_window_stays_until_newer_ones_push_it_out() {
+fn window_stays_until_newer_ones_push_it_out() {
     let frames = squares_in_rows(32);
     let s = RenderSettings {
         mode: OutputMode::Swarm,
@@ -659,7 +684,7 @@ fn a_window_stays_until_newer_ones_push_it_out() {
 }
 
 #[test]
-fn faces_on_a_frame_without_people_change_nothing() {
+fn no_faces_leaves_output_unchanged() {
     let frames = jump();
     let all = FaceParts {
         face: true,
@@ -667,9 +692,9 @@ fn faces_on_a_frame_without_people_change_nothing() {
         mouth: true,
         body: true,
     };
-    for detect in [Detect::Motion, Detect::FacesOnly] {
+    for detection_mode in [DetectionMode::Motion, DetectionMode::FacesOnly] {
         let s = RenderSettings {
-            detect,
+            detection_mode,
             ..RenderSettings::default()
         };
         let with = RenderSettings { faces: all, ..s };
@@ -697,7 +722,7 @@ impl FrameSource for GappyFrames<'_> {
 
 /// Renders the last of `frames` through `state`, with the frames in `missing` unavailable.
 fn render_kept(
-    state: &mut Incremental,
+    state: &mut IncrementalRenderer,
     s: &RenderSettings,
     frames: &[Image<u8>],
     missing: &[usize],
@@ -708,7 +733,7 @@ fn render_kept(
         missing,
     };
     let last = frames.len() - 1;
-    state.advance(
+    state.render_frame(
         s,
         &mut source,
         frames.len(),
@@ -731,7 +756,7 @@ fn painted_out(frames: &[Image<u8>], range: std::ops::Range<usize>) -> Vec<Image
 /// An edit upstream that only touches frames before the one rendered, as a keyframed grade
 /// or a paint fix can, reaches the render: kept work for those frames isn't trusted blindly.
 #[test]
-fn edits_to_earlier_frames_reach_the_render() {
+fn earlier_frame_edit_invalidates_cache() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let last = frames.len() - 1;
@@ -743,13 +768,13 @@ fn edits_to_earlier_frames_reach_the_render() {
             s.mode
         );
 
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         let _ = render_kept(&mut state, &s, &frames, &[]);
         let again = render_kept(&mut state, &s, &edited, &[]);
         assert!(again.pixels == cold.pixels, "{:?}: same frame", s.mode);
 
         // Playback stepping onto a frame it hasn't seen, after the frames before it changed.
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         let _ = render_kept(&mut state, &s, &frames[..last], &[]);
         let next = render_kept(&mut state, &s, &edited, &[]);
         assert!(next.pixels == cold.pixels, "{:?}: next frame", s.mode);
@@ -758,16 +783,16 @@ fn edits_to_earlier_frames_reach_the_render() {
 
 /// A frame the host couldn't hand over is read again next time, not kept as empty.
 #[test]
-fn a_missing_frame_is_read_again() {
+fn missing_frame_is_read_again() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let last = frames.len() - 1;
         let full = render_frames(&s, &frames, last as i64).0;
         let gap = [last - 4, last - 3, last - 2, last - 1];
 
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         let without = render_kept(&mut state, &s, &frames, &gap);
-        let mut cold = Incremental::default();
+        let mut cold = IncrementalRenderer::default();
         assert!(
             without.pixels == render_kept(&mut cold, &s, &frames, &gap).pixels,
             "{:?}: the gap renders like a cold render with the gap",
@@ -785,7 +810,7 @@ fn a_missing_frame_is_read_again() {
 
 /// A change upstream that leaves the luma grid as it was still drops the kept tiles.
 #[test]
-fn swarm_sees_edits_that_keep_the_grid() {
+fn alpha_only_edit_invalidates_swarm_tiles() {
     let s = swarm_settings();
     let frames = crossing::<u8>();
     let last = frames.len() - 1;
@@ -795,7 +820,7 @@ fn swarm_sees_edits_that_keep_the_grid() {
     let grid = |img: &Image<u8>| downsample(&img.view(), s.grid_width);
     assert!(grid(&edited[last]) == grid(&frames[last]));
 
-    let mut state = Incremental::default();
+    let mut state = IncrementalRenderer::default();
     let _ = render_kept(&mut state, &s, &frames, &[]);
     let out = render_kept(&mut state, &s, &edited, &[]);
     assert!(out.pixels == render_frames(&s, &edited, last as i64).0.pixels);
@@ -821,7 +846,7 @@ impl FrameSource for FixedFrames<'_> {
 /// Renders frame `n` of `frames` through `state` from a fixed source: the output, and how
 /// many frames were read.
 fn render_fixed(
-    state: &mut Incremental,
+    state: &mut IncrementalRenderer,
     s: &RenderSettings,
     frames: &[Image<u8>],
     n: usize,
@@ -831,25 +856,25 @@ fn render_fixed(
         images: &frames[..=n],
         reads: 0,
     };
-    state.advance(s, &mut source, n + 1, n as i64, &mut out.view_mut());
+    state.render_frame(s, &mut source, n + 1, n as i64, &mut out.view_mut());
     (out, source.reads)
 }
 
 /// From a fixed source a kept state reads only what it lacks, and still renders what a cold
 /// render does, in any order.
 #[test]
-fn a_fixed_source_reads_only_new_frames() {
+fn fixed_source_reads_only_new_frames() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let cold = |n: usize| render_frames(&s, &frames[..=n], n as i64).0.pixels;
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         for n in 0..frames.len() {
             let (out, reads) = render_fixed(&mut state, &s, &frames, n);
             assert!(out.pixels == cold(n), "{:?}: frame {n}", s.mode);
             // The current frame, checked and then drawn, and nothing earlier.
             assert!(reads <= 2, "{:?}: frame {n} read {reads}", s.mode);
         }
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         for n in [29, 3, 17, 18, 2, 29, 0, 12] {
             let (out, _) = render_fixed(&mut state, &s, &frames, n);
             assert!(out.pixels == cold(n), "{:?}: shuffled, frame {n}", s.mode);
@@ -857,11 +882,11 @@ fn a_fixed_source_reads_only_new_frames() {
     }
 }
 
-/// The start of a clip isn't a missing frame. With the defaults a render reads 76 frames, and
-/// each of the first 76, whose background runs past the start, is worked out once: every
-/// render after the first reads only its own frame, and matches a cold render.
+/// The start of a clip isn't a missing frame. Each frame whose background runs past the start,
+/// the first `previous_frames_needed` + 1 of them, is analysed once: every render after the
+/// first reads only its own frame, and matches a cold render.
 #[test]
-fn the_start_of_a_clip_is_worked_out_once() {
+fn clip_start_frames_are_analysed_once() {
     let swarm = RenderSettings {
         mode: OutputMode::Swarm,
         ..RenderSettings::default()
@@ -872,7 +897,7 @@ fn the_start_of_a_clip_is_worked_out_once() {
         .collect();
     for s in [RenderSettings::default(), swarm] {
         let needed = previous_frames_needed(&s) as usize;
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         for n in 0..frames.len() {
             // What an OpenFX host hands over: the frames asked for, from the start of the clip.
             let clip = &frames[n.saturating_sub(needed)..=n];
@@ -881,7 +906,7 @@ fn the_start_of_a_clip_is_worked_out_once() {
                 images: clip,
                 reads: 0,
             };
-            state.advance(&s, &mut source, clip.len(), n as i64, &mut out.view_mut());
+            state.render_frame(&s, &mut source, clip.len(), n as i64, &mut out.view_mut());
             let reads = source.reads;
             let cold = render_frames(&s, clip, n as i64).0;
             assert!(out.pixels == cold.pixels, "{:?}: frame {n}", s.mode);
@@ -893,13 +918,13 @@ fn the_start_of_a_clip_is_worked_out_once() {
 /// A fixed source that starts its numbering over (a seek back, a new clip) hands over a
 /// different current frame, and what was kept goes.
 #[test]
-fn a_fixed_source_that_starts_over_is_noticed() {
+fn fixed_source_restart_clears_cache() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let other: Vec<Image<u8>> = (0..frames.len() as i32)
             .map(|f| frame_with_square(W, H, 300 - f * 9, 20, 30))
             .collect();
-        let mut state = Incremental::default();
+        let mut state = IncrementalRenderer::default();
         for n in 0..12 {
             let _ = render_fixed(&mut state, &s, &frames, n);
         }
@@ -912,7 +937,7 @@ fn a_fixed_source_that_starts_over_is_noticed() {
 }
 
 #[test]
-fn oldest_grid_stays_out_of_mask() {
+fn decayed_oldest_grid_yields_no_blobs() {
     let flat = LumaGrid {
         width: 192,
         height: 108,
@@ -922,6 +947,6 @@ fn oldest_grid_stays_out_of_mask() {
     for y in 40..60 {
         history[0].pixels[y * 192 + 90..y * 192 + 110].fill(240);
     }
-    let found = motion::detect(&history, &flat, &MotionSettings::default());
+    let found = motion::detect_motion(&history, &flat, &MotionSettings::default());
     assert!(found.blobs.is_empty());
 }

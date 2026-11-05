@@ -121,7 +121,7 @@ pub trait CpuEffect: Send {
         self.frames_before(params, frame_rate)
     }
 
-    /// Whether the effect keeps what it worked out between renders. Hosts that can keep one
+    /// Whether the effect keeps computed state between renders. Hosts that can keep one
     /// effect per instance then do (OpenFX, FFGL, the preview); After Effects never does. What
     /// it keeps must not change any frame, even when earlier frames change upstream or a host
     /// can't hand one over: `vfx_host::contract::check` tests an effect for that.
@@ -193,6 +193,10 @@ pub struct Report {
     pub faces: Option<String>,
     /// What it found. A host uses the names it knows and ignores the rest.
     pub readings: Vec<Reading>,
+    /// The last time the GPU failed a render, why; the render was drawn another way.
+    pub gpu_fault: Option<String>,
+    /// Whether it ran out of GPU memory for what it keeps, and draws less to keep its rate.
+    pub out_of_gpu_memory: bool,
 }
 
 /// A named number an effect found ([`Report::readings`]).

@@ -326,7 +326,8 @@ pub trait FrameSource {
 
     /// Whether frames arrive from a live stream, so an effect should draw what it has rather than
     /// hold up the output: true for [`History`], false where a render may be exported and has to
-    /// be exact whatever it costs.
+    /// be exact whatever it costs. A live source that is also [fixed](Self::fixed) numbers each
+    /// frame once, and starts over only from a lower number.
     fn live(&self) -> bool {
         false
     }
@@ -341,8 +342,9 @@ pub trait FrameSource {
         false
     }
 
-    /// How many of the newest frames a [fixed](Self::fixed) source still has the pixels of.
-    /// Older ones come as `None`, and stay gone.
+    /// How many of the newest frames a [fixed](Self::fixed) source still has the pixels of, or
+    /// will fetch: older ones come as `None`, and stay gone for as long as it says so. An effect
+    /// that keeps work works those frames out again if the source later stops being fixed.
     fn held(&self) -> usize {
         usize::MAX
     }

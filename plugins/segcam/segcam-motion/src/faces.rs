@@ -170,7 +170,7 @@ pub fn find<C: Channel>(frame: &View<C>, parts: FaceParts, cells: usize) -> Vec<
                 w: s.rect.w,
                 h: s.rect.h,
             },
-            pixels: (s.rect.w * s.rect.h * cells as f64).round() as i32,
+            cell_count: (s.rect.w * s.rect.h * cells as f64).round() as i32,
             kind: match s.kind {
                 Kind::Face => SegmentKind::Face,
                 Kind::EyeLeft => SegmentKind::EyeLeft,
@@ -178,8 +178,8 @@ pub fn find<C: Channel>(frame: &View<C>, parts: FaceParts, cells: usize) -> Vec<
                 Kind::Mouth => SegmentKind::Mouth,
                 Kind::Body => SegmentKind::Body,
             },
-            reused: None,
-            detected: s.detected.map(|r| NormRect {
+            reused_from: None,
+            detected_bounds: s.detected.map(|r| NormRect {
                 x: r.x,
                 y: r.y,
                 w: r.w,
@@ -212,7 +212,7 @@ pub fn readings(models_loaded: bool, blobs: &[Blob]) -> Vec<Reading> {
         return vec![Reading::new("face", 0.0)];
     };
     let face = blobs[at];
-    let found = face.detected.unwrap_or(face.bounds);
+    let found = face.detected_bounds.unwrap_or(face.bounds);
     let (x, y, w, h) = (found.x, found.y, found.w, found.h);
     let mut readings = vec![
         Reading::new("face", 1.0),
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn readings_use_detected_box() {
         let found = Blob {
-            detected: Some(NormRect {
+            detected_bounds: Some(NormRect {
                 x: 0.0,
                 y: 0.25,
                 w: 0.25,

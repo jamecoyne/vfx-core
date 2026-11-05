@@ -6,13 +6,12 @@
 use segcam_motion::gpu::NoGpu;
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
-    AnalysisStep, Argb, Channel, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground,
-    View, ViewMut,
+    AnalysisStep, Argb, Channel, DetectionMode, IncrementalRenderer, OutputMode, RenderSettings,
+    SwarmBackground, View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, Image};
 
-/// Most pixels a frame may have off by over half a level: 1 in 10,000, and at least 4. The
-/// 1080p clip's cases measured at most 8 of 2,073,600 on an RTX 4070.
+/// Most pixels a frame may have off by over half a level: 1 in 10,000, and at least 4.
 fn cap(pixels: usize) -> usize {
     (pixels / 10_000).max(4)
 }
@@ -80,7 +79,7 @@ fn cases() -> Vec<(&'static str, RenderSettings)> {
         max_tiles: 30,
         ..RenderSettings::default()
     };
-    let threshold = Detect::Threshold;
+    let threshold = DetectionMode::Threshold;
     vec![
         ("overlay", RenderSettings::default()),
         (
@@ -112,7 +111,7 @@ fn cases() -> Vec<(&'static str, RenderSettings)> {
         (
             "threshold swarm straight",
             RenderSettings {
-                detect: threshold,
+                detection_mode: threshold,
                 straight_alpha: true,
                 ..swarm
             },
@@ -120,7 +119,7 @@ fn cases() -> Vec<(&'static str, RenderSettings)> {
         (
             "threshold swarm source mirror",
             RenderSettings {
-                detect: threshold,
+                detection_mode: threshold,
                 swarm_background: SwarmBackground::Source,
                 mirror: true,
                 ..swarm
@@ -147,8 +146,8 @@ fn cases() -> Vec<(&'static str, RenderSettings)> {
 fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     let frames = clip::<C>(w, h, 24);
     let needed = segcam_motion::previous_frames_needed(s) as usize;
-    let mut cpu = Incremental::default();
-    let mut gpu = Incremental::default();
+    let mut cpu = IncrementalRenderer::default();
+    let mut gpu = IncrementalRenderer::default();
     match segcam_motion::gpu::status() {
         Ok(()) => {}
         Err(NoGpu::NoAdapter(e)) => {
@@ -159,7 +158,7 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     }
     gpu.use_gpu(true);
     gpu.gpu_overlay(true);
-    gpu.gpu_threshold(0.0);
+    gpu.set_gpu_min_coverage(0.0);
     let mut a = vec![Argb::<C>::default(); (w * h) as usize];
     let mut b = a.clone();
     for n in 0..frames.len() {
@@ -170,14 +169,14 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
             width: w,
             height: h,
         };
-        cpu.advance(
+        cpu.render_frame(
             s,
             &mut source(),
             count,
             n as i64,
             &mut ViewMut::from_pixels(&mut a, w, h),
         );
-        gpu.advance(
+        gpu.render_frame(
             s,
             &mut source(),
             count,
@@ -219,7 +218,7 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     if let Err(e) = segcam_motion::gpu::status() {
         panic!("{name}: {e}");
     }
-    let (drawn, faults) = gpu.gpu().map_or((0, 0), |d| (d.drawn, d.faults));
+    let (drawn, faults) = gpu.drawer().map_or((0, 0), |d| (d.drawn, d.faults));
     assert_eq!(faults, 0, "{name}: renders fell back to the CPU");
     assert_eq!(
         drawn,

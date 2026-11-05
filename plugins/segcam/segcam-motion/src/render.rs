@@ -1,14 +1,12 @@
-//! Everything between "here are some frames" and "here is the output picture", generic over
-//! the channel type so one implementation serves After Effects' 8, 16 and 32 bpc worlds and
-//! the command-line tool alike. Rows run top to bottom. Pixels are premultiplied unless
-//! [`RenderSettings::straight_alpha`] says otherwise; After Effects' effect worlds are straight.
+//! CPU rendering, generic over channel type so one implementation serves all host depths. Rows
+//! run top to bottom. Pixels are premultiplied unless [`RenderSettings::straight_alpha`].
 
 use std::collections::VecDeque;
 
 use crate::font;
-use crate::incremental::Incremental;
+use crate::incremental::IncrementalRenderer;
 use crate::motion::{
-    Blob, LumaGrid, Motion, MotionSettings, NormRect, SegmentKind, ThresholdSettings,
+    Blob, LumaGrid, MotionSettings, NormRect, SegmentKind, Segmentation, ThresholdSettings,
 };
 use crate::pixel::{Argb, Channel, Color, Depth, View, ViewMut, make_pixel, scale_pixel};
 use crate::swarm::{self, SwarmMetrics, Tile};
@@ -29,13 +27,13 @@ pub enum OutputMode {
 impl OutputMode {
     pub const NAMES: [&str; 4] = ["Overlay", "Motion matte", "Box matte", "Swarm"];
 
-    /// From a 1-based popup value, as After Effects stores it.
-    pub fn from_index(index: i32) -> Option<Self> {
-        match index {
-            1 => Some(Self::Overlay),
-            2 => Some(Self::Matte),
-            3 => Some(Self::BoxMatte),
-            4 => Some(Self::Swarm),
+    /// From the 0-based value of the `output` parameter.
+    pub fn from_choice(choice: i32) -> Option<Self> {
+        match choice {
+            0 => Some(Self::Overlay),
+            1 => Some(Self::Matte),
+            2 => Some(Self::BoxMatte),
+            3 => Some(Self::Swarm),
             _ => None,
         }
     }
@@ -43,7 +41,7 @@ impl OutputMode {
 
 /// What finds the segments.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Detect {
+pub enum DetectionMode {
     /// What moved against a background of the frames before.
     #[default]
     Motion,
@@ -93,7 +91,7 @@ impl AnalysisStep {
     pub const MAX_EVERY: i64 = 4;
 
     /// For a clip at `frame_rate` frames a second; every frame where that isn't known.
-    pub fn at(frame_rate: Option<f64>) -> Self {
+    pub fn for_frame_rate(frame_rate: Option<f64>) -> Self {
         let every = frame_rate
             .filter(|r| r.is_finite() && *r > 0.0)
             .map_or(1, |r| (r / Self::ANALYSES_A_SECOND).round() as i64);
@@ -117,7 +115,7 @@ impl Default for AnalysisStep {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderSettings {
     pub mode: OutputMode,
-    pub detect: Detect,
+    pub detection_mode: DetectionMode,
     pub motion: MotionSettings,
     pub threshold: ThresholdSettings,
     pub faces: FaceParts,
@@ -146,7 +144,7 @@ impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             mode: OutputMode::Overlay,
-            detect: Detect::Motion,
+            detection_mode: DetectionMode::Motion,
             motion: MotionSettings::default(),
             threshold: ThresholdSettings::default(),
             faces: FaceParts::default(),
@@ -173,7 +171,7 @@ impl Default for RenderSettings {
 impl RenderSettings {
     /// segcam 1.1's look, for comparing with the app: Swarm of motion and every face part, the
     /// longest trail so windows go by count, analysing as 1.1 does at the clip's `frame_rate`.
-    pub fn look_1_1(frame_rate: Option<f64>) -> Self {
+    pub fn segcam_1_1_preset(frame_rate: Option<f64>) -> Self {
         Self {
             mode: OutputMode::Swarm,
             faces: FaceParts {
@@ -183,7 +181,7 @@ impl RenderSettings {
                 body: true,
             },
             trail_frames: 120,
-            analysis_step: AnalysisStep::at(frame_rate),
+            analysis_step: AnalysisStep::for_frame_rate(frame_rate),
             ..Self::default()
         }
     }
@@ -205,9 +203,9 @@ pub fn previous_frames_needed(s: &RenderSettings) -> i32 {
 /// How many frames before a frame its detection reaches back: the background's analyses, for
 /// motion.
 pub fn history_frames(s: &RenderSettings) -> i32 {
-    match s.detect {
-        Detect::Motion => s.background_frames.max(1) * s.analysis_step.every as i32,
-        Detect::Threshold | Detect::FacesOnly => 0,
+    match s.detection_mode {
+        DetectionMode::Motion => s.background_frames.max(1) * s.analysis_step.every as i32,
+        DetectionMode::Threshold | DetectionMode::FacesOnly => 0,
     }
 }
 
@@ -220,7 +218,7 @@ pub fn segment_label(kind: SegmentKind, frame: i64, index: usize) -> String {
 
 /// The label of `blob`, segment `index` of frame `frame`, or the one it had if it was reused.
 pub fn blob_label(blob: &Blob, frame: i64, index: usize) -> String {
-    let (frame, index) = blob.reused.unwrap_or((frame, index));
+    let (frame, index) = blob.reused_from.unwrap_or((frame, index));
     segment_label(blob.kind, frame, index)
 }
 
@@ -300,7 +298,7 @@ pub fn contains(outer: PixelRect, inner: PixelRect) -> bool {
 }
 
 /// Normalized → output pixels, mirrored about the vertical centre line if asked.
-pub fn to_pixels(r: &NormRect, width: i32, height: i32, mirrored: bool) -> PixelRect {
+pub fn norm_rect_to_pixels(r: &NormRect, width: i32, height: i32, mirrored: bool) -> PixelRect {
     let x = if mirrored { 1.0 - r.x - r.w } else { r.x };
     let (w, h) = (f64::from(width), f64::from(height));
     let (x0, y0) = ((x * w).floor() as i32, (r.y * h).floor() as i32);
@@ -401,45 +399,71 @@ pub fn copy_scaled<C: Channel>(src: &View<C>, dst: &mut ViewMut<C>, mirrored: bo
 // ---------------------------------------------------------------------------------------
 // The overlay and the mattes
 
+/// The overlay's measures at a canvas height, shared by the CPU and GPU paths.
+pub(crate) struct OverlayLayout {
+    pub line: i32,
+    pub text_scale: i32,
+}
+
+impl OverlayLayout {
+    pub fn new(canvas_height: i32) -> Self {
+        Self {
+            line: 2.max((f64::from(canvas_height) / 540.0).round() as i32),
+            text_scale: 1.max((f64::from(canvas_height) / 600.0).round() as i32),
+        }
+    }
+
+    /// The gap between an ID chip's edge and its text.
+    pub fn chip_padding(&self) -> i32 {
+        2 * self.text_scale
+    }
+
+    /// The ID chip of box `r`: on the box's top edge, outside it; inside if the box is at the top.
+    pub fn chip(&self, r: PixelRect, label: &str) -> PixelRect {
+        let (scale, pad) = (self.text_scale, self.chip_padding());
+        let mut chip = PixelRect::new(
+            r.x,
+            r.y - text_height(scale) - 2 * pad,
+            text_width(label, scale) + 2 * pad,
+            text_height(scale) + 2 * pad,
+        );
+        if chip.y < 0 {
+            chip.y = r.y;
+        }
+        chip
+    }
+}
+
 pub fn draw_overlay<C: Channel>(
     out: &mut ViewMut<C>,
     blobs: &[Blob],
     frame: i64,
     s: &RenderSettings,
 ) {
-    let green = make_pixel::<C>(s.box_color, 1.0);
+    let box_color = make_pixel::<C>(s.box_color, 1.0);
     let black = make_pixel::<C>(Color::default(), 1.0);
-    let line = 2.max((f64::from(out.height) / 540.0).round() as i32);
-    let scale = 1.max((f64::from(out.height) / 600.0).round() as i32);
+    let layout = OverlayLayout::new(out.height);
+    let pad = layout.chip_padding();
 
     for (i, blob) in blobs.iter().enumerate() {
-        let r = to_pixels(&blob.bounds, out.width, out.height, s.mirror);
+        let r = norm_rect_to_pixels(&blob.bounds, out.width, out.height, s.mirror);
         if s.boxes {
-            stroke_rect(out, r, line, green);
+            stroke_rect(out, r, layout.line, box_color);
         }
         if !s.labels {
             continue;
         }
 
-        // The ID chip sits on the box's top edge, outside it; inside if the box is at the top.
         let label = blob_label(blob, frame, i);
-        let pad = 2 * scale;
-        let mut chip = PixelRect::new(
-            r.x,
-            r.y - text_height(scale) - 2 * pad,
-            text_width(&label, scale) + 2 * pad,
-            text_height(scale) + 2 * pad,
-        );
-        if chip.y < 0 {
-            chip.y = r.y;
-        }
-        fill_rect(out, chip, green);
+        let chip = layout.chip(r, &label);
+        fill_rect(out, chip, box_color);
+        let scale = layout.text_scale;
         draw_text(out, chip.x + pad, chip.y + pad, &label, scale, black);
     }
 }
 
 /// Bilinear sample of the grid-sized mask at normalized (u, v) in source orientation.
-pub fn sample_mask(m: &Motion, u: f64, v: f64) -> f32 {
+pub fn sample_mask(m: &Segmentation, u: f64, v: f64) -> f32 {
     if m.width <= 0 || m.height <= 0 {
         return 0.0;
     }
@@ -457,7 +481,7 @@ pub fn sample_mask(m: &Motion, u: f64, v: f64) -> f32 {
 
 pub fn apply_matte<C: Channel>(
     out: &mut ViewMut<C>,
-    motion: &Motion,
+    motion: &Segmentation,
     boxes: bool,
     mirrored: bool,
     straight_alpha: bool,
@@ -467,7 +491,7 @@ pub fn apply_matte<C: Channel>(
         let v = (f64::from(y) + 0.5) / f64::from(h);
         for (x, px) in (0..).zip(out.row_mut(y).iter_mut()) {
             let u = (f64::from(if mirrored { w - 1 - x } else { x }) + 0.5) / f64::from(w);
-            let k = if boxes {
+            let coverage = if boxes {
                 let inside = motion.blobs.iter().any(|b| {
                     let r = &b.bounds;
                     u >= r.x && u < r.x + r.w && v >= r.y && v < r.y + r.h
@@ -476,12 +500,12 @@ pub fn apply_matte<C: Channel>(
             } else {
                 sample_mask(motion, u, v)
             };
-            if k <= 0.0 {
+            if coverage <= 0.0 {
                 *px = Argb::default();
-            } else if k < 1.0 && straight_alpha {
-                px.alpha = C::from_unit(px.alpha.to_unit() * k);
-            } else if k < 1.0 {
-                *px = scale_pixel(px, k);
+            } else if coverage < 1.0 && straight_alpha {
+                px.alpha = C::from_unit(px.alpha.to_unit() * coverage);
+            } else if coverage < 1.0 {
+                *px = scale_pixel(px, coverage);
             }
         }
     }
@@ -491,37 +515,33 @@ pub fn apply_matte<C: Channel>(
 
 /// The tiles a frame's blobs become, biggest first, titled with their labels. Reused faces,
 /// which come last, already have windows from their own frame, so they get tiles only if
-/// `reused` asks for them.
-pub fn frame_tiles<C: Channel>(
-    motion: &Motion,
+/// `include_reused_faces` asks for them.
+pub fn cut_frame_tiles<C: Channel>(
+    motion: &Segmentation,
     frame: Option<&View<C>>,
     number: i64,
     canvas_w: i32,
     canvas_h: i32,
     mirrored: bool,
-    reused: bool,
+    include_reused_faces: bool,
 ) -> Vec<Tile> {
     let make = |b: usize| {
         let blob = &motion.blobs[b];
         let title = format!("LO.FI.SCI.FI {}", blob_label(blob, number, b));
-        swarm::make_tile(blob, frame, title, canvas_w, canvas_h, mirrored)
+        swarm::cut_tile(blob, frame, title, canvas_w, canvas_h, mirrored)
     };
-    let count = if reused {
+    let count = if include_reused_faces {
         motion.blobs.len()
     } else {
         motion
             .blobs
             .iter()
-            .take_while(|b| b.reused.is_none())
+            .take_while(|b| b.reused_from.is_none())
             .count()
     };
     // A camera move makes big segments, each copied whole, so they're shared out over a
     // few threads, as the swarm's drawing is.
-    const THREADS: usize = 6;
-    let threads = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(THREADS)
-        .min(count);
+    let threads = vfx_plugin::vfx_host::worker_threads().min(count);
     if threads < 2 {
         return (0..count).map(make).collect();
     }
@@ -546,44 +566,34 @@ pub fn frame_tiles<C: Channel>(
     tiles.into_inner().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A tile in a [`Pile`]: owned, so a buried one can drop its pixels, or borrowed from a cache.
-pub trait PiledTile {
-    fn tile(&self) -> &Tile;
-    /// Called when a newer tile covers this one whole.
-    fn bury(&mut self) {}
+/// A cached tile in a [`Pile`], with its frame and its index in that frame's tiles.
+#[derive(Clone, Copy)]
+pub struct PileEntry<'a> {
+    pub tile: &'a Tile,
+    pub frame: i64,
+    pub index: usize,
 }
 
-impl PiledTile for Tile {
-    fn tile(&self) -> &Tile {
-        self
-    }
-    fn bury(&mut self) {
-        self.hidden = true;
-        self.pixels = Vec::new();
-        self.bar = None;
-    }
-}
-
-impl PiledTile for &Tile {
-    fn tile(&self) -> &Tile {
-        self
-    }
+/// An entry of a [`Pile`], with what it adds to the pile's byte budget.
+struct PiledTile<'a> {
+    entry: PileEntry<'a>,
+    /// A newer tile covers it whole, so it isn't drawn.
+    buried: bool,
+    /// What it adds to the pile's `stored_pixels`: 0 once buried.
+    counted_pixels: usize,
 }
 
 /// segcam's pile, oldest first. It is only trimmed by count, so a window stays until
-/// `max_tiles` newer ones push it out. To keep memory bounded, tiles are stored at 8 bits and
-/// a tile buried whole under a newer one drops its pixels, which does not change the picture.
-/// The byte budget is a last resort for extreme piles.
-pub struct Pile<T> {
-    /// Each tile, whether it is buried, and the pixels it still counts for.
-    tiles: VecDeque<(T, bool, usize)>,
+/// `max_tiles` newer ones push it out. The byte budget is a last resort for extreme piles.
+pub struct Pile<'a> {
+    tiles: VecDeque<PiledTile<'a>>,
     stored_pixels: usize,
     title_height: i32,
     canvas: PixelRect,
     max_tiles: usize,
 }
 
-impl<T: PiledTile> Pile<T> {
+impl<'a> Pile<'a> {
     const BYTE_BUDGET: usize = 768 << 20;
 
     pub fn new(canvas_w: i32, canvas_h: i32, max_tiles: i32) -> Self {
@@ -597,52 +607,54 @@ impl<T: PiledTile> Pile<T> {
     }
 
     /// Adds `tile` on top, burying older tiles it covers and trimming the oldest.
-    pub fn push(&mut self, tile: T) {
-        let kept = tile.tile().pixels.len();
-        self.stored_pixels += kept;
-        let cover = swarm::tile_extent(tile.tile().video, self.title_height);
-        for (older, buried, counted) in self.tiles.iter_mut().filter(|(_, b, _)| !b) {
-            let shown = intersect(
-                swarm::tile_extent(older.tile().video, self.title_height),
+    pub fn push(&mut self, entry: PileEntry<'a>) {
+        let tile_pixels = entry.tile.pixels.len();
+        self.stored_pixels += tile_pixels;
+        let cover = swarm::window_rect(entry.tile.content_rect, self.title_height);
+        for older in self.tiles.iter_mut().filter(|t| !t.buried) {
+            let visible = intersect(
+                swarm::window_rect(older.entry.tile.content_rect, self.title_height),
                 self.canvas,
             );
-            if contains(cover, shown) {
-                *buried = true;
-                self.stored_pixels -= *counted;
-                *counted = 0;
-                older.bury();
+            if contains(cover, visible) {
+                older.buried = true;
+                self.stored_pixels -= older.counted_pixels;
+                older.counted_pixels = 0;
             }
         }
-        let hidden = tile.tile().hidden;
-        self.tiles.push_back((tile, hidden, kept));
+        self.tiles.push_back(PiledTile {
+            entry,
+            buried: entry.tile.hidden,
+            counted_pixels: tile_pixels,
+        });
         while self.tiles.len() > self.max_tiles
             || (self.stored_pixels * size_of::<Argb<u8>>() > Self::BYTE_BUDGET
                 && self.tiles.len() > 1)
         {
-            if let Some((_, _, counted)) = self.tiles.pop_front() {
-                self.stored_pixels -= counted;
+            if let Some(oldest) = self.tiles.pop_front() {
+                self.stored_pixels -= oldest.counted_pixels;
             }
         }
     }
 
     /// The tiles still drawn, oldest first.
-    pub fn shown(&self) -> impl Iterator<Item = &Tile> {
-        self.shown_entries().map(PiledTile::tile)
+    pub fn visible(&self) -> impl Iterator<Item = &'a Tile> + '_ {
+        self.visible_entries().map(|entry| entry.tile)
     }
 
     /// The entries still drawn, oldest first.
-    pub fn shown_entries(&self) -> impl Iterator<Item = &T> {
-        self.tiles.iter().filter(|(_, b, _)| !b).map(|(t, _, _)| t)
+    pub fn visible_entries(&self) -> impl Iterator<Item = PileEntry<'a>> + '_ {
+        self.tiles.iter().filter(|t| !t.buried).map(|t| t.entry)
     }
 }
 
 /// Draws the output for the current frame from its motion and, for the swarm, the pile's
-/// shown tiles.
+/// visible tiles.
 pub fn draw_output<'t, C: Channel>(
     out: &mut ViewMut<C>,
     s: &RenderSettings,
     frame: Option<View<C>>,
-    motion: &Motion,
+    motion: &Segmentation,
     frame_number: i64,
     tiles: impl IntoIterator<Item = &'t Tile>,
 ) {
@@ -686,5 +698,5 @@ pub fn render<C: Depth>(
     frame_number: i64,
     out: &mut ViewMut<C>,
 ) {
-    Incremental::default().advance(s, frames, frame_count, frame_number, out);
+    IncrementalRenderer::default().render_frame(s, frames, frame_count, frame_number, out);
 }

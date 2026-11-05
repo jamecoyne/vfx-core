@@ -23,7 +23,7 @@ Always the first four. Overlay is the core effect, Swarm the mode. Runs compared
 | overlay faces | overlay, plus Face, Eyes, Mouth and Body |
 | show | Output Swarm, Detect Motion, Background 16, Trail 24, Swarm max tiles 100, backdrop Transparent, no face parts |
 | show faces | show, plus Face, Eyes, Mouth and Body |
-| 1.1 look | show faces with Trail 120, analysing at 1.1's rate from the clip's frame rate: `RenderSettings::look_1_1`, in the CLI `--preset 1.1 --fps RATE --keep` |
+| 1.1 look | show faces with Trail 120, analysing at 1.1's rate from the clip's frame rate: `RenderSettings::segcam_1_1_preset`, in the CLI `--preset 1.1 --fps RATE --keep` |
 
 A host that gives no frame rate (Resolume) analyses every frame, so its 1.1 look rows say so.
 
@@ -96,6 +96,16 @@ composition, one run of 3 minutes each, the same build, the first row with `VFX_
 From the FFGL timing log (`VFX_FFGL_TIMING=1`): the medians of its 300-frame batches after the
 first, which holds the face models' load, so the first 40 frames aren't split out. Times run
 from the readback to the frame shown; fps is frames over the run.
+
+## GPU thresholds
+
+`GPU_MIN_COVERAGE_8_BIT` (0.5) and `GPU_MIN_COVERAGE_DEEPER` (1.5) in `src/incremental.rs` sit a
+little above where CPU and GPU drawing cross. On an RTX 4070 at 1080p the CPU took about 2.7 ms per
+canvas of window pixels at 8 bit and 2.2 ms in float; the GPU took about 1.2 ms and 3.6 ms whatever
+the windows.
+
+`tests/gpu.rs` allows 1 pixel in 10,000, at least 4, off by over half a level. The 1080p clip's
+cases measured at most 8 of 2,073,600 on an RTX 4070.
 
 ## When
 

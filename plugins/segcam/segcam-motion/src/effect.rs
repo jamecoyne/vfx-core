@@ -2,21 +2,29 @@
 //! the host works in. Hosts fetch (or keep) the frames before the current one that
 //! [`CpuEffect::frames_before`] asks for.
 
-#[cfg(not(target_arch = "wasm32"))]
 use vfx_core::Target;
 use vfx_core::cpu::{FrameSource, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Report, Unit};
 
 use crate::{
-    AnalysisStep, Color, Detect, FaceParts, Incremental, MotionSettings, OutputMode,
+    AnalysisStep, Color, DetectionMode, FaceParts, IncrementalRenderer, MotionSettings, OutputMode,
     RenderSettings, SwarmBackground, ThresholdSettings,
 };
+
+/// Detect starts as segcam 1.1 does, on faces. Browsers have no face models, where that would
+/// show nothing at all.
+const DETECT_DEFAULT: i32 = if cfg!(target_arch = "wasm32") { 0 } else { 2 };
 
 /// The controls, with segcam's units (percentages are 0-100), ranges and defaults: those of
 /// [`RenderSettings::default`], but Detect and the face parts start as segcam 1.1 does.
 pub const PARAMS: &[ParamSpec] = &[
     ParamSpec::choice("output", &OutputMode::NAMES, 0).label("Output"),
-    ParamSpec::choice("detect", &["Motion", "Threshold", "Faces only"], 2).label("Detect"),
+    ParamSpec::choice(
+        "detect",
+        &["Motion", "Threshold", "Faces only"],
+        DETECT_DEFAULT,
+    )
+    .label("Detect"),
     ParamSpec::float("sensitivity", 0.0, 100.0, 86.4)
         .label("Sensitivity")
         .group("Motion")
@@ -90,14 +98,14 @@ pub const PARAMS: &[ParamSpec] = &[
 
 /// One frame's settings, analysing every frame. `premultiplied` says how the host's frames
 /// store colour.
-pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
+pub fn settings_from_params(p: &ParamValues, premultiplied: bool) -> RenderSettings {
     let [r, g, b, _] = p.color("box_color");
     RenderSettings {
-        mode: OutputMode::from_index(p.int("output") + 1).unwrap_or(OutputMode::Overlay),
-        detect: match p.int("detect") {
-            1 => Detect::Threshold,
-            2 => Detect::FacesOnly,
-            _ => Detect::Motion,
+        mode: OutputMode::from_choice(p.int("output")).unwrap_or(OutputMode::Overlay),
+        detection_mode: match p.int("detect") {
+            1 => DetectionMode::Threshold,
+            2 => DetectionMode::FacesOnly,
+            _ => DetectionMode::Motion,
         },
         faces: FaceParts {
             face: p.bool("face"),
@@ -135,32 +143,32 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
     }
 }
 
-/// segcam Motion. It keeps what it works out for each frame (see [`Incremental`]), so a host
-/// that keeps the instance works out only what changed since the last render.
+/// segcam Motion. Caches per-frame analysis (see [`IncrementalRenderer`]), so a kept instance
+/// recomputes only what changed.
 pub struct SegcamMotion {
-    state: Incremental,
+    renderer: IncrementalRenderer,
 }
 
 impl Default for SegcamMotion {
     /// Draws Swarm on the GPU where there is one, unless `SEGCAM_GPU=0`.
     fn default() -> Self {
-        Self::with_gpu(crate::gpu::wanted())
+        Self::with_gpu(crate::gpu::enabled_by_env())
     }
 }
 
 impl SegcamMotion {
     /// With `gpu` false, always on the CPU.
     pub fn with_gpu(gpu: bool) -> Self {
-        let mut state = Incremental::default();
-        state.use_gpu(gpu);
-        Self { state }
+        let mut renderer = IncrementalRenderer::default();
+        renderer.use_gpu(gpu);
+        Self { renderer }
     }
 
-    /// On the GPU from `share` of the canvas in window pixels (see
-    /// [`Incremental::gpu_threshold`]); 0 draws every swarm render there.
-    pub fn with_gpu_threshold(share: f64) -> Self {
+    /// On the GPU from `min_coverage` (see [`IncrementalRenderer::set_gpu_min_coverage`]); 0 draws
+    /// every swarm render there.
+    pub fn with_gpu_min_coverage(min_coverage: f64) -> Self {
         let mut effect = Self::with_gpu(true);
-        effect.state.gpu_threshold(share);
+        effect.renderer.set_gpu_min_coverage(min_coverage);
         effect
     }
 }
@@ -175,25 +183,25 @@ impl CpuEffect for SegcamMotion {
     }
 
     fn clear_history(&mut self) -> bool {
-        self.state.clear_history();
+        self.renderer.clear_history();
         true
     }
 
     fn frames_before(&self, params: &ParamValues, frame_rate: Option<f64>) -> usize {
         let s = RenderSettings {
-            analysis_step: AnalysisStep::at(frame_rate),
-            ..settings(params, false)
+            analysis_step: AnalysisStep::for_frame_rate(frame_rate),
+            ..settings_from_params(params, false)
         };
         crate::previous_frames_needed(&s) as usize
     }
 
-    /// None: earlier frames live on as the grids, segments and tiles kept from them.
+    /// Returns 0: cached grids, segments and tiles replace held frames.
     fn frames_held(&self, _params: &ParamValues, _frame_rate: Option<f64>) -> usize {
         0
     }
 
     fn values_known(&self, params: &ParamValues) {
-        if settings(params, false).faces.any() {
+        if settings_from_params(params, false).faces.any() {
             crate::faces::start();
         }
     }
@@ -207,20 +215,19 @@ impl CpuEffect for SegcamMotion {
         ctx: &Context,
     ) {
         let s = RenderSettings {
-            analysis_step: AnalysisStep::at(ctx.frame_rate),
-            ..settings(params, ctx.premultiplied)
+            analysis_step: AnalysisStep::for_frame_rate(ctx.frame_rate),
+            ..settings_from_params(params, ctx.premultiplied)
         };
-        let (state, n) = (&mut self.state, ctx.frame);
+        let (renderer, n) = (&mut self.renderer, ctx.frame);
         match output {
-            ImageMut::U8(mut out) => state.advance(&s, frames, count, n, &mut out),
-            ImageMut::U16(mut out) => state.advance(&s, frames, count, n, &mut out),
-            ImageMut::F32(mut out) => state.advance(&s, frames, count, n, &mut out),
+            ImageMut::U8(mut out) => renderer.render_frame(&s, frames, count, n, &mut out),
+            ImageMut::U16(mut out) => renderer.render_frame(&s, frames, count, n, &mut out),
+            ImageMut::F32(mut out) => renderer.render_frame(&s, frames, count, n, &mut out),
         }
     }
 
     /// A swarm drawn on the GPU goes into `target` when it is on the device the swarm draws
     /// on, which it is where the host shared it before the first render (FFGL).
-    #[cfg(not(target_arch = "wasm32"))]
     fn render_to(
         &mut self,
         frames: &mut dyn FrameSource,
@@ -230,17 +237,17 @@ impl CpuEffect for SegcamMotion {
         params: &ParamValues,
         ctx: &Context,
     ) -> bool {
-        self.state.offer_target(target);
+        self.renderer.offer_target(target);
         self.render(frames, count, output, params, ctx);
-        self.state.took_target()
+        self.renderer.took_target()
     }
 
     fn unfinished(&self) -> bool {
-        self.state.unfinished()
+        self.renderer.unfinished()
     }
 
     fn report(&self) -> Report {
-        self.state.report()
+        self.renderer.report()
     }
 }
 
@@ -251,10 +258,10 @@ mod tests {
     use vfx_core::cpu::{Argb, History, ViewMut};
 
     #[test]
-    fn controls_start_as_1_1() {
-        let mut s = settings(&ParamValues::new(PARAMS), false);
-        let core = RenderSettings {
-            detect: Detect::FacesOnly,
+    fn default_params_match_segcam_1_1() {
+        let mut s = settings_from_params(&ParamValues::new(PARAMS), false);
+        let expected = RenderSettings {
+            detection_mode: DetectionMode::FacesOnly,
             faces: FaceParts {
                 eyes: true,
                 mouth: true,
@@ -264,9 +271,9 @@ mod tests {
             ..RenderSettings::default()
         };
         // Parameters are f32, so 86.4% arrives as 0.86400002: the same threshold.
-        assert_eq!(s.motion.threshold(), core.motion.threshold());
-        s.motion.sensitivity = core.motion.sensitivity;
-        assert_eq!(s, core);
+        assert_eq!(s.motion.threshold(), expected.motion.threshold());
+        s.motion.sensitivity = expected.motion.sensitivity;
+        assert_eq!(s, expected);
     }
 
     #[test]
@@ -326,9 +333,71 @@ mod tests {
         );
     }
 
+    /// A clip loop or new source: the history starts over and the same numbers hold other pixels.
+    #[test]
+    fn history_restart_after_clear_matches_fresh_effect() {
+        let (w, h) = (160, 90);
+        let frame_with_square = |frame: &mut [Argb<u8>], x0: i32| {
+            for (i, p) in frame.iter_mut().enumerate() {
+                let (x, y) = (i as i32 % w, i as i32 / w);
+                let v = if (x0..x0 + 24).contains(&x) && (20..44).contains(&y) {
+                    250
+                } else {
+                    80
+                };
+                *p = Argb {
+                    alpha: 255,
+                    red: v,
+                    green: v,
+                    blue: v,
+                };
+            }
+        };
+        let mut params = ParamValues::new(PARAMS);
+        for (name, value) in [
+            ("output", vfx_core::ParamValue::Int(3)),
+            ("detect", vfx_core::ParamValue::Int(0)),
+            ("eyes", vfx_core::ParamValue::Bool(false)),
+            ("mouth", vfx_core::ParamValue::Bool(false)),
+        ] {
+            params.set(name, value).expect("a segcam parameter");
+        }
+        let play = |effect: &mut SegcamMotion, history: &mut History<u8>, xs: &[i32]| {
+            let mut out = vec![Argb::<u8>::default(); (w * h) as usize];
+            for &x in xs {
+                let before = effect.frames_before(&params, None);
+                let frame = history.next(before, effect.frames_held(&params, None));
+                frame_with_square(frame, x);
+                let ctx = Context {
+                    frame: history.frame_number(),
+                    ..Context::at(0.0)
+                };
+                let count = history.len();
+                let view = ViewMut::from_pixels(&mut out, w, h);
+                effect.render(history, count, ImageMut::U8(view), &params, &ctx);
+            }
+            out
+        };
+        let other_clip: Vec<i32> = (0..8).map(|f| 120 - f * 12).collect();
+        let mut kept = SegcamMotion::with_gpu(false);
+        let mut history = History::<u8>::default();
+        history.resize(w, h);
+        play(&mut kept, &mut history, &[10, 22, 34, 46, 58, 70, 82, 94]);
+        history.clear();
+        assert!(kept.clear_history());
+        let got = play(&mut kept, &mut history, &other_clip);
+
+        let mut fresh = SegcamMotion::with_gpu(false);
+        let mut history = History::<u8>::default();
+        history.resize(w, h);
+        let want = play(&mut fresh, &mut history, &other_clip);
+        assert!(got == want, "a kept effect kept something across the clear");
+        assert!(want.iter().any(|p| p.alpha == 255), "no windows drawn");
+    }
+
     /// Driven the way a streaming host drives it: one frame at a time, kept in a history.
     #[test]
-    fn finds_motion_through_the_effect_interface() {
+    fn history_driven_matte_keeps_moving_square() {
         let (w, h) = (160, 90);
         let grey = |v: u8| Argb {
             alpha: 255,

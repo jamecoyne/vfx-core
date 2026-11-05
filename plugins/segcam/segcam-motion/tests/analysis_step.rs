@@ -7,8 +7,8 @@ use motion_only::motion_only;
 use segcam_motion::motion::{self, LumaGrid};
 use segcam_motion::render::{copy_scaled, downsample, draw_overlay};
 use segcam_motion::{
-    AnalysisStep, Argb, Detect, OutputMode, RenderSettings, SegcamMotion, SwarmBackground, View,
-    ViewMut, previous_frames_needed, render,
+    AnalysisStep, Argb, DetectionMode, OutputMode, RenderSettings, SegcamMotion, SwarmBackground,
+    View, ViewMut, previous_frames_needed, render,
 };
 use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamValue, ParamValues};
@@ -61,8 +61,8 @@ fn cold(s: &RenderSettings, frames: &[Frame], number: usize) -> Frame {
 }
 
 #[test]
-fn step_at_each_frame_rate() {
-    let every = |rate| AnalysisStep::at(rate).every;
+fn analysis_step_follows_frame_rate() {
+    let every = |rate| AnalysisStep::for_frame_rate(rate).every;
     assert_eq!(every(None), 1);
     for rate in [
         23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 72.0,
@@ -81,7 +81,7 @@ fn step_at_each_frame_rate() {
     assert_eq!(every(Some(480.0)), AnalysisStep::MAX_EVERY);
     assert_eq!(every(Some(0.0)), 1);
 
-    let at_120 = AnalysisStep::at(Some(120.0));
+    let at_120 = AnalysisStep::for_frame_rate(Some(120.0));
     assert_eq!(at_120.analysis_frame(10, 0), 10);
     assert_eq!(at_120.analysis_frame(11, 0), 10);
     // A clip starting on an odd frame analyses its first.
@@ -90,7 +90,7 @@ fn step_at_each_frame_rate() {
 
 /// Between analyses no window spawns, so the swarm holds still.
 #[test]
-fn the_swarm_holds_between_analyses() {
+fn swarm_holds_between_analyses() {
     let frames = crossing(24);
     let s = RenderSettings {
         mode: OutputMode::Swarm,
@@ -99,7 +99,7 @@ fn the_swarm_holds_between_analyses() {
         ..RenderSettings::default()
     };
     let at_120 = RenderSettings {
-        analysis_step: AnalysisStep::at(Some(120.0)),
+        analysis_step: AnalysisStep::for_frame_rate(Some(120.0)),
         ..s
     };
     for n in [10, 16, 22] {
@@ -123,12 +123,12 @@ fn as_host(s: &RenderSettings, frames: &[Frame], number: usize) -> Frame {
 /// With no background the trail starts at the first frame handed over. When that frame falls
 /// between analyses it spawns nothing, so the oldest windows don't come and go.
 #[test]
-fn the_oldest_trail_frame_waits_for_its_analysis() {
+fn oldest_trail_frame_between_analyses_spawns_no_windows() {
     let frames = crossing(24);
     let n = 21;
     let s = RenderSettings {
         mode: OutputMode::Swarm,
-        detect: Detect::Threshold,
+        detection_mode: DetectionMode::Threshold,
         swarm_background: SwarmBackground::Black,
         ..RenderSettings::default()
     };
@@ -137,7 +137,7 @@ fn the_oldest_trail_frame_waits_for_its_analysis() {
         analysis_step,
         ..s
     };
-    let at_120 = AnalysisStep::at(Some(120.0));
+    let at_120 = AnalysisStep::for_frame_rate(Some(120.0));
     assert!(as_host(&trail(11, at_120), &frames, n) == as_host(&trail(10, at_120), &frames, n));
     let every = AnalysisStep::EVERY_FRAME;
     assert!(as_host(&trail(11, every), &frames, n) != as_host(&trail(10, every), &frames, n));
@@ -150,7 +150,7 @@ fn overlay_shows_the_last_analysis() {
     let frames = crossing(24);
     let s = RenderSettings {
         background_frames: 6,
-        analysis_step: AnalysisStep::at(Some(119.88)),
+        analysis_step: AnalysisStep::for_frame_rate(Some(119.88)),
         ..RenderSettings::default()
     };
     let grids: Vec<LumaGrid> = frames
@@ -164,7 +164,7 @@ fn overlay_shows_the_last_analysis() {
         .rev()
         .map(|k| grids[analysis - 2 * k].clone())
         .collect();
-    let found = motion::detect(&background, &grids[analysis], &s.motion);
+    let found = motion::detect_motion(&background, &grids[analysis], &s.motion);
     assert!(!found.blobs.is_empty());
     let mut want = vec![Argb::default(); (W * H) as usize];
     let mut view = ViewMut::from_pixels(&mut want, W, H);
@@ -188,7 +188,7 @@ impl FrameSource for Gappy<'_> {
 
 /// A frame whose analysis the host can't hand over analyses itself, over the analyses before.
 #[test]
-fn a_missing_analysis_is_stood_in_for() {
+fn missing_analysis_analyses_current_frame() {
     let frames = crossing(24);
     let n = 15;
     let at = |analysis_step| RenderSettings {
@@ -206,7 +206,7 @@ fn a_missing_analysis_is_stood_in_for() {
         render(s, &mut source, n + 1, n as i64, view);
         out
     };
-    let at_120 = at(AnalysisStep::at(Some(120.0)));
+    let at_120 = at(AnalysisStep::for_frame_rate(Some(120.0)));
     let stood_in = without_analysis(&at_120);
     let grids: Vec<LumaGrid> = frames
         .iter()
@@ -214,7 +214,7 @@ fn a_missing_analysis_is_stood_in_for() {
         .collect();
     // The analyses before it, without the missing one.
     let background: Vec<LumaGrid> = (1..6).rev().map(|k| grids[n - 1 - 2 * k].clone()).collect();
-    let found = motion::detect(&background, &grids[n], &at_120.motion);
+    let found = motion::detect_motion(&background, &grids[n], &at_120.motion);
     let mut want = vec![Argb::default(); (W * H) as usize];
     let mut view = ViewMut::from_pixels(&mut want, W, H);
     copy_scaled(&View::from_pixels(&frames[n], W, H), &mut view, false);
@@ -226,7 +226,7 @@ fn a_missing_analysis_is_stood_in_for() {
 /// Background counts analyses: every 2nd frame of a clip at 120 fps finds what the clip of those
 /// frames finds at 60.
 #[test]
-fn background_counts_analyses() {
+fn background_counts_analyses_not_frames() {
     let frames = crossing(40);
     let at_60: Vec<Frame> = frames.iter().step_by(2).cloned().collect();
     let boxes = |s: &RenderSettings, frames: &[Frame], number: usize| {
@@ -241,7 +241,7 @@ fn background_counts_analyses() {
         ..RenderSettings::default()
     };
     let doubled = RenderSettings {
-        analysis_step: AnalysisStep::at(Some(120.0)),
+        analysis_step: AnalysisStep::for_frame_rate(Some(120.0)),
         ..s
     };
     for n in [8, 12, 16] {
@@ -287,7 +287,7 @@ fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]
 /// A seek back starts the frame count over, so the analyses fall on the new frames as they
 /// would for a fresh effect.
 #[test]
-fn seek_back_restarts_count() {
+fn seek_back_restarts_analysis_cadence() {
     let frames = crossing(30);
     let mut effect = SegcamMotion::default();
     let mut history = History::default();
@@ -341,7 +341,7 @@ fn live(
 /// A kept effect works from what it kept: a host holding only the current frame shows what one
 /// holding them all shows, in every mode, at any rate, with tiles pushed out and buried.
 #[test]
-fn holding_only_the_current_frame_changes_nothing() {
+fn holding_only_current_frame_matches_full_history() {
     let frames = crossing(40);
     for output in 0..4 {
         for (trail, max_tiles) in [(60, 100), (12, 3)] {
@@ -371,7 +371,7 @@ fn holding_only_the_current_frame_changes_nothing() {
 /// Frames whose pixels are gone can't be cut again: a setting changed live reaches new windows
 /// only, as in segcam 1.1, and the windows up stay.
 #[test]
-fn a_setting_changed_live_leaves_the_windows_up() {
+fn live_setting_change_keeps_windows() {
     let frames = crossing(24);
     let mut effect = SegcamMotion::with_gpu(false);
     let mut values = motion_only(effect.params());

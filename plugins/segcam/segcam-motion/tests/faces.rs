@@ -9,7 +9,8 @@ mod portrait;
 
 use portrait::{H, W, drifting, frame, portrait};
 use segcam_motion::{
-    AnalysisStep, Argb, Detect, FaceParts, OutputMode, RenderSettings, SegcamMotion, View, ViewMut,
+    AnalysisStep, Argb, DetectionMode, FaceParts, OutputMode, RenderSettings, SegcamMotion, View,
+    ViewMut,
 };
 use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamValue, ParamValues, Processor};
@@ -201,7 +202,7 @@ fn boxes_every(
     let s = RenderSettings {
         analysis_step,
         mode: OutputMode::BoxMatte,
-        detect: Detect::FacesOnly,
+        detection_mode: DetectionMode::FacesOnly,
         faces: FaceParts {
             face: true,
             ..FaceParts::default()

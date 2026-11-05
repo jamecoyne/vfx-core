@@ -16,8 +16,8 @@ use std::process::ExitCode;
 
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
-    AnalysisStep, Argb, Detect, Incremental, OutputMode, RenderSettings, SwarmBackground, View,
-    ViewMut,
+    AnalysisStep, Argb, DetectionMode, IncrementalRenderer, OutputMode, RenderSettings,
+    SwarmBackground, View, ViewMut,
 };
 use vfx_core::cpu::{FrameSource, Image};
 
@@ -83,10 +83,10 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
                 }
             }
             "--detect" => {
-                s.detect = match value()? {
-                    "motion" => Detect::Motion,
-                    "threshold" => Detect::Threshold,
-                    "faces" => Detect::FacesOnly,
+                s.detection_mode = match value()? {
+                    "motion" => DetectionMode::Motion,
+                    "threshold" => DetectionMode::Threshold,
+                    "faces" => DetectionMode::FacesOnly,
                     _ => return None,
                 }
             }
@@ -116,12 +116,12 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
                 s = match value()? {
                     "1.1" => RenderSettings {
                         analysis_step: s.analysis_step,
-                        ..RenderSettings::look_1_1(None)
+                        ..RenderSettings::segcam_1_1_preset(None)
                     },
                     _ => return None,
                 }
             }
-            "--fps" => s.analysis_step = AnalysisStep::at(Some(value()?.parse().ok()?)),
+            "--fps" => s.analysis_step = AnalysisStep::for_frame_rate(Some(value()?.parse().ok()?)),
             "--max-tiles" => s.max_tiles = value()?.parse().ok()?,
             "--straight-alpha" => s.straight_alpha = true,
             "--mirror" => s.mirror = true,
@@ -148,12 +148,13 @@ fn main() -> ExitCode {
     // The GPU's state is kept between frames, which renders the same frames as a cold render.
     // Waiting for the device here puts every frame on it.
     let gpu =
-        (!cpu && segcam_motion::gpu::wanted() && segcam_motion::gpu::status().is_ok()).then(|| {
-            let mut state = Incremental::default();
-            state.use_gpu(true);
-            state
-        });
-    let state = gpu.or_else(|| kept.then(Incremental::default));
+        (!cpu && segcam_motion::gpu::enabled_by_env() && segcam_motion::gpu::status().is_ok())
+            .then(|| {
+                let mut state = IncrementalRenderer::default();
+                state.use_gpu(true);
+                state
+            });
+    let state = gpu.or_else(|| kept.then(IncrementalRenderer::default));
     if float {
         run::<f32>(width, height, settings, state)
     } else {
@@ -165,7 +166,7 @@ fn run<C: Depth>(
     width: i32,
     height: i32,
     settings: RenderSettings,
-    mut kept: Option<Incremental>,
+    mut kept: Option<IncrementalRenderer>,
 ) -> ExitCode {
     let pixels = width as usize * height as usize;
     let keep = segcam_motion::previous_frames_needed(&settings) as usize + 1;
@@ -204,7 +205,7 @@ fn run<C: Depth>(
         let count = ring.frames.len();
         let mut view = ViewMut::from_pixels(&mut out, width, height);
         match &mut kept {
-            Some(state) => state.advance(&settings, &mut ring, count, frame, &mut view),
+            Some(state) => state.render_frame(&settings, &mut ring, count, frame, &mut view),
             None => segcam_motion::render(&settings, &mut ring, count, frame, &mut view),
         }
 
@@ -212,8 +213,8 @@ fn run<C: Depth>(
             && state.drew_on_gpu()
         {
             on_gpu += 1;
-            if let Some(gpu) = state.gpu() {
-                adapter.clone_from(&gpu.adapter().name);
+            if let Some(drawer) = state.drawer() {
+                adapter.clone_from(&drawer.adapter().name);
             }
         }
 

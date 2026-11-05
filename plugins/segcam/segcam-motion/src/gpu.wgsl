@@ -13,24 +13,23 @@ struct Globals {
     // 0: clear, 1: black, 2: the frame.
     backdrop: u32,
     count: u32,
-    items: u32,
     corner: u32,
-    corner_lo: i32,
+    corner_min_offset: i32,
     corner_size: i32,
     title_height: i32,
     bar_h: i32,
     scale: f32,
     radius: f32,
-    full: f32,
+    inner_coverage: f32,
     opacity: f32,
     edge_shade: f32,
     line: i32,
     text_scale: i32,
     // Tables in `data`: 8-bit levels as units, and where title bars are sampled.
-    units: u32,
+    unit_table: u32,
     bar_x: u32,
     bar_y: u32,
-    green: vec4<f32>,
+    box_color: vec4<f32>,
 }
 
 const STRAIGHT: u32 = 1u;
@@ -62,7 +61,7 @@ fn white() -> f32 {
 
 /// 8-bit levels as the CPU reads them, n / 255 rounded once.
 fn units8(n: vec4<u32>) -> vec4<f32> {
-    let o = g.units;
+    let o = g.unit_table;
     return bitcast<vec4<f32>>(vec4<u32>(data[o + n.x], data[o + n.y], data[o + n.z],
         data[o + n.w]));
 }
@@ -167,20 +166,20 @@ fn overlay(@builtin(global_invocation_id) id: vec3<u32>) {
     let line = g.line;
     let s = g.text_scale;
     for (var b = 0u; b < g.count; b++) {
-        let o = g.items + b * BLOB_WORDS;
+        let o = b * BLOB_WORDS;
         let r = rect(o);
         if has(BOXES) && (inside(Rect(r.x, r.y, r.w, line), x, y)
             || inside(Rect(r.x, r.y + r.h - line, r.w, line), x, y)
             || inside(Rect(r.x, r.y, line, r.h), x, y)
             || inside(Rect(r.x + r.w - line, r.y, line, r.h), x, y)) {
-            color = g.green;
+            color = g.box_color;
             painted = true;
         }
         if !has(LABELS) {
             continue;
         }
         if inside(rect(o + 4u), x, y) {
-            color = g.green;
+            color = g.box_color;
             painted = true;
         }
         let rx = x - bitcast<i32>(data[o + 8u]);
@@ -211,7 +210,7 @@ fn overlay(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------------------------------
-// The swarm: each window in pile order, as `draw_window_with` draws it.
+// The swarm: each window in pile order, as `draw_prepared_window` draws it.
 
 fn corner_loss(i: i32, j: i32) -> f32 {
     let n = g.corner_size;
@@ -263,7 +262,7 @@ fn sample_bar(bar: u32, width: i32, lx: i32, ly: i32) -> vec3<f32> {
 
 /// Draws window `w` over `px`; false if the window doesn't reach the pixel.
 fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
-    let o = g.items + w * WINDOW_WORDS;
+    let o = w * WINDOW_WORDS;
     let area = rect(o + 4u);
     if !inside(area, x, y) {
         return false;
@@ -293,9 +292,9 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
     let vx = x - stored.x;
     let vy = y - stored.y;
     let in_stored = vx >= 0 && vx < stored.w && vy >= 0 && vy < stored.h;
-    var cov = g.full;
+    var coverage = g.inner_coverage;
     if !(dx == 0.0 && dy == 0.0) {
-        cov = clamp(g.radius + 0.5 - sqrt(dx * dx + dy * dy), 0.0, 1.0);
+        coverage = clamp(g.radius + 0.5 - sqrt(dx * dx + dy * dy), 0.0, 1.0);
     }
     var tile_color = vec3<f32>(0.0);
     if pixels && in_stored {
@@ -304,7 +303,7 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
     }
     // At 8 bits a frozen tile's pixel under the whole mask is the tile's own level.
     if g.depth == 0u && !has(LIVE) && pixels && ly > g.title_height && ly < frame_r.h
-        && lx >= 0 && lx < frame_r.w && in_stored && cov == 1.0 {
+        && lx >= 0 && lx < frame_r.w && in_stored && coverage == 1.0 {
         *px = vec4<f32>(1.0, tile_color);
         return true;
     }
@@ -331,8 +330,8 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
                 c = c * g.edge_shade;
             }
         }
-        p = lerp(p, c, cov);
-        a += cov * (1.0 - a);
+        p = lerp(p, c, coverage);
+        a += coverage * (1.0 - a);
     }
     if has(STRAIGHT) && a > 0.0 && a < 1.0 {
         p = p / a;
@@ -344,7 +343,7 @@ fn draw_window(w: u32, x: i32, y: i32, px: ptr<function, vec4<f32>>) -> bool {
 /// Whether window `w` covers the pixel whole, so nothing under it shows: exactly at 8 and 16
 /// bits, within a rounding step at float.
 fn covers(w: u32, x: i32, y: i32) -> bool {
-    let o = g.items + w * WINDOW_WORDS;
+    let o = w * WINDOW_WORDS;
     if !inside(rect(o), x, y) {
         return false;
     }
@@ -355,7 +354,7 @@ fn covers(w: u32, x: i32, y: i32) -> bool {
     let dx = bitcast<f32>(atlas[plan + 2u * aw + u32(x - area.x)]);
     let dy = bitcast<f32>(atlas[plan + 3u * aw + 2u * ah + u32(y - area.y)]);
     if dx == 0.0 && dy == 0.0 {
-        return g.full == 1.0;
+        return g.inner_coverage == 1.0;
     }
     return clamp(g.radius + 0.5 - sqrt(dx * dx + dy * dy), 0.0, 1.0) == 1.0;
 }
@@ -382,7 +381,7 @@ fn swarm(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation
     for (var first = 0u; first < g.count; first += 256u) {
         var hit = 0u;
         if first + li < g.count {
-            let area = rect(g.items + (first + li) * WINDOW_WORDS + 4u);
+            let area = rect((first + li) * WINDOW_WORDS + 4u);
             hit = u32(area.x < block.x + block.w && block.x < area.x + area.w
                 && area.y < block.y + block.h && block.y < area.y + area.h);
         }

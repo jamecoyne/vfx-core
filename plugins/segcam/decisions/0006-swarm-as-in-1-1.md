@@ -50,7 +50,7 @@ order, so a render works from the frames before it, which the host fetches or ke
   frame was enough at 60 fps.
 - Live hosts hold the current frame only (`CpuEffect::frames_held`). Earlier frames live on as
   their grids, segments and the tiles the pile still draws, so a setting changed live reaches new
-  windows only, as in 1.1, and the first frames after it don't work out the trail again.
+  windows only, as in 1.1, and the first frames after it don't recompute the trail.
 - 1.1's swarm cap is 100 at start and 60 from the show's cue; the default stays 100.
 - Outside Swarm a render reads back to the last analysis, so the analysis a frame shows is always
   there. With faces on it reads one step more, so the analysis whose faces it reuses is there too.
