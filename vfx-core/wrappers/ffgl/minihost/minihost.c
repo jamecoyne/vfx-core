@@ -498,6 +498,7 @@ static void case_segcam(void) {
     case_info();
     void *inst = instantiate(63, 37);
     Frame f = frame(63, 37, 128, 64);
+    set(inst, "Output", 0);
     CHECK(render(inst, &f), "segcam first frame failed");
     CHECK(max_diff(&f) <= 1.0f / 255, "segcam first overlay should preserve the input");
     set(inst, "Output", 1);
