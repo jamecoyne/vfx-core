@@ -2,52 +2,55 @@
 
 The repository's preview: one effect at a time, on a test pattern, an image, a video file, a
 webcam or, on Windows, a Spout sender. [docs/DEVELOPING.md](../../../docs/DEVELOPING.md#the-preview)
-describes it.
+describes how it fits in the repository, and [DEVELOPING.md](DEVELOPING.md) covers measuring with it.
 
-A file dropped on the window opens as the source. In a browser, a drop goes the way of the file
-picker: video only, the first of several files, and anything else leaves the source as it is and
+A file dropped on the window opens as the source. In a browser, a drop works like the file picker.
+It takes video only and the first of several files. Anything else leaves the source as it is and
 shows a message.
-
-On Windows the preview draws with D3D12. NVIDIA's Vulkan driver grows the preview's memory for as
-long as it renders, and D3D12 stays level. `WGPU_BACKEND=vulkan` still picks Vulkan.
 
 ## Spout
 
-On Windows the input menu lists the Spout senders running, such as TouchDesigner's Spout Out,
-beside the webcams, and the list follows senders as they start and stop. Picking one plays its
-frames through the effect as they arrive. They stay on the GPU when the sender draws on the same
-GPU as the preview. A sender on another GPU still plays: its frames are copied through RAM, which
-the log reports. A sender that closes is waited for, and when it starts again, even at another
-size, it plays again by itself. The sender's texture can be 8 bit RGBA or BGRA, 10 bit RGB, or 16
-or 32 bit float. Frames larger than 1920 pixels across are scaled down to fit, as videos are.
-The Expressions panel's Detect faces box doesn't read a Spout sender yet; an effect that finds
-faces itself, as segcam does, still gives the face variables.
+On Windows, the input menu lists the Spout senders that are running, such as TouchDesigner's Spout
+Out. They appear beside the webcams, and the list updates as senders start and stop. Picking one
+plays its frames through the effect as they arrive.
+
+Frames stay on the GPU when the sender uses the same GPU as the preview. A sender on another GPU
+still plays, with its frames copied through RAM.
+
+When a sender closes, the preview waits for it and plays it again once it restarts, even at another
+size.
+
+The sender's texture can be 8 bit RGBA or BGRA, 10 bit RGB, or 16 or 32 bit float. Frames larger
+than 1920 pixels across are scaled down to fit, the same as videos.
+
+The Expressions panel's Detect faces box doesn't read a Spout sender yet. An effect that finds faces
+itself, like segcam, still gives the face variables.
 
 ## Record
 
-Record saves the effect's output as a video file, without the panel: an H.264 MP4 through ffmpeg
-on the desktop, at 30 fps from the render loop. In a browser it goes through `canvas.captureStream`
-and `MediaRecorder` to a download: H.264 in MP4 where the browser records that (Chrome 126 and
-later, Safari), otherwise WebM. There is no sound in the recording on either.
+Record saves the live output as a video file. On the desktop it writes an H.264 MP4
+through ffmpeg, at 30 fps from the render loop. In a browser it uses `canvas.captureStream` and
+`MediaRecorder`, and downloads the result. The browser's format is H.264 in MP4 where it can record
+that (Chrome 126 and later, Safari). Otherwise it is WebM. Recordings have no sound.
+
+Record doesn't work in the browser on the WebGL2 fallback yet. It needs WebGPU.
 
 ## Keys
 
 | Key | What |
 |---|---|
-| `c` | clears the shown effect's earlier frames, as the Clear button does |
-| `h` | hides the panel and the bar, so only the picture shows |
+| `c` | clears the shown effect's earlier frames, same as the Clear button |
+| `h` | hides the panel and the bar |
 | `m`, `l`, `i`, `a` | flip segcam's Mirror, Labels, Invert and Auto level |
 | `[`, `]` | step segcam's Sensitivity, or Level while it detects by threshold, by 2% of its range |
 | Space, Escape | play and pause a video, and quit; on the desktop |
 
-## Scripted runs
+## Starting it set up
 
-Flags set the preview up and measure it, so a measurement is a command and needs no clicks.
-With no flags it opens the window with nothing set up.
+Flags open the preview already set up, for example on segcam's Swarm with a clip:
 
 ```sh
-cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
-    --input clip.mp4 --stats --seconds 10 --quiet
+cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm clip.mp4
 ```
 
 | Flag | What |
@@ -59,45 +62,17 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 | `--input SOURCE` | `pattern[:NAME\|N]`, `camera[:NAME\|N]` (part of a webcam's name), `spout[:NAME]` (a Spout sender by its name or part of it, on Windows; one named in full may start later), or a video or image path |
 | `--size WxH` | the frame size; videos, webcams and stills are fitted into it |
 | `--gpu GPU` | `high`, `low`, or part of an adapter's name; the default is `high`. Effects draw on this device too |
-| `--stats` | the stats bar on stdout, once a second |
-| `--frames N`, `--seconds N` | exit after that many frames or seconds |
-| `--quiet` | keep the window hidden and render only the effect |
 | `--record FILE` | record the output into an MP4 until the run ends |
-| `--lose-gpu S[:KIND]` | lose the GPU device S seconds in, to test reopening it; repeatable. `destroy`, or `removed` for D3D12's own removal, which goes through wgpu as a driver's loss does (D3D12 only) |
 | `--list` | the effects and their parameters |
 
-`--stats` prints one line a second, always with these keys in this order, then a last line
-when `--frames` or `--seconds` ends the run:
+With no flags the window opens with nothing set up. With only `--effect` and a file, a mistake in a
+flag shows in the panel.
 
-```text
-stats t=18.4 effect=segcam-motion on=cpu source=59.9 rendered=39.4 rendered_ms=8.9 worst_ms=23.5 drawn=0.0 screen=19.7 size=1920x1080 cpu=29.2 app_cpu=239.9 mem_mb=1932 gpu=n/a
-done frames=905 seconds=20.00 effect=segcam-motion on=cpu source=59.9 rendered=37.2 rendered_ms=10.0 worst_ms=2661.5 drawn=0.0 screen=18.6
-```
+## The GPU
 
-The keys follow the frames: `source` is the rate they arrive from the decoder, whether they
-are taken or dropped (or `pattern` and `still`), `rendered` the renders the effect finished each second, and
-`screen` the new frames presented in the window each second. A picture in RAM counts only if
-it differs from the last one. A picture drawn on the GPU (a GPU effect, or segcam's Swarm drawn
-into the output frame) counts if its frame or parameters changed, and the bar then says
-`screen 60 fps drawn`. `drawn` is how many of the renders a second were drawn on the GPU.
-`on` says whether the
-effect renders on the CPU or in GPU passes; it can't see what a CPU effect does inside its
-render. For a CPU effect `rendered_ms` and `worst_ms` are a render's mean and longest time
-over the second (the run, on the `done` line); a GPU effect's work ends on the GPU, so it has
-neither, and for a CPU effect drawing into the output frame the times stop at its submit. `frames` counts passes of the app's loop, which a visible window paces by vsync and
-which repeats the last frame when nothing new came in; `--frames N` stops after that many.
-`cpu` is the machine's, `app_cpu` this process's as a share of one core, and `gpu` is `n/a`
-where the OS doesn't report it. A `fault` key follows, and the bar starts with it in colour, once
-the shared device is lost or reports an error. `out_of_gpu_memory=true` follows once the effect
-has run out of GPU memory for what it keeps and draws less to keep its rate, and the bar says so too. Under `--quiet` loops are unpaced and each waits for the GPU,
-nothing is presented so `screen` is 0, and a test pattern (which changes every loop) shows
-the effect's throughput in `rendered`.
+On the desktop, a lost GPU device is reopened in place. The source, the settings and a recording
+carry on, and the title shows it while the device reopens. In the browser, a lost device ends the
+recording, and the page says to reload.
 
-A lost device is reopened in place, on the same adapter for about 30 s and then on any, trying at 1, 2, 4, 8, 16 and then every 30 s. The source, the settings and a recording go on; the title says so meanwhile. On D3D12 the same adapter can't come back while anything holds the old device. A scripted run with a loss it didn't ask for ends with exit 2, and one whose device isn't back in 60 s too.
-
-The window's bottom bar shows the same, source to screen: `source 60 fps | segcam Motion on
-CPU: rendered 39 fps, 9 ms, worst 24 ms | screen 20 fps`, then the machine. The `done` line's
-worst above is the face models loading in the first render.
-
-In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
-`--effect` and a file, mistakes show in the panel.
+On Windows the preview draws with D3D12 by default, which avoids the memory growth seen with
+NVIDIA's Vulkan driver on the setups tested. `WGPU_BACKEND=vulkan` picks Vulkan instead.

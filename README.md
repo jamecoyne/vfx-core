@@ -15,9 +15,9 @@ Resolume, with a preview app that also runs in the browser.
 
 ## segcam
 
-segcam picks out what moves in a shot, plus faces and bodies, and turns them into labelled boxes,
-mattes that cut the moving parts out, or Swarm: a collage of frozen tiles drawn as macOS windows
-that trail the subject. It started as a macOS app. The plugins:
+segcam finds what moves in a shot, and faces and bodies. It draws them as labelled boxes, as mattes
+that cut out the moving parts, or as Swarm. Swarm is a collage of frozen tiles, drawn as macOS
+style windows that trail the subject. segcam started as a macOS app. The plugins:
 
 | Host | Plugin | macOS | Windows |
 |---|---|---|---|
@@ -36,13 +36,17 @@ Apple M1 or newer) with a 6 core CPU. Swarm draws on the GPU when there is one.
 
 | Effect | What it does |
 |---|---|
-| [segcam Motion](plugins/segcam/segcam-motion) | segcam: boxes, mattes and the window swarm, with faces and bodies |
+| [segcam](plugins/segcam/segcam-motion) | boxes, mattes and the window swarm, with faces and bodies |
 | [Colour Adjust](plugins/colour-adjust) | brightness, contrast and saturation, on the GPU |
 | [Gaussian Blur](plugins/gaussian-blur) | separable blur, horizontal, vertical or both, on the GPU |
 | [Vignette](plugins/vignette) | fades towards a colour away from a centre, on the GPU |
 | [Blend](plugins/blend) | a second layer over the input: normal, add, multiply or screen, on the GPU |
-| [VFX Preview](plugins/vfx-chain) | the four above as one chain, with linear light: the host harnesses' effect |
-| [core effects](vfx-core/src/effects) | the building blocks behind them, plus flip and feedback trail to try in the preview |
+| [VFX Preview](plugins/vfx-chain) | the four above as one chain, with an optional linear light stage |
+| [core effects](vfx-core/src/effects) | the building blocks behind the four, and Flip and Feedback Trail, which the preview offers too |
+
+Each effect is one plugin crate under [`plugins/`](plugins). The toolchain, the host targets and the
+preview app are in [`vfx-core/`](vfx-core), and the preview is at
+[`vfx-core/hosts/preview`](vfx-core/hosts/preview).
 
 ## Make your own effect
 

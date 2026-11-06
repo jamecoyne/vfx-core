@@ -15,7 +15,7 @@ let parts = Parts { face: true, eyes: true, mouth: true, body: false };
 let segments = segmenter.find(&image, parts);
 ```
 
-macOS uses Vision, like segcam 1.1. Windows runs the models on a GPU through DirectML, or on the
+macOS uses Vision, as the macOS app does. Windows runs the models on a GPU through DirectML, or on the
 CPU if that's more than half again as fast in a short trial, since in a render the CPU kernels
 share the cores. Among GPUs that time close it takes the lowest numbered, and an integrated GPU
 beside a discrete one gets no trial. `SEGCAM_FACE_DEVICE` skips the trial, with `cpu` or a DXGI

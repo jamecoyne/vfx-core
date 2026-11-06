@@ -1,13 +1,11 @@
-# Developing segcam Motion
+# Developing segcam
 
-segcam's motion segmenter as a vfx-core effect, ported from jamecoyne's C++ After Effects effect,
-which isn't in this repository. It is one crate: a `CpuEffect`, exported to After Effects, OpenFX
+segcam's motion segmenter as a vfx-core effect, ported from jamecoyne's C++ After Effects effect. It is one crate: a `CpuEffect`, exported to After Effects, OpenFX
 and FFGL with `vfx_plugin::export!(cpu: SegcamMotion)` and offered by the preview app.
 
-Its CPU path computes what the C++ core computes the same way (the same `f32` and `f64` arithmetic
-in the same order, the same rounding), and with the same settings the two render byte identical
-frames (see [Checking it](#checking-it)). The GPU draw, faces and the current defaults came after
-the port.
+Its CPU path does the same arithmetic as the C++ core. The `f32` and `f64` operations run in the same
+order, with the same rounding. With the same settings, the two render byte identical frames. See
+[Checking it](#checking-it). The GPU draw, faces and the current defaults came after the port.
 
 | file | |
 | --- | --- |
@@ -24,68 +22,86 @@ the port.
 
 ## How it renders
 
-It asks for the frames of the **Background** analyses before the current one, plus **Trail frames**
-less one in Swarm mode and what the analysis adds (see below), through `CpuEffect::frames_before`.
-It keeps each frame's grid, motion and tiles until they age out (`src/incremental.rs`), with a hash
-of the frame's pixels. A check reads each frame a render depends on and finds an edit upstream
-however far back it is. Only a frame whose pixels changed is analysed again, along with the motion
-and tiles that depend on it. A check hashes a frame's bytes as the host holds them and converts only a
-frame it needs (`FrameSource::with_frame_if_wanted`).
+### Frames and the cache
 
-While Resolve streams, a render reads the current frame and those it hasn't analysed. An edit is
-caught when that frame is rendered, or at the next check: the first two renders after a pause or a
-jump. A frame the host couldn't hand over counts as empty for that render and is read again next
-time. In the OpenFX mini host, renders forwards, backwards, shuffled and cold give the same output
-(see [OpenFX](#openfx)). After Effects makes a new effect per render, and Multi Frame Rendering on
-and off give the same frames.
+`CpuEffect::frames_before` asks for the frames of the **Background** analyses before the current
+one, plus **Trail frames** minus one in Swarm, plus what the analysis rate adds (below).
+`src/incremental.rs` keeps each frame's grid, motion and tiles until they age out, keyed by a hash
+of the frame's bytes as the host holds them. A check hashes every frame the render depends on, so an
+upstream edit is found however far back it is. Only frames whose hash changed are analysed again,
+with the motion and tiles that depend on them. `FrameSource::with_frame_if_wanted` lets the check
+hash a frame without converting it, and only frames that need analysis get converted.
 
-Resolve playback is the exception. After 8 single steps in a row, a stream that skips a frame counts
-as playback and doesn't go back for the frames Resolve dropped. It keeps up, and its pictures can
-differ from an export. A step over 16 frames out of a run renders exact, since that frame stays on
-screen when paused. Nothing a plugin can read separates playback from a render Resolve will save,
-and its render cache can carry playback pictures into an export (the limit is in the
-[segcam README](../README.md#known-limits), the reasoning in
-[ADR 3](../decisions/0003-editing-promise.md)).
+While Resolve streams, a render reads the current frame and the frames not yet analysed. An edit is
+caught when its frame renders, or at the next full check, which runs on the first two renders after
+a pause or a jump. A frame the host couldn't hand over counts as empty for that render and is read
+again on the next. In the OpenFX mini host, renders run forwards, backwards, shuffled and cold give
+the same output ([OpenFX](#openfx)). After Effects makes a new effect per render, and Multi Frame
+Rendering on and off give the same frames.
 
-Where the host says the frame rate (OpenFX, After Effects, a video in the preview), it analyses the
-frames whose number divides by round(rate / 60), at most 4: every frame below 90 fps, every 2nd
-below 150, every 3rd below 210, every 4th from there. The frames between show the last analysis:
-its boxes and IDs, and no new windows. Background counts these analyses. Resolume says no frame
-rate, and there every frame is analysed. Outside Swarm a render reads back to the analysis the frame
-shows; when the host can't hand it over, the frame analyses itself. With faces on, a render reads
-one analysis more, to get the analysis whose faces it reuses.
+### Resolve playback
 
-Faces run on every 2nd analysis, the even frame numbers below 90 fps: the analysis between shows the
-faces of the one before, with their IDs, or finds its own when the host doesn't hand that frame
-over. On Windows the models load on a thread of their own, and a line on stderr says which device
-they run on. A short trial at the start times DirectML and the CPU, and picks DirectML if it comes
-within 1.5 times of the fastest, since in a render the CPU shares its cores with everything else.
-`SEGCAM_FACE_DEVICE=cpu`, or a DXGI adapter number, skips the trial. In Resolume and the preview detection runs beside the renders. Faces can arrive a few
-frames late, each new window showing the frame its face was found in, and a slow device finds faces
-less often instead of slowing the renders.
+The OpenFX wrapper (`vfx-core/wrappers/ofx/src/lib.rs`) treats a stream as playback after 8 single
+steps in a row followed by a skipped frame. Playback doesn't fetch the frames Resolve dropped, since
+a dropped frame costs far more to fetch than a decoded one, so playback output can differ from an
+export. A step of more than 16 frames out of a run is a stop, and that render does the full check,
+since its frame stays on screen while paused. No host property separates playback from a render
+Resolve will save, and Resolve's render cache can carry playback pictures into an export. The user
+facing limit is in the [segcam README](../README.md#known-limits), the reasoning in
+[ADR 3](../decisions/0003-editing-promise.md).
+
+### Analysis rate
+
+With a known frame rate (OpenFX, After Effects, a video in the preview), the analysed frames are
+those whose number is a multiple of `round(rate / 60)`, capped at 4: every frame below 90 fps,
+every 2nd below 150, every 3rd below 210 and every 4th above. Frames between show the last analysis,
+its boxes and IDs, with no new windows. **Background** counts analyses, not frames. Resolume gives no
+frame rate, so every frame is analysed there. Outside Swarm a render reads back to the analysis its
+frame shows, and when the host can't hand that frame over, the render analyses its own frame. With
+faces on, a render reads one analysis further back, for the analysis whose faces it reuses.
+
+### Faces
+
+Faces run on every 2nd analysis: the even frame numbers, below 90 fps. The analysis between reuses
+the previous one's faces and IDs, and runs its own detection only when the host doesn't hand that
+frame over.
+
+On Windows the models load on their own thread and log the device they run on to stderr. A short
+trial at startup times DirectML against the CPU and picks DirectML when it is within 1.5x of the
+faster, because the CPU shares its cores with the render. `SEGCAM_FACE_DEVICE` (`cpu`, or a DXGI
+adapter index) skips the trial (`plugins/segcam/segcam-face/src/runtime.rs`).
+
+In live hosts (Resolume and the preview, `plan.live`), detection runs beside the renders through
+`LiveFaces::exchange` in `src/faces.rs`. Faces can arrive a few frames late, each new window shows
+the frame its face was found in, and a slow device detects less often instead of the render waiting.
+
+### Live hosts
 
 Resolume and the preview hand frames over one at a time and hold only the current one in full
-(`CpuEffect::frames_held`). Earlier frames live on as their grids, segments and the tiles the pile
-still draws, and a setting changed live reaches new windows only. A picture that holds exactly
-still counts as one frame there (`History::drop_repeat`), and its windows stay until it changes.
+(`CpuEffect::frames_held`). Earlier frames survive only as their grids, segments and the
+tiles the pile still draws, so a setting changed live reaches new windows only. A picture that holds
+exactly still counts as one frame (`History::drop_repeat`), and its windows stay until it changes.
 
-In Resolume on Windows a swarm drawn on the GPU stays there: the plugin shares the device its frames
-are on, and the swarm draws into a frame Resolume shows from (`CpuEffect::render_to`), with no copy
-back. There the swarm always draws on the GPU, since the share of windows below which it draws on
-the CPU was set by the cost of the copy back. The output is byte for byte the swarm read back, and a
-frame drawn on the CPU (while the device opens, or after a fault) goes through RAM as before.
+In Resolume on Windows the swarm draws straight into the frame Resolume shows
+(`CpuEffect::render_to`) on the device the plugin shares with Resolume, with no readback. On this
+path the swarm always draws on the GPU, since the window coverage threshold for the CPU draw was set
+by the readback's cost. The output is byte identical to the swarm read back. A frame drawn on the
+CPU, while the device opens or after a fault, goes through RAM.
 
-A lost GPU device is replaced. Renders draw on the CPU meanwhile, and a new device opens on a backoff
-of 1, 2, 4, 8, 16 and then every 30 s, on the same adapter for about 30 s and then on any. A first open
-that fails, finding no adapter or only a software one included, tries again at 1, 2, 4, 8 and 16 s,
-since a driver reset can look like any of these, and draws on the CPU for good after that. Each try
-holds the D3D12 device lock, so face models that load during a reset wait behind the tries. Face models
-that keep failing reload on the same backoff. In Resolume on Windows the plugin opens the new shared
-device off the render thread.
+### Device loss
+
+A lost device is replaced while renders draw on the CPU. Reopening backs off at 1, 2, 4, 8 and 16 s,
+then every 30 s, on the same adapter for about 30 s and then on any. A failed first open (no adapter,
+or only a software adapter) retries at 1, 2, 4, 8 and 16 s, since a driver reset can look like
+either, then stays on the CPU. Each try holds the D3D12 device lock, so face models loading during a
+reset wait behind it, and face models that keep failing reload on the same backoff. In Resolume on
+Windows the new shared device opens off the render thread.
+
+### Detection and drawing
 
 Detection runs on the CPU: a connected component labeller over a grid, 192 columns by default, fed
-one frame at a time. Swarm's drawing runs on the GPU when there is one and its windows cover enough
-of the frame ([GPU thresholds](../BENCHMARK.md#gpu-thresholds)), and on the CPU otherwise.
+one frame at a time. Swarm draws on the GPU when there is one and its windows cover enough of the
+frame ([GPU thresholds](../BENCHMARK.md#gpu-thresholds)), and on the CPU otherwise.
 
 ## Building
 
@@ -95,12 +111,16 @@ cargo vfx package -p segcam-motion    # macOS installers for After Effects and O
 cargo vfx install -p segcam-motion    # Resolume; prints the sudo commands for the others
 ```
 
-The plugins install alongside the C++ effect. In After Effects the bundle is
-`SegcamMotionRust.plugin`, its match name `LOFISCIFI segcam Motion Rust`, and it appears as
-**Effect ▸ LO.FI.SCI.FI ▸ segcam**; projects saved with one effect don't switch to the
-other. In OpenFX hosts it is **LO.FI.SCI.FI / segcam**, identifier
-`com.lofiscifi.SegcamMotionRust`; in Resolume, **segcam Motion**, ID `SGCM`. Its logs are
-`~/Library/Logs/SegcamMotionRust-<host>.log` (on Windows, in `%TEMP%`).
+In every host it shows as **segcam**: **Effect ▸ LO.FI.SCI.FI ▸ segcam** in After Effects and
+**LO.FI.SCI.FI / segcam** in OpenFX hosts. Resolume shows its short name, **segcam Motion**, since
+FFGL hosts cut names at 16 bytes.
+
+Saved projects find the plugin by its identifiers, which never change once shipped: the After
+Effects match name `LOFISCIFI segcam Motion Rust`, the OpenFX identifier
+`com.lofiscifi.SegcamMotionRust` and the FFGL code `SGCM`. They differ from jamecoyne's C++
+effect's, so both install side by side and a project keeps whichever of the two it was saved with.
+The files are named `SegcamMotionRust`, and its logs are `~/Library/Logs/SegcamMotionRust-<host>.log`
+(on Windows, in `%TEMP%`).
 
 ## In the preview app
 
@@ -109,11 +129,14 @@ cargo vfx preview -p segcam-motion -- clip.mp4
 ```
 
 opens the preview on segcam, with test patterns, images, video files or a webcam. On the web build,
-add `?effect=segcam-motion` to the page's address. The preview hands it one frame per render: a new
-time adds the input to its history, the same time renders that frame again with the current
-parameters, and an earlier time (a seek back) starts over. On the desktop it waits for each frame's
-readback, and an MP4 export sees every frame. A browser can't wait on the GPU, and there the output
-runs a frame or two behind.
+add `?effect=segcam-motion` to the page's address.
+
+The preview hands segcam one frame per render. A new time adds the input to its history. The same
+time renders that frame again with the current parameters. An earlier time, such as a seek back,
+starts over.
+
+On the desktop, the preview waits for each frame's readback, so an MP4 export sees every frame. A
+browser can't wait on the GPU, so its output runs a frame or two behind.
 
 ## Checking it
 
@@ -131,11 +154,13 @@ runs the core checks, and the effect through vfx-core's `CpuEffect` interface:
 
 `segcam-motion` takes the same options as the C++ effect's CLI, and the two can be compared on any
 clip. Its Background default is 64 where the C++ CLI's is 16, and its Trail frames default is 60
-where the C++ CLI's is 24. Pass both to compare Swarm:
+where the C++ CLI's is 24. Pass both to compare Swarm, and `--cpu` to draw it on the CPU, the
+reference the C++ matches:
 
 ```bash
+cargo build --release -p segcam-motion --bin segcam-motion
 ffmpeg -i in.mov -vf scale=960:540 -f rawvideo -pix_fmt argb - |
-  target/release/segcam-motion 960 540 --mode swarm --background 16 --trail 24 |
+  target/release/segcam-motion 960 540 --mode swarm --background 16 --trail 24 --cpu |
   ffmpeg -f rawvideo -pix_fmt argb -s 960x540 -r 30 -i - -pix_fmt yuv420p out.mp4
 ```
 
