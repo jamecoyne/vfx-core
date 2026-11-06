@@ -1,6 +1,6 @@
-//! `cargo vfx new NAME`: an effect crate in `vfx-core/effects/NAME`, ready to build for every
+//! `cargo vfx new NAME`: an effect crate in `plugins/NAME`, ready to build for every
 //! host and to try in the preview. It starts as a CPU effect that inverts the picture by an
-//! amount; `vfx-core/effects/vfx-chain` shows a GPU one. The crate joins the workspace and the preview's
+//! amount; `plugins/vfx-chain` shows a GPU one. The crate joins the workspace and the preview's
 //! dependencies, so nothing else needs editing.
 
 use std::fs;
@@ -18,7 +18,7 @@ pub fn new(root: &Path, name: &str) -> Result<(), String> {
             "`{name}`: name the crate in lower case, digits and hyphens, like my-glow"
         ));
     }
-    let dir = root.join("vfx-core/effects").join(name);
+    let dir = root.join("plugins").join(name);
     if dir.exists() {
         return Err(format!("{} already exists", dir.display()));
     }
@@ -33,10 +33,10 @@ pub fn new(root: &Path, name: &str) -> Result<(), String> {
 
     let workspace = root.join("Cargo.toml");
     let text = fs::read_to_string(&workspace).map_err(|e| e.to_string())?;
-    let text = add_member(&text, &format!("vfx-core/effects/{name}"))?;
+    let text = add_member(&text, &format!("plugins/{name}"))?;
     fs::write(&workspace, text).map_err(|e| e.to_string())?;
 
-    let preview = root.join("vfx-core/examples/preview/Cargo.toml");
+    let preview = root.join("vfx-core/hosts/preview/Cargo.toml");
     let text = fs::read_to_string(&preview).map_err(|e| e.to_string())?;
     let text = add_effect_dependency(&text, name)?;
     fs::write(&preview, text).map_err(|e| e.to_string())?;
@@ -130,11 +130,11 @@ ffgl = ["vfx-plugin/ffgl"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-vfx-core = {{ path = "../.." }}
-vfx-plugin = {{ path = "../../wrappers/plugin" }}
+vfx-core = {{ path = "../../vfx-core" }}
+vfx-plugin = {{ path = "../../vfx-core/wrappers/plugin" }}
 
 [build-dependencies]
-vfx-build = {{ path = "../../wrappers/build" }}
+vfx-build = {{ path = "../../vfx-core/wrappers/build" }}
 "#
         )
     }
@@ -250,20 +250,24 @@ fn add_member(text: &str, member: &str) -> Result<String, String> {
     Ok(format!("{}{sep}\"{member}\"{}", &text[..end], &text[end..]))
 }
 
-/// `text` (the preview's manifest) with a path dependency on `effects/<name>`, after the last
+/// `text` (the preview's manifest) with a path dependency on `plugins/<name>`, after the last
 /// effect crate it already lists.
 fn add_effect_dependency(text: &str, name: &str) -> Result<String, String> {
-    let line = format!("{name} = {{ path = \"../../effects/{name}\" }}\n");
+    let line = format!("{name} = {{ path = \"../../../plugins/{name}\" }}\n");
     if text.contains(&line) {
         return Ok(text.to_owned());
     }
-    let marker = "path = \"../../effects/";
-    let last = text
-        .match_indices(marker)
-        .last()
-        .ok_or("the preview's Cargo.toml lists no effect crate")?
-        .0;
-    let after = last + text[last..].find('\n').ok_or("no newline")? + 1;
+    // After the last plain path dependency on a plugin: an optional one (segcam-face, under
+    // a target table) isn't an effect crate the preview offers.
+    let mut after = None;
+    let mut end = 0;
+    for l in text.split_inclusive('\n') {
+        end += l.len();
+        if l.contains("path = \"../../../plugins/") && l.trim_end().ends_with("\" }") {
+            after = Some(end);
+        }
+    }
+    let after = after.ok_or("the preview's Cargo.toml lists no effect crate")?;
     Ok(format!("{}{line}{}", &text[..after], &text[after..]))
 }
 
@@ -283,15 +287,15 @@ mod tests {
 
     #[test]
     fn registers_in_the_workspace_and_the_preview() {
-        let ws = "[workspace]\nmembers = [\".\", \"effects/a\"]\n";
+        let ws = "[workspace]\nmembers = [\".\", \"plugins/a\"]\n";
         assert_eq!(
-            add_member(ws, "effects/b").unwrap(),
-            "[workspace]\nmembers = [\".\", \"effects/a\", \"effects/b\"]\n"
+            add_member(ws, "plugins/b").unwrap(),
+            "[workspace]\nmembers = [\".\", \"plugins/a\", \"plugins/b\"]\n"
         );
-        let preview = "[dependencies]\nx = 1\na = { path = \"../../effects/a\" }\ny = 2\n";
+        let preview = "[dependencies]\nx = 1\na = { path = \"../../../plugins/a\" }\ny = 2\n\n[target.'cfg(windows)'.dependencies]\nf = { path = \"../../../plugins/f\", optional = true }\n";
         assert_eq!(
             add_effect_dependency(preview, "b").unwrap(),
-            "[dependencies]\nx = 1\na = { path = \"../../effects/a\" }\nb = { path = \"../../effects/b\" }\ny = 2\n"
+            "[dependencies]\nx = 1\na = { path = \"../../../plugins/a\" }\nb = { path = \"../../../plugins/b\" }\ny = 2\n\n[target.'cfg(windows)'.dependencies]\nf = { path = \"../../../plugins/f\", optional = true }\n"
         );
     }
 

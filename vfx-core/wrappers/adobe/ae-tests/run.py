@@ -38,7 +38,7 @@ AERENDER = Path(f"/Applications/{AE_APP}/aerender")
 
 
 def plugin_env():
-    """VFX Preview's names and IDs, from vfx-core/effects/vfx-chain's [package.metadata.vfx]."""
+    """VFX Preview's names and IDs, from plugins/vfx-chain's [package.metadata.vfx]."""
     out = subprocess.check_output(["cargo", "vfx", "env", "-p", "vfx-chain"], cwd=ROOT, text=True)
     values = {}
     for line in out.splitlines():

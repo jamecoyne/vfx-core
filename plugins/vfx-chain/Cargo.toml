@@ -28,13 +28,13 @@ ffgl = ["vfx-plugin/ffgl"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-vfx-core = { path = "../.." }
-vfx-plugin = { path = "../../wrappers/plugin" }
+vfx-core = { path = "../../vfx-core" }
+vfx-plugin = { path = "../../vfx-core/wrappers/plugin" }
 
 [build-dependencies]
-vfx-build = { path = "../../wrappers/build" }
+vfx-build = { path = "../../vfx-core/wrappers/build" }
 
 [dev-dependencies]
 pollster = "1.0.1"
 # The After Effects harness's reference renderer (examples/ae_reference.rs).
-vfx-host = { path = "../../wrappers/common" }
+vfx-host = { path = "../../vfx-core/wrappers/common" }

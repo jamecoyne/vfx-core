@@ -35,10 +35,10 @@ jobs:
       # The core, the host-neutral crates and the effect crates (as libraries): plain Rust
       # and wgpu, so they build and test on every OS.
       - name: Clippy
-        run: cargo clippy -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p segcam-motion -p segcam-face -p cargo-vfx --all-targets -- -D warnings
+        run: cargo clippy -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p colour-adjust -p gaussian-blur -p vignette -p blend -p segcam-motion -p segcam-face -p cargo-vfx --all-targets -- -D warnings
 
       - name: Tests (headless render, effects, reference checks)
-        run: cargo test -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p segcam-motion -p segcam-face -p cargo-vfx
+        run: cargo test -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p colour-adjust -p gaussian-blur -p vignette -p blend -p segcam-motion -p segcam-face -p cargo-vfx
 
       # segcam-face without ONNX Runtime: Vision alone on macOS, no detector elsewhere.
       - name: segcam-face without ONNX Runtime
@@ -70,7 +70,7 @@ jobs:
       - name: Host target tests and clippy (every host feature on)
         run: |
           cargo test -p vfx-ae -p vfx-ofx -p vfx-ffgl -p vfx-ffgl-common
-          cargo clippy -p vfx-ae -p vfx-ofx -p vfx-ffgl -p vfx-ffgl-common -p vfx-plugin -p vfx-chain -p segcam-motion --features vfx-chain/ae,vfx-chain/ofx,vfx-chain/ffgl,segcam-motion/ae,segcam-motion/ofx,segcam-motion/ffgl --all-targets -- -D warnings
+          cargo clippy -p vfx-ae -p vfx-ofx -p vfx-ffgl -p vfx-ffgl-common -p vfx-plugin -p vfx-chain -p colour-adjust -p gaussian-blur -p vignette -p blend -p segcam-motion --features vfx-chain/ae,vfx-chain/ofx,vfx-chain/ffgl,colour-adjust/ae,colour-adjust/ofx,colour-adjust/ffgl,gaussian-blur/ae,gaussian-blur/ofx,gaussian-blur/ffgl,vignette/ae,vignette/ofx,vignette/ffgl,blend/ae,blend/ofx,blend/ffgl,segcam-motion/ae,segcam-motion/ofx,segcam-motion/ffgl --all-targets -- -D warnings
 
       # Each effect in the minimal OpenFX host, built on the official OpenFX headers:
       # VFX Preview's checks, and segcam's frames against its CLI.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the preview for the browser (WebGPU) into target/web/:
 #   index.html, vfx-preview.js, vfx-preview_bg.wasm
-# Usage: vfx-core/examples/preview/web/build.sh [--serve]
+# Usage: vfx-core/hosts/preview/web/build.sh [--serve]
 # Needs the wasm32-unknown-unknown target and wasm-bindgen-cli at the version of the
 # wasm-bindgen crate in Cargo.lock. --serve starts a local server on port 8123.
 set -euo pipefail

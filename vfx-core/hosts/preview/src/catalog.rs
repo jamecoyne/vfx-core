@@ -9,7 +9,8 @@
 use std::sync::OnceLock;
 
 use vfx_core::Processor;
-use vfx_core::effects::{Blend, ColorAdjust, FeedbackTrail, Flip, GaussianBlur, Vignette};
+use vfx_core::effects::{FeedbackTrail, Flip};
+use vfx_host::Kind;
 
 pub struct Entry {
     pub name: String,
@@ -26,7 +27,8 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// An effect crate's plugin: its name, description and effect.
+    /// An effect crate's plugin: its name, description and effect. One that takes a layer
+    /// starts with a pattern as it.
     pub fn plugin(plugin: &'static vfx_host::Plugin) -> Self {
         Self {
             name: plugin.info.name.to_owned(),
@@ -34,7 +36,7 @@ impl Entry {
             about: plugin.info.description.to_owned(),
             make: plugin.make,
             premultiplied: false,
-            layer_by_default: false,
+            layer_by_default: matches!(plugin.kind, Kind::Gpu) && plugin.outline().layers > 0,
         }
     }
 
@@ -48,16 +50,6 @@ impl Entry {
             layer_by_default: false,
         }
     }
-
-    fn premultiplied(mut self) -> Self {
-        self.premultiplied = true;
-        self
-    }
-
-    fn layer_by_default(mut self) -> Self {
-        self.layer_by_default = true;
-        self
-    }
 }
 
 // `effect_crates()`: an `Entry::plugin` for each effect crate this crate depends on.
@@ -65,35 +57,13 @@ include!(concat!(env!("OUT_DIR"), "/effect_crates.rs"));
 
 /// Every effect in this repository: the effect crates, then the core effects.
 pub fn repository() -> Vec<Entry> {
-    // VFX Preview chains every effect in this list, so it duplicates them here. It stays a
-    // host plugin; only the preview leaves it out.
+    // VFX Preview chains the colour, vignette, blend and blur plugins, which are in this
+    // list on their own. It stays a host plugin; only the preview leaves it out.
     let mut all: Vec<Entry> = effect_crates()
         .into_iter()
         .filter(|e| e.name != "VFX Preview")
         .collect();
     all.extend([
-        Entry::new(
-            "Colour Adjust",
-            "Brightness, contrast and saturation.",
-            || Processor::Gpu(Box::<ColorAdjust>::default()),
-        ),
-        Entry::new(
-            "Gaussian Blur",
-            "Separable blur, horizontal, vertical or both.",
-            || Processor::Gpu(Box::<GaussianBlur>::default()),
-        )
-        .premultiplied(),
-        Entry::new(
-            "Vignette",
-            "Fades towards a colour away from a centre. Click the image to move the centre.",
-            || Processor::Gpu(Box::<Vignette>::default()),
-        ),
-        Entry::new(
-            "Blend",
-            "Blends a second layer over the input. Pick the layer under Input.",
-            || Processor::Gpu(Box::<Blend>::default()),
-        )
-        .layer_by_default(),
         Entry::new(
             "Flip",
             "Mirrors the frame. Flips when a value is above 0.5.",
@@ -156,7 +126,7 @@ mod tests {
     #[test]
     fn slugs_name_effects() {
         assert_eq!(slug("segcam Motion"), "segcam-motion");
-        assert_eq!(slug("segcam Motion (Rust)"), "segcam-motion-rust");
+        assert_eq!(slug("segcam"), "segcam");
         assert!(find_slug("segcam-motion").is_some());
         assert!(find_slug("vfx-preview").is_none());
         assert!(find_slug("gaussian-blur").is_some());

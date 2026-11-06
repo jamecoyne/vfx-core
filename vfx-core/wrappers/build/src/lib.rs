@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn the_preview_links_every_effect_crate() {
-        let preview = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/preview");
+        let preview = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hosts/preview");
         let names: Vec<String> = effect_dependencies(&preview)
             .unwrap()
             .into_iter()

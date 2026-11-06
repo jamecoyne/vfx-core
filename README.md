@@ -37,8 +37,12 @@ Apple M1 or newer) with a 6 core CPU. Swarm draws on the GPU when there is one.
 | Effect | What it does |
 |---|---|
 | [segcam Motion](plugins/segcam/segcam-motion) | segcam: boxes, mattes and the window swarm, with faces and bodies |
-| [VFX Preview](vfx-core/effects/vfx-chain) | colour adjust, vignette, a blend with a second layer and blur, on the GPU |
-| [core effects](vfx-core/src/effects) | colour, blur, vignette, blend, flip, feedback trail: building blocks to try in the preview |
+| [Colour Adjust](plugins/colour-adjust) | brightness, contrast and saturation, on the GPU |
+| [Gaussian Blur](plugins/gaussian-blur) | separable blur, horizontal, vertical or both, on the GPU |
+| [Vignette](plugins/vignette) | fades towards a colour away from a centre, on the GPU |
+| [Blend](plugins/blend) | a second layer over the input: normal, add, multiply or screen, on the GPU |
+| [VFX Preview](plugins/vfx-chain) | the four above as one chain, with linear light: the host harnesses' effect |
+| [core effects](vfx-core/src/effects) | the building blocks behind them, plus flip and feedback trail to try in the preview |
 
 ## Make your own effect
 

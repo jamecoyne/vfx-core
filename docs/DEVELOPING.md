@@ -10,13 +10,13 @@ builds and packages them:
 | After Effects | `vfx-core/wrappers/adobe` (`vfx-ae`) | After Effects 2026 (Premiere untested) | builds and unit tests; checked in After Effects with the earlier per-effect wrappers |
 | OpenFX | `vfx-core/wrappers/ofx` (`vfx-ofx`) | DaVinci Resolve, Nuke, Natron… | both effects pass their mini-host checks; Resolve 21 and Natron 2.5 were checked with the earlier wrappers |
 | FFGL | `vfx-core/wrappers/ffgl` (`vfx-ffgl`) | Resolume Avenue / Arena | both effects pass the mini host (GPU sharing, RAM and software GL); Avenue was checked with the earlier wrappers |
-| Preview app | `vfx-core/examples/preview` (`vfx-preview`) | desktop and browser (WebGPU) | shows any one effect, with expressions and MP4 export; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
+| Preview app | `vfx-core/hosts/preview` (`vfx-preview`) | desktop and browser (WebGPU) | shows any one effect, with expressions and MP4 export; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
 
 ## An effect crate
 
-`cargo vfx new my-glow` makes one in `vfx-core/effects/my-glow`: a CPU effect to start from,
+`cargo vfx new my-glow` makes one in `plugins/my-glow`: a CPU effect to start from,
 already in the workspace and the preview. `plugins/segcam/segcam-motion` and
-`vfx-core/effects/vfx-chain` are
+`plugins/vfx-chain` are
 complete examples. The parts:
 
 ```toml
@@ -142,8 +142,8 @@ only items (`unfinished`, `share`, `shared`) are the only platform conditional p
 ## Layout
 
 One Cargo workspace (`Cargo.toml` at the root) in two folders: `vfx-core/`, the toolchain,
-and `plugins/`, effects built with it. Nothing in `vfx-core/` depends on `plugins/` except the
-preview's list of effects.
+and `plugins/`, every effect crate built with it. Nothing in `vfx-core/` depends on `plugins/`
+except the preview's list of effects.
 
 ```
 vfx-core/
@@ -151,9 +151,6 @@ vfx-core/
     cpu.rs              frames in RAM for CPU effects: ARGB at 8/16/32 bits, strided views, history
     effects/            the core effects
   tests/                headless GPU tests for the core
-  effects/
-    vfx-chain/          VFX Preview, the chain of core effects: the demo effect
-      examples/ae_reference.rs   its After Effects render path without After Effects
   wrappers/
     common/             vfx-host: the registered plugin, the GPU, the render pool, the log,
                         control layout, kept CPU effects and their contract
@@ -168,10 +165,12 @@ vfx-core/
     ffgl-common/        FFGL bindings, GL transfers and pixel repacking
     package-win.sh      an effect's Windows installer (Inno Setup)
   tools/cargo-vfx/      cargo vfx: builds, packages and installs effect crates
-  examples/preview/     the preview: a library host (`vfx_preview::run`) and the repository's app
+  hosts/preview/        the preview: a library host (`vfx_preview::run`) and the repository's app
     src/catalog.rs      the effects it offers (effect crates listed by build.rs)
     web/                index.html and build.sh for the WebGPU build
 plugins/
+  vfx-chain/            VFX Preview, the chain of core effects: the sample plugin
+    examples/ae_reference.rs   its After Effects render path without After Effects
   segcam/
     segcam-motion/      segcam Motion, ported from C++ (own README)
       ae-tests/ ofx-tests/ ffgl-tests/   host checks against the C++ effect and its CLI
@@ -195,7 +194,7 @@ acts on every effect crate; output goes to `target/vfx-plugin/`.
 | What | Command | Result |
 |---|---|---|
 | The effects | `cargo vfx list` | each effect crate and its identity |
-| A new effect | `cargo vfx new my-glow` | `vfx-core/effects/my-glow`, added to the workspace and the preview |
+| A new effect | `cargo vfx new my-glow` | `plugins/my-glow`, added to the workspace and the preview |
 | segcam's benchmark | `cargo vfx bench clip.mp4 [--preset overlay] [--depth 8] [--runs 2] [--cpu] [--reference DIR]` | the offline rows of `plugins/segcam/BENCHMARK.md`, timed on the release CLI; needs ffmpeg |
 | Checks | `cargo vfx check` | effects missing from the preview, and installed After Effects plugins that share a match name; `--quick` and `--full` run the test tiers ([Testing](#testing)) |
 | Plugins | `cargo vfx build [-p segcam-motion] [--hosts ae,ofx,ffgl] [--native]` | `<file>.plugin`, `.ofx.bundle` and `.bundle` on macOS (one universal binary; `--native` builds this Mac's architecture only); `.aex`, `.ofx.bundle` and `.dll` on Windows |
@@ -203,8 +202,8 @@ acts on every effect crate; output goes to `target/vfx-plugin/`.
 | Install | `cargo vfx install [--hosts ffgl]` | copies FFGL bundles into Resolume's Extra Effects; for After Effects and OpenFX, prints the `sudo installer` commands |
 | Windows installer | `EFFECT=segcam-motion vfx-core/wrappers/package-win.sh` | `<file>-<version>-Windows-Setup.exe` and a `.zip` (needs [Inno Setup](https://jrsoftware.org/isinfo.php)) |
 | Preview (desktop) | `cargo vfx preview [-p segcam-motion] [-- clip.mp4]` | the preview, opened on the effect; drop an image or video on it |
-| Preview (web) | `vfx-core/examples/preview/web/build.sh --serve` | http://localhost:8123, or `?effect=segcam-motion` to open on an effect (needs `wasm-bindgen-cli` at the lockfile's version) |
-| Tests | `cargo test -p vfx-core -p vfx-host -p vfx-chain -p segcam-motion` | headless GPU and CPU tests |
+| Preview (web) | `vfx-core/hosts/preview/web/build.sh --serve` | http://localhost:8123, or `?effect=segcam-motion` to open on an effect (needs `wasm-bindgen-cli` at the lockfile's version) |
+| Tests | `cargo test -p vfx-core -p vfx-host -p vfx-chain -p colour-adjust -p gaussian-blur -p vignette -p blend -p segcam-motion` | headless GPU and CPU tests |
 
 `cargo vfx package` signs and notarizes only when `SIGN_IDENTITY`, `NOTARY_PROFILE` and
 `INSTALLER_IDENTITY` are set; without them the packages are unsigned (fine locally).
@@ -220,7 +219,7 @@ parameter has an expression box (`sin(time/4)`, `bass * 2`, face tracking), and 
 renders to MP4 through it. It links the effects it offers, so the same build runs on the
 desktop and in the browser. Its build script lists every effect crate among its
 dependencies, as `Entry::plugin(&segcam_motion::VFX_PLUGIN)` (the crate as its plugins see
-it); `vfx-core/examples/preview/src/catalog.rs` adds the core effects.
+it); `vfx-core/hosts/preview/src/catalog.rs` adds the core effects.
 
 Another crate's effect can use the preview as a library:
 `vfx_preview::run(vec![Entry::plugin(&my_effect::VFX_PLUGIN)])`.

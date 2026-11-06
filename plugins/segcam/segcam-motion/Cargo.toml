@@ -10,7 +10,7 @@ description = "Motion segmentation from segcam: overlay, mattes and the swarm co
 # (id, ae-match-name, ffgl-code): choose them once and keep them across versions. The
 # match name differs from segcam's C++ effect's, so both can be installed side by side.
 [package.metadata.vfx]
-name = "segcam Motion (Rust)"
+name = "segcam"
 short-name = "segcam Motion"          # FFGL hosts show 16 bytes of a name
 category = "LO.FI.SCI.FI"
 file = "SegcamMotionRust"

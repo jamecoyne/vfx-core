@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn keys_reach_the_shown_effects_parameters() {
         let mut c = Controls {
-            effect: catalog::find("segcam Motion (Rust)").unwrap(),
+            effect: catalog::find("segcam").unwrap(),
             ..Controls::default()
         };
         c.flip_toggle("labels");
@@ -726,10 +726,10 @@ mod tests {
     #[test]
     fn camera_turns_mirror_on_and_file_turns_it_off() {
         let mut c = Controls::default();
-        let segcam = &c.params[catalog::find("segcam Motion (Rust)").unwrap()];
+        let segcam = &c.params[catalog::find("segcam").unwrap()];
         assert!(!segcam.bool("mirror"));
         c.mirror_for_source(true);
-        let segcam = catalog::find("segcam Motion (Rust)").unwrap();
+        let segcam = catalog::find("segcam").unwrap();
         assert!(c.params[segcam].bool("mirror"), "the effect isn't shown");
         c.mirror_for_source(false);
         assert!(!c.params[segcam].bool("mirror"));
