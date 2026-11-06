@@ -31,7 +31,7 @@ itself, as segcam does, still gives the face variables.
 Record saves the output as a video file, without the panel. On the desktop it writes an H.264 MP4
 through ffmpeg, at 30 fps from the render loop. In a browser it uses `canvas.captureStream` and
 `MediaRecorder`, and downloads the result. The browser's format is H.264 in MP4 where it can record
-that (Chrome 126 and later, Safari). Otherwise it is WebM. Neither format has sound.
+that (Chrome 126 and later, Safari). Otherwise it is WebM. Recordings have no sound.
 
 Record doesn't work in the browser on the WebGL2 fallback yet. It needs WebGPU.
 
@@ -129,5 +129,5 @@ In a scripted run, a mistake in a flag prints one line and exits with code 2. Wi
 
 ## Graphics backend
 
-On Windows the preview draws with D3D12 by default. On the NVIDIA setups tested, Vulkan's memory grew
-over a long show, and D3D12 stays level. `WGPU_BACKEND=vulkan` picks Vulkan instead.
+On Windows the preview draws with D3D12 by default, which avoids the memory growth seen with
+NVIDIA's Vulkan driver on the setups tested. `WGPU_BACKEND=vulkan` picks Vulkan instead.

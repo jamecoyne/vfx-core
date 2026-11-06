@@ -104,8 +104,8 @@ readings by name.
 
 The core API for 1.0 comes from [ADR 7](../plugins/segcam/decisions/0007-core-api.md). A PR that adds
 a trait method, a `Context` field or a `Gpu` function adds a row here, and says so in its
-description. Every new trait method has a default. `Context::at` fills every new field. So old
-targets keep compiling. Once 1.0 is released, nothing here is removed or renamed.
+description. Every new trait method has a default and `Context::at` fills every new field, so old targets
+keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 
 | Item | Where |
 |---|---|
@@ -246,8 +246,8 @@ Record needs WebGPU in the browser.
 
 On the desktop, a lost GPU device is reopened in place. In the browser, the page says to reload.
 
-On Windows, the preview draws with D3D12 by default. On the NVIDIA setups tested, Vulkan's memory
-grew over a long show, and D3D12 stays level. `WGPU_BACKEND=vulkan` picks Vulkan instead.
+On Windows the preview draws with D3D12 by default, which avoids the memory growth seen with
+NVIDIA's Vulkan driver on the setups tested. `WGPU_BACKEND=vulkan` picks Vulkan instead.
 
 ## Releases
 
@@ -298,8 +298,8 @@ The test profile optimises `segcam-motion` and `vfx-core`, so their pixel tests 
 Overflow checks and debug assertions stay on. Several clones or worktrees on one machine can
 share compiled dependencies through [sccache](https://github.com/mozilla/sccache):
 `cargo install sccache`, then set `RUSTC_WRAPPER=sccache` in your shell (not in the repository's
-config); the tiers use it when it is set. On Windows, sccache can't build `web-sys` for wasm, because
-the command line gets too long. So the full tier runs the wasm check without it. Unset
+config); the tiers use it when it is set. On Windows, sccache can't build `web-sys` for wasm,
+because the command line gets too long, and the full tier runs the wasm check without it. Unset
 `RUSTC_WRAPPER` for the web build too.
 
 Unit tests cover the core, each effect, and each target's parameter mapping and pixel
@@ -325,15 +325,15 @@ conversions. Each host also has a harness that runs the effects:
 
 ## Design notes
 
-- Each effect's entry points live in one binary. `cargo vfx` builds an effect crate once per
+- One binary per effect holds every host's entry points. `cargo vfx` builds an effect crate once per
   architecture, with the host features on. It then copies the binary into each host's bundle layout.
   Each export macro registers the crate's `VFX_PLUGIN` static, which the target crates read.
 - GPU effects get one device per plugin, with instances pooled. Building pipelines is the expensive
-  part of a render. So prepared instances are kept per device and size, and each render borrows one.
+  part of a render, so prepared instances are kept per device and size, and each render borrows one.
   Concurrent renders (After Effects MFR, OpenFX hosts) each borrow their own.
 - CPU effects read host frames where they are. After Effects' buffers are read at their own depth,
   without copies. OpenFX frames are converted one at a time. Resolume and the preview hand over one
-  frame at a time. So they keep a history of recent frames, in full as far as the effect's
+  frame at a time and keep a history of recent frames, in full as far as the effect's
   `frames_held` asks.
 - Plugins never use wgpu's OpenGL backend. Headless devices use Vulkan, Metal or DX12. The OpenGL
   backend releases whatever context is current when it starts. On Windows, that context belongs to

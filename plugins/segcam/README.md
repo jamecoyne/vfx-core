@@ -87,8 +87,8 @@ Apple M1 Pro and up runs it comfortably. Segcam draws on the GPU when there is o
 
 ## Known limits
 
-- After Effects renders every frame from scratch. So segcam is slower there than in Resolve or
-  Resolume.
+- After Effects renders every frame from scratch, which makes segcam slower there than in Resolve
+  or Resolume.
 - On Windows, faces run on the CPU if `DirectML.dll` isn't next to the plugin. That still works, but
   it is slower.
 - The browser build has no faces yet, and Detect starts on Motion there.

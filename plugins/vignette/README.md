@@ -11,8 +11,8 @@ edges darken. It works in After Effects, OpenFX (Resolve, Nuke, Natron), Resolum
 | Color | RGBA | black, opaque |
 | Amount | 0 to 1 | 1 |
 
-Distance from the centre is divided by half the frame's diagonal. So a radius of 1 reaches the
-corners, whatever the frame size or aspect. The fade reaches the colour at the radius, and it starts
+Distance from the centre is divided by half the frame's diagonal, so a radius of 1 reaches the
+corners whatever the frame size or aspect. The fade reaches the colour at the radius, and it starts
 `Softness` inside that radius. A radius of 0 covers the whole frame.
 
 ## Building

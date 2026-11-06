@@ -64,8 +64,8 @@ times that of the fastest. The CPU shares its cores with everything else during 
 trial allows for that. `SEGCAM_FACE_DEVICE=cpu`, or a DXGI adapter number, skips the trial.
 
 In Resolume and the preview, detection runs beside the renders. Faces can arrive a few frames late.
-Each new window shows the frame its face was found in. A slow device finds faces less often, and the
-renders don't slow down.
+Each new window shows the frame its face was found in. A slow device finds faces less often, which
+leaves the GPU more time for the renders.
 
 Resolume and the preview hand frames over one at a time and hold only the current one in full
 (`CpuEffect::frames_held`). Earlier frames live on as their grids, segments and the tiles the pile
