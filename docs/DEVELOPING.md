@@ -168,7 +168,7 @@ vfx-core/
   tools/cargo-vfx/      cargo vfx: builds, packages and installs effect crates
   hosts/preview/        the preview: a library host (`vfx_preview::run`) and the repository's app
     src/catalog.rs      the effects it offers (effect crates listed by build.rs)
-    web/                index.html and build.sh for the WebGPU build
+    web/                index.html and build.sh for the browser build (WebGPU, or WebGL2 without it)
 plugins/
   colour-adjust/        Colour Adjust: the core ColorAdjust effect as a plugin (own README)
   gaussian-blur/        Gaussian Blur (own README)
