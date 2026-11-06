@@ -8,6 +8,7 @@
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -673,6 +674,17 @@ impl VulkanParts {
         })
     }
 
+    /// A first setup's Vulkan half, on the render thread.
+    ///
+    /// # Safety
+    /// The host's GL context must be current.
+    unsafe fn open_here(size: (u32, u32)) -> Result<Self, InteropError> {
+        // SAFETY: the caller has the current context.
+        let luid = unsafe { gl::shared_memory_luid() }.map_err(InteropError::Unsupported)?;
+        let device = SharedDevice::open(luid).map_err(InteropError::Unsupported)?;
+        Self::new(device, size)
+    }
+
     /// All of a reopen's work that can leave the render thread. A panic is a failed try.
     fn open_and_make(luid: [u8; 8], size: (u32, u32)) -> Result<Self, InteropError> {
         catch_unwind(|| {
@@ -721,22 +733,15 @@ pub struct Interop {
     input_framebuffer: gl::TextureFramebuffer,
     host_to_canvas: gl::Blit,
     canvas_to_host: gl::Blit,
+    /// Set on an interop a reopen made, until [`Self::present`] has shown a frame the effect drew
+    /// on the new device. The log line it leaves is how a test tells that the effect draws on the
+    /// GPU again, and not only that the interop is back.
+    first_present_after_reopen: AtomicBool,
     /// Last, to drop after what was made on it.
     device: Arc<SharedDevice>,
 }
 
 impl Interop {
-    /// # Safety
-    /// The host's GL context must be current.
-    pub unsafe fn new(size: (u32, u32)) -> Result<Self, InteropError> {
-        // SAFETY: the caller has the current context.
-        unsafe {
-            let luid = gl::shared_memory_luid().map_err(InteropError::Unsupported)?;
-            let device = SharedDevice::open(luid).map_err(InteropError::Unsupported)?;
-            Self::finish(VulkanParts::new(device, size)?)
-        }
-    }
-
     /// The GL half of a setup: the imports, the framebuffer and shaders, and the first handoff.
     ///
     /// # Safety
@@ -795,6 +800,7 @@ impl Interop {
                 input_framebuffer,
                 host_to_canvas,
                 canvas_to_host,
+                first_present_after_reopen: AtomicBool::new(false),
             };
             let handoff = {
                 let _queue = interop.lock_queue();
@@ -890,7 +896,14 @@ impl Interop {
         );
         gpu.queue.submit([encoder.finish()]);
         // SAFETY: the copy is submitted, and the caller has the context current.
-        unsafe { self.draw_output_to_host() }
+        unsafe { self.draw_output_to_host() }?;
+        if self
+            .first_present_after_reopen
+            .swap(false, Ordering::Relaxed)
+        {
+            LOG.note("a CPU effect's frame drawn on a new device reached the host");
+        }
+        Ok(())
     }
 
     /// Renders a GPU effect from the host's texture into its bound framebuffer.
@@ -1205,9 +1218,9 @@ pub struct InteropSlot {
     device_faults: Option<DeviceFaults>,
     /// From a device's first loss on: when to try for a new one.
     backoff: Option<ReopenBackoff>,
-    /// From a loss until an interop is set up again. Any failure to set up meanwhile is retried on
-    /// the backoff, since a reset can hide an adapter for seconds, and the work stays off the render
-    /// thread.
+    /// From a loss until an interop is set up again. Any failure to set up meanwhile but a hang is
+    /// retried on the backoff, since a reset can hide an adapter for seconds, and the work stays off
+    /// the render thread.
     reopening: bool,
     /// The setup of a reopen, while it's on its thread.
     setup_on_thread: Option<SetupOnThread>,
@@ -1294,7 +1307,9 @@ impl InteropSlot {
             self.setup_on_thread = None;
             match answer {
                 // SAFETY: the caller has the context current.
-                Ok(parts) if asked_for == size => unsafe { self.finish_reopen(parts, started) },
+                Ok(parts) if asked_for == size => unsafe {
+                    self.finish_setup(parts, Some(started))
+                },
                 // The host changed size meanwhile. The device is there now, so this one is quick.
                 // SAFETY: the caller has the context current.
                 Ok(_) => unsafe { self.start_setup_on_thread(size) },
@@ -1312,8 +1327,9 @@ impl InteropSlot {
         }
         // A setup that panics on a lost device would otherwise fail every frame from here on.
         // SAFETY: the context is current.
-        match catch_unwind(|| unsafe { Interop::new(size) }) {
-            Ok(Ok(interop)) => self.use_interop(interop),
+        match catch_unwind(|| unsafe { VulkanParts::open_here(size) }) {
+            // SAFETY: the caller has the context current.
+            Ok(Ok(parts)) => unsafe { self.finish_setup(parts, None) },
             Ok(Err(e)) => self.record_setup_error(e),
             Err(_) => self.record_setup_error(InteropError::Failed("setup panicked".into())),
         }
@@ -1332,28 +1348,49 @@ impl InteropSlot {
         }
     }
 
-    /// The part of a reopen that needs GL. It stays on the render thread, since the imports, the
-    /// shaders and the first handoff are all on the host's context.
+    /// The part of a setup that needs GL, for a first setup and a reopen alike. It stays on the
+    /// render thread, since the imports, the shaders and the first handoff are all on the host's
+    /// context. `reopen_asked_at` is when a reopen's thread was started.
     ///
     /// # Safety
     /// The host's GL context must be current.
-    unsafe fn finish_reopen(&mut self, parts: VulkanParts, asked_at: Instant) {
-        let on_thread = asked_at.elapsed();
+    unsafe fn finish_setup(&mut self, parts: VulkanParts, reopen_asked_at: Option<Instant>) {
+        let on_thread = reopen_asked_at.map(|at| at.elapsed());
         let started = Instant::now();
         let faults = parts.device.gpu.faults();
         // SAFETY: the caller has the context current.
-        match catch_unwind(AssertUnwindSafe(|| unsafe { Interop::finish(parts) })) {
-            Ok(Ok(interop)) => {
-                LOG.note(&format!(
-                    "shared frames back on a new device: {} ms on a thread, {} ms on the render thread",
-                    on_thread.as_millis(),
-                    started.elapsed().as_millis(),
-                ));
+        let finished = catch_unwind(AssertUnwindSafe(|| unsafe { Interop::finish(parts) }))
+            .unwrap_or_else(|_| Err(InteropError::Failed("setup panicked".into())));
+        if let (Ok(_), Some(on_thread)) = (&finished, on_thread) {
+            LOG.note(&format!(
+                "shared frames back on a new device: {} ms on a thread, {} ms on the render thread",
+                on_thread.as_millis(),
+                started.elapsed().as_millis(),
+            ));
+        }
+        self.take_setup(finished, faults);
+    }
+
+    /// Where every setup that reached a device ends. A handoff that hung turns the slot off like
+    /// any hung setup, and the slot keeps the device's record, since the loss of that device is
+    /// what lets it try again.
+    fn take_setup(&mut self, finished: Result<Interop, InteropError>, faults: DeviceFaults) {
+        match finished {
+            Ok(interop) => {
+                if self.reopening {
+                    interop
+                        .first_present_after_reopen
+                        .store(true, Ordering::Relaxed);
+                }
                 self.reopening = false;
                 self.use_interop(interop);
             }
-            Ok(Err(e)) => self.record_reopen_error(e, faults),
-            Err(_) => self.record_setup_error(InteropError::Failed("setup panicked".into())),
+            Err(error) => {
+                if matches!(error, InteropError::Hung) {
+                    self.device_faults = Some(faults);
+                }
+                self.record_setup_error(error);
+            }
         }
     }
 
@@ -1442,15 +1479,6 @@ impl InteropSlot {
             backoff.lost(set_up_at.elapsed());
         }
         self.no_setup_before = Some(Instant::now() + backoff.next_delay());
-    }
-
-    /// A device that answered and then hung turns the slot off like any hung setup, and it keeps
-    /// the device's record, since the loss of that device is what lets the slot try again.
-    fn record_reopen_error(&mut self, error: InteropError, faults: DeviceFaults) {
-        if matches!(error, InteropError::Hung) {
-            self.device_faults = Some(faults);
-        }
-        self.record_setup_error(error);
     }
 
     fn record_setup_error(&mut self, error: InteropError) {
@@ -1621,21 +1649,33 @@ mod tests {
         assert!(waiting_for_new_device(&slot), "stayed off after the loss");
     }
 
-    /// A setup that hung on a reopen's device turns the slot off until that device is lost.
+    /// A handoff that hung turns the slot off until its device is lost, in an instance's first
+    /// setup as in a reopen.
     #[test]
-    fn a_loss_undoes_a_hang_in_a_reopen() {
-        let Some((a, _b)) = two_devices() else {
-            return;
-        };
-        a.watch_faults();
-        let mut slot = InteropSlot::new(false);
-        slot.record_reopen_error(InteropError::Hung, a.faults());
-        assert!(slot.disabled);
-        slot.check_device();
-        assert!(slot.disabled, "tried again on a device that's still there");
-        lose(&a);
-        slot.check_device();
-        assert!(waiting_for_new_device(&slot), "stayed off after the loss");
+    fn a_loss_undoes_a_hung_setup() {
+        for reopen in [false, true] {
+            let Some((a, _b)) = two_devices() else {
+                return;
+            };
+            a.watch_faults();
+            let mut slot = InteropSlot::new(false);
+            if reopen {
+                slot.retry_on_backoff();
+            }
+            slot.take_setup(Err(InteropError::Hung), a.faults());
+            assert!(slot.disabled, "reopen {reopen}: tried again after a hang");
+            slot.check_device();
+            assert!(
+                slot.disabled,
+                "reopen {reopen}: tried again on a device that's still there"
+            );
+            lose(&a);
+            slot.check_device();
+            assert!(
+                waiting_for_new_device(&slot),
+                "reopen {reopen}: stayed off after the loss"
+            );
+        }
     }
 
     /// One test at a time shares a device, since [`Gpu::share`] holds one for the whole process.

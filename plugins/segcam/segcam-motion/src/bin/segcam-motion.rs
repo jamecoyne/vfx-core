@@ -146,7 +146,8 @@ fn main() -> ExitCode {
     };
 
     // The GPU's state is kept between frames, which renders the same frames as a cold render.
-    // Waiting for the device here puts every frame on it.
+    // Waiting for the device here puts every frame on it. A first open that fails leaves this run
+    // on the CPU, without waiting for its retries.
     let gpu =
         (!cpu && segcam_motion::gpu::enabled_by_env() && segcam_motion::gpu::status().is_ok())
             .then(|| {

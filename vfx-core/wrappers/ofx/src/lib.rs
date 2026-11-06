@@ -518,12 +518,13 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         "render path: GPU effect, frames through RAM, {depth:?}"
     ));
     let result = match vfx_host::gpu(&LOG) {
-        Some(gpu) => {
-            catch_unwind(AssertUnwindSafe(|| pipeline::run(gpu, &job))).unwrap_or_else(|_| {
-                LOG.note("warning: GPU render failed, passing frames through");
-                input.clone()
-            })
-        }
+        Some(device) => catch_unwind(AssertUnwindSafe(|| {
+            pipeline::run(device.gpu(), device.pool_key, &job)
+        }))
+        .unwrap_or_else(|_| {
+            LOG.note("warning: GPU render failed, passing frames through");
+            input.clone()
+        }),
         None => input.clone(),
     };
     // SAFETY: the window lies inside the output image's bounds and the canvas.

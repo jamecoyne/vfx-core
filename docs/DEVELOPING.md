@@ -214,8 +214,8 @@ Each plugin writes one-line notes about which render path ran to
 
 ## The preview
 
-The preview hosts one effect at a time: test patterns, images, video files or a webcam
-go in, a panel made from the effect's parameters drives it, every float and integer
+The preview hosts one effect at a time: test patterns, images, video files, a webcam or,
+on Windows, a Spout sender go in, a panel made from the effect's parameters drives it, every float and integer
 parameter has an expression box (`sin(time/4)`, `bass * 2`, face tracking), and a video
 renders to MP4 through it. It links the effects it offers, so the same build runs on the
 desktop and in the browser. Its build script lists every effect crate among its
