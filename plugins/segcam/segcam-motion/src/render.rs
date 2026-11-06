@@ -513,8 +513,9 @@ pub fn apply_matte<C: Channel>(
 
 // ---------------------------------------------------------------------------------------
 
-/// The tiles a frame's blobs become, biggest first, titled with their labels. Reused faces,
-/// which come last, already have windows from their own frame, so they get tiles only if
+/// The tiles a frame's blobs become, titled with their labels. They go bottom to top as segcam 1.1
+/// stacks one analysis: faces and their parts, bodies, then motion or threshold regions, biggest
+/// first. Reused faces already have windows from their own frame, so they get tiles only if
 /// `include_reused_faces` asks for them.
 pub fn cut_frame_tiles<C: Channel>(
     motion: &Segmentation,
@@ -534,37 +535,37 @@ pub fn cut_frame_tiles<C: Channel>(
         };
         swarm::cut_tile(blob, source, title, canvas_w, canvas_h, mirrored)
     };
-    let count = if include_reused_faces {
-        motion.blobs.len()
-    } else {
-        motion
-            .blobs
-            .iter()
-            .take_while(|b| b.reused_from.is_none())
-            .count()
+    let blobs = &motion.blobs;
+    let is_region = |b: usize| {
+        matches!(
+            blobs[b].kind,
+            SegmentKind::Motion | SegmentKind::ThresholdRegion
+        )
     };
+    let faces = (0..blobs.len())
+        .filter(|&b| !is_region(b) && (include_reused_faces || blobs[b].reused_from.is_none()));
+    let order: Vec<usize> = faces
+        .chain((0..blobs.len()).filter(|&b| is_region(b)))
+        .collect();
+    let count = order.len();
     // A camera move makes big segments, each copied whole, so they're shared out over a
     // few threads, as the swarm's drawing is.
     let threads = vfx_plugin::vfx_host::worker_threads().min(count);
     if threads < 2 {
-        return (0..count).map(make).collect();
+        return order.into_iter().map(make).collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let tiles = std::sync::Mutex::new(vec![Tile::default(); count]);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let b = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if b >= count {
-                        break;
-                    }
-                    let tile = make(b);
-                    if let Ok(mut tiles) = tiles.lock() {
-                        tiles[b] = tile;
-                    }
-                }
-            });
+    vfx_plugin::vfx_host::on_workers(threads, || {
+        loop {
+            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if at >= count {
+                break;
+            }
+            let tile = make(order[at]);
+            if let Ok(mut tiles) = tiles.lock() {
+                tiles[at] = tile;
+            }
         }
     });
     tiles.into_inner().unwrap_or_else(|e| e.into_inner())

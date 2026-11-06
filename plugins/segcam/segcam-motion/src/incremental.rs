@@ -14,8 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
-use vfx_core::cpu::FrameSource;
-use vfx_core::wgpu;
+use vfx_core::cpu::{FrameSource, Image};
 use vfx_core::{Reading, Report};
 use vfx_plugin::vfx_host::by_rows;
 
@@ -59,21 +58,47 @@ struct AnalysisKey {
     face_source: Option<(i64, i64)>,
 }
 
+/// What a render knows of a frame's pixels from having read them.
+#[derive(Clone, Copy, PartialEq)]
+enum PixelsRead {
+    /// Their hash: an upstream edit can leave the luma grid unchanged.
+    Hash(u64),
+    /// A live source numbers each frame once, so it doesn't pay for a hash. Any later check that
+    /// does hash the frame finds it changed, so it is worked out again.
+    NotHashed,
+}
+
+/// A frame's analysis, with the key it was computed for.
+struct KeptAnalysis {
+    key: AnalysisKey,
+    segments: Segmentation,
+}
+
+/// A frame's tiles, with the key and mirroring they were cut for.
+struct KeptTiles {
+    key: AnalysisKey,
+    mirror: bool,
+    tiles: Vec<Tile>,
+}
+
+/// What is kept of one frame. Each part comes and goes on its own: a change to a frame drops the
+/// analysis of the frames that used it as background, and keeps their grids.
+#[derive(Default)]
+struct KeptFrame {
+    grid: Option<LumaGrid>,
+    read: Option<PixelsRead>,
+    analysis: Option<KeptAnalysis>,
+    tiles: Option<KeptTiles>,
+}
+
 #[derive(Default)]
 pub struct IncrementalRenderer {
     history_format: Option<HistoryFormat>,
-    grids: BTreeMap<i64, LumaGrid>,
-    /// Hash of each frame's pixels: an upstream edit can leave the luma grid unchanged.
-    frame_hashes: BTreeMap<i64, u64>,
-    motion: BTreeMap<i64, (AnalysisKey, Segmentation)>,
-    /// Tiles by frame, with the key and mirroring they were cut for.
-    tiles: BTreeMap<i64, (AnalysisKey, bool, Vec<Tile>)>,
+    kept: BTreeMap<i64, KeptFrame>,
     /// Created on the first GPU render after the device opens, not per instance, because hosts
     /// create instances often. A frame's tiles enter the atlas on first GPU draw.
     drawer: Option<Box<Drawer>>,
-    atlas_allocations: BTreeMap<i64, AtlasAllocation>,
-    /// A live render out of atlas stops drawing frames older than this.
-    oldest_frame_in_atlas: Option<i64>,
+    atlas: AtlasPlacements,
     /// Whether the last render's source is live, so it must not stall to stay exact.
     source_is_live: bool,
     gpu_wanted: bool,
@@ -98,14 +123,84 @@ pub struct IncrementalRenderer {
     face_detection_calls: u32,
     /// A host's GPU frame the render may draw into instead of its output.
     target: Option<TargetOffer>,
+    /// The slot this instance draws from, where it isn't the process's.
+    #[cfg(test)]
+    test_slot: Option<&'static gpu::DeviceSlot>,
 }
 
-/// A host's frame on `device`, offered to one render ([`vfx_core::CpuEffect::render_to`]), and
-/// whether the render drew into it.
+/// A host's frame, offered to one render ([`vfx_core::CpuEffect::render_to`]), the record of
+/// the device it's on, and whether the render drew into it.
 struct TargetOffer {
-    device: wgpu::Device,
+    faults: vfx_core::DeviceFaults,
     frame: vfx_core::Frame,
     drawn_into: bool,
+}
+
+/// What stays the same through one render.
+struct RenderPlan<'a> {
+    s: &'a RenderSettings,
+    number: i64,
+    /// The frame at index 0 of this render's count. A source that holds fewer frames than it
+    /// counts ([`FrameSource::held`]) can't hand over the oldest of them.
+    first: i64,
+    canvas: (i32, i32),
+    to_analyse: BTreeSet<i64>,
+    /// How many frames back a frame's background reaches.
+    background: i64,
+    /// Frames using a frame as background and, with faces, the next analysis.
+    invalidation_reach: i64,
+    trail_len: i64,
+    fixed: bool,
+    live: bool,
+    /// A live source numbers each frame once, so a number says which frame it is.
+    numbers_identify_frames: bool,
+    /// The current frame is analysed again to take what detection found: a picture that holds
+    /// still stays one frame, and only an analysis takes faces.
+    takes_faces_on_held_picture: bool,
+}
+
+impl<'a> RenderPlan<'a> {
+    fn new(
+        s: &'a RenderSettings,
+        source: &dyn FrameSource,
+        count: usize,
+        number: i64,
+        canvas: (i32, i32),
+    ) -> Self {
+        let first = number - count as i64 + 1;
+        let background = i64::from(history_frames(s));
+        Self {
+            s,
+            number,
+            first,
+            canvas,
+            to_analyse: frames_to_analyse(s, number, first),
+            background,
+            invalidation_reach: background.max(i64::from(s.faces.any()) * s.analysis_step.every),
+            trail_len: trail_frame_count(s),
+            fixed: source.fixed(),
+            live: source.live(),
+            numbers_identify_frames: source.fixed() && source.live(),
+            takes_faces_on_held_picture: false,
+        }
+    }
+
+    /// What a render must read when earlier frames may have changed. Frames between analyses are
+    /// no analysis's input.
+    fn frames_feeding_analysis(&self) -> BTreeSet<i64> {
+        let oldest_analysed = self
+            .to_analyse
+            .first()
+            .map_or(self.number, |&f| f.min(self.number));
+        let oldest = (oldest_analysed - self.background).max(self.first);
+        (oldest..=self.number)
+            .filter(|f| {
+                f.rem_euclid(self.s.analysis_step.every) == 0
+                    || *f == self.number
+                    || self.to_analyse.contains(f)
+            })
+            .collect()
+    }
 }
 
 /// Below these coverages, CPU drawing beats the GPU's readback cost. Coverage is window pixels
@@ -136,6 +231,14 @@ impl IncrementalRenderer {
         if !on {
             self.set_drawer(None);
         }
+    }
+
+    fn device_slot(&self) -> &'static gpu::DeviceSlot {
+        #[cfg(test)]
+        if let Some(slot) = self.test_slot {
+            return slot;
+        }
+        &gpu::SHARED_SLOT
     }
 
     /// Whether Swarm is to draw on the GPU where there is one (see [`Self::use_gpu`]).
@@ -174,7 +277,7 @@ impl IncrementalRenderer {
 
     fn set_drawer(&mut self, drawer: Option<Box<Drawer>>) {
         self.drawer = drawer;
-        self.atlas_allocations.clear();
+        self.atlas.frames.clear();
     }
 
     /// Draws Overlay on the GPU too. Off by default: while frames go through host memory, the
@@ -189,7 +292,7 @@ impl IncrementalRenderer {
     pub fn offer_target(&mut self, target: vfx_core::Target<'_>) {
         let f = target.frame;
         self.target = Some(TargetOffer {
-            device: target.gpu.device.clone(),
+            faults: target.gpu.faults(),
             frame: vfx_core::Frame {
                 texture: f.texture.clone(),
                 view: f.view.clone(),
@@ -211,7 +314,7 @@ impl IncrementalRenderer {
     fn can_draw_into_target<C: Channel>(&self, drawer: &Drawer, (w, h): (i32, i32)) -> bool {
         let fits = self.target.as_ref().is_some_and(|offer| {
             (offer.frame.width, offer.frame.height) == (w as u32, h as u32)
-                && drawer.draws_on(&offer.device)
+                && drawer.draws_on(&offer.faults)
         });
         size_of::<C>() == 1 && fits
     }
@@ -222,14 +325,14 @@ impl IncrementalRenderer {
     pub fn render_frame<C: Depth>(
         &mut self,
         s: &RenderSettings,
-        frames: &mut dyn FrameSource,
+        source: &mut dyn FrameSource,
         count: usize,
         number: i64,
         out: &mut ViewMut<C>,
     ) {
         self.unfinished = false;
         self.drew_on_gpu = Some(false);
-        self.source_is_live = frames.live();
+        self.source_is_live = source.live();
         if out.is_empty() {
             return;
         }
@@ -239,7 +342,7 @@ impl IncrementalRenderer {
             faces: FaceParts::default(),
             ..*s
         };
-        let s = if frames.live() && s.faces.any() && !self.face_models_ready() {
+        let s = if source.live() && s.faces.any() && !self.face_models_ready() {
             &without_faces
         } else {
             s
@@ -249,14 +352,7 @@ impl IncrementalRenderer {
             fill_rect(out, all, Argb::default());
             return;
         }
-        let mode_uses_gpu =
-            s.mode == OutputMode::Swarm || s.mode == OutputMode::Overlay && self.gpu_overlay;
-        // While the device opens, renders draw on the CPU.
-        if self.gpu_wanted && self.drawer.is_none() && mode_uses_gpu && !gpu::opening() {
-            let drawer = gpu::device().and_then(Drawer::new).map(Box::new);
-            self.gpu_wanted = drawer.is_some();
-            self.set_drawer(drawer);
-        }
+        self.open_drawer_if_wanted(s);
         let (w, h) = (out.width, out.height);
         let history_format = HistoryFormat {
             width: w,
@@ -268,210 +364,325 @@ impl IncrementalRenderer {
             self.clear_history();
             self.history_format = Some(history_format);
         }
-        let swarm = s.mode == OutputMode::Swarm;
-        let background = i64::from(history_frames(s));
-        // Frames using this one as background and, with faces, the next analysis.
-        let invalidation_reach = background.max(i64::from(s.faces.any()) * s.analysis_step.every);
-        let trail_len = trail_frame_count(s);
-        let first = number - count as i64 + 1;
-        let to_analyse = frames_to_analyse(s, number, first);
 
-        // Frames the host didn't hand over count as empty, as in a cold render, but nothing
-        // computed from one is cached, so it is read again next time.
-        let mut missing = BTreeSet::new();
-        let oldest =
-            (to_analyse.first().map_or(number, |&f| f.min(number)) - background).max(first);
-        // A fixed source's earlier frames never change, so only the current frame is hashed: a
-        // different hash means the source restarted. A live source numbers each frame once, so
-        // its frames aren't hashed at all, an entry only marks a frame read, and a lower number
-        // means it restarted.
-        let fixed = frames.fixed();
-        let numbers_identify_frames = fixed && frames.live();
-        let mut current_hash = None;
-        if numbers_identify_frames {
-            if self
-                .frame_hashes
-                .last_key_value()
-                .is_some_and(|(&newest, _)| number < newest)
-            {
-                self.clear_history();
-            }
-        } else if fixed {
-            frames.with_frame((number - first) as usize, &mut |image| {
-                current_hash = image.and_then(C::view).map(|v| frame_hash(&v));
-            });
-            if current_hash
-                .is_none_or(|hash| self.frame_hashes.get(&number).is_some_and(|k| *k != hash))
-            {
-                self.clear_history();
-            }
-        }
-        // Frames older than `oldest_held_frame` can't be read from this source again.
-        let held = i64::try_from(frames.held()).unwrap_or(i64::MAX);
-        let oldest_held_frame = if fixed {
+        let mut plan = RenderPlan::new(s, source, count, number, (w, h));
+        let current_hash = self.check_for_restart(&plan, source);
+        // Frames older than this can't be read from this source again.
+        let held = i64::try_from(source.held()).unwrap_or(i64::MAX);
+        let oldest_held_frame = if plan.fixed {
             number.saturating_sub(held) + 1
         } else {
             i64::MIN
         };
         // A hash vouches for what a frame's pixels gave. Those of a frame out of the source's reach
         // get released, so a source that hands it over again later has it worked out again.
-        if fixed && held != i64::MAX {
-            self.frame_hashes = self.frame_hashes.split_off(&oldest_held_frame);
+        if plan.fixed && held != i64::MAX {
+            for (_, kept) in self.kept.range_mut(..oldest_held_frame) {
+                kept.read = None;
+            }
         }
+        plan.takes_faces_on_held_picture = self.drop_analysis_for_waiting_faces(&plan);
+        let swarm = s.mode == OutputMode::Swarm;
         if swarm {
-            self.pin_unreadable_frames(s, first, number, oldest_held_frame);
+            self.pin_unreadable_frames(s, plan.first, number, oldest_held_frame);
         }
-        let frames_to_read = if fixed {
-            self.frames_to_read(s, first, number, oldest_held_frame)
+        let frames_to_read = if plan.fixed {
+            self.frames_to_read(s, plan.first, number, oldest_held_frame)
         } else {
-            // Frames between analyses are no analysis's input.
-            let feeding = |f: &i64| {
-                f.rem_euclid(s.analysis_step.every) == 0 || *f == number || to_analyse.contains(f)
-            };
-            (oldest..=number).filter(feeding).collect()
+            plan.frames_feeding_analysis()
         };
-        let live = frames.live();
-        if !live || !s.faces.any() {
+        if !plan.live || !s.faces.any() {
             self.live_faces.forget();
         }
+
+        // Frames the host didn't hand over count as empty, as in a cold render, but nothing
+        // computed from one is cached, so it is read again next time.
+        let mut missing = BTreeSet::new();
         for frame in frames_to_read {
-            frames.with_frame((frame - first) as usize, &mut |image| {
+            let index = (frame - plan.first) as usize;
+            let before = self.read_before(frame);
+            let read_known = if plan.fixed && before.is_some() {
+                before
+            } else if plan.numbers_identify_frames {
+                Some(PixelsRead::NotHashed)
+            } else if frame == number {
+                current_hash.map(PixelsRead::Hash)
+            } else {
+                None
+            };
+            let read = std::cell::Cell::new(read_known);
+            // A frame found unchanged with nothing left to work out needs no pixels, and converting
+            // them is most of what a check costs a host that converts. A fixed source lists only
+            // frames it needs. Decided here, after earlier frames' changes have dropped what they
+            // invalidate.
+            let unchanged_is_enough = !plan.fixed
+                && frame != number
+                && (!plan.to_analyse.contains(&frame)
+                    || self.is_cached(frame, &analysis_key(s, frame, plan.first), s));
+            let mut wanted = |rows: &[&[u8]]| {
+                if read_known.is_some() {
+                    return true;
+                }
+                let hashed = PixelsRead::Hash(frame_hash(rows));
+                read.set(Some(hashed));
+                !(unchanged_is_enough && before == Some(hashed))
+            };
+            let mut use_frame = |image: Option<Image<'_>>| {
                 let view = image.and_then(C::view);
-                match &view {
-                    None => {
-                        self.invalidate_frame(frame, invalidation_reach);
-                        missing.insert(frame);
-                    }
-                    Some(_) if fixed && self.frame_hashes.contains_key(&frame) => {}
-                    Some(v) => {
-                        // Revalidating existing hashes reads every frame, so hash in parallel.
-                        let hash = current_hash.filter(|_| frame == number).unwrap_or_else(|| {
-                            if numbers_identify_frames {
-                                0
-                            } else if self.frame_hashes.contains_key(&frame) {
-                                frame_hash_parallel(v)
-                            } else {
-                                frame_hash(v)
-                            }
-                        });
-                        if self.frame_hashes.get(&frame) != Some(&hash) {
-                            // A fixed source's frame read for the first time can't have
-                            // changed what later frames computed from it; in other sources
-                            // an uncached frame may have.
-                            if !fixed {
-                                self.invalidate_frame(frame, invalidation_reach);
-                            }
-                            self.grids.insert(frame, downsample(v, s.grid_width));
-                            self.frame_hashes.insert(frame, hash);
-                        }
-                    }
-                }
-                let source_frame = face_source_frame(s, frame, first);
-                let source_key = analysis_key(s, source_frame, first);
-                let key = analysis_key(s, frame, first);
-                // Outside the swarm a missing analysis frame isn't analysed: the frame
-                // displaying it analyses itself instead.
-                let wanted = to_analyse.contains(&frame) && (swarm || view.is_some())
-                    || !swarm
-                        && frame == number
-                        && self.displayed_analysis_frame(s, number, first) == number;
-                if wanted && !self.is_cached(frame, &key, s) {
-                    let motion = match self.cached_motion(frame, &key) {
-                        Some(motion) => motion.clone(),
-                        None => {
-                            let empty = LumaGrid::default();
-                            let grid = self.grids.get(&frame).unwrap_or(&empty);
-                            let mut motion = match s.detection_mode {
-                                DetectionMode::Motion => {
-                                    let history = (key.background_start..frame)
-                                        .filter(|k| k.rem_euclid(s.analysis_step.every) == 0)
-                                        .map(|k| self.grids.get(&k).unwrap_or(&empty));
-                                    motion::detect_motion(history, grid, &s.motion)
-                                }
-                                DetectionMode::Threshold => {
-                                    motion::detect_threshold(grid, &s.threshold, &s.motion)
-                                }
-                                DetectionMode::FacesOnly => Segmentation {
-                                    mask: vec![0; grid.count()],
-                                    width: grid.width,
-                                    height: grid.height,
-                                    ..Segmentation::default()
-                                },
-                            };
-                            // The face source is analysed first, unless it is missing or a
-                            // live source left it out, which leaves it no grid and no faces.
-                            let source_motion = key
-                                .face_source
-                                .filter(|_| {
-                                    !missing.contains(&source_frame)
-                                        && self.grids.contains_key(&source_frame)
-                                })
-                                .and_then(|_| self.cached_motion(source_frame, &source_key));
-                            if let Some(before) = source_motion {
-                                motion.blobs.extend(reused_faces(before, source_frame));
-                            } else if let Some(view) = view.as_ref().filter(|_| s.faces.any()) {
-                                #[cfg(test)]
-                                {
-                                    self.face_detection_calls += 1;
-                                }
-                                if live {
-                                    // A live render takes the newest faces there are, and those
-                                    // already shown stay until newer ones arrive.
-                                    let (cells, first) = (grid.count(), motion.blobs.len());
-                                    self.live_faces.exchange(view, s.faces, cells, frame, first);
-                                    motion.blobs.extend(self.live_faces.faces_on(frame));
-                                } else {
-                                    // Any other render may be exported, so it has this frame's
-                                    // own faces, however long they take.
-                                    let found = crate::faces::find(view, s.faces, grid.count());
-                                    motion.blobs.extend(found);
-                                }
-                            }
-                            self.motion.insert(frame, (key, motion.clone()));
-                            motion
-                        }
-                    };
-                    if swarm {
-                        // Reused faces need tiles here if a trail no longer than the step draws
-                        // no earlier analysis, or if the windows of held faces would leave it
-                        // before the next analysis, as a slow detection's do on a short trail.
-                        let next_analysis = frame + s.analysis_step.every;
-                        let held_windows_leaving = self
-                            .live_faces
-                            .windows_leave_before(next_analysis, trail_len);
-                        let include_reused_faces =
-                            trail_len <= s.analysis_step.every || held_windows_leaving;
-                        let tiles = cut_frame_tiles(
-                            &motion,
-                            view.as_ref(),
-                            self.live_faces.found_in::<C>().as_ref(),
-                            frame,
-                            (w, h),
-                            s.mirror,
-                            include_reused_faces,
-                        );
-                        self.tiles.insert(frame, (key, s.mirror, tiles));
-                        self.atlas_allocations.remove(&frame);
-                        if held_windows_leaving {
-                            self.live_faces.windows_cut_on(frame);
-                        }
-                    }
-                }
+                self.note_pixels(&plan, frame, view.as_ref(), read.get(), &mut missing);
+                self.analyse_frame(&plan, frame, view.as_ref(), &missing);
                 if frame == number {
                     self.draw(s, count, number, view, out);
                 }
-            });
+            };
+            source.with_frame_if_wanted(index, &mut wanted, &mut use_frame);
         }
         for &frame in &missing {
-            self.invalidate_frame(frame, invalidation_reach);
+            self.invalidate_frame(frame, plan.invalidation_reach);
         }
-        let retention_radius = background + trail_len + 2 * AnalysisStep::MAX_EVERY;
+        let retention_radius = plan.background + plan.trail_len + 2 * AnalysisStep::MAX_EVERY;
         // Later frames are read when they come up. Keeping them from a seek would only compare
         // their hashes then with pixels that needn't match: Resolve hands over different pixels for
         // a frame in playback than for the same frame otherwise, which would clear the history.
         self.retain_frames(number - retention_radius..=number);
         if swarm {
             self.release_undrawn_data(s, count, number, (w, h), oldest_held_frame);
+        }
+    }
+
+    /// While a device opens, or until a lost one's replaced, renders draw on the CPU.
+    fn open_drawer_if_wanted(&mut self, s: &RenderSettings) {
+        let mode_uses_gpu =
+            s.mode == OutputMode::Swarm || s.mode == OutputMode::Overlay && self.gpu_overlay;
+        // Read first, so a frame offered on a new device doesn't meet a drawer on the lost one.
+        if let Some(why) = self.drawer.as_ref().and_then(|drawer| drawer.loss()) {
+            self.fall_back(&Fault(why));
+        }
+        if self.gpu_wanted && self.drawer.is_none() && mode_uses_gpu {
+            match self.device_slot().now() {
+                gpu::DeviceNow::Ready(device) => {
+                    if let Some(drawer) = Drawer::new(device) {
+                        self.last_reported_fault = None;
+                        self.set_drawer(Some(Box::new(drawer)));
+                    }
+                }
+                gpu::DeviceNow::Waiting => {}
+                gpu::DeviceNow::Never => self.gpu_wanted = false,
+            }
+        }
+    }
+
+    /// Clears the history if the source started over, or if a fixed source can't hand over the
+    /// current frame, and returns the current frame's hash if that took one. A fixed source's
+    /// earlier frames never change, so only the current frame is hashed: a different hash means the
+    /// source restarted. A live source numbers each frame once, so its frames aren't hashed at all,
+    /// and a lower number means it restarted.
+    fn check_for_restart(
+        &mut self,
+        plan: &RenderPlan<'_>,
+        source: &mut dyn FrameSource,
+    ) -> Option<u64> {
+        let mut current_hash = None;
+        if plan.numbers_identify_frames {
+            let newest_read = self.kept.iter().rev().find(|(_, k)| k.read.is_some());
+            if newest_read.is_some_and(|(&newest, _)| plan.number < newest) {
+                self.clear_history();
+            }
+        } else if plan.fixed {
+            source.with_frame_if_wanted(
+                (plan.number - plan.first) as usize,
+                &mut |rows| {
+                    current_hash = Some(frame_hash(rows));
+                    false
+                },
+                &mut |_| {},
+            );
+            let read = self.read_before(plan.number);
+            if current_hash.is_none_or(|hash| read.is_some_and(|r| r != PixelsRead::Hash(hash))) {
+                self.clear_history();
+            }
+        }
+        current_hash
+    }
+
+    /// Whether a finished detection waits while the current frame's analysis is already kept, in
+    /// which case that analysis goes so this render takes the faces. A frame between analyses
+    /// has none to redo, so a picture holding still there keeps the faces it shows.
+    fn drop_analysis_for_waiting_faces(&mut self, plan: &RenderPlan<'_>) -> bool {
+        if !plan.numbers_identify_frames
+            || !plan.s.faces.any()
+            || !plan.to_analyse.contains(&plan.number)
+            || !self.live_faces.answer_waiting()
+        {
+            return false;
+        }
+        match self.kept.get_mut(&plan.number) {
+            Some(kept) if kept.analysis.is_some() => {
+                kept.analysis = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Records that `frame` was read as `read`, with its grid, and drops what a change to it
+    /// invalidates. A frame with no pixels or no `read` counts as missing.
+    fn note_pixels<C: Depth>(
+        &mut self,
+        plan: &RenderPlan<'_>,
+        frame: i64,
+        view: Option<&View<C>>,
+        read: Option<PixelsRead>,
+        missing: &mut BTreeSet<i64>,
+    ) {
+        let (Some(v), Some(read)) = (view, read) else {
+            self.invalidate_frame(frame, plan.invalidation_reach);
+            missing.insert(frame);
+            return;
+        };
+        if self.read_before(frame) != Some(read) {
+            // A fixed source's frame read for the first time can't have changed what later frames
+            // computed from it; in other sources an uncached frame may have.
+            if !plan.fixed {
+                self.invalidate_frame(frame, plan.invalidation_reach);
+            }
+            let kept = self.kept.entry(frame).or_default();
+            kept.grid = Some(downsample(v, plan.s.grid_width));
+            kept.read = Some(read);
+        }
+    }
+
+    /// Works out `frame`'s analysis and tiles, if this render wants them and they aren't kept.
+    fn analyse_frame<C: Depth>(
+        &mut self,
+        plan: &RenderPlan<'_>,
+        frame: i64,
+        view: Option<&View<C>>,
+        missing: &BTreeSet<i64>,
+    ) {
+        let s = plan.s;
+        let swarm = s.mode == OutputMode::Swarm;
+        let key = analysis_key(s, frame, plan.first);
+        // Outside the swarm a missing analysis frame isn't analysed: the frame displaying it
+        // analyses itself instead.
+        let wanted = plan.to_analyse.contains(&frame) && (swarm || view.is_some())
+            || !swarm
+                && frame == plan.number
+                && self.displayed_analysis_frame(s, plan.number, plan.first) == plan.number;
+        if !wanted || self.is_cached(frame, &key, s) {
+            return;
+        }
+        let motion = match self.cached_motion(frame, &key) {
+            Some(motion) => motion.clone(),
+            None => {
+                let segments = self.find_segments(plan, frame, &key, view, missing);
+                let motion = segments.clone();
+                self.kept.entry(frame).or_default().analysis = Some(KeptAnalysis { key, segments });
+                motion
+            }
+        };
+        if swarm {
+            self.cut_tiles(plan, frame, key, &motion, view);
+        }
+    }
+
+    /// `frame`'s segments under `s`: what moved or passed the threshold, then its faces.
+    fn find_segments<C: Depth>(
+        &mut self,
+        plan: &RenderPlan<'_>,
+        frame: i64,
+        key: &AnalysisKey,
+        view: Option<&View<C>>,
+        missing: &BTreeSet<i64>,
+    ) -> Segmentation {
+        let s = plan.s;
+        let empty = LumaGrid::default();
+        let grid = self.grid(frame).unwrap_or(&empty);
+        let mut motion = match s.detection_mode {
+            DetectionMode::Motion => {
+                let history = (key.background_start..frame)
+                    .filter(|k| k.rem_euclid(s.analysis_step.every) == 0)
+                    .map(|k| self.grid(k).unwrap_or(&empty));
+                motion::detect_motion(history, grid, &s.motion)
+            }
+            DetectionMode::Threshold => motion::detect_threshold(grid, &s.threshold, &s.motion),
+            DetectionMode::FacesOnly => Segmentation {
+                mask: vec![0; grid.count()],
+                width: grid.width,
+                height: grid.height,
+                ..Segmentation::default()
+            },
+        };
+        let cells = grid.count();
+        // The face source is analysed first, unless it is missing or a live source left it out,
+        // which leaves it no grid and no faces.
+        let source_frame = face_source_frame(s, frame, plan.first);
+        let source_key = analysis_key(s, source_frame, plan.first);
+        let source_motion = key
+            .face_source
+            .filter(|_| !plan.takes_faces_on_held_picture)
+            .filter(|_| !missing.contains(&source_frame) && self.grid(source_frame).is_some())
+            .and_then(|_| self.cached_motion(source_frame, &source_key));
+        if let Some(before) = source_motion {
+            motion.blobs.extend(reused_faces(before, source_frame));
+        } else if let Some(view) = view.filter(|_| s.faces.any()) {
+            #[cfg(test)]
+            {
+                self.face_detection_calls += 1;
+            }
+            if plan.live {
+                // A live render takes the newest faces there are, and those already shown stay
+                // until newer ones arrive.
+                let first_face = motion.blobs.len();
+                self.live_faces
+                    .exchange(view, s.faces, cells, frame, first_face);
+                motion.blobs.extend(self.live_faces.faces_on(frame));
+            } else {
+                // Any other render may be exported, so it has this frame's own faces, however long
+                // they take.
+                motion
+                    .blobs
+                    .extend(crate::faces::find(view, s.faces, cells));
+            }
+        }
+        motion
+    }
+
+    /// Cuts `frame`'s windows out of its pixels, and frees its old place in the atlas.
+    fn cut_tiles<C: Depth>(
+        &mut self,
+        plan: &RenderPlan<'_>,
+        frame: i64,
+        key: AnalysisKey,
+        motion: &Segmentation,
+        view: Option<&View<C>>,
+    ) {
+        let s = plan.s;
+        // Reused faces need tiles here if a trail no longer than the step draws no earlier
+        // analysis, or if the windows of held faces would leave it before the next analysis, as a
+        // slow detection's do on a short trail.
+        let next_analysis = frame + s.analysis_step.every;
+        let held_windows_leaving = self
+            .live_faces
+            .windows_leave_before(next_analysis, plan.trail_len);
+        let include_reused_faces = plan.trail_len <= s.analysis_step.every || held_windows_leaving;
+        let tiles = cut_frame_tiles(
+            motion,
+            view,
+            self.live_faces.found_in::<C>().as_ref(),
+            frame,
+            plan.canvas,
+            s.mirror,
+            include_reused_faces,
+        );
+        self.kept.entry(frame).or_default().tiles = Some(KeptTiles {
+            key,
+            mirror: s.mirror,
+            tiles,
+        });
+        self.atlas.frames.remove(&frame);
+        if held_windows_leaving {
+            self.live_faces.windows_cut_on(frame);
         }
     }
 
@@ -489,16 +700,19 @@ impl IncrementalRenderer {
             .filter(|&f| f < oldest_held_frame)
         {
             let key = analysis_key(s, frame, first);
-            let motion = self
-                .motion
-                .entry(frame)
-                .or_insert((key, Segmentation::default()));
-            motion.0 = key;
-            let tiles = self
-                .tiles
-                .entry(frame)
-                .or_insert((key, s.mirror, Vec::new()));
-            (tiles.0, tiles.1) = (key, s.mirror);
+            let kept = self.kept.entry(frame).or_default();
+            kept.analysis
+                .get_or_insert_with(|| KeptAnalysis {
+                    key,
+                    segments: Segmentation::default(),
+                })
+                .key = key;
+            let tiles = kept.tiles.get_or_insert_with(|| KeptTiles {
+                key,
+                mirror: s.mirror,
+                tiles: Vec::new(),
+            });
+            (tiles.key, tiles.mirror) = (key, s.mirror);
         }
     }
 
@@ -513,16 +727,18 @@ impl IncrementalRenderer {
         (width, height): (i32, i32),
         oldest_held_frame: i64,
     ) {
-        if self.tiles.range(..oldest_held_frame).next().is_none() {
+        let mut older = self.kept.range(..oldest_held_frame);
+        if !older.any(|(_, kept)| kept.tiles.is_some()) {
             return;
         }
         let visible: BTreeSet<(i64, usize)> =
-            build_pile(&self.tiles, s, count, number, width, height)
+            build_pile(&self.kept, s, count, number, width, height)
                 .visible_entries()
                 .map(|p| (p.frame, p.index))
                 .collect();
-        for (&frame, (_, _, tiles)) in self.tiles.range_mut(..oldest_held_frame) {
-            for (index, tile) in tiles.iter_mut().enumerate() {
+        for (&frame, kept) in self.kept.range_mut(..oldest_held_frame) {
+            let tiles = kept.tiles.iter_mut().flat_map(|cut| cut.tiles.iter_mut());
+            for (index, tile) in tiles.enumerate() {
                 if !visible.contains(&(frame, index)) {
                     tile.hidden = true;
                     tile.pixels = Vec::new();
@@ -531,11 +747,13 @@ impl IncrementalRenderer {
             }
         }
         let oldest_displayed_analysis = number - AnalysisStep::MAX_EVERY;
-        for (_, (_, motion)) in self
-            .motion
+        for (_, kept) in self
+            .kept
             .range_mut(..oldest_held_frame.min(oldest_displayed_analysis))
         {
-            motion.mask = Vec::new();
+            if let Some(analysis) = &mut kept.analysis {
+                analysis.segments.mask = Vec::new();
+            }
         }
     }
 
@@ -563,7 +781,7 @@ impl IncrementalRenderer {
             (analysis_key(s, frame, first)
                 .background_start
                 .max(oldest_held_frame)..frame)
-                .filter(|k| k.rem_euclid(s.analysis_step.every) == 0 && !self.grids.contains_key(k))
+                .filter(|&k| k.rem_euclid(s.analysis_step.every) == 0 && self.grid(k).is_none())
         };
         for frame in frames_to_analyse(s, number, first)
             .into_iter()
@@ -623,7 +841,7 @@ impl IncrementalRenderer {
             .map(str::to_owned);
         report.readings = self.readings.clone();
         report.gpu_fault = self.last_reported_fault.clone();
-        report.out_of_gpu_memory = self.oldest_frame_in_atlas.is_some();
+        report.out_of_gpu_memory = self.atlas.oldest_frame.is_some();
         report
     }
 
@@ -646,8 +864,9 @@ impl IncrementalRenderer {
         drawn
     }
 
-    /// Device loss disables the GPU for this instance. Any other fault retries on the next
-    /// render, unless [`gpu::MAX_RECENT_FAULTS`] is reached (cooldown).
+    /// Device loss leaves this instance on the CPU until the slot has another device, whose drawer
+    /// starts with an empty atlas: tiles are in RAM, so the trail goes on. Any other fault retries
+    /// on the next render, unless [`gpu::MAX_RECENT_FAULTS`] is reached (cooldown).
     fn fall_back(&mut self, fault: &Fault) {
         if self.last_reported_fault.as_ref() != Some(&fault.0) {
             eprintln!(
@@ -657,10 +876,7 @@ impl IncrementalRenderer {
             self.last_reported_fault = Some(fault.0.clone());
         }
         match &mut self.drawer {
-            Some(drawer) if drawer.lost() => {
-                self.gpu_wanted = false;
-                self.set_drawer(None);
-            }
+            Some(drawer) if drawer.lost() => self.set_drawer(None),
             Some(drawer) => drawer.record_fault(),
             None => {}
         }
@@ -675,7 +891,7 @@ impl IncrementalRenderer {
         out: &mut ViewMut<C>,
     ) {
         let first = number - count as i64 + 1;
-        let pile = build_pile(&self.tiles, s, count, number, out.width, out.height);
+        let pile = build_pile(&self.kept, s, count, number, out.width, out.height);
         let (analysis_frame, motion) = self.displayed_analysis(s, number, first);
         draw_output(out, s, frame, motion, analysis_frame, pile.visible());
     }
@@ -741,79 +957,26 @@ impl IncrementalRenderer {
         };
         let m = SwarmMetrics::new(h);
         let shadow = swarm::shadow_kernel(m.scale);
-        let pile = build_pile(&self.tiles, s, count, number, w, h);
+        let pile = build_pile(&self.kept, s, count, number, w, h);
         let mut visible: Vec<PileEntry> = pile.visible_entries().collect();
-        // Only a live render goes without windows, and a live stream can end with some left out.
-        if !self.source_is_live {
-            self.oldest_frame_in_atlas = None;
-        }
-        if let Some(oldest) = self.oldest_frame_in_atlas {
-            let dropping = visible.iter().any(|p| p.frame < oldest);
-            visible.retain(|p| p.frame >= oldest);
-            // The trail has moved past what was dropped.
-            if !dropping {
-                self.oldest_frame_in_atlas = None;
-            }
-        }
+        self.atlas
+            .leave_out_dropped(&mut visible, self.source_is_live);
         let window_pixel_count = window_pixels(visible.iter().map(|p| p.tile), &m, &shadow, w, h);
-        let motion = cached_motion(&self.motion, number, &analysis_key(s, number, first))
-            .unwrap_or(&NO_SEGMENTS);
-        if window_pixel_count * 1000 < canvas_pixels * min_coverage_permille {
-            draw_output(
-                out,
-                s,
-                frame,
-                motion,
-                number,
-                visible.iter().map(|p| p.tile),
-            );
+        let enough_windows = window_pixel_count * 1000 >= canvas_pixels * min_coverage_permille;
+        let live = self.source_is_live;
+        if !enough_windows
+            || !self
+                .atlas
+                .place(&self.kept, &visible, drawer, (w, h), &shadow, live)?
+        {
+            let motion = cached_analysis(&self.kept, number, &analysis_key(s, number, first))
+                .unwrap_or(&NO_SEGMENTS);
+            let windows = visible.iter().map(|p| p.tile);
+            draw_output(out, s, frame, motion, number, windows);
             return Ok(());
         }
-        // Only frames with a visible tile keep atlas allocations, newest first. A render that may
-        // be exported must be exact, so a full atlas draws it on the CPU and frames leaving the
-        // trail free space for the next. A CPU draw would stall a live render, so that one gives
-        // up its oldest windows instead, or waits a render for a growing atlas.
-        let wanted: BTreeSet<i64> = visible.iter().map(|p| p.frame).collect();
-        self.atlas_allocations.retain(|f, _| wanted.contains(f));
-        for &f in wanted.iter().rev() {
-            if self.atlas_allocations.contains_key(&f)
-                || self.oldest_frame_in_atlas.is_some_and(|oldest| f < oldest)
-            {
-                continue;
-            }
-            let Some((_, _, tiles)) = self.tiles.get(&f) else {
-                continue;
-            };
-            loop {
-                if let Some(allocation) = drawer.upload_tiles(tiles, (w, h), &shadow)? {
-                    self.atlas_allocations.insert(f, allocation);
-                    break;
-                }
-                if !self.source_is_live {
-                    draw_output(
-                        out,
-                        s,
-                        frame,
-                        motion,
-                        number,
-                        visible.iter().map(|p| p.tile),
-                    );
-                    return Ok(());
-                }
-                if drawer.atlas_growing() {
-                    break;
-                }
-                let evicted = self.atlas_allocations.keys().next().copied();
-                let Some(oldest) = evicted.filter(|&oldest| oldest < f) else {
-                    self.oldest_frame_in_atlas = Some(f + 1);
-                    break;
-                };
-                self.atlas_allocations.remove(&oldest);
-                self.oldest_frame_in_atlas = Some(oldest + 1);
-            }
-        }
         let windows = visible.iter().filter_map(|p| {
-            let allocation = self.atlas_allocations.get(&p.frame)?;
+            let allocation = self.atlas.frames.get(&p.frame)?;
             Some((p.tile, allocation.slots[p.index]))
         });
         if into_target && let Some(offer) = self.target.as_mut() {
@@ -830,12 +993,8 @@ impl IncrementalRenderer {
     /// Clears every frame. Dropping the allocations frees their atlas space; the drawer keeps its
     /// buffers, its atlas at the size it grew to, and its fault and refusal history.
     pub fn clear_history(&mut self) {
-        self.grids.clear();
-        self.frame_hashes.clear();
-        self.motion.clear();
-        self.tiles.clear();
-        self.atlas_allocations.clear();
-        self.oldest_frame_in_atlas = None;
+        self.kept.clear();
+        self.atlas = AtlasPlacements::default();
         self.live_faces.forget();
         self.unfinished = false;
         if let Some(drawer) = &mut self.drawer {
@@ -847,57 +1006,139 @@ impl IncrementalRenderer {
     fn is_cached(&self, frame: i64, key: &AnalysisKey, s: &RenderSettings) -> bool {
         self.cached_motion(frame, key).is_some()
             && (s.mode != OutputMode::Swarm
-                || cached_tiles(&self.tiles, frame, key, s.mirror).is_some())
+                || cached_tiles(&self.kept, frame, key, s.mirror).is_some())
     }
 
     fn cached_motion(&self, frame: i64, key: &AnalysisKey) -> Option<&Segmentation> {
-        cached_motion(&self.motion, frame, key)
+        cached_analysis(&self.kept, frame, key)
+    }
+
+    fn grid(&self, frame: i64) -> Option<&LumaGrid> {
+        self.kept.get(&frame)?.grid.as_ref()
+    }
+
+    fn read_before(&self, frame: i64) -> Option<PixelsRead> {
+        self.kept.get(&frame)?.read
     }
 
     /// Drops `frame`'s cached data, and the motion and tiles of the `dependents` frames after it.
     fn invalidate_frame(&mut self, frame: i64, dependents: i64) {
-        self.grids.remove(&frame);
-        self.frame_hashes.remove(&frame);
+        if let Some(kept) = self.kept.get_mut(&frame) {
+            kept.grid = None;
+            kept.read = None;
+        }
         for later in frame..=frame + dependents {
-            self.motion.remove(&later);
-            self.tiles.remove(&later);
-            self.atlas_allocations.remove(&later);
+            if let Some(kept) = self.kept.get_mut(&later) {
+                kept.analysis = None;
+                kept.tiles = None;
+            }
+            self.atlas.frames.remove(&later);
         }
     }
 
     fn retain_frames(&mut self, frames: RangeInclusive<i64>) {
-        self.grids.retain(|f, _| frames.contains(f));
-        self.frame_hashes.retain(|f, _| frames.contains(f));
-        self.motion.retain(|f, _| frames.contains(f));
-        self.tiles.retain(|f, _| frames.contains(f));
-        self.atlas_allocations.retain(|f, _| frames.contains(f));
+        self.kept.retain(|f, _| frames.contains(f));
+        self.atlas.frames.retain(|f, _| frames.contains(f));
     }
 }
 
-/// The cached motion of `frame`, if computed for `key`.
-fn cached_motion<'a>(
-    kept: &'a BTreeMap<i64, (AnalysisKey, Segmentation)>,
+/// Where kept frames' tiles sit in the atlas. It stays apart from [`KeptFrame`] because a draw
+/// changes it while the windows it draws borrow their tiles.
+#[derive(Default)]
+struct AtlasPlacements {
+    frames: BTreeMap<i64, AtlasAllocation>,
+    /// A live render out of atlas stops drawing frames older than this.
+    oldest_frame: Option<i64>,
+}
+
+impl AtlasPlacements {
+    /// Takes out the windows a live render gave up for space, until the trail has moved past them.
+    /// Only a live render goes without windows, and a live stream can end with some left out.
+    fn leave_out_dropped(&mut self, visible: &mut Vec<PileEntry>, live: bool) {
+        if !live {
+            self.oldest_frame = None;
+        }
+        if let Some(oldest) = self.oldest_frame {
+            let dropping = visible.iter().any(|p| p.frame < oldest);
+            visible.retain(|p| p.frame >= oldest);
+            if !dropping {
+                self.oldest_frame = None;
+            }
+        }
+    }
+
+    /// Gives every frame with a `visible` window a place, newest first, and only those keep one.
+    /// `false` when a render that may be exported doesn't fit: it has to be exact, so it draws on
+    /// the CPU and frames leaving the trail free space for the next. A CPU draw would stall a
+    /// `live` render, so that one gives up its oldest windows instead, or waits a render for a
+    /// growing atlas.
+    fn place(
+        &mut self,
+        kept: &BTreeMap<i64, KeptFrame>,
+        visible: &[PileEntry],
+        drawer: &mut Drawer,
+        canvas: (i32, i32),
+        shadow: &swarm::ShadowKernel,
+        live: bool,
+    ) -> Result<bool, Fault> {
+        let wanted: BTreeSet<i64> = visible.iter().map(|p| p.frame).collect();
+        self.frames.retain(|f, _| wanted.contains(f));
+        for &f in wanted.iter().rev() {
+            if self.frames.contains_key(&f) || self.oldest_frame.is_some_and(|oldest| f < oldest) {
+                continue;
+            }
+            let Some(cut) = kept.get(&f).and_then(|k| k.tiles.as_ref()) else {
+                continue;
+            };
+            loop {
+                if let Some(allocation) = drawer.upload_tiles(&cut.tiles, canvas, shadow)? {
+                    self.frames.insert(f, allocation);
+                    break;
+                }
+                if !live {
+                    return Ok(false);
+                }
+                if drawer.atlas_growing() {
+                    break;
+                }
+                let evicted = self.frames.keys().next().copied();
+                let Some(oldest) = evicted.filter(|&oldest| oldest < f) else {
+                    self.oldest_frame = Some(f + 1);
+                    break;
+                };
+                self.frames.remove(&oldest);
+                self.oldest_frame = Some(oldest + 1);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// The analysis of `frame`, if computed for `key`.
+fn cached_analysis<'a>(
+    kept: &'a BTreeMap<i64, KeptFrame>,
     frame: i64,
     key: &AnalysisKey,
 ) -> Option<&'a Segmentation> {
-    kept.get(&frame).filter(|(b, _)| b == key).map(|(_, m)| m)
+    let analysis = kept.get(&frame)?.analysis.as_ref()?;
+    (analysis.key == *key).then_some(&analysis.segments)
 }
 
-/// The cached tiles of `frame`, if cut for `key` and `mirror`.
+/// The tiles of `frame`, if cut for `key` and `mirror`.
 fn cached_tiles<'a>(
-    kept: &'a BTreeMap<i64, (AnalysisKey, bool, Vec<Tile>)>,
+    kept: &'a BTreeMap<i64, KeptFrame>,
     frame: i64,
     key: &AnalysisKey,
     mirror: bool,
 ) -> Option<&'a [Tile]> {
-    let (b, m, tiles) = kept.get(&frame)?;
-    (b == key && *m == mirror).then_some(tiles.as_slice())
+    let cut = kept.get(&frame)?.tiles.as_ref()?;
+    (cut.key == *key && cut.mirror == mirror).then_some(cut.tiles.as_slice())
 }
 
 /// The pile of the `kept` tiles a swarm render of frame `number`, the last of `count`, draws
 /// from on a `width` x `height` canvas; empty for other outputs.
 fn build_pile<'a>(
-    kept: &'a BTreeMap<i64, (AnalysisKey, bool, Vec<Tile>)>,
+    kept: &'a BTreeMap<i64, KeptFrame>,
     s: &RenderSettings,
     count: usize,
     number: i64,
@@ -1030,9 +1271,8 @@ fn fold_hash(hashes: impl Iterator<Item = u64>) -> u64 {
 }
 
 /// A hash of a row, read as u64 words in four lanes so it's limited by memory bandwidth.
-fn row_hash<C: Channel>(row: &[Argb<C>]) -> u64 {
+fn row_hash(bytes: &[u8]) -> u64 {
     let mut lanes = [0u64; 4];
-    let bytes: &[u8] = bytemuck::cast_slice(row);
     let (words, rest) = bytes.as_chunks::<8>();
     for chunk in words.chunks(4) {
         for (lane, word) in lanes.iter_mut().zip(chunk) {
@@ -1047,18 +1287,15 @@ fn row_hash<C: Channel>(row: &[Argb<C>]) -> u64 {
     fold_hash(lanes.into_iter())
 }
 
-/// A hash of every pixel, from the rows' hashes in order, so any thread count gives the same one.
-fn frame_hash<C: Channel>(view: &View<C>) -> u64 {
-    fold_hash((0..view.height).map(|y| row_hash(view.row(y))))
-}
-
-/// [`frame_hash`] on the host worker threads.
-fn frame_hash_parallel<C: Channel>(view: &View<C>) -> u64 {
-    let mut rows = vec![0u64; view.height as usize];
-    by_rows(&mut rows, 1, |y, hash| {
-        hash[0] = row_hash(view.row(y as i32));
+/// A hash of every byte of a frame ([`FrameSource::with_frame_if_wanted`]), on the host worker
+/// threads, from the rows' hashes in order, so any thread count gives the same one. A stream's
+/// single frame hashes on threads too: one thread made a stream render slower at 1080p Float.
+fn frame_hash(rows: &[&[u8]]) -> u64 {
+    let mut hashes = vec![0u64; rows.len()];
+    by_rows(&mut hashes, 1, |y, hash| {
+        hash[0] = row_hash(rows[y]);
     });
-    fold_hash(rows.into_iter())
+    fold_hash(hashes.into_iter())
 }
 
 #[cfg(test)]
@@ -1066,9 +1303,9 @@ mod tests {
     use super::gpu::gpu_test_lock;
     use std::sync::Arc;
     use std::time::Duration;
+    use vfx_core::wgpu;
 
     use vfx_core::cpu::Image;
-    use vfx_core::wgpu;
 
     use super::*;
     use crate::gpu;
@@ -1188,6 +1425,39 @@ mod tests {
         assert!(render(&mut kept, &frames, 13) == fresh);
     }
 
+    /// A host handing over a picture again makes no new windows: the picture after repeats is the
+    /// one without them, and rendering a repeat shows what the frame before it showed.
+    #[test]
+    fn repeated_frames_add_nothing() {
+        let frames = crossing();
+        let s = swarm_settings();
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let play = |repeats: usize| {
+            let mut state = IncrementalRenderer::default();
+            let mut history = vfx_core::cpu::History::<u8>::default();
+            history.resize(W, H);
+            let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+            for frame in &frames {
+                let mut shown = None;
+                for _ in 0..=repeats {
+                    history.next(needed, 0).copy_from_slice(frame);
+                    history.drop_repeat();
+                    let count = history.len();
+                    let number = history.frame_number();
+                    let view = &mut ViewMut::from_pixels(&mut out, W, H);
+                    state.render_frame(&s, &mut history, count, number, view);
+                    assert!(
+                        shown.is_none_or(|shown| shown == out),
+                        "a repeat changed the picture"
+                    );
+                    shown = Some(out.clone());
+                }
+            }
+            out
+        };
+        assert!(play(3) == play(0));
+    }
+
     /// A frame whose faces would come from the one before looks for itself if that was dropped.
     #[test]
     fn dropped_face_source_leaves_frame_to_detect() {
@@ -1214,8 +1484,7 @@ mod tests {
         let mut state = IncrementalRenderer::default();
         render(&mut state, &frames, 10);
         render(&mut state, &frames, 2);
-        assert!(state.frame_hashes.keys().all(|&frame| frame <= 2));
-        assert!(state.motion.keys().all(|&frame| frame <= 2));
+        assert!(state.kept.keys().all(|&frame| frame <= 2));
     }
 
     const ALL_PARTS: FaceParts = FaceParts {
@@ -1309,6 +1578,84 @@ mod tests {
         );
         drop(models);
         renders.join().unwrap();
+    }
+
+    /// A picture that holds still takes what detection found in it, on a frame with faces of its
+    /// own and on one that reuses the frame before's, and doesn't change again until there's more.
+    #[test]
+    fn held_picture_takes_the_faces_found_in_it() {
+        wait_for_models();
+        // The worker waits behind this, so the only answers are the ones left here.
+        let models = crate::faces::lock_models();
+        let frames = crossing();
+        let s = with_faces(ALL_PARTS);
+        let before = crate::previous_frames_needed(&s) as usize;
+        let mut state = IncrementalRenderer::default();
+        let mut history = vfx_core::cpu::History::<u8>::default();
+        history.resize(W, H);
+        let mut show = |state: &mut IncrementalRenderer, frame: &[Argb<u8>]| {
+            history.next(before, before).copy_from_slice(frame);
+            history.drop_repeat();
+            let (count, number) = (history.len(), history.frame_number());
+            let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+            let view = &mut ViewMut::from_pixels(&mut out, W, H);
+            state.render_frame(&s, &mut history, count, number, view);
+            out
+        };
+        let face = motion::Blob {
+            bounds: crate::NormRect {
+                x: 0.25,
+                y: 0.25,
+                w: 0.5,
+                h: 0.5,
+            },
+            kind: motion::SegmentKind::Face,
+            ..motion::Blob::default()
+        };
+        for (at, red) in [(0, 201), (1, 202)] {
+            let found_in = Argb {
+                alpha: 255,
+                red,
+                green: 7,
+                blue: 9,
+            };
+            let first = show(&mut state, &frames[at]);
+            assert!(!first.contains(&found_in));
+            assert!(state.live_faces.request_out());
+            let requests = state.live_faces.requests_sent;
+            state
+                .live_faces
+                .answer_with(ALL_PARTS, vec![face], found_in, (W, H));
+            let with_faces = show(&mut state, &frames[at]);
+            assert!(with_faces.contains(&found_in), "no window at frame {at}");
+            assert!(!state.live_faces.answer_waiting());
+            assert!(show(&mut state, &frames[at]) == with_faces);
+            assert_eq!(state.live_faces.requests_sent, requests);
+        }
+        drop(models);
+    }
+
+    /// A picture that holds still is asked about once, however long it holds.
+    #[test]
+    fn held_picture_stops_asking_for_faces() {
+        wait_for_models();
+        let frames = crossing();
+        let s = with_faces(ALL_PARTS);
+        let before = crate::previous_frames_needed(&s) as usize;
+        let mut state = IncrementalRenderer::default();
+        let mut history = vfx_core::cpu::History::<u8>::default();
+        history.resize(W, H);
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            history.next(before, before).copy_from_slice(&frames[0]);
+            history.drop_repeat();
+            let (count, number) = (history.len(), history.frame_number());
+            let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+            let view = &mut ViewMut::from_pixels(&mut out, W, H);
+            state.render_frame(&s, &mut history, count, number, view);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.live_faces.requests_sent, 1);
     }
 
     /// A live source whose numbering restarts drops what detection found in the frames before.
@@ -1424,7 +1771,7 @@ mod tests {
                 state.live_faces.hold(ALL_PARTS, vec![face], 0, 0);
                 continue;
             }
-            let (_, motion) = &state.motion[&(n as i64)];
+            let motion = &state.kept[&(n as i64)].analysis.as_ref().unwrap().segments;
             let shown = motion
                 .blobs
                 .iter()
@@ -1553,7 +1900,63 @@ mod tests {
             .iter()
             .map(|t| bytemuck::cast_slice::<_, u8>(&t.pixels)[1])
             .collect();
-        assert_eq!(reds, [50, 200]);
+        assert_eq!(
+            reds,
+            [200, 50],
+            "the face first, cut from the frame it was found in"
+        );
+    }
+
+    /// As segcam 1.1 stacks one analysis, bottom to top: faces and parts, bodies, then motion. The
+    /// labels keep each blob's number, and a reused face has its window already.
+    #[test]
+    fn one_analysis_stacks_as_in_segcam() {
+        use motion::SegmentKind::{Body, EyeLeft, Face, Motion, Mouth};
+        let pixels = vec![Argb::<u8>::default(); (W * H) as usize];
+        let view = View::from_pixels(&pixels, W, H);
+        let blob = |kind, reused_from| motion::Blob {
+            bounds: crate::NormRect {
+                x: 0.1,
+                y: 0.1,
+                w: 0.2,
+                h: 0.2,
+            },
+            kind,
+            reused_from,
+            ..motion::Blob::default()
+        };
+        let motion = Segmentation {
+            blobs: vec![
+                blob(Motion, None),
+                blob(Motion, None),
+                blob(Face, None),
+                blob(EyeLeft, None),
+                blob(Mouth, None),
+                blob(Body, None),
+                blob(Face, Some((3, 0))),
+            ],
+            ..Segmentation::default()
+        };
+        let titles = |reused| {
+            cut_frame_tiles(&motion, Some(&view), None, 4, (W, H), false, reused)
+                .iter()
+                .map(|t| t.title.strip_prefix("LO.FI.SCI.FI ").unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let stack = [
+            "face#4.3",
+            "eye.L#4.4",
+            "mouth#4.5",
+            "body#4.6",
+            "motion#4.1",
+            "motion#4.2",
+        ];
+        assert_eq!(titles(false), stack);
+        assert_eq!(
+            titles(true)[4],
+            "face#3.1",
+            "a reused face stays with the faces"
+        );
     }
 
     /// A render that may be exported doesn't draw without faces: it waits for the models.
@@ -1597,6 +2000,23 @@ mod tests {
         state.drawer().map_or(0, |d| d.faults)
     }
 
+    /// The tables buffer never moves once made, so it can't land in a block the atlas has just
+    /// taken and hold that block when the atlas outgrows it.
+    #[test]
+    fn renders_leave_the_tables_buffer_as_made() {
+        let _lock = gpu_test_lock();
+        let Some(dev) = own_device() else { return };
+        let frames = crossing();
+        let mut on_gpu = on_device(&dev);
+        let made = on_gpu.drawer().unwrap().table_buffer_bytes();
+        assert!(made > 0);
+        for n in 0..frames.len() {
+            render(&mut on_gpu, &frames, n);
+        }
+        assert!(drawn(&on_gpu) > 0);
+        assert_eq!(on_gpu.drawer().unwrap().table_buffer_bytes(), made);
+    }
+
     /// Whether every channel of `b` is within a level of `a`'s: what the GPU's drawing promises.
     fn within_a_level(a: &[Argb<u8>], b: &[Argb<u8>]) -> bool {
         a.iter().zip(b).all(|(p, q)| {
@@ -1611,45 +2031,115 @@ mod tests {
         })
     }
 
-    /// A device lost between renders, as when a driver resets, leaves the instance drawing
-    /// what the CPU draws, and no new instance draws on that device.
+    /// A device lost between renders, as when a driver resets: renders are what the CPU draws
+    /// until the slot has another device, then the GPU's again, on a fresh atlas with the trail
+    /// still there. This loses it by `destroy()`, which goes another way through wgpu than a real
+    /// loss: it shows this code's states, not what a driver does.
     #[test]
-    fn lost_gpu_falls_back_to_the_cpu() {
+    fn lost_gpu_draws_on_the_cpu_and_reopens() {
         let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+        if gpu::open(&choice).is_err() && gpu::open("fallback").is_err() {
+            eprintln!("no adapter: skipped");
+            return;
+        }
+        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(move |_| {
+            gpu::open(&choice).or_else(|_| gpu::open("fallback"))
+        })));
+        let device = |slot: &'static gpu::DeviceSlot| loop {
+            match slot.now() {
+                gpu::DeviceNow::Ready(dev) => return dev,
+                gpu::DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+                gpu::DeviceNow::Never => panic!("the slot gave up"),
+            }
+        };
+        let first = device(slot);
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
-        let mut on_gpu = on_device(&dev);
-        for n in 0..frames.len() {
-            if n == 7 {
-                assert!(drawn(&on_gpu) > 0, "drawing on the GPU before the loss");
-                let draw = on_gpu.report().draw.expect("a render");
-                assert_eq!(draw, format!("GPU ({})", dev.info.name));
-                dev.device.destroy();
-            }
-            let (a, b) = (
-                render(&mut cpu, &frames, n),
-                render(&mut on_gpu, &frames, n),
-            );
-            assert!(n < 7 || a == b, "frame {n} isn't the CPU's after the loss");
+        let mut on_gpu = IncrementalRenderer {
+            test_slot: Some(slot),
+            ..Default::default()
+        };
+        on_gpu.use_gpu(true);
+        on_gpu.set_gpu_min_coverage(0.0);
+        for n in 0..7 {
+            render(&mut cpu, &frames, n);
+            render(&mut on_gpu, &frames, n);
         }
-        assert_eq!(cpu.report().draw.as_deref(), Some("CPU"));
+        assert!(drawn(&on_gpu) > 0, "drawing on the GPU before the loss");
+        assert_eq!(
+            on_gpu.report().draw,
+            Some(format!("GPU ({})", first.info.name))
+        );
+        first.device.destroy();
+
+        // Right after the loss, and for as long as the slot has no device.
+        let (a, b) = (
+            render(&mut cpu, &frames, 7),
+            render(&mut on_gpu, &frames, 7),
+        );
+        assert!(a == b, "the render after the loss isn't the CPU's");
         assert_eq!(on_gpu.report().draw.as_deref(), Some("CPU"));
-        assert!(dev.lost().is_some(), "the loss went unnoticed");
+        assert!(first.lost().is_some(), "the loss went unnoticed");
         assert!(
             on_gpu.drawer().is_none(),
-            "the instance is still on the GPU"
+            "still drawing on the lost device"
         );
-        assert!(!on_gpu.gpu_wanted, "the instance still looks for a GPU");
+        assert!(gpu::Drawer::new(first.clone()).is_none(), "a drawer on it");
+        assert!(on_gpu.gpu_wanted, "the instance gave up on the GPU");
+
+        let second = device(slot);
         assert!(
-            gpu::Drawer::new(dev).is_none(),
-            "a new instance draws on the lost device"
+            !Arc::ptr_eq(&first, &second),
+            "the slot kept the lost device"
         );
+        assert!(second.lost().is_none());
+        // An instance that was on the GPU comes back to it, and draws the whole trail again.
+        let (a, b) = (
+            render(&mut cpu, &frames, 8),
+            render(&mut on_gpu, &frames, 8),
+        );
+        assert!(drawn(&on_gpu) > 0, "the instance stayed on the CPU");
+        assert_eq!(
+            on_gpu.report().draw,
+            Some(format!("GPU ({})", second.info.name))
+        );
+        assert!(
+            on_gpu.report().gpu_fault.is_none(),
+            "the old fault still shows"
+        );
+        assert!(within_a_level(&a, &b), "the picture after the reopen");
     }
 
-    /// Hashes from both paths are compared when a host stops streaming.
+    /// A first open that keeps failing leaves the CPU for good once its retries are spent: with no
+    /// adapter the CPU is the machine's path. Until then renders draw on the CPU and keep asking.
     #[test]
-    fn parallel_frame_hash_matches_serial() {
+    fn failed_first_open_leaves_the_cpu_for_good() {
+        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(|_| {
+            Err(gpu::NoGpu::NoAdapter("none here".into()))
+        })));
+        let mut on_cpu = IncrementalRenderer {
+            test_slot: Some(slot),
+            ..Default::default()
+        };
+        on_cpu.use_gpu(true);
+        assert!(slot.status().is_err());
+        render(&mut on_cpu, &crossing(), 0);
+        assert!(on_cpu.gpu_wanted, "the first failure was final");
+        let deadline = std::time::Instant::now() + gpu::FIRST_OPEN_TEST_DEADLINE;
+        while !matches!(slot.next_first_open_try(), gpu::DeviceNow::Never) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slot never gave up"
+            );
+        }
+        render(&mut on_cpu, &crossing(), 0);
+        assert!(!on_cpu.gpu_wanted);
+    }
+
+    /// Hashes are compared across renders that may run on different numbers of threads.
+    #[test]
+    fn frame_hash_is_the_rows_hashes_in_order_and_sees_every_pixel() {
         // An odd width leaves a row's last pixel out of the words of 8-bit frames.
         let (w, h) = (201, 130);
         let mut pixels: Vec<Argb<u8>> = (0..w * h)
@@ -1664,10 +2154,10 @@ mod tests {
             })
             .collect();
         let hash = |pixels: &[Argb<u8>]| {
-            let view = View::from_pixels(pixels, w, h);
-            let serial = frame_hash(&view);
-            assert_eq!(frame_hash_parallel(&view), serial);
-            serial
+            let rows = View::from_pixels(pixels, w, h).byte_rows();
+            let hash = frame_hash(&rows);
+            assert_eq!(hash, fold_hash(rows.iter().map(|row| row_hash(row))));
+            hash
         };
         let before = hash(&pixels);
         let last = pixels.len() - 1;
@@ -1689,8 +2179,256 @@ mod tests {
                 blue: 0.5,
             })
             .collect();
-        let view = View::from_pixels(&floats, w, h);
-        assert_eq!(frame_hash_parallel(&view), frame_hash(&view));
+        let rows = View::from_pixels(&floats, w, h).byte_rows();
+        assert_eq!(
+            frame_hash(&rows),
+            fold_hash(rows.iter().map(|row| row_hash(row)))
+        );
+    }
+
+    /// A Float frame hashes as its bits. Equal bits are the same frame, whatever the values, NaN
+    /// included. Equal values in other bits, 0 and -0 or NaNs with other payloads, are a changed
+    /// frame: that costs the work again, and never keeps work for pixels that changed.
+    #[test]
+    fn frame_hash_of_float_rows_follows_their_bits() {
+        let (w, h) = (5, 3);
+        let mut floats = vec![
+            Argb {
+                alpha: 1.0f32,
+                red: 0.0,
+                green: 0.5,
+                blue: 0.25,
+            };
+            (w * h) as usize
+        ];
+        let hash = |floats: &[Argb<f32>]| frame_hash(&View::from_pixels(floats, w, h).byte_rows());
+        let zero = hash(&floats);
+        floats[7].red = -0.0;
+        assert_ne!(hash(&floats), zero, "-0 in place of 0");
+        floats[7].red = f32::NAN;
+        let nan = hash(&floats);
+        assert_eq!(hash(&floats), nan, "the same NaN");
+        floats[7].red = f32::from_bits(f32::NAN.to_bits() | 1);
+        assert!(floats[7].red.is_nan());
+        assert_ne!(hash(&floats), nan, "a NaN with another payload");
+        floats[7].red = 0.0;
+        assert_eq!(hash(&floats), zero);
+    }
+
+    /// A host's padding after each row is no part of the frame: a view's rows end at its width.
+    #[test]
+    fn frame_hash_leaves_out_row_padding() {
+        let (w, h) = (3, 4);
+        let row = w as usize * size_of::<Argb<u8>>();
+        let stride = row + 8;
+        let packed: Vec<u8> = (0..h as usize * row)
+            .map(|i| (i * 13 % 256) as u8)
+            .collect();
+        let expected = frame_hash(&View::<u8>::new(&packed, w, h, row).byte_rows());
+        let mut padded = vec![0u8; h as usize * stride];
+        for fill in [0x00, 0xff] {
+            for (y, line) in padded.chunks_mut(stride).enumerate() {
+                line[..row].copy_from_slice(&packed[y * row..(y + 1) * row]);
+                line[row..].fill(fill);
+            }
+            let rows = View::<u8>::new(&padded, w, h, stride).byte_rows();
+            assert_eq!(frame_hash(&rows), expected, "padding {fill:#x}");
+        }
+    }
+
+    /// A source whose [`FrameSource::with_frame`] is costly, and which holds frames in other bytes
+    /// than it shows, as a host does: reversed rows, counting the frames it converts.
+    struct ConvertingFrames<'a> {
+        frames: &'a [Vec<Argb<u8>>],
+        converted: Vec<usize>,
+    }
+
+    impl FrameSource for ConvertingFrames<'_> {
+        fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+            self.converted.push(index);
+            f(self
+                .frames
+                .get(index)
+                .map(|p| Image::U8(View::from_pixels(p, W, H))));
+        }
+
+        fn with_frame_if_wanted(
+            &mut self,
+            index: usize,
+            wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+            f: &mut dyn FnMut(Option<Image<'_>>),
+        ) {
+            if let Some(pixels) = self.frames.get(index) {
+                let mut rows = View::from_pixels(pixels, W, H).byte_rows();
+                rows.reverse();
+                if !wanted(&rows) {
+                    return;
+                }
+            }
+            self.with_frame(index, f);
+        }
+    }
+
+    fn render_converting(
+        state: &mut IncrementalRenderer,
+        frames: &[Vec<Argb<u8>>],
+        n: usize,
+    ) -> (Vec<Argb<u8>>, Vec<usize>) {
+        let s = swarm_settings();
+        let start = n.saturating_sub(crate::previous_frames_needed(&s) as usize);
+        let clip = &frames[start..=n];
+        let mut pixels = vec![Argb::default(); (W * H) as usize];
+        let mut source = ConvertingFrames {
+            frames: clip,
+            converted: Vec::new(),
+        };
+        let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
+        state.render_frame(&s, &mut source, clip.len(), n as i64, out);
+        let converted = source.converted.iter().map(|i| i + start).collect();
+        (pixels, converted)
+    }
+
+    /// A check with nothing changed converts only the frame it draws; a change anywhere in an
+    /// earlier frame is still seen, and what it invalidates comes out as a fresh render's.
+    #[test]
+    fn check_converts_only_what_changed() {
+        let mut frames = crossing();
+        let n = frames.len() - 1;
+        let mut state = IncrementalRenderer::default();
+        let (first, _) = render_converting(&mut state, &frames, n);
+        let (same, converted) = render_converting(&mut state, &frames, n);
+        assert_eq!(same, first);
+        assert_eq!(converted, [n], "nothing changed");
+
+        for pixel in [0, frames[4].len() - 1, frames[4].len() / 2] {
+            frames[4][pixel].alpha ^= 1;
+            let (_, converted) = render_converting(&mut state, &frames, n);
+            assert!(converted.contains(&4), "a change at pixel {pixel}");
+            assert!(!converted.contains(&3), "frames before it are unchanged");
+            let (again, converted) = render_converting(&mut state, &frames, n);
+            assert_eq!(converted, [n], "the change is taken in");
+            let mut fresh = IncrementalRenderer::default();
+            let (cold, _) = render_converting(&mut fresh, &frames, n);
+            assert_eq!(again, cold);
+        }
+    }
+
+    /// A frame that goes missing from a check counts as empty, as in a cold render, and one that
+    /// comes back gives what it gave before.
+    #[test]
+    fn check_sees_a_frame_go_missing_and_come_back() {
+        let frames = crossing();
+        let n = frames.len() - 1;
+        let mut state = IncrementalRenderer::default();
+        let (first, _) = render_converting(&mut state, &frames, n);
+
+        struct Gap<'a>(ConvertingFrames<'a>, usize);
+        impl FrameSource for Gap<'_> {
+            fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+                if index == self.1 {
+                    f(None);
+                } else {
+                    self.0.with_frame(index, f);
+                }
+            }
+            fn with_frame_if_wanted(
+                &mut self,
+                index: usize,
+                wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+                f: &mut dyn FnMut(Option<Image<'_>>),
+            ) {
+                if index == self.1 {
+                    f(None);
+                } else {
+                    self.0.with_frame_if_wanted(index, wanted, f);
+                }
+            }
+        }
+        let s = swarm_settings();
+        let start = n.saturating_sub(crate::previous_frames_needed(&s) as usize);
+        let clip = &frames[start..=n];
+        let with_gap = |state: &mut IncrementalRenderer| {
+            let mut pixels = vec![Argb::<u8>::default(); (W * H) as usize];
+            let converting = ConvertingFrames {
+                frames: clip,
+                converted: Vec::new(),
+            };
+            let mut source = Gap(converting, 4 - start);
+            let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
+            state.render_frame(&s, &mut source, clip.len(), n as i64, out);
+            pixels
+        };
+        let after_gap = with_gap(&mut state);
+        let cold = with_gap(&mut IncrementalRenderer::default());
+        assert_eq!(after_gap, cold, "the missing frame counts as empty");
+
+        let (back, _) = render_converting(&mut state, &frames, n);
+        assert_eq!(back, first);
+    }
+
+    /// A check that skips converting earlier frames can't hide what a lost device took with it:
+    /// the tiles are in RAM, so the new device's empty atlas fills from them and the whole trail
+    /// draws. A change to an earlier frame is still found on the new device.
+    #[test]
+    fn check_after_a_new_device_draws_the_whole_trail_without_converting() {
+        let _lock = gpu_test_lock();
+        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+        if gpu::open(&choice).is_err() && gpu::open("fallback").is_err() {
+            eprintln!("no adapter: skipped");
+            return;
+        }
+        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(move |_| {
+            gpu::open(&choice).or_else(|_| gpu::open("fallback"))
+        })));
+        let device = || loop {
+            match slot.now() {
+                gpu::DeviceNow::Ready(dev) => return dev,
+                gpu::DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+                gpu::DeviceNow::Never => panic!("the slot gave up"),
+            }
+        };
+        let first_device = device();
+        let mut frames = crossing();
+        let n = frames.len() - 1;
+        let cold = |frames: &[Vec<Argb<u8>>]| {
+            render_converting(&mut IncrementalRenderer::default(), frames, n).0
+        };
+        let mut state = IncrementalRenderer {
+            test_slot: Some(slot),
+            ..Default::default()
+        };
+        state.use_gpu(true);
+        state.set_gpu_min_coverage(0.0);
+        render_converting(&mut state, &frames, n);
+        let (on_first, converted) = render_converting(&mut state, &frames, n);
+        assert_eq!(converted, [n], "nothing changed");
+        assert!(drawn(&state) > 0, "drawing on the GPU before the loss");
+        assert!(within_a_level(&cold(&frames), &on_first));
+
+        first_device.device.destroy();
+        let (on_cpu, converted) = render_converting(&mut state, &frames, n);
+        assert_eq!(converted, [n], "the loss changed no frame");
+        assert_eq!(state.report().draw.as_deref(), Some("CPU"));
+        assert_eq!(on_cpu, cold(&frames), "the render after the loss");
+
+        let second_device = device();
+        assert!(!Arc::ptr_eq(&first_device, &second_device));
+        let (on_second, converted) = render_converting(&mut state, &frames, n);
+        assert_eq!(converted, [n], "the new device needs no earlier frame");
+        assert!(drawn(&state) > 0, "the instance stayed on the CPU");
+        assert_eq!(
+            state.report().draw,
+            Some(format!("GPU ({})", second_device.info.name))
+        );
+        assert!(within_a_level(&cold(&frames), &on_second));
+
+        frames[4][0].alpha ^= 1;
+        let (_, converted) = render_converting(&mut state, &frames, n);
+        assert!(converted.contains(&4), "the change on the new device");
+        assert!(!converted.contains(&3), "frames before it are unchanged");
+        let (edited, converted) = render_converting(&mut state, &frames, n);
+        assert_eq!(converted, [n], "the change is taken in");
+        assert!(within_a_level(&cold(&frames), &edited));
     }
 
     /// A validation error leaves the device usable: it is counted, not kept as a failure, so
@@ -1891,9 +2629,10 @@ mod tests {
         // The current frame's are dropped by the next render.
         let last = frames.len() as i64 - 1;
         let tiles: Vec<&Tile> = state
-            .tiles
+            .kept
             .range(..last)
-            .flat_map(|(_, (_, _, t))| t)
+            .filter_map(|(_, kept)| kept.tiles.as_ref())
+            .flat_map(|cut| &cut.tiles)
             .collect();
         let with_pixels = tiles.iter().filter(|t| !t.pixels.is_empty()).count();
         assert!(tiles.len() > 2, "the clip spawned too few tiles");
@@ -1971,10 +2710,7 @@ mod tests {
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             state.render_frame(&s, &mut history, count, n as i64, view);
         }
-        assert!(
-            state.oldest_frame_in_atlas.is_some(),
-            "the atlas never filled"
-        );
+        assert!(state.atlas.oldest_frame.is_some(), "the atlas never filled");
         assert_eq!(drawn(&state), frames.len() as u64, "a render left the GPU");
         assert_eq!(faults(&state), 0);
         assert!(state.report().out_of_gpu_memory);
@@ -2008,15 +2744,12 @@ mod tests {
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             state.render_frame(&s, &mut history, count, n as i64, view);
         }
-        assert!(
-            state.oldest_frame_in_atlas.is_some(),
-            "the atlas never filled"
-        );
+        assert!(state.atlas.oldest_frame.is_some(), "the atlas never filled");
         let n = frames.len() - 1;
         let after = render(&mut state, &frames, n);
         let fresh = render(&mut IncrementalRenderer::default(), &frames, n);
         assert!(within_a_level(&fresh, &after));
-        assert_eq!(state.oldest_frame_in_atlas, None);
+        assert_eq!(state.atlas.oldest_frame, None);
     }
 
     /// An atlas too small for the trail draws the renders it can't hold on the CPU, and the

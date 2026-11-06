@@ -12,13 +12,14 @@ use crate::render::FaceParts;
 #[cfg(not(target_arch = "wasm32"))]
 mod models {
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{Mutex, MutexGuard, Once, OnceLock};
+    use std::sync::{LazyLock, Mutex, MutexGuard, Once, OnceLock};
     use std::time::Instant;
 
     use segcam_face::{Image, Parts, Pixels, Segmenter};
+    use vfx_core::ReopenBackoff;
 
     pub(super) static MODELS: OnceLock<Mutex<Option<Segmenter>>> = OnceLock::new();
-    static RUNS_ON: OnceLock<String> = OnceLock::new();
+    static RUNS_ON: Mutex<Option<&'static str>> = Mutex::new(None);
 
     /// The models, once they have loaded or failed to. A panic while they ran leaves them usable:
     /// each find starts over, so only that detection's faces are lost, where staying poisoned would
@@ -62,6 +63,11 @@ mod models {
     /// A panic in a broken runtime counts as no models, so [`wait`] and [`ready`] still get an answer.
     fn load() {
         let _device_lock = segcam_face::d3d12_device_lock();
+        let _ = MODELS.set(Mutex::new(new_segmenter()));
+    }
+
+    /// The caller holds the D3D12 device lock.
+    fn new_segmenter() -> Option<Segmenter> {
         let started = Instant::now();
         let segmenter = catch_unwind(AssertUnwindSafe(load_warmed_segmenter)).unwrap_or(None);
         match &segmenter {
@@ -72,16 +78,102 @@ mod models {
                     started.elapsed().as_millis()
                 );
                 let device_name = device.split(" (").next().unwrap_or_default();
-                let _ = RUNS_ON.set(device_name.to_owned());
+                // Once per load, and models load again only after a driver reset.
+                *RUNS_ON.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Box::leak(device_name.to_owned().into_boxed_str()));
             }
             None => eprintln!("segcam Motion: no face models"),
         }
-        let _ = MODELS.set(Mutex::new(segmenter));
+        segmenter
     }
 
     /// "DirectML 0", "CPU" or "Vision", once the models have loaded.
     pub fn runs_on() -> Option<&'static str> {
-        RUNS_ON.get().map(String::as_str)
+        *RUNS_ON.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// When models that stopped working are next to load again: none while they work.
+    #[derive(Default)]
+    pub(super) struct Reload {
+        backoff: ReopenBackoff,
+        next_try: Option<Instant>,
+        loaded_at: Option<Instant>,
+        /// Which optional models the ones that stopped working had, which a new load has to have.
+        had: Option<(bool, bool)>,
+        /// Loads in a row that came up short of `had`.
+        short_loads: u32,
+    }
+
+    /// How many short loads to try before keeping what loads. A model that doesn't come back after
+    /// a reset is better missing than a reload of the others every 30 s all show.
+    const SHORT_LOADS_TO_TRY: u32 = 5;
+
+    impl Reload {
+        /// Drops models whose runs keep failing and loads new ones on the backoff, since a session
+        /// can't outlive its device. The old ones go first: a process has one D3D12 device per
+        /// adapter, and a new session would be handed the removed one while they hold it. A load
+        /// missing an optional model the old ones had is used and tried again a few times, since
+        /// that's probably the reset and not the machine.
+        pub(super) fn keep_working<T>(
+            &mut self,
+            models: &mut Option<T>,
+            failing: impl Fn(&T) -> bool,
+            optional: impl Fn(&T) -> (bool, bool),
+            release: impl Fn(T),
+            load: impl FnOnce() -> Option<T>,
+        ) {
+            if let Some(old) = models.take_if(|m| failing(m)) {
+                eprintln!("segcam Motion: the face models stopped working");
+                if let Some(loaded_at) = self.loaded_at.take() {
+                    self.backoff.lost(loaded_at.elapsed());
+                }
+                self.had.get_or_insert(optional(&old));
+                release(old);
+                self.next_try = Some(Instant::now() + self.backoff.next_delay());
+            }
+            if self.next_try.is_some_and(|at| Instant::now() >= at) {
+                if let Some(partial) = models.take() {
+                    release(partial);
+                }
+                *models = load();
+                let short = models.as_ref().is_some_and(|m| {
+                    let (mesh, bodies) = optional(m);
+                    self.had
+                        .is_some_and(|had| (had.0 && !mesh) || (had.1 && !bodies))
+                });
+                self.short_loads += u32::from(short);
+                let keep = models.is_some() && (!short || self.short_loads >= SHORT_LOADS_TO_TRY);
+                if models.is_some() {
+                    self.loaded_at = Some(Instant::now());
+                }
+                self.next_try = (!keep).then(|| Instant::now() + self.backoff.next_delay());
+                if keep {
+                    self.had = None;
+                    self.short_loads = 0;
+                }
+            }
+        }
+    }
+
+    /// See [`Reload::keep_working`]. The caller holds the models' lock.
+    pub(super) fn keep_working(models: &mut Option<Segmenter>) {
+        static RELOAD: LazyLock<Mutex<Reload>> = LazyLock::new(Default::default);
+        RELOAD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keep_working(
+                models,
+                Segmenter::failing,
+                Segmenter::optional_models,
+                |old| {
+                    let _device_lock = segcam_face::d3d12_device_lock();
+                    let _ = catch_unwind(AssertUnwindSafe(move || drop(old)));
+                },
+                || {
+                    let _device_lock = segcam_face::d3d12_device_lock();
+                    new_segmenter()
+                },
+            );
     }
 
     /// The best segmenter after a first run, since Vision loads its own models on its first
@@ -107,6 +199,123 @@ mod models {
         }
         Some(segmenter)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Reload, SHORT_LOADS_TO_TRY};
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        /// Models that keep failing go at once, and new ones load, retrying until they do.
+        #[test]
+        fn failing_models_are_replaced() {
+            let optional = |_: &i32| (true, true);
+            let mut reload = Reload::default();
+            let mut models = Some(1);
+            reload.keep_working(
+                &mut models,
+                |_| false,
+                optional,
+                drop,
+                || panic!("models work"),
+            );
+            assert_eq!(models, Some(1));
+
+            let released = Cell::new(None);
+            let release = |old| released.set(Some(old));
+            reload.keep_working(&mut models, |_| true, optional, release, || None);
+            assert_eq!(released.get(), Some(1));
+            assert_eq!(models, None, "loaded before the backoff");
+
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+            assert_eq!(models, None);
+            assert!(reload.next_try.is_some(), "a failed load gave up");
+
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, drop, || Some(2));
+            assert_eq!(models, Some(2));
+            assert!(reload.next_try.is_none());
+        }
+
+        /// A load missing what the old models had is used, and replaced by a later full one.
+        #[test]
+        fn a_partial_load_tries_again() {
+            let optional = |m: &i32| (*m >= 10, true);
+            let mut reload = Reload::default();
+            let mut models = Some(10);
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, drop, || Some(1));
+            assert_eq!(models, Some(1), "a partial load is better than none");
+            assert!(reload.next_try.is_some(), "a partial load stayed");
+
+            let released = Cell::new(None);
+            let release = |old| released.set(Some(old));
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, release, || Some(11));
+            assert_eq!(released.get(), Some(1), "the partial models were held");
+            assert_eq!(models, Some(11));
+            assert!(reload.next_try.is_none());
+        }
+
+        /// A machine that never had the optional models isn't asked for them after a reset.
+        #[test]
+        fn a_load_matching_the_old_models_is_complete() {
+            let optional = |_: &i32| (false, false);
+            let mut reload = Reload::default();
+            let mut models = Some(1);
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, drop, || Some(2));
+            assert!(reload.next_try.is_none());
+        }
+
+        /// A load with more than the old models had is complete, and isn't loaded again.
+        #[test]
+        fn a_fuller_load_than_before_is_complete() {
+            let optional = |m: &i32| (*m >= 10, true);
+            let mut reload = Reload::default();
+            let mut models = Some(1);
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+            reload.next_try = Some(Instant::now());
+            reload.keep_working(&mut models, |_| false, optional, drop, || Some(11));
+            assert_eq!(models, Some(11));
+            assert!(reload.next_try.is_none(), "full models load again");
+        }
+
+        /// A model that never comes back stops the reloads after a few tries.
+        #[test]
+        fn short_loads_stop_after_a_few() {
+            let optional = |m: &i32| (*m >= 10, true);
+            let mut reload = Reload::default();
+            let mut models = Some(10);
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+            for tries in 1..=SHORT_LOADS_TO_TRY {
+                assert!(reload.next_try.is_some(), "stopped before try {tries}");
+                reload.next_try = Some(Instant::now());
+                reload.keep_working(&mut models, |_| false, optional, drop, || Some(1));
+            }
+            assert_eq!(models, Some(1));
+            assert!(reload.next_try.is_none(), "goes on reloading");
+        }
+
+        /// Models that lasted start the backoff over, so a reset hours later waits 1 s again.
+        #[test]
+        fn models_that_lasted_start_the_backoff_over() {
+            let optional = |_: &i32| (true, true);
+            let mut reload = Reload::default();
+            for _ in 0..5 {
+                reload.backoff.next_delay();
+            }
+            let mut models = Some(1);
+            reload.loaded_at = Instant::now().checked_sub(Duration::from_secs(120));
+            reload.keep_working(&mut models, |_| true, optional, drop, || None);
+            let wait = reload.next_try.expect("a time to try") - Instant::now();
+            assert!(wait <= Duration::from_secs(1), "waits {wait:?}");
+        }
+    }
 }
 
 /// Detection for one instance's live renders, on the one worker thread instances share, so a render
@@ -119,8 +328,9 @@ mod live {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Sender, channel};
     use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
-    use crate::motion::Blob;
+    use crate::motion::{Blob, SegmentKind};
     use crate::pixel::{Argb, Channel, View};
     use crate::render::FaceParts;
 
@@ -142,10 +352,31 @@ mod live {
             .as_ref()
     }
 
+    /// The worker runs the models at most one part in this many of the time: a detection that took
+    /// `d` is followed by the next no sooner than `d` times this after it started. On a GPU that
+    /// also draws the renders, an integrated one above all, back to back detections leave the
+    /// renders waiting behind them. Where a detection is short beside a frame, this never waits.
+    const DETECTION_PACE: u32 = 2;
+
+    /// Bodies are looked for no more often than once per their detection's time times this; the
+    /// detections between keep the bodies found last. Body detection runs beside the faces on the
+    /// same device, takes longer than they do on an integrated GPU, and bodies move less between
+    /// detections than faces, eyes and mouths. Where it is short beside a frame, every detection
+    /// looks for bodies.
+    const BODY_PACE: u32 = 4;
+
     /// The faces found in one frame, and that frame's pixels.
     struct Detection {
         blobs: Vec<Blob>,
+        /// The parts the render asked for, also when [`BODY_PACE`] left bodies out of this one.
         parts: FaceParts,
+        /// Whether this detection looked for bodies, or keeps the ones held.
+        looked_for_bodies: bool,
+        /// When the detection started on the worker, how long it took and how long its bodies
+        /// took, which pace the next ones.
+        started: Instant,
+        took: Duration,
+        body_time: Option<Duration>,
         pixels: Arc<dyn Any + Send + Sync>,
         width: i32,
         height: i32,
@@ -181,6 +412,13 @@ mod live {
         held: Option<HeldFaces>,
         /// The parts last asked for.
         parts: FaceParts,
+        /// The newest frame asked about, which a picture that holds still isn't asked about again:
+        /// it would never stop, and its windows would move with each answer's small differences.
+        asked_about: Option<i64>,
+        /// The soonest the next request goes out, by [`DETECTION_PACE`].
+        next_request: Option<Instant>,
+        /// The soonest a request looks for bodies again, by [`BODY_PACE`].
+        next_bodies: Option<Instant>,
         #[cfg(test)]
         pub requests_sent: u32,
     }
@@ -202,10 +440,23 @@ mod live {
                 // Faces found for other parts stop showing.
                 self.parts = parts;
                 self.held = None;
+                self.asked_about = None;
+                self.next_bodies = None;
             }
             let finished = self.answer.lock().ok().and_then(|mut a| a.take());
-            if let Some(found) = finished.filter(|found| found.parts == parts) {
+            if let Some(mut found) = finished.filter(|found| found.parts == parts) {
+                self.next_request = Some(found.started + found.took * DETECTION_PACE);
+                if let Some(body_time) = found.body_time {
+                    self.next_bodies = Some(found.started + body_time * BODY_PACE);
+                }
                 if let Some(replaced) = self.held.take() {
+                    if !found.looked_for_bodies {
+                        let bodies = replaced
+                            .blobs
+                            .iter()
+                            .filter(|b| b.kind == SegmentKind::Body);
+                        found.blobs.extend(bodies);
+                    }
                     self.spare_frame = Some(replaced.pixels);
                 }
                 self.held = Some(HeldFaces {
@@ -218,9 +469,17 @@ mod live {
                     windows_on: frame,
                 });
             }
-            if !self.requested.load(Ordering::Acquire) {
+            let paced = self.next_request.is_some_and(|at| Instant::now() < at);
+            if self.asked_about != Some(frame) && !paced && !self.requested.load(Ordering::Acquire)
+            {
+                self.asked_about = Some(frame);
                 self.request(view, parts, cells);
             }
+        }
+
+        /// Whether a finished detection waits for the next [`LiveFaces::exchange`].
+        pub fn answer_waiting(&self) -> bool {
+            self.answer.lock().is_ok_and(|answer| answer.is_some())
         }
 
         /// The held faces, for `frame`'s blobs. On the frame they were attached to they count as
@@ -275,20 +534,31 @@ mod live {
                 pixels.extend_from_slice(frame.row(y));
             }
             let (width, height) = (frame.width, frame.height);
+            let looked_for_bodies =
+                parts.body && self.next_bodies.is_none_or(|at| Instant::now() >= at);
+            let run_parts = FaceParts {
+                body: looked_for_bodies,
+                ..parts
+            };
             let answer = Arc::clone(&self.answer);
             let requested = Arc::clone(&self.requested);
             let job = move || {
                 if Arc::strong_count(&answer) > 1 {
                     // A panic in a broken runtime counts as no faces, so the request still gets an
                     // answer.
-                    let blobs = catch_unwind(AssertUnwindSafe(|| {
-                        super::find_in(&pixels, width, height, parts, cells)
+                    let started = Instant::now();
+                    let found = catch_unwind(AssertUnwindSafe(|| {
+                        super::find_in(&pixels, width, height, run_parts, cells)
                     }))
                     .unwrap_or_default();
                     if let Ok(mut answer) = answer.lock() {
                         *answer = Some(Detection {
-                            blobs,
+                            blobs: found.blobs,
                             parts,
+                            looked_for_bodies,
+                            started,
+                            took: started.elapsed(),
+                            body_time: found.body_time,
                             pixels: Arc::new(pixels),
                             width,
                             height,
@@ -317,6 +587,8 @@ mod live {
                 *answer = None;
             }
             self.held = None;
+            self.asked_about = None;
+            self.next_bodies = None;
         }
 
         #[cfg(test)]
@@ -342,6 +614,51 @@ mod live {
         pub fn hold_pixels(&mut self, pixels: Vec<Argb<u8>>, width: i32, height: i32) {
             let held = self.held.as_mut().expect("faces held");
             (held.pixels, held.width, held.height) = (Arc::new(pixels), width, height);
+        }
+
+        /// Leaves an answer as the worker would, with its frame all `found_in`.
+        #[cfg(test)]
+        pub fn answer_with(
+            &mut self,
+            parts: FaceParts,
+            blobs: Vec<Blob>,
+            found_in: Argb<u8>,
+            (width, height): (i32, i32),
+        ) {
+            let pixels = vec![found_in; (width * height) as usize];
+            *self.answer.lock().unwrap() = Some(Detection {
+                blobs,
+                parts,
+                looked_for_bodies: true,
+                started: Instant::now(),
+                took: Duration::ZERO,
+                body_time: None,
+                pixels: Arc::new(pixels),
+                width,
+                height,
+            });
+        }
+
+        /// Leaves an answer as a detection that took `took` would, having looked for bodies or not.
+        #[cfg(test)]
+        pub fn answer_after(
+            &mut self,
+            parts: FaceParts,
+            blobs: Vec<Blob>,
+            took: Duration,
+            looked_for_bodies: bool,
+        ) {
+            *self.answer.lock().unwrap() = Some(Detection {
+                blobs,
+                parts,
+                looked_for_bodies,
+                started: Instant::now(),
+                took,
+                body_time: looked_for_bodies.then_some(took),
+                pixels: Arc::new(()),
+                width: 0,
+                height: 0,
+            });
         }
 
         #[cfg(test)]
@@ -388,7 +705,15 @@ pub fn find<C: Channel>(frame: &View<C>, parts: FaceParts, cells: usize) -> Vec<
     for y in 0..frame.height {
         pixels.extend_from_slice(frame.row(y));
     }
-    find_in(&pixels, frame.width, frame.height, parts, cells)
+    find_in(&pixels, frame.width, frame.height, parts, cells).blobs
+}
+
+/// What [`find_in`] found, and how long its body detection took if it ran one.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct Found {
+    blobs: Vec<Blob>,
+    body_time: Option<std::time::Duration>,
 }
 
 /// [`find`] in a frame of tightly packed rows, once the models have loaded. The models sample the
@@ -400,7 +725,7 @@ fn find_in<C: Channel>(
     height: i32,
     parts: FaceParts,
     cells: usize,
-) -> Vec<Blob> {
+) -> Found {
     use segcam_face::{Image, Kind, Parts, Pixels};
 
     use crate::motion::{NormRect, SegmentKind};
@@ -416,10 +741,11 @@ fn find_in<C: Channel>(
         stride: width.max(0) as usize,
     };
     let Some(mut slot) = models::lock() else {
-        return Vec::new();
+        return Found::default();
     };
+    models::keep_working(&mut slot);
     let Some(segmenter) = slot.as_mut() else {
-        return Vec::new();
+        return Found::default();
     };
     let wanted = Parts {
         face: parts.face,
@@ -427,7 +753,7 @@ fn find_in<C: Channel>(
         mouth: parts.mouth,
         body: parts.body,
     };
-    segmenter
+    let blobs = segmenter
         .find(&image, wanted)
         .iter()
         .map(|s| Blob {
@@ -456,7 +782,9 @@ fn find_in<C: Channel>(
                 .landmarks
                 .map(|points| points.map(|(x, y)| (x as f32, y as f32))),
         })
-        .collect()
+        .collect();
+    let body_time = segmenter.body_time().filter(|_| parts.body);
+    Found { blobs, body_time }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -496,6 +824,10 @@ impl LiveFaces {
     pub fn windows_cut_on(&mut self, _frame: i64) {}
 
     pub fn forget(&mut self) {}
+
+    pub fn answer_waiting(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -558,6 +890,7 @@ pub fn readings(models_loaded: bool, blobs: &[Blob]) -> Vec<Reading> {
 mod tests {
     use super::*;
     use crate::motion::NormRect;
+    use std::time::Duration;
 
     #[test]
     fn held_faces_count_as_found_on_their_own_frame() {
@@ -593,6 +926,56 @@ mod tests {
         }
         assert_eq!(live.requests_sent, 1);
         drop(models);
+    }
+
+    /// A slow detection holds the next request back, and a quick one doesn't.
+    #[test]
+    fn a_slow_detection_paces_the_next_request() {
+        let _gpu_lock = crate::gpu::gpu_test_lock();
+        let models = lock_models();
+        let pixels = vec![crate::pixel::Argb::<u8>::default(); 16];
+        let view = View::from_pixels(&pixels, 4, 4);
+        let parts = FaceParts {
+            face: true,
+            ..FaceParts::default()
+        };
+        let mut slow = LiveFaces::default();
+        slow.answer_after(parts, Vec::new(), Duration::from_secs(3600), true);
+        slow.exchange(&view, parts, 1, 0, 0);
+        slow.exchange(&view, parts, 1, 1, 0);
+        assert_eq!(slow.requests_sent, 0, "asked while the device is busy");
+        let mut quick = LiveFaces::default();
+        quick.answer_after(parts, Vec::new(), Duration::ZERO, true);
+        quick.exchange(&view, parts, 1, 0, 0);
+        assert_eq!(quick.requests_sent, 1);
+        drop(models);
+    }
+
+    /// A detection that left bodies out keeps the bodies held, and one that looked for them
+    /// replaces them.
+    #[test]
+    fn a_detection_without_bodies_keeps_the_held_ones() {
+        let pixels = vec![crate::pixel::Argb::<u8>::default(); 16];
+        let view = View::from_pixels(&pixels, 4, 4);
+        let parts = FaceParts {
+            face: true,
+            body: true,
+            ..FaceParts::default()
+        };
+        let blob = |kind| Blob {
+            kind,
+            ..Blob::default()
+        };
+        let kinds = |live: &LiveFaces| live.faces_on(1).map(|b| b.kind).collect::<Vec<_>>();
+        let busy = Duration::from_secs(3600);
+        let mut live = LiveFaces::default();
+        live.hold(parts, vec![blob(SegmentKind::Body)], 0, 0);
+        live.answer_after(parts, vec![blob(SegmentKind::Face)], busy, false);
+        live.exchange(&view, parts, 1, 1, 0);
+        assert_eq!(kinds(&live), [SegmentKind::Face, SegmentKind::Body]);
+        live.answer_after(parts, vec![blob(SegmentKind::Face)], busy, true);
+        live.exchange(&view, parts, 1, 1, 0);
+        assert_eq!(kinds(&live), [SegmentKind::Face]);
     }
 
     /// An answer that was on its way when the renders moved elsewhere never attaches.

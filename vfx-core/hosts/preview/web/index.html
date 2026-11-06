@@ -17,6 +17,10 @@
 </head>
 <body>
   <div id="status">Loading VFX Preview…</div>
+  <script>
+    // Until the app has loaded and takes drops itself, a dropped file must not replace the page.
+    for (const type of ["dragover", "drop"]) addEventListener(type, (e) => e.preventDefault());
+  </script>
   <script type="module">
     import init from "./vfx-preview.js";
     if (!navigator.gpu) {

@@ -16,6 +16,7 @@ pub mod vision;
 pub mod yunet;
 
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub use picodet::Body;
 pub use yunet::Face;
@@ -212,6 +213,48 @@ impl Segmenter {
         }
     }
 
+    /// Which of the optional models loaded: the mesh, for eyes and mouths, and bodies. A load during
+    /// a reset can get the detector and miss these, which a later load puts right.
+    pub fn optional_models(&self) -> (bool, bool) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Vision(_) => (true, true),
+            #[cfg(feature = "onnx")]
+            Self::Ort(segmenter, _) => (segmenter.mesh.is_some(), segmenter.bodies.is_some()),
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => (false, false),
+        }
+    }
+
+    /// Whether the models' runs keep failing, as they do once a driver reset takes their device.
+    pub fn failing(&self) -> bool {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Vision(_) => false,
+            #[cfg(feature = "onnx")]
+            Self::Ort(segmenter, _) => {
+                segmenter.detector.failing()
+                    || segmenter.bodies.as_ref().is_some_and(BodyDetector::failing)
+            }
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => false,
+        }
+    }
+
+    /// How long finding bodies took in the last [`Segmenter::find`] that looked for them. The body
+    /// detector runs beside the faces. None before the first such find, and from Vision, which
+    /// finds everything in one request.
+    pub fn body_time(&self) -> Option<Duration> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Vision(_) => None,
+            #[cfg(feature = "onnx")]
+            Self::Ort(segmenter, _) => segmenter.body_time,
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => None,
+        }
+    }
+
     /// The `parts` in `image`: each face and then its parts, then the bodies.
     pub fn find(&mut self, image: &Image, parts: Parts) -> &[Segment] {
         match self {
@@ -228,6 +271,11 @@ impl Segmenter {
 /// Finds faces in a frame, best first.
 pub trait Detector {
     fn detect(&mut self, image: &Image) -> Vec<Face>;
+
+    /// Whether its last few runs all failed.
+    fn failing(&self) -> bool {
+        false
+    }
 }
 
 /// Face landmarks normalized to the frame, indexed as MediaPipe Face Mesh's.
@@ -238,6 +286,11 @@ pub trait Landmarker {
 /// Finds people in a frame, best first.
 pub trait BodyDetector: Send {
     fn detect(&mut self, image: &Image) -> Vec<Body>;
+
+    /// Whether its last few runs all failed.
+    fn failing(&self) -> bool {
+        false
+    }
 }
 
 /// Turns detections into segments, sized to match segcam 1.1.
@@ -246,6 +299,8 @@ pub struct FaceSegmenter<D, M, B> {
     pub mesh: Option<M>,
     pub bodies: Option<B>,
     segments: Vec<Segment>,
+    /// How long the body detector took in the last find that ran it.
+    pub body_time: Option<Duration>,
 }
 
 /// Face boxes are square, as tall as YuNet's box and moved down by this fraction of its height.
@@ -264,6 +319,20 @@ const MOUTH_OFFSET_Y: f64 = 0.1;
 const EYE_OUTLINE_SCALE: f64 = 1.7;
 const LIP_OUTLINE_SCALE: f64 = 1.27;
 
+/// Finds bodies beside the faces. One thread kept for the process, so finding starts none: see
+/// `on_workers` in vfx-host for why a thread per frame is a problem in a show. It isn't one of the
+/// frame workers, since a detection takes far longer than a band of pixels.
+static BODY_WORKER: std::sync::LazyLock<Option<rayon::ThreadPool>> = std::sync::LazyLock::new(
+    || {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "segcam body detection".to_owned())
+            .build()
+            .inspect_err(|e| eprintln!("segcam-face: no body detection thread, bodies are found in turn with faces: {e}"))
+            .ok()
+    },
+);
+
 impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
     pub fn new(detector: D, mesh: Option<M>, bodies: Option<B>) -> Self {
         Self {
@@ -271,6 +340,7 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
             mesh,
             bodies,
             segments: Vec::new(),
+            body_time: None,
         }
     }
 
@@ -278,21 +348,49 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
     pub fn find(&mut self, image: &Image, parts: Parts) -> &[Segment] {
         self.segments.clear();
         let mut bodies = self.bodies.take();
-        let found = std::thread::scope(|scope| {
-            let finding = bodies
-                .as_mut()
-                .filter(|_| parts.body)
-                .map(|b| scope.spawn(|| b.detect(image)));
+        let mut found = Vec::new();
+        let mut body_time = None;
+        let mut find_faces = || {
             if parts.face || parts.eyes || parts.mouth {
                 for face in &self.detector.detect(image) {
                     self.push_face(image, face, parts);
                 }
             }
-            finding
-                .map(|f| f.join().unwrap_or_default())
-                .unwrap_or_default()
-        });
+        };
+        let finding = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match bodies.as_mut().filter(|_| parts.body) {
+                Some(bodies) => {
+                    // A body detector's panic costs this frame's bodies, never the faces, and the
+                    // detector is kept for the next frame.
+                    let mut detect = || {
+                        let started = Instant::now();
+                        let detect = std::panic::AssertUnwindSafe(|| bodies.detect(image));
+                        found = std::panic::catch_unwind(detect).unwrap_or_default();
+                        body_time = Some(started.elapsed());
+                    };
+                    match &*BODY_WORKER {
+                        Some(worker) => worker.in_place_scope(|scope| {
+                            scope.spawn(|_| detect());
+                            find_faces();
+                        }),
+                        None => {
+                            detect();
+                            find_faces();
+                        }
+                    }
+                }
+                None => find_faces(),
+            }
+        }));
+        // The body detector goes back before a face detector's panic carries on to the caller,
+        // which would otherwise lose it for the rest of the process.
         self.bodies = bodies;
+        if body_time.is_some() {
+            self.body_time = body_time;
+        }
+        if let Err(panic) = finding {
+            std::panic::resume_unwind(panic);
+        }
         for body in found {
             self.push(Kind::Body, body.rect);
         }
@@ -421,6 +519,102 @@ mod tests {
             stride: 1,
         };
         image.rgb(0, 0)
+    }
+
+    struct OneFace;
+    impl Detector for OneFace {
+        fn detect(&mut self, _: &Image) -> Vec<Face> {
+            let rect = Rect {
+                x: 0.4,
+                y: 0.4,
+                w: 0.2,
+                h: 0.2,
+            };
+            vec![Face {
+                rect,
+                landmarks: [(0.5, 0.5); 5],
+                score: 1.0,
+            }]
+        }
+    }
+    struct NoMesh;
+    impl Landmarker for NoMesh {
+        fn landmarks(&mut self, _: &Image, _: &Face) -> Option<Vec<(f64, f64)>> {
+            None
+        }
+    }
+    /// Panics on its first run and finds one body after.
+    struct PanicsOnce(bool);
+    impl BodyDetector for PanicsOnce {
+        fn detect(&mut self, _: &Image) -> Vec<Body> {
+            if !self.0 {
+                self.0 = true;
+                panic!("body detector failed");
+            }
+            vec![Body {
+                rect: Rect {
+                    x: 0.1,
+                    y: 0.1,
+                    w: 0.5,
+                    h: 0.8,
+                },
+                score: 1.0,
+            }]
+        }
+    }
+
+    #[test]
+    fn a_body_detector_panic_costs_only_that_frames_bodies() {
+        let pixels = [0u8; 4 * 4 * 4];
+        let image = Image {
+            pixels: Pixels::Argb8(&pixels),
+            width: 4,
+            height: 4,
+            stride: 4,
+        };
+        let all = Parts {
+            face: true,
+            eyes: false,
+            mouth: false,
+            body: true,
+        };
+        let mut segmenter = FaceSegmenter::new(OneFace, None::<NoMesh>, Some(PanicsOnce(false)));
+        let kinds = |s: &[Segment]| s.iter().map(|s| s.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(segmenter.find(&image, all)), [Kind::Face]);
+        assert!(segmenter.bodies.is_some());
+        assert_eq!(kinds(segmenter.find(&image, all)), [Kind::Face, Kind::Body]);
+    }
+
+    /// Panics on every run.
+    struct PanickingFaces;
+    impl Detector for PanickingFaces {
+        fn detect(&mut self, _: &Image) -> Vec<Face> {
+            panic!("face detector failed")
+        }
+    }
+
+    #[test]
+    fn a_face_detector_panic_keeps_the_body_detector() {
+        let pixels = [0u8; 4 * 4 * 4];
+        let image = Image {
+            pixels: Pixels::Argb8(&pixels),
+            width: 4,
+            height: 4,
+            stride: 4,
+        };
+        let all = Parts {
+            face: true,
+            eyes: false,
+            mouth: false,
+            body: true,
+        };
+        let mut segmenter =
+            FaceSegmenter::new(PanickingFaces, None::<NoMesh>, Some(PanicsOnce(true)));
+        let finding = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            segmenter.find(&image, all);
+        }));
+        assert!(finding.is_err(), "the face detector's panic was swallowed");
+        assert!(segmenter.bodies.is_some(), "the body detector was lost");
     }
 
     #[test]

@@ -16,9 +16,6 @@ pub const FRAME_FORMAT: vfx_core::wgpu::TextureFormat = vfx_core::wgpu::TextureF
 /// Prepared instances kept for reuse. Enough for a few sizes × concurrent renders.
 const POOL_LIMIT: usize = 8;
 
-/// Device key for the plugin's own headless device (the CPU path).
-pub const HEADLESS_DEVICE: usize = 0;
-
 static POOL: Mutex<Vec<Prepared>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,8 +111,9 @@ pub struct Job<'a> {
     pub layer: Option<&'a [f32]>,
 }
 
-pub fn run(gpu: &Gpu, job: &Job) -> Vec<f32> {
-    let mut lease = Lease::new(gpu, HEADLESS_DEVICE, &job.spec);
+/// Renders `job` on `gpu`, with what was prepared under the pool key `device`.
+pub fn run(gpu: &Gpu, device: usize, job: &Job) -> Vec<f32> {
+    let mut lease = Lease::new(gpu, device, &job.spec);
     lease.input().write(gpu, bytemuck::cast_slice(job.input));
     if let Some(layer) = job.layer {
         lease.layer().write(gpu, bytemuck::cast_slice(layer));
@@ -128,6 +126,17 @@ pub fn run(gpu: &Gpu, job: &Job) -> Vec<f32> {
     p.readback
         .get_or_insert_with(|| Readback::new(gpu, &p.output))
         .read_f32(gpu, &p.output)
+}
+
+/// Drops what was prepared on the device `device` keys: it's lost, and a new device may be given
+/// the same key. The instances are dropped after the pool is unlocked, since dropping a lost
+/// device's objects can wait and every render takes the lock.
+pub fn forget_device(device: usize) {
+    let forgotten: Vec<Prepared> = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.extract_if(.., |p| p.key.device == device).collect()
+    };
+    drop(forgotten);
 }
 
 fn take(gpu: &Gpu, key: Key) -> Prepared {

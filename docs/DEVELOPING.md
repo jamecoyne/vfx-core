@@ -117,8 +117,11 @@ old targets keep compiling. From 1.0 on, nothing here is removed or renamed.
 | `FrameSource`: `with_frame`; `History` | vfx-core | from the start; `fixed` since #31 |
 | `FrameSource::held`; `History::next(before, held)` | vfx-core | #57 |
 | `FrameSource::live` (true for `History`) | vfx-core | #59 |
+| `DeviceFaults::same_device` (whether two records are one device, across wgpu instances), `ReopenBackoff` (when to try for a new device after a loss) | vfx-core | device reopen |
+| `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core | #82 |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core | from the start |
 | `Gpu::share`, `Gpu::shared` | vfx-core | #47 in browsers; native since #70 |
+| `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core | this PR |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core | from the start; `ViewMut::bands` since #11, `Argb` as bytemuck `Pod` since #39 |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core | from the start |
 | `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host | #16; the frame rate since #50 |
@@ -177,8 +180,9 @@ plugins/
 
 ## Building and running
 
-Needs a current stable Rust (egui needs 1.95+; CI uses latest stable). macOS bundles are
-universal, so add both targets once:
+Needs a current stable Rust (egui needs 1.95+; CI uses latest stable). The desktop preview also
+needs `ffmpeg` and `ffprobe` on PATH for video files, webcams and Record, and `ffplay` for sound.
+macOS bundles are universal, so add both targets once:
 
 ```bash
 rustup target add aarch64-apple-darwin x86_64-apple-darwin wasm32-unknown-unknown
@@ -209,8 +213,8 @@ Each plugin writes one-line notes about which render path ran to
 
 ## The preview
 
-The preview hosts one effect at a time: test patterns, images, video files or a webcam
-go in, a panel made from the effect's parameters drives it, every float and integer
+The preview hosts one effect at a time: test patterns, images, video files, a webcam or,
+on Windows, a Spout sender go in, a panel made from the effect's parameters drives it, every float and integer
 parameter has an expression box (`sin(time/4)`, `bass * 2`, face tracking), and a video
 renders to MP4 through it. It links the effects it offers, so the same build runs on the
 desktop and in the browser. Its build script lists every effect crate among its

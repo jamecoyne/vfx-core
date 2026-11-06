@@ -3,8 +3,8 @@
 //! `MAX_IMAGE_SIDE`, onto an offscreen canvas and copied from there onto the GPU. The
 //! desktop build uses ffmpeg instead (`video.rs`).
 //!
-//! Browsers answer a file pick or a camera request later, so both land in a [`Pending`]
-//! the app checks each frame.
+//! Browsers answer a file pick, a dropped file or a camera request later, so all of them land
+//! in a [`Pending`] the app checks each frame.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -16,8 +16,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    HtmlInputElement, HtmlVideoElement, MediaStream, MediaStreamTrack, OffscreenCanvas,
-    OffscreenCanvasRenderingContext2d, Url,
+    CanvasRenderingContext2d, DragEvent, File, HtmlCanvasElement, HtmlInputElement,
+    HtmlVideoElement, MediaStream, MediaStreamTrack, Url,
 };
 
 use crate::effects::MAX_IMAGE_SIDE;
@@ -25,7 +25,7 @@ use crate::effects::MAX_IMAGE_SIDE;
 /// The panel's webcam list: the browser picks the camera (and asks first).
 pub static CAMERAS: LazyLock<Vec<String>> = LazyLock::new(|| vec!["Webcam".to_string()]);
 
-/// A file pick or camera request, filled in when the browser answers.
+/// A file pick, dropped file or camera request, filled in when the browser answers.
 pub type Pending = Rc<RefCell<Option<Result<WebVideo, String>>>>;
 
 /// A `<video>` element playing a file or the camera.
@@ -35,7 +35,8 @@ pub struct WebVideo {
     camera: Option<MediaStream>,
     /// The file's object URL, revoked on drop.
     url: Option<String>,
-    canvas: Option<(OffscreenCanvas, OffscreenCanvasRenderingContext2d)>,
+    /// A page canvas, not an OffscreenCanvas: WebGL2 can't copy from an OffscreenCanvas.
+    canvas: Option<(HtmlCanvasElement, CanvasRenderingContext2d)>,
     /// The video time of the last frame copied, so a paused video isn't copied again.
     last_copied_time: Option<f64>,
     /// The last frame the browser presented, its media time and count, from
@@ -240,8 +241,16 @@ impl WebVideo {
             .as_ref()
             .is_none_or(|(c, _)| (c.width(), c.height()) != (w, h))
         {
-            let canvas = OffscreenCanvas::new(w, h).map_err(js_error_text)?;
-            let context: OffscreenCanvasRenderingContext2d = canvas
+            let canvas: HtmlCanvasElement = web_sys::window()
+                .and_then(|window| window.document())
+                .ok_or("no document")?
+                .create_element("canvas")
+                .map_err(js_error_text)?
+                .dyn_into()
+                .map_err(|_| "not a canvas")?;
+            canvas.set_width(w);
+            canvas.set_height(h);
+            let context: CanvasRenderingContext2d = canvas
                 .get_context("2d")
                 .map_err(js_error_text)?
                 .ok_or("no 2D context")?
@@ -261,7 +270,7 @@ impl WebVideo {
             .map_err(js_error_text)?;
         gpu.queue.copy_external_image_to_texture(
             &wgpu::CopyExternalImageSourceInfo {
-                source: wgpu::ExternalImageSource::OffscreenCanvas(canvas.clone()),
+                source: wgpu::ExternalImageSource::HTMLCanvasElement(canvas.clone()),
                 origin: wgpu::Origin2d::ZERO,
                 flip_y: false,
             },
@@ -306,6 +315,60 @@ impl Drop for WebVideo {
     }
 }
 
+/// Starts playing a picked or dropped file. The check is on the type the browser reports: the
+/// picker's filter can be switched to all files, and a drop has no filter. An element given
+/// something else never reports a size, so the source would just not change.
+fn open_file(file: &File) -> Result<WebVideo, String> {
+    if !file.type_().starts_with("video/") {
+        return Err(format!("{} isn't a video", file.name()));
+    }
+    let url = Url::create_object_url_with_blob(file).map_err(js_error_text)?;
+    let video = new_video_element()?;
+    video.set_loop(true);
+    video.set_src(&url);
+    Ok(WebVideo::new(video, file.name(), None, Some(url)))
+}
+
+/// Takes files dropped anywhere on the page, as the desktop window does, instead of letting the
+/// browser leave the page to show them. The first file of several lands in `pending`. Drags
+/// don't produce pointer events, so the canvas and the panel keep theirs. The listeners stay for
+/// the life of the page.
+pub fn listen_for_dropped_files(pending: &Pending) {
+    let answer = pending.clone();
+    let result = (|| -> Result<(), String> {
+        let window = web_sys::window().ok_or("no window")?;
+        // The browser only fires `drop` where `dragover` was cancelled.
+        let on_drag_over = Closure::<dyn FnMut(DragEvent)>::new(|event: DragEvent| {
+            event.prevent_default();
+            if let Some(transfer) = event.data_transfer() {
+                transfer.set_drop_effect("copy");
+            }
+        });
+        let on_drop = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
+            event.prevent_default();
+            let file = event
+                .data_transfer()
+                .and_then(|transfer| transfer.files())
+                .and_then(|files| files.get(0));
+            if let Some(file) = file {
+                *answer.borrow_mut() = Some(open_file(&file));
+            }
+        });
+        window
+            .add_event_listener_with_callback(
+                "dragover",
+                on_drag_over.into_js_value().unchecked_ref(),
+            )
+            .map_err(js_error_text)?;
+        window
+            .add_event_listener_with_callback("drop", on_drop.into_js_value().unchecked_ref())
+            .map_err(js_error_text)
+    })();
+    if let Err(e) = result {
+        *pending.borrow_mut() = Some(Err(e));
+    }
+}
+
 /// Opens the browser's file picker for a video; the answer lands in `pending`.
 pub fn pick_file(pending: &Pending) {
     let answer = pending.clone();
@@ -325,14 +388,7 @@ pub fn pick_file(pending: &Pending) {
             let Some(file) = picked.files().and_then(|f| f.get(0)) else {
                 return;
             };
-            let opened = (|| {
-                let url = Url::create_object_url_with_blob(&file).map_err(js_error_text)?;
-                let video = new_video_element()?;
-                video.set_loop(true);
-                video.set_src(&url);
-                Ok(WebVideo::new(video, file.name(), None, Some(url)))
-            })();
-            *answer.borrow_mut() = Some(opened);
+            *answer.borrow_mut() = Some(open_file(&file));
         });
         input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
         on_change.forget();

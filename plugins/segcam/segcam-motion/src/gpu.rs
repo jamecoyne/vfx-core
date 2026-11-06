@@ -5,16 +5,16 @@
 //! CPU path stays the reference and the fallback; Overlay draws there unless asked
 //! ([`crate::IncrementalRenderer::gpu_overlay`]). The device opens in the background, and renders
 //! draw on the CPU until it is ready. A render the GPU fails is drawn on the CPU and the next one
-//! retries the GPU, or after `MAX_RECENT_FAULTS`, retries after `FAULT_COOLDOWN`; a lost device
-//! is disabled for every instance. In browsers it draws on the device the host shares. A draw into
-//! a host's frame needs no readback anywhere; otherwise a browser reads it back at the next render
-//! of the same frame.
+//! retries the GPU, or after `MAX_RECENT_FAULTS`, retries after `FAULT_COOLDOWN`. After a device is
+//! lost every instance draws on the CPU until [`DeviceSlot`] has another. In browsers it draws on
+//! the device the host shares. A draw into a host's frame needs no readback anywhere; otherwise a
+//! browser reads it back at the next render of the same frame.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 #[cfg(test)]
 use std::sync::MutexGuard;
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
@@ -23,7 +23,7 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
-use vfx_core::{DeviceFaults, wgpu};
+use vfx_core::{DeviceFaults, ReopenBackoff, wgpu};
 
 use crate::chrome;
 use crate::font;
@@ -47,9 +47,8 @@ pub struct GpuContext {
     /// A render that sees the device's error count move falls back and the device stays; once the
     /// device is lost, nothing draws on it.
     faults: DeviceFaults,
-    /// Whether a host shared this device. Only then can a host's frame be on it: wgpu compares
-    /// devices by an id unique within one `Instance`, so a device opened here can compare equal
-    /// to a host's.
+    /// Whether a host shared this device. Only then can a host's frame be on it, and only the host
+    /// can replace it.
     host_shared: bool,
     /// An atlas built ahead for the first drawer, so its first render doesn't allocate one.
     preallocated_atlas: Mutex<Option<Atlas>>,
@@ -65,9 +64,9 @@ struct Unpack {
 }
 
 impl GpuContext {
-    /// Whether `device` is this one.
-    pub(crate) fn wraps(&self, device: &wgpu::Device) -> bool {
-        self.host_shared && self.device == *device
+    /// Whether the device `faults` reports on is this one, shared by a host.
+    pub(crate) fn wraps(&self, faults: &DeviceFaults) -> bool {
+        self.host_shared && self.faults.same_device(faults)
     }
 
     /// The unpack for frames of `format`.
@@ -198,10 +197,14 @@ pub fn adapter_choice() -> String {
 /// Why there is no GPU to draw on.
 #[derive(Clone, Debug)]
 pub enum NoGpu {
-    /// No adapter, software ones left out: the CPU is the path for this machine.
+    /// No adapter, software ones left out. Once a first open's retries are spent, the CPU is the
+    /// path for this machine.
     NoAdapter(String),
     /// There is one, but making its device or drawing on it failed.
     Failed(String),
+    /// The device was lost while it was being set up. This says nothing about the machine, so
+    /// even a first open tries again for as long as a lost device would.
+    Lost(String),
 }
 
 impl std::fmt::Display for NoGpu {
@@ -209,54 +212,250 @@ impl std::fmt::Display for NoGpu {
         match self {
             NoGpu::NoAdapter(e) => write!(f, "no GPU: {e}"),
             NoGpu::Failed(e) => write!(f, "the GPU failed: {e}"),
+            NoGpu::Lost(e) => write!(f, "the GPU was lost: {e}"),
         }
     }
 }
 
-/// Whether there is a working GPU, or why not. Waits for the device to open.
+/// Whether there is a working GPU, or why not. Waits for the first open. A first open that fails
+/// answers its reason at once, and a later call can answer `Ok` once a retry opens a device. After
+/// a loss it answers that the GPU failed, without waiting for another device.
 pub fn status() -> Result<(), NoGpu> {
-    open_shared_device();
-    status_of(&DEVICE)
+    SHARED_SLOT.status()
 }
 
-fn status_of(opened: &OnceLock<Opened>) -> Result<(), NoGpu> {
-    match opened.wait() {
-        Ok(dev) => dev.lost().map_or(Ok(()), |e| Err(NoGpu::Failed(e))),
-        Err(e) => Err(e.clone()),
-    }
-}
-
-/// Whether the shared device is still opening: no answer yet from [`device`].
+/// Whether the first device is still opening: no answer yet from [`status`].
 pub fn opening() -> bool {
-    open_shared_device();
-    DEVICE.get().is_none()
+    SHARED_SLOT.first_open_pending()
 }
 
-/// The shared device, or `None` while it opens, where there is no adapter, or once it is lost.
-pub fn device() -> Option<Arc<GpuContext>> {
-    open_shared_device();
-    let dev = DEVICE.get()?.as_ref().ok()?;
-    dev.lost().is_none().then(|| dev.clone())
+/// What an instance can draw on right now.
+pub enum DeviceNow {
+    Ready(Arc<GpuContext>),
+    /// None yet: one is opening, or a lost one is to be replaced. Renders draw on the CPU and ask
+    /// again.
+    Waiting,
+    /// This machine's path is the CPU.
+    Never,
 }
 
-type Opened = Result<Arc<GpuContext>, NoGpu>;
+/// The device every instance draws with.
+pub(crate) static SHARED_SLOT: LazyLock<DeviceSlot> =
+    LazyLock::new(|| DeviceSlot::new(|adapter| open_on(&adapter_choice(), adapter)));
 
-static DEVICE: OnceLock<Opened> = OnceLock::new();
+/// Tries after a first open that failed, on the reopen backoff: 1, 2, 4, 8 and 16 s, about as long
+/// as a reset can hide an adapter. A reset can make the first open fail in ways that look like the
+/// machine's answer: the device is lost inside `request_device`, the driver panics while the
+/// pipelines build, or the hardware adapter is hidden so that none is found or only a software one.
+/// None of these can be told apart from a machine without a usable GPU, so all are tried again,
+/// and the last answer after these tries is final. A browser's tries would run inside a render,
+/// and its device is the host's, which the host replaces itself: there the first answer is final.
+const FIRST_OPEN_RETRIES: u32 = if cfg!(target_arch = "wasm32") { 0 } else { 5 };
 
-/// Opens the device every instance shares, on first use, in the background: opening it and
-/// compiling its pipelines would stall a render. Software adapters (WARP, lavapipe) are left
-/// out unless `SEGCAM_GPU_ADAPTER=fallback` asks for one; `SEGCAM_GPU_ADAPTER=low` picks the
-/// low power adapter (an integrated GPU).
-fn open_shared_device() {
-    static START: Once = Once::new();
-    START.call_once(|| {
-        let load = || {
-            let choice = adapter_choice();
+/// How long a test waits on first open tries with a mock open. A try takes the D3D12 device lock
+/// before it opens anything, and a face test in the same process can hold that lock while its
+/// models load.
+#[cfg(test)]
+pub(crate) const FIRST_OPEN_TEST_DEADLINE: Duration = Duration::from_secs(60);
+
+enum SlotState {
+    Unopened,
+    /// With why the last device was lost, where this replaces one. Without, the first open.
+    Opening {
+        replaces: Option<String>,
+    },
+    Open {
+        device: Arc<GpuContext>,
+        opened_at: Instant,
+    },
+    /// No device has opened yet: the last of `failures` tries answered `why`, and the next isn't
+    /// before `next_try`.
+    FirstOpenFailed {
+        why: NoGpu,
+        failures: u32,
+        next_try: Instant,
+    },
+    /// Another try after [`SlotState::FirstOpenFailed`] is in flight. Unlike the first open,
+    /// [`DeviceSlot::status`] doesn't wait for it.
+    RetryingFirstOpen {
+        why: NoGpu,
+        failures: u32,
+    },
+    /// No device opened in [`FIRST_OPEN_RETRIES`] tries after the first, which is final.
+    Refused(NoGpu),
+    /// Lost, and the next try isn't before `next_try`. Any failure on the way back is retried,
+    /// since adapters can be missing during a driver reset.
+    Lost {
+        why: String,
+        next_try: Instant,
+    },
+}
+
+/// One device for every instance, replaced after a loss. Opening goes on a background thread:
+/// making a device and compiling its pipelines would stall a render.
+pub(crate) struct DeviceSlot {
+    /// Opens a device, on the adapter with this name if one is given.
+    open: OpenDevice,
+    state: Mutex<SlotState>,
+    backoff: Mutex<ReopenBackoff>,
+    /// The name of the adapter of the last device of segcam's own that was lost.
+    lost_adapter: Mutex<Option<String>>,
+    answered: Condvar,
+}
+
+type OpenDevice = Box<dyn Fn(Option<&str>) -> Result<GpuContext, NoGpu> + Send + Sync>;
+
+impl DeviceSlot {
+    pub(crate) fn new(
+        open: impl Fn(Option<&str>) -> Result<GpuContext, NoGpu> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            open: Box::new(open),
+            state: Mutex::new(SlotState::Unopened),
+            backoff: Mutex::new(ReopenBackoff::default()),
+            lost_adapter: Mutex::new(None),
+            answered: Condvar::new(),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn backoff(&self) -> std::sync::MutexGuard<'_, ReopenBackoff> {
+        self.backoff.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lost_adapter(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.lost_adapter.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What to draw on now; moves the slot on when a device is lost or a try is due.
+    pub(crate) fn now(&'static self) -> DeviceNow {
+        let mut state = self.state();
+        let replaces = match &*state {
+            SlotState::Unopened => None,
+            SlotState::Opening { .. } | SlotState::RetryingFirstOpen { .. } => {
+                return DeviceNow::Waiting;
+            }
+            SlotState::Refused(_) => return DeviceNow::Never,
+            SlotState::FirstOpenFailed {
+                why,
+                failures,
+                next_try,
+            } => {
+                if !host_device_usable() || Instant::now() < *next_try {
+                    return DeviceNow::Waiting;
+                }
+                *state = SlotState::RetryingFirstOpen {
+                    why: why.clone(),
+                    failures: *failures,
+                };
+                drop(state);
+                self.open_in_background();
+                return DeviceNow::Waiting;
+            }
+            SlotState::Open { device, opened_at } => {
+                let Some(why) = device.lost() else {
+                    return DeviceNow::Ready(device.clone());
+                };
+                self.backoff().lost(opened_at.elapsed());
+                // A host's replacement is taken as soon as there is one.
+                let delay = match device.host_shared {
+                    true => Duration::ZERO,
+                    false => {
+                        *self.lost_adapter() = Some(device.info.name.clone());
+                        self.backoff().next_delay()
+                    }
+                };
+                retire(device.clone());
+                *state = SlotState::Lost {
+                    why,
+                    next_try: Instant::now() + delay,
+                };
+                return DeviceNow::Waiting;
+            }
+            SlotState::Lost { why, next_try } => {
+                if !host_device_usable() || Instant::now() < *next_try {
+                    return DeviceNow::Waiting;
+                }
+                Some(why.clone())
+            }
+        };
+        *state = SlotState::Opening { replaces };
+        drop(state);
+        self.open_in_background();
+        DeviceNow::Waiting
+    }
+
+    /// Starts the first open if nothing has.
+    fn start(&'static self) {
+        let mut state = self.state();
+        if matches!(*state, SlotState::Unopened) {
+            *state = SlotState::Opening { replaces: None };
+            drop(state);
+            self.open_in_background();
+        }
+    }
+
+    pub(crate) fn status(&'static self) -> Result<(), NoGpu> {
+        self.start();
+        let mut state = self.state();
+        while matches!(*state, SlotState::Opening { replaces: None }) {
+            state = self.answered.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        match &*state {
+            SlotState::Open { device, .. } => {
+                device.lost().map_or(Ok(()), |e| Err(NoGpu::Failed(e)))
+            }
+            SlotState::Refused(e)
+            | SlotState::FirstOpenFailed { why: e, .. }
+            | SlotState::RetryingFirstOpen { why: e, .. } => Err(e.clone()),
+            SlotState::Lost { why, .. } => Err(NoGpu::Failed(why.clone())),
+            SlotState::Opening {
+                replaces: Some(why),
+            } => Err(NoGpu::Failed(why.clone())),
+            SlotState::Opening { replaces: None } | SlotState::Unopened => {
+                unreachable!("started above and waited for")
+            }
+        }
+    }
+
+    /// Moves a slot whose first open failed to its next try without waiting out the backoff, and
+    /// answers what `now` says then. Waits for a try in flight to answer first.
+    #[cfg(test)]
+    pub(crate) fn next_first_open_try(&'static self) -> DeviceNow {
+        let deadline = Instant::now() + FIRST_OPEN_TEST_DEADLINE;
+        loop {
+            match &mut *self.state() {
+                SlotState::RetryingFirstOpen { .. } | SlotState::Opening { .. } => {}
+                SlotState::FirstOpenFailed { next_try, .. } => {
+                    *next_try = Instant::now();
+                    break;
+                }
+                _ => break,
+            }
+            assert!(Instant::now() < deadline, "a try never answered");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.now()
+    }
+
+    fn first_open_pending(&'static self) -> bool {
+        self.start();
+        matches!(*self.state(), SlotState::Opening { replaces: None })
+    }
+
+    fn open_in_background(&'static self) {
+        let load = move || {
             // Wrapping a host's device creates none, so it needn't wait behind the face trial.
             #[cfg(not(target_arch = "wasm32"))]
-            let _device_lock = (!choice.is_empty() || vfx_core::Gpu::shared().is_none())
+            let _device_lock = (!adapter_choice().is_empty() || vfx_core::Gpu::shared().is_none())
                 .then(segcam_face::d3d12_device_lock);
-            open_and_publish(&DEVICE, || open(&choice));
+            let adapter = (self.backoff().same_adapter_only())
+                .then(|| self.lost_adapter().clone())
+                .flatten();
+            self.publish(open_with_atlas(&self.open, adapter.as_deref()));
         };
         #[cfg(not(target_arch = "wasm32"))]
         let spawned = std::thread::Builder::new()
@@ -268,14 +467,80 @@ fn open_shared_device() {
         if !spawned {
             load();
         }
-    });
+    }
+
+    fn publish(&self, opened: Result<Arc<GpuContext>, NoGpu>) {
+        let mut state = self.state();
+        // Tries so far that opened nothing, where no device has opened yet.
+        let (replaces, failures) = match &*state {
+            SlotState::Opening { replaces } => (replaces.clone(), 0),
+            SlotState::RetryingFirstOpen { failures, .. } => (None, *failures),
+            // Only a try in flight publishes, and nothing else leaves these two states.
+            _ => return,
+        };
+        *state = match (opened, replaces) {
+            (Ok(device), replaces) => {
+                eprintln!("segcam Motion: drawing on the GPU ({})", device.info.name);
+                // A first device that opened without a loss starts the backoff afresh, whatever
+                // its failed tries counted. One that follows a loss keeps counting, as any
+                // replacement does until it lasts.
+                if replaces.is_none() {
+                    *self.backoff() = ReopenBackoff::default();
+                }
+                SlotState::Open {
+                    device,
+                    opened_at: Instant::now(),
+                }
+            }
+            (Err(NoGpu::Lost(why)), None) => {
+                let delay = self.backoff().next_delay();
+                eprintln!(
+                    "segcam Motion: the GPU was lost as it opened ({why}); next try in {delay:?}"
+                );
+                SlotState::Lost {
+                    why,
+                    next_try: Instant::now() + delay,
+                }
+            }
+            (Err(e), None) if failures < FIRST_OPEN_RETRIES => {
+                let delay = self.backoff().next_delay();
+                eprintln!("segcam Motion: no GPU yet ({e}); next try in {delay:?}");
+                SlotState::FirstOpenFailed {
+                    why: e,
+                    failures: failures + 1,
+                    next_try: Instant::now() + delay,
+                }
+            }
+            (Err(e), None) => {
+                eprintln!("segcam Motion: drawing on the CPU ({e})");
+                SlotState::Refused(e)
+            }
+            (Err(e), Some(why)) => {
+                let delay = self.backoff().next_delay();
+                eprintln!("segcam Motion: no new device yet ({e}); next try in {delay:?}");
+                SlotState::Lost {
+                    why,
+                    next_try: Instant::now() + delay,
+                }
+            }
+        };
+        self.answered.notify_all();
+    }
 }
 
-/// Opens the device with `open` and publishes the result to `opened`. A driver panic counts as a
-/// failed GPU, so waiters aren't left blocked.
-fn open_and_publish(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<GpuContext, NoGpu>) {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let dev = Arc::new(open()?);
+/// Whether a try may go ahead as far as a host's concerned: while the device it shares is lost,
+/// only the host can replace it. A device of segcam's own couldn't take the host's frames, and it
+/// would compete with the one the host is opening.
+fn host_device_usable() -> bool {
+    !adapter_choice().is_empty()
+        || vfx_core::Gpu::shared().is_none_or(|gpu| gpu.faults().lost().is_none())
+}
+
+/// Opens a device with `open` and builds its first atlas. A driver panic counts as a failed GPU, so
+/// waiters aren't left blocked.
+fn open_with_atlas(open: &OpenDevice, adapter: Option<&str>) -> Result<Arc<GpuContext>, NoGpu> {
+    catch_unwind(AssertUnwindSafe(|| {
+        let dev = Arc::new(open(adapter)?);
         if let Ok(mut preallocated_atlas) = dev.preallocated_atlas.lock() {
             *preallocated_atlas = Some(Atlas::new(&dev));
         }
@@ -288,16 +553,40 @@ fn open_and_publish(opened: &OnceLock<Opened>, open: impl FnOnce() -> Result<Gpu
             .or_else(|| panic.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "opening the device panicked".into());
         Err(NoGpu::Failed(why))
-    });
-    match &result {
-        Ok(dev) => eprintln!("segcam Motion: drawing on the GPU ({})", dev.info.name),
-        Err(e) => eprintln!("segcam Motion: drawing on the CPU ({e})"),
-    }
-    let _ = opened.set(result);
+    })
 }
 
+/// Drops a lost device once its last drawer has gone, off the render thread: wgpu's queue waits
+/// when it drops and panics on anything but a loss from that wait. Making or releasing a D3D12
+/// device takes the lock face models take. If the drop panics, what's left of the device leaks.
 #[cfg(not(target_arch = "wasm32"))]
+fn retire(device: Arc<GpuContext>) {
+    let spawned = std::thread::Builder::new()
+        .name("segcam GPU retire".into())
+        .spawn(move || {
+            while Arc::strong_count(&device) > 1 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let _device_lock = segcam_face::d3d12_device_lock();
+            if catch_unwind(AssertUnwindSafe(move || drop(device))).is_err() {
+                eprintln!("segcam Motion: dropping a lost device panicked; it stays allocated");
+            }
+        });
+    drop(spawned);
+}
+
+/// Browsers free it when it goes, and have no threads to do it on.
+#[cfg(target_arch = "wasm32")]
+fn retire(_device: Arc<GpuContext>) {}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
+    open_on(choice, None)
+}
+
+/// A device, on the adapter named `lost_adapter` where there is one to go back to.
+#[cfg(not(target_arch = "wasm32"))]
+fn open_on(choice: &str, lost_adapter: Option<&str>) -> Result<GpuContext, NoGpu> {
     // A host that shows frames from the GPU shares the device they're on, so the swarm can draw
     // its output there. An adapter asked for by name still gets a device of its own.
     if choice.is_empty()
@@ -311,12 +600,15 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
         let errors_before = gpu.faults().errors().0;
         let dev = on_shared(gpu);
         return match (dev.lost(), dev.errors()) {
-            (Some(e), _) => Err(NoGpu::Failed(e)),
+            (Some(e), _) => Err(NoGpu::Lost(e)),
             (None, (count, e)) if count != errors_before => Err(NoGpu::Failed(e)),
             _ => Ok(dev),
         };
     }
-    let adapter = pick_adapter(choice)?;
+    let adapter = match lost_adapter {
+        Some(name) => adapter_named(name)?,
+        None => pick_adapter(choice)?,
+    };
     let info = adapter.get_info();
     // The atlas grows with the trail: take as much of a binding as the adapter allows.
     let supported = adapter.limits();
@@ -328,6 +620,7 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("segcam Motion"),
         required_limits,
+        memory_hints: vfx_core::Gpu::memory_hints(),
         ..wgpu::DeviceDescriptor::default()
     }))
     .map_err(|e| NoGpu::Failed(e.to_string()))?;
@@ -337,21 +630,37 @@ pub(crate) fn open(choice: &str) -> Result<GpuContext, NoGpu> {
         .min(supported.max_buffer_size);
     let dev = GpuContext::build(device, queue, info, max_binding, faults, false);
     match (dev.lost(), dev.errors()) {
-        (Some(e), _) | (None, (1.., e)) => Err(NoGpu::Failed(e)),
+        (Some(e), _) => Err(NoGpu::Lost(e)),
+        (None, (1.., e)) => Err(NoGpu::Failed(e)),
         _ => Ok(dev),
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn pick_adapter(choice: &str) -> Result<wgpu::Adapter, NoGpu> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+fn new_instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         // The D3D12 validation layer changes what DirectML finds in the same process, so it
         // is on only with WGPU_VALIDATION=1.
         flags: (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION)
             .with_env(),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
+    })
+}
+
+/// The adapter called `name`, if it's back.
+#[cfg(not(target_arch = "wasm32"))]
+fn adapter_named(name: &str) -> Result<wgpu::Adapter, NoGpu> {
+    let instance = new_instance();
+    pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY))
+        .into_iter()
+        .find(|adapter| adapter.get_info().name == name)
+        .ok_or_else(|| NoGpu::NoAdapter(format!("{name} isn't back")))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_adapter(choice: &str) -> Result<wgpu::Adapter, NoGpu> {
+    let instance = new_instance();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: match choice {
             "low" => wgpu::PowerPreference::LowPower,
@@ -433,7 +742,7 @@ fn on_shared(gpu: vfx_core::Gpu) -> GpuContext {
 
 // Browsers can't wait for a device inside a render, so this draws on the one the host shared.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn open(_choice: &str) -> Result<GpuContext, NoGpu> {
+fn open_on(_choice: &str, _lost_adapter: Option<&str>) -> Result<GpuContext, NoGpu> {
     let gpu =
         vfx_core::Gpu::shared().ok_or_else(|| NoGpu::NoAdapter("the host shared no GPU".into()))?;
     Ok(on_shared(gpu))
@@ -772,6 +1081,12 @@ impl GrowableBuffer {
     }
 }
 
+/// What the tables buffer starts at, ahead of the atlas growing: 46 KB at 1080p with 100 tiles, and
+/// about 100 KB at 4K. Grown later, it would land in the allocator's newest block, the one the
+/// atlas has just taken, and hold that block once the atlas outgrows it (see
+/// [`vfx_core::Gpu::memory_hints`]).
+const TABLE_BUFFER_BYTES: u64 = 256 << 10;
+
 /// Per effect instance GPU state: buffers, atlas, timeouts, fault history.
 pub struct Drawer {
     dev: Arc<GpuContext>,
@@ -838,6 +1153,13 @@ impl Drawer {
             .lock()
             .ok()
             .and_then(|mut s| s.take());
+        let mut table_buffer = GrowableBuffer::new("segcam tables", U::STORAGE | U::COPY_DST);
+        let table_bytes = TABLE_BUFFER_BYTES
+            .min(dev.max_binding)
+            .min(dev.device.limits().max_buffer_size);
+        table_buffer
+            .ensure_size(&dev, dev.max_binding, table_bytes)
+            .ok()?;
         let drawer = Self {
             globals: dev.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("segcam globals"),
@@ -854,7 +1176,7 @@ impl Drawer {
             frame_buffer: GrowableBuffer::new("segcam frame", U::STORAGE | U::COPY_DST),
             output_buffer: GrowableBuffer::new("segcam output", U::STORAGE | U::COPY_SRC),
             readback_buffer: GrowableBuffer::new("segcam readback", U::MAP_READ | U::COPY_DST),
-            table_buffer: GrowableBuffer::new("segcam tables", U::STORAGE | U::COPY_DST),
+            table_buffer,
             atlas: Arc::new(Mutex::new(
                 preallocated_atlas.unwrap_or_else(|| Atlas::new(&dev)),
             )),
@@ -885,9 +1207,14 @@ impl Drawer {
         &self.dev.info
     }
 
-    /// Whether this draws on `device`.
-    pub fn draws_on(&self, device: &wgpu::Device) -> bool {
-        self.dev.wraps(device)
+    /// Whether this draws on the host's device `faults` reports on.
+    pub fn draws_on(&self, faults: &DeviceFaults) -> bool {
+        self.dev.wraps(faults)
+    }
+
+    /// Why the device is lost, if it's known to be. No poll, so a render can ask every time.
+    pub(crate) fn loss(&self) -> Option<String> {
+        self.dev.lost()
     }
 
     /// Whether the device is lost, which it says when polled.
@@ -950,6 +1277,12 @@ impl Drawer {
     #[cfg(test)]
     pub(crate) fn small_atlas(&mut self, words: u64) {
         self.atlas = Arc::new(Mutex::new(Atlas::with_words(&self.dev, words)));
+    }
+
+    /// The tables buffer's size.
+    #[cfg(test)]
+    pub(crate) fn table_buffer_bytes(&self) -> u64 {
+        self.table_buffer.buffer.as_ref().map_or(0, |b| b.size())
     }
 
     /// The atlas's size and its free space, in words.
@@ -1514,14 +1847,13 @@ impl Drawer {
             let mapped: &[u8] = &mapped;
             let threads =
                 vfx_plugin::vfx_host::worker_threads().clamp(1, out.height.max(1) as usize);
-            std::thread::scope(|scope| {
-                for mut band in out.bands(threads) {
-                    scope.spawn(move || {
-                        for y in band.rows() {
-                            let at = y as usize * row;
-                            pixel_bytes_mut(band.row_mut(y)).copy_from_slice(&mapped[at..at + row]);
-                        }
-                    });
+            let bands = std::sync::Mutex::new(out.bands(threads));
+            vfx_plugin::vfx_host::on_workers(threads, || {
+                while let Some(mut band) = bands.lock().ok().and_then(|mut bands| bands.pop()) {
+                    for y in band.rows() {
+                        let at = y as usize * row;
+                        pixel_bytes_mut(band.row_mut(y)).copy_from_slice(&mapped[at..at + row]);
+                    }
                 }
             });
         }
@@ -1763,18 +2095,123 @@ mod tests {
         assert!(atlas_accepts_writes(&atlas, &dev), "the atlas is invalid");
     }
 
+    /// A try after a loss asks for the adapter that was lost.
+    #[test]
+    fn a_new_device_is_asked_for_on_the_lost_adapter() {
+        let _lock = gpu_test_lock();
+        let choice = adapter_choice();
+        if open(&choice).is_err() && open("fallback").is_err() {
+            eprintln!("no adapter: skipped");
+            return;
+        }
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let told = asked.clone();
+        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |adapter| {
+            told.lock().unwrap().push(adapter.map(str::to_owned));
+            open(&choice).or_else(|_| open("fallback"))
+        })));
+        let device = || loop {
+            match slot.now() {
+                DeviceNow::Ready(dev) => return dev,
+                DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+                DeviceNow::Never => panic!("the slot gave up"),
+            }
+        };
+        let first = device();
+        first.device.destroy();
+        let _ = vfx_core::poll_device(&first.device, wgpu::PollType::wait_indefinitely());
+        let name = first.info.name.clone();
+        let second = device();
+        assert!(second.lost().is_none());
+        assert_eq!(*asked.lock().unwrap(), [None, Some(name)]);
+    }
+
     /// A panic while the device opens, as a broken driver can cause, answers that the GPU
     /// failed instead of leaving every caller waiting.
     #[test]
     fn panic_while_opening_is_a_failed_gpu() {
-        static OPENED: OnceLock<Opened> = OnceLock::new();
-        let opening =
-            std::thread::spawn(|| open_and_publish(&OPENED, || panic!("a broken driver")));
-        opening.join().expect("the panic got out of the opening");
-        assert!(OPENED.get().is_some(), "still opening after the panic");
-        match status_of(&OPENED) {
+        let slot: &'static DeviceSlot =
+            Box::leak(Box::new(DeviceSlot::new(|_| panic!("a broken driver"))));
+        match slot.status() {
             Err(NoGpu::Failed(e)) => assert!(e.contains("a broken driver"), "{e}"),
             other => panic!("not a failed GPU: {other:?}"),
+        }
+    }
+
+    /// An adapter hidden by a reset during the first open isn't the machine's answer: `status`
+    /// reports it without waiting for another try, renders keep asking, and the next try opens.
+    #[test]
+    fn first_open_without_an_adapter_tries_again() {
+        let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = tries.clone();
+        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(NoGpu::NoAdapter("hidden by a reset".into()))
+        })));
+        assert!(matches!(slot.status(), Err(NoGpu::NoAdapter(_))));
+        assert!(!slot.first_open_pending(), "status waits for retries");
+        assert!(
+            matches!(slot.now(), DeviceNow::Waiting),
+            "the first answer was final"
+        );
+        assert!(matches!(slot.next_first_open_try(), DeviceNow::Waiting));
+        // Wait for the try just started to answer.
+        let _ = slot.next_first_open_try();
+        assert!(
+            tries.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "no second try"
+        );
+    }
+
+    /// A first open that keeps failing, here with a driver panic, becomes final after
+    /// [`FIRST_OPEN_RETRIES`] more tries and keeps its reason.
+    #[test]
+    fn first_open_failures_are_final_after_the_retries() {
+        let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = tries.clone();
+        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            panic!("a driver reset")
+        })));
+        assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
+        let deadline = Instant::now() + FIRST_OPEN_TEST_DEADLINE;
+        while !matches!(slot.next_first_open_try(), DeviceNow::Never) {
+            assert!(Instant::now() < deadline, "the slot never gave up");
+        }
+        assert_eq!(
+            tries.load(std::sync::atomic::Ordering::Relaxed),
+            1 + FIRST_OPEN_RETRIES
+        );
+        match slot.status() {
+            Err(NoGpu::Failed(e)) => assert!(e.contains("a driver reset"), "{e}"),
+            other => panic!("not a failed GPU: {other:?}"),
+        }
+    }
+
+    /// A first open that overlaps a loss isn't the machine's answer: the slot tries again.
+    #[test]
+    fn first_open_overlapping_a_loss_tries_again() {
+        let _lock = gpu_test_lock();
+        if open("fallback").is_err() {
+            eprintln!("no adapter: skipped");
+            return;
+        }
+        let tries = std::sync::atomic::AtomicU32::new(0);
+        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| match tries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => Err(NoGpu::Lost("mid open".into())),
+            _ => open("fallback"),
+        })));
+        assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match slot.now() {
+                DeviceNow::Ready(_) => return,
+                DeviceNow::Never => panic!("the first open's loss was final"),
+                DeviceNow::Waiting if Instant::now() > deadline => panic!("no second try"),
+                DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+            }
         }
     }
 }

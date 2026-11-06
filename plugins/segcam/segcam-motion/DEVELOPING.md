@@ -29,7 +29,8 @@ less one in Swarm mode and what the analysis adds (see below), through `CpuEffec
 It keeps each frame's grid, motion and tiles until they age out (`src/incremental.rs`), with a hash
 of the frame's pixels. A check reads each frame a render depends on and finds an edit upstream
 however far back it is. Only a frame whose pixels changed is analysed again, along with the motion
-and tiles that depend on it.
+and tiles that depend on it. A check hashes a frame's bytes as the host holds them and converts only a
+frame it needs (`FrameSource::with_frame_if_wanted`).
 
 While Resolve streams, a render reads the current frame and those it hasn't analysed. An edit is
 caught when that frame is rendered, or at the next check: the first two renders after a pause or a
@@ -57,19 +58,30 @@ one analysis more, to get the analysis whose faces it reuses.
 Faces run on every 2nd analysis, the even frame numbers below 90 fps: the analysis between shows the
 faces of the one before, with their IDs, or finds its own when the host doesn't hand that frame
 over. On Windows the models load on a thread of their own, and a line on stderr says which device
-they run on. In Resolume and the preview detection runs beside the renders. Faces can arrive a few
+they run on. A short trial at the start times DirectML and the CPU, and picks DirectML if it comes
+within 1.5 times of the fastest, since in a render the CPU shares its cores with everything else.
+`SEGCAM_FACE_DEVICE=cpu`, or a DXGI adapter number, skips the trial. In Resolume and the preview detection runs beside the renders. Faces can arrive a few
 frames late, each new window showing the frame its face was found in, and a slow device finds faces
 less often instead of slowing the renders.
 
 Resolume and the preview hand frames over one at a time and hold only the current one in full
 (`CpuEffect::frames_held`). Earlier frames live on as their grids, segments and the tiles the pile
-still draws, and a setting changed live reaches new windows only.
+still draws, and a setting changed live reaches new windows only. A picture that holds exactly
+still counts as one frame there (`History::drop_repeat`), and its windows stay until it changes.
 
 In Resolume on Windows a swarm drawn on the GPU stays there: the plugin shares the device its frames
 are on, and the swarm draws into a frame Resolume shows from (`CpuEffect::render_to`), with no copy
 back. There the swarm always draws on the GPU, since the share of windows below which it draws on
 the CPU was set by the cost of the copy back. The output is byte for byte the swarm read back, and a
 frame drawn on the CPU (while the device opens, or after a fault) goes through RAM as before.
+
+A lost GPU device is replaced. Renders draw on the CPU meanwhile, and a new device opens on a backoff
+of 1, 2, 4, 8, 16 and then every 30 s, on the same adapter for about 30 s and then on any. A first open
+that fails, finding no adapter or only a software one included, tries again at 1, 2, 4, 8 and 16 s,
+since a driver reset can look like any of these, and draws on the CPU for good after that. Each try
+holds the D3D12 device lock, so face models that load during a reset wait behind the tries. Face models
+that keep failing reload on the same backoff. In Resolume on Windows the plugin opens the new shared
+device off the render thread.
 
 Detection runs on the CPU: a connected component labeller over a grid, 192 columns by default, fed
 one frame at a time. Swarm's drawing runs on the GPU when there is one and its windows cover enough

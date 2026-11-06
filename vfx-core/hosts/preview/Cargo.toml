@@ -55,21 +55,28 @@ segcam-face = { path = "../../../plugins/segcam/segcam-face", optional = true }
 [target.'cfg(windows)'.dependencies]
 # A job object, so ffmpeg and ffplay close with the app.
 windows-sys = { version = "0.61.2", features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# wgpu's own version. `--lose-gpu SECONDS:removed` casts its D3D12 device, and Spout input
+# (spout.rs) opens senders' textures with D3D11 and shares them with wgpu's device.
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common",
+    "Win32_Security", "Win32_System_Memory", "Win32_System_Threading",
+] }
 
 # The web build (GitHub Pages): WebGPU in the browser, started from JavaScript.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Browsers are single-threaded: lets wgpu's WebGPU types satisfy vfx-core's `Send`
 # bound on effects. Safe without wasm threads (atomics), which this build doesn't use.
-wgpu = { version = "=30.0.1", features = ["fragile-send-sync-non-atomic-wasm"] }
+wgpu = { version = "=30.0.1", features = ["fragile-send-sync-non-atomic-wasm", "webgl"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 # The DOM, plus a <video> for video files and the webcam (web_media.rs).
 web-sys = { version = "0.3", features = [
-    "Document", "Element", "HtmlElement", "Location", "Window",
+    "DataTransfer", "Document", "DragEvent", "Element", "HtmlElement", "Location", "Window",
     "HtmlInputElement", "HtmlMediaElement", "HtmlVideoElement", "File", "FileList", "Blob", "Url",
     "Navigator", "MediaDevices", "MediaStream", "MediaStreamTrack", "MediaStreamConstraints",
-    "OffscreenCanvas", "OffscreenCanvasRenderingContext2d",
+    "CanvasRenderingContext2d",
     "BlobEvent", "BlobPropertyBag", "HtmlAnchorElement", "HtmlCanvasElement", "MediaRecorder",
     "MediaRecorderOptions", "RecordingState", "console",
 ] }

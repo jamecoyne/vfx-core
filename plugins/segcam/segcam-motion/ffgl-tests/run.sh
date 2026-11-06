@@ -18,6 +18,11 @@ case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*) plugin="$target/release/segcam_motion.dll" host="$target/ffgl-minihost/minihost.exe" cli="$target/release/segcam-motion.exe" ;;
   *) plugin="$target/release/libsegcam_motion.dylib" host="$target/ffgl-minihost/minihost" cli="$target/release/segcam-motion" ;;
 esac
+# On the GPU, in a process of its own, since a process has one device slot. Windows only, like the
+# shared frames it needs.
+if [ "$case_name" = all ] && [ "${host%.exe}" != "$host" ]; then
+  "$host" "$plugin" segcam-device-reopen
+fi
 if [ "$case_name" = all ] || [ "$case_name" = segcam ]; then
   "$(command -v python3 || command -v python)" "$here/compare.py" "$host" "$plugin" "$cli" ${quick[@]+"${quick[@]}"} "${@:2}"
 fi

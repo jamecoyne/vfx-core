@@ -15,6 +15,10 @@ use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, Gpu, ParamValues, Target};
 use vfx_host::{CpuInstance, by_rows};
 
+/// How long a frame read back may take once the poll has returned.
+#[cfg(not(target_arch = "wasm32"))]
+const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub enum Input<'a> {
     Gpu(&'a Frame),
     /// A decoded frame in RAM; empty until the first arrives.
@@ -99,6 +103,22 @@ impl CpuStage {
         self.reader = None;
     }
 
+    /// Goes on with what's in RAM on a new device, after the last was lost: the effect keeps its
+    /// history and the next render draws for the new device. The output starts black until then.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn move_to_device(&mut self, gpu: &Gpu) {
+        self.output = Frame::new(
+            gpu,
+            self.size.0,
+            self.size.1,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        self.output_drawn_on_gpu = false;
+        self.reader = None;
+        self.rendered_with = None;
+        self.upload_pending = !self.shown.is_empty();
+    }
+
     pub fn output(&self) -> &Frame {
         &self.output
     }
@@ -160,6 +180,7 @@ impl CpuStage {
                             };
                         }
                     });
+                    self.history.drop_repeat();
                 });
                 self.reader = Some(reader);
             }
@@ -168,6 +189,7 @@ impl CpuStage {
                 if !pixels.is_empty() && self.last_time != Some(time) {
                     self.next_history_frame(time, values, frame_rate)
                         .copy_from_slice(pixels);
+                    self.history.drop_repeat();
                 }
             }
         }
@@ -443,8 +465,12 @@ impl GpuFrameReader {
         if vfx_core::poll_device(&gpu.device, wgpu::PollType::wait_indefinitely()).is_err() {
             return;
         }
-        if let Ok(Ok(())) = rx.recv() {
-            self.with_mapped_rows(&self.buffer, time, f);
+        // D3D12 finishes a poll on a removed device without having found the loss, so the map may
+        // never answer. A frame that doesn't arrive is skipped; a buffer still being mapped can't
+        // be mapped again, so the next read needs a new one.
+        match rx.recv_timeout(READBACK_TIMEOUT) {
+            Ok(Ok(())) => self.with_mapped_rows(&self.buffer, time, f),
+            _ => self.buffer = new_readback_buffer(gpu, self.pitch, input.height),
         }
     }
 
@@ -714,6 +740,8 @@ mod tests {
         stage.push_input(&gpu, Input::Gpu(&input), 0.0, &values, None);
         assert_eq!(stage.history.len(), 1);
 
+        // Another picture, so only the failed read keeps it from counting as a frame.
+        input.write(&gpu, bytemuck::cast_slice(&vec![0.75f32; 32 * 32 * 4]));
         gpu.device.destroy();
         stage.push_input(&gpu, Input::Gpu(&input), 1.0, &values, None);
         assert_eq!(

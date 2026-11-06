@@ -19,14 +19,18 @@ vfx-preview [FLAGS] [FILE]
   --mode NAME          the effect's mode: an option of its menu (Swarm, \"Motion matte\")
   --param NAME=VALUE   a parameter by its name; repeatable. Numbers, true/false, an
                        option's name or index, r,g,b,a for colours, x,y for points
-  --input SOURCE       pattern[:NAME|N], camera[:NAME|N], or a video or image path
+  --input SOURCE       pattern[:NAME|N], camera[:NAME|N], spout[:NAME] (Windows), or a video
+                       or image path
   --size WxH           the frame size (patterns, and videos, webcams and stills fitted into it)
   --gpu GPU            high, low, or part of an adapter's name (default high)
   --detect-faces       tick the Expressions panel's Detect faces
   --stats              print the stats bar to stdout once a second
   --frames N           exit after N frames
   --seconds N          exit after N seconds
+  --record FILE        record the output into FILE, an MP4, until the run ends
   --quiet              no window on screen (frames unpaced, not shown)
+  --lose-gpu S[:KIND]  lose the GPU device S seconds in, to test reopening it; repeatable. KIND is
+                       destroy (default), or removed for D3D12's own device removal
   --list               print the effects and their parameters, then exit
   --help               print this, then exit
 ";
@@ -44,7 +48,9 @@ pub struct Options {
     pub detect_faces: bool,
     pub stats: bool,
     pub stop: Option<StopAfter>,
+    pub record: Option<PathBuf>,
     pub quiet: bool,
+    pub forced_losses: Vec<ForcedLoss>,
     pub list: bool,
     pub help: bool,
 }
@@ -55,7 +61,26 @@ pub enum Source {
     Pattern(String),
     /// A webcam by part of its name or its index; empty for the first.
     Camera(String),
+    /// A Spout sender by its name or part of it; empty for the first running.
+    Spout(String),
     File(PathBuf),
+}
+
+/// A device loss `--lose-gpu` asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ForcedLoss {
+    pub after_seconds: f64,
+    pub kind: LossKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LossKind {
+    /// `Device::destroy`, on any backend. wgpu finds this one from a poll, by another way than a
+    /// driver's loss.
+    Destroy,
+    /// `ID3D12Device5::RemoveDevice`, which goes through wgpu as a driver's loss does on D3D12, and
+    /// takes every user of that adapter's D3D12 device in this process with it, as DirectML.
+    Removed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -76,7 +101,10 @@ impl Options {
             || self.stats
             || self.stop.is_some()
             || self.quiet
-            || matches!(self.input, Some(Source::Pattern(_) | Source::Camera(_)))
+            || matches!(
+                self.input,
+                Some(Source::Pattern(_) | Source::Camera(_) | Source::Spout(_))
+            )
     }
 }
 
@@ -124,7 +152,23 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String
                 }
                 options.stop = Some(StopAfter::Seconds(s));
             }
+            "--record" => options.record = Some(value()?.into()),
             "--quiet" => options.quiet = true,
+            "--lose-gpu" => {
+                let v = value()?;
+                let (seconds, kind) = v.split_once(':').unwrap_or((&v, "destroy"));
+                let kind = match kind {
+                    "destroy" => LossKind::Destroy,
+                    "removed" => LossKind::Removed,
+                    _ => return Err(format!("--lose-gpu {v}: destroy or removed")),
+                };
+                options.forced_losses.push(ForcedLoss {
+                    after_seconds: seconds
+                        .parse()
+                        .map_err(|_| format!("--lose-gpu {v}: not a number of seconds"))?,
+                    kind,
+                });
+            }
             "--list" => options.list = true,
             "--help" | "-h" => options.help = true,
             _ if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
@@ -139,6 +183,7 @@ fn parse_source(text: &str) -> Source {
     match kind {
         "pattern" => Source::Pattern(rest.to_owned()),
         "camera" => Source::Camera(rest.to_owned()),
+        "spout" => Source::Spout(rest.to_owned()),
         _ => Source::File(text.into()),
     }
 }
@@ -430,8 +475,25 @@ mod tests {
             "--seconds",
             "5",
             "--quiet",
+            "--lose-gpu",
+            "3",
+            "--lose-gpu",
+            "4.5:removed",
         ])
         .unwrap();
+        assert_eq!(
+            o.forced_losses,
+            [
+                ForcedLoss {
+                    after_seconds: 3.0,
+                    kind: LossKind::Destroy
+                },
+                ForcedLoss {
+                    after_seconds: 4.5,
+                    kind: LossKind::Removed
+                },
+            ]
+        );
         assert!(o.detect_faces);
         assert_eq!(o.mode.as_deref(), Some("Swarm"));
         assert_eq!(o.params, [("grid".to_owned(), "96".to_owned())]);
@@ -444,6 +506,9 @@ mod tests {
             args(&["--input", "camera"]).unwrap().input,
             Some(Source::Camera("".into()))
         );
+        let spout = args(&["--input", "spout:TD out"]).unwrap();
+        assert_eq!(spout.input, Some(Source::Spout("TD out".into())));
+        assert!(spout.scripted());
     }
 
     #[test]
@@ -452,6 +517,8 @@ mod tests {
         assert!(args(&["--size", "0x10"]).is_err());
         assert!(args(&["--frames", "many"]).is_err());
         assert!(args(&["--seconds", "0"]).is_err());
+        assert!(args(&["--lose-gpu", "soon"]).is_err());
+        assert!(args(&["--lose-gpu", "3:gently"]).is_err());
         assert!(args(&["--param", "grid"]).is_err());
         assert!(args(&["--effect"]).is_err());
         assert!(args(&["--fast"]).is_err());

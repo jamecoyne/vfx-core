@@ -168,7 +168,9 @@ struct Instance {
     interop_disabled: bool,
     /// The frame a CPU effect may draw its output into, on the interop's device.
     #[cfg(target_os = "windows")]
-    gpu_output_frame: Option<vfx_core::Frame>,
+    gpu_output_frame: Option<shared::OutputFrame>,
+    /// RAM path renders until the plugin's own device is destroyed, for tests.
+    renders_until_own_device_loss: Option<u32>,
 }
 
 /// `VFX_FFGL_PATH=ram`: every frame through RAM, the zero-copy paths off.
@@ -206,6 +208,28 @@ impl Instance {
             interop_disabled: ram_path_forced(),
             #[cfg(target_os = "windows")]
             gpu_output_frame: None,
+            renders_until_own_device_loss: std::env::var("VFX_FFGL_LOSE_OWN_DEVICE_AFTER")
+                .ok()
+                .and_then(|count| count.parse().ok()),
+        }
+    }
+
+    /// Destroys the plugin's own device once `VFX_FFGL_LOSE_OWN_DEVICE_AFTER`, read when the
+    /// instance is made, has counted down its RAM path renders. A test of the way back from a
+    /// loss: the device's loss callback runs, and this render fails and passes its frame through.
+    fn force_own_device_loss_for_tests(
+        renders_until_loss: &mut Option<u32>,
+        device: &vfx_host::OwnDevice,
+    ) {
+        let Some(renders) = renders_until_loss else {
+            return;
+        };
+        *renders = renders.saturating_sub(1);
+        if *renders == 0 {
+            *renders_until_loss = None;
+            let device = &device.gpu().device;
+            device.destroy();
+            let _ = vfx_core::poll_device(device, vfx_core::wgpu::PollType::wait_indefinitely());
         }
     }
 
@@ -347,6 +371,14 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
                 if let Err(e) = unsafe { shared::share_device_with_cpu_effects() } {
                     LOG.note(&format!("warning: no shared device for GPU output: {e}"));
                 }
+            }
+            // A GPU effect that renders through RAM opens the plugin's own device; start that now
+            // so it's ready by the first frames. On Windows those normally go through the device
+            // shared with OpenGL, and the plugin's own is opened only when they can't.
+            if vfx_host::plugin().kind == Kind::Gpu
+                && (!cfg!(target_os = "windows") || ram_path_forced())
+            {
+                let _ = vfx_host::gpu_now(&LOG);
             }
             let mut instance = Instance::new();
             match unsafe { gl::Blit::new(gl::PASS) } {
@@ -543,6 +575,7 @@ unsafe fn process_cpu(
             cpu.history.next(frames_before, frames_held),
         )
     };
+    cpu.history.drop_repeat();
     let read_time = started.elapsed();
     let ctx = Context {
         frame: cpu.history.frame_number(),
@@ -558,7 +591,7 @@ unsafe fn process_cpu(
     let target = (instance.interop.current())
         .zip(instance.gpu_output_frame.as_ref())
         .filter(|_| gpu_output_ready)
-        .map(|(interop, frame)| vfx_core::Target::new(interop.gpu(), frame));
+        .map(|(interop, output)| vfx_core::Target::new(interop.gpu(), output.frame()));
     #[cfg(not(target_os = "windows"))]
     let target = None;
     let effect = &cpu.effect;
@@ -575,14 +608,16 @@ unsafe fn process_cpu(
     let render_time = started.elapsed() - read_time;
     #[cfg(target_os = "windows")]
     if on_gpu {
+        instance.interop.force_loss_before_present_for_tests();
         let presented = (instance.interop.current())
             .zip(instance.gpu_output_frame.as_ref())
-            .map(|(interop, frame)| {
+            .map(|(interop, output)| {
                 // SAFETY: the context is current with the host's framebuffer bound, and the effect
-                // drew `frame` on the interop's device.
-                catch_unwind(AssertUnwindSafe(|| unsafe { interop.present(frame) })).unwrap_or_else(
-                    |_| Err(shared::InteropError::Failed("the render panicked".into())),
-                )
+                // drew the frame on the interop's device.
+                catch_unwind(AssertUnwindSafe(|| unsafe {
+                    interop.present(output.frame())
+                }))
+                .unwrap_or_else(|_| Err(shared::InteropError::Failed("the render panicked".into())))
             });
         if let Some(Err(e)) = presented {
             // This frame exists only on the GPU, so the input stands in for it. The next ones go
@@ -674,16 +709,7 @@ unsafe fn prepare_gpu_output(
         instance.gpu_output_frame = None;
         return false;
     };
-    let frame = &mut instance.gpu_output_frame;
-    if frame.as_ref().is_none_or(|f| (f.width, f.height) != size) {
-        let (w, h) = size;
-        *frame = Some(vfx_core::Frame::new(
-            interop.gpu(),
-            w,
-            h,
-            pipeline::FRAME_FORMAT,
-        ));
-    }
+    shared::OutputFrame::keep_or_make(&mut instance.gpu_output_frame, interop.gpu(), size);
     true
 }
 
@@ -733,19 +759,30 @@ unsafe fn process_gpu(
         }
     }
 
-    let Some(gpu) = vfx_host::gpu(&LOG) else {
+    // Never waits for a device: until one is open, and while a lost one is replaced, frames pass
+    // through.
+    let Some(device) = vfx_host::gpu_now(&LOG) else {
+        LOG.note("render path: passing frames through: no device for the RAM path");
         return pass_through(blit);
     };
 
     #[cfg(target_os = "macos")]
     if !instance.interop_disabled {
-        if instance.interop.as_ref().is_none_or(|i| i.size() != (w, h)) {
+        if (instance.interop.as_ref()).is_none_or(|i| i.size() != (w, h) || !i.renders_on(&device))
+        {
             // SAFETY: the context is current; the old interop belongs to it.
             if let Some(old) = instance.interop.take() {
                 unsafe { old.delete() };
             }
-            match unsafe { surface::Interop::new(gpu, (w, h)) } {
+            match unsafe { surface::Interop::new(device.clone(), (w, h)) } {
                 Ok(interop) => instance.interop = Some(interop),
+                // A device lost again since it opened: the next replacement builds the interop.
+                Err(e) if device.lost().is_some() => {
+                    LOG.note(&format!(
+                        "warning: zero-copy path not set up on a lost device, passing frames through: {e}"
+                    ));
+                    return pass_through(blit);
+                }
                 Err(e) => {
                     LOG.note(&format!(
                         "warning: zero-copy path unavailable, using RAM: {e}"
@@ -759,14 +796,7 @@ unsafe fn process_gpu(
             let hardware = (input_texture.hardware_width, input_texture.hardware_height);
             // SAFETY: the context is current; the texture is the host's input.
             let rendered = catch_unwind(AssertUnwindSafe(|| unsafe {
-                interop.render(
-                    gpu,
-                    &values,
-                    ctx,
-                    input_texture.handle,
-                    hardware,
-                    args.host_fbo,
-                )
+                interop.render(&values, ctx, input_texture.handle, hardware, args.host_fbo)
             }));
             if rendered.is_err() {
                 LOG.note("warning: GPU render failed, passing frames through");
@@ -829,7 +859,10 @@ unsafe fn process_gpu(
         layer: None,
     };
     LOG.note("render path: GPU through RAM (texture readback)");
-    let Ok(result) = catch_unwind(AssertUnwindSafe(|| pipeline::run(gpu, &job))) else {
+    Instance::force_own_device_loss_for_tests(&mut instance.renders_until_own_device_loss, &device);
+    let Ok(result) = catch_unwind(AssertUnwindSafe(|| {
+        pipeline::run(device.gpu(), device.pool_key, &job)
+    })) else {
         LOG.note("warning: GPU render failed, passing frames through");
         return pass_through(blit);
     };
