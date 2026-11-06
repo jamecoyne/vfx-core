@@ -38,8 +38,8 @@ and find each frame's own faces.
 
 The browser has no faces yet.
 
-On a slow GPU, live playback finds faces and bodies less often, so the picture keeps its rate.
-Exports still find every frame's faces.
+On a slow GPU, live playback finds faces and bodies less often, to leave the GPU more time for the
+picture. Exports still find every frame's faces.
 
 ## Parameters
 
