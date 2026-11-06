@@ -18,6 +18,10 @@ vfx-host = { path = "../../wrappers/common" }
 # build script lists every path dependency with [package.metadata.vfx]; `cargo vfx new` adds
 # a new effect here, and `cargo vfx check` reports one that's missing.
 vfx-chain = { path = "../../../plugins/vfx-chain" }
+colour-adjust = { path = "../../../plugins/colour-adjust" }
+gaussian-blur = { path = "../../../plugins/gaussian-blur" }
+vignette = { path = "../../../plugins/vignette" }
+blend = { path = "../../../plugins/blend" }
 segcam-motion = { path = "../../../plugins/segcam/segcam-motion" }
 wgpu = "=30.0.1"
 # egui's winit backend targets winit 0.30.

@@ -257,13 +257,17 @@ fn add_effect_dependency(text: &str, name: &str) -> Result<String, String> {
     if text.contains(&line) {
         return Ok(text.to_owned());
     }
-    let marker = "path = \"../../../plugins/";
-    let last = text
-        .match_indices(marker)
-        .last()
-        .ok_or("the preview's Cargo.toml lists no effect crate")?
-        .0;
-    let after = last + text[last..].find('\n').ok_or("no newline")? + 1;
+    // After the last plain path dependency on a plugin: an optional one (segcam-face, under
+    // a target table) isn't an effect crate the preview offers.
+    let mut after = None;
+    let mut end = 0;
+    for l in text.split_inclusive('\n') {
+        end += l.len();
+        if l.contains("path = \"../../../plugins/") && l.trim_end().ends_with("\" }") {
+            after = Some(end);
+        }
+    }
+    let after = after.ok_or("the preview's Cargo.toml lists no effect crate")?;
     Ok(format!("{}{line}{}", &text[..after], &text[after..]))
 }
 
@@ -288,10 +292,10 @@ mod tests {
             add_member(ws, "plugins/b").unwrap(),
             "[workspace]\nmembers = [\".\", \"plugins/a\", \"plugins/b\"]\n"
         );
-        let preview = "[dependencies]\nx = 1\na = { path = \"../../../plugins/a\" }\ny = 2\n";
+        let preview = "[dependencies]\nx = 1\na = { path = \"../../../plugins/a\" }\ny = 2\n\n[target.'cfg(windows)'.dependencies]\nf = { path = \"../../../plugins/f\", optional = true }\n";
         assert_eq!(
             add_effect_dependency(preview, "b").unwrap(),
-            "[dependencies]\nx = 1\na = { path = \"../../../plugins/a\" }\nb = { path = \"../../../plugins/b\" }\ny = 2\n"
+            "[dependencies]\nx = 1\na = { path = \"../../../plugins/a\" }\nb = { path = \"../../../plugins/b\" }\ny = 2\n\n[target.'cfg(windows)'.dependencies]\nf = { path = \"../../../plugins/f\", optional = true }\n"
         );
     }
 

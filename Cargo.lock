@@ -269,6 +269,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "blend"
+version = "0.1.0"
+dependencies = [
+ "vfx-build",
+ "vfx-core",
+ "vfx-plugin",
+]
+
+[[package]]
 name = "block2"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -459,6 +468,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ec7c5eb7a16992b1904d76c517d170ab353b0e0b3d5a0c81a8a0cd1037893cf"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "colour-adjust"
+version = "0.1.0"
+dependencies = [
+ "vfx-build",
+ "vfx-core",
+ "vfx-plugin",
 ]
 
 [[package]]
@@ -960,6 +978,16 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "gaussian-blur"
+version = "0.1.0"
+dependencies = [
+ "pollster 1.0.1",
+ "vfx-build",
+ "vfx-core",
+ "vfx-plugin",
 ]
 
 [[package]]
@@ -3447,11 +3475,14 @@ dependencies = [
 name = "vfx-preview"
 version = "0.1.0"
 dependencies = [
+ "blend",
  "bytemuck",
+ "colour-adjust",
  "console_error_panic_hook",
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "gaussian-blur",
  "image",
  "js-sys",
  "ort",
@@ -3464,6 +3495,7 @@ dependencies = [
  "vfx-chain",
  "vfx-core",
  "vfx-host",
+ "vignette",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -3471,6 +3503,15 @@ dependencies = [
  "wgpu",
  "windows-sys 0.61.2",
  "winit",
+]
+
+[[package]]
+name = "vignette"
+version = "0.1.0"
+dependencies = [
+ "vfx-build",
+ "vfx-core",
+ "vfx-plugin",
 ]
 
 [[package]]
