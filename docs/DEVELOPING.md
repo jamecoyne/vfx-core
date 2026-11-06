@@ -8,8 +8,8 @@ builds and packages them:
 | Host target | Crate | Hosts | Checked with the generic target |
 |---|---|---|---|
 | After Effects | `vfx-core/wrappers/adobe` (`vfx-ae`) | After Effects 2026 (Premiere untested) | builds and unit tests; checked in After Effects with the earlier per-effect wrappers |
-| OpenFX | `vfx-core/wrappers/ofx` (`vfx-ofx`) | DaVinci Resolve, Nuke, Natron… | both effects pass their mini-host checks; Resolve 21 and Natron 2.5 were checked with the earlier wrappers |
-| FFGL | `vfx-core/wrappers/ffgl` (`vfx-ffgl`) | Resolume Avenue / Arena | both effects pass the mini host (GPU sharing, RAM and software GL); Avenue was checked with the earlier wrappers |
+| OpenFX | `vfx-core/wrappers/ofx` (`vfx-ofx`) | DaVinci Resolve, Nuke, Natron… | VFX Preview (`plugins/vfx-chain`) and segcam Motion pass their mini host checks; Resolve 21 and Natron 2.5 were checked with the earlier wrappers |
+| FFGL | `vfx-core/wrappers/ffgl` (`vfx-ffgl`) | Resolume Avenue / Arena | VFX Preview and segcam Motion pass the mini host (GPU sharing, RAM and software GL); Avenue was checked with the earlier wrappers |
 | Preview app | `vfx-core/hosts/preview` (`vfx-preview`) | desktop and browser (WebGPU) | shows any one effect, with expressions and MP4 export; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
 
 ## An effect crate
@@ -229,13 +229,14 @@ it); `vfx-core/hosts/preview/src/catalog.rs` adds the core effects.
 Another crate's effect can use the preview as a library:
 `vfx_preview::run(vec![Entry::plugin(&my_effect::VFX_PLUGIN)])`.
 
+Spout senders on Windows (TouchDesigner's Spout Out, for one) can be picked as the source;
+[the preview's README](../vfx-core/hosts/preview/README.md) lists its keys, flags and Spout
+details. The browser build uses WebGPU where the browser has it and falls back to WebGL2 without
+it. Record needs WebGPU in the browser. On the desktop a lost GPU device is reopened in place; in
+the browser the page says to reload.
+
 On Windows the preview draws with D3D12, which avoids the memory growth seen with NVIDIA's Vulkan
-driver on the NVIDIA setups tested. `WGPU_BACKEND=vulkan` still picks Vulkan. The browser build uses
-WebGPU where the browser has it and falls back to WebGL2 without it. Record needs WebGPU in the
-browser. On the desktop a lost GPU device is reopened in place; in the browser the page says to
-reload. Spout senders on Windows (TouchDesigner's Spout Out, for
-one) can be picked as the source; [the preview's README](../vfx-core/hosts/preview/README.md) lists
-its keys, flags and Spout details.
+driver on the NVIDIA setups tested. `WGPU_BACKEND=vulkan` picks Vulkan instead.
 
 ## Releases
 
@@ -347,7 +348,7 @@ conversions. Each host also has a harness that runs the effects:
 ## Known gaps
 
 - After Effects on Windows: the `.aex` builds in CI but hasn't been tried in After Effects.
-- After Effects 26.5 on macOS passes both effects' harnesses. Natron was last checked with the
+- After Effects 26.5 on macOS passes the VFX Preview and segcam Motion harnesses. Natron was last checked with the
   earlier per effect wrappers.
 - Premiere Pro is untested. Signing and notarization have never run.
 - OpenFX GPU rendering (Resolve's Metal extension) and an FFGL thumbnail aren't done.

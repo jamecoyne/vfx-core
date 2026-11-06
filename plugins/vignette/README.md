@@ -1,8 +1,7 @@
 # Vignette
 
-Fades towards a colour away from a centre, on the GPU. It is the core
-[`Vignette`](../../vfx-core/src/effects/vignette.rs) as a plugin for After Effects, OpenFX
-(Resolve, Nuke, Natron), Resolume and the preview.
+Darkens the picture towards its edges, or fades it to any colour away from a centre, on the GPU.
+For After Effects, OpenFX (Resolve, Nuke, Natron), Resolume and the preview.
 
 | Parameter | Range | Default |
 |---|---|---|
@@ -16,7 +15,10 @@ Distance is measured from the centre and divided by half the frame's diagonal, s
 reaches the corners whatever the frame size or aspect. The fade reaches the colour at the radius and
 starts `Softness` inside it. A radius of 0 covers the whole frame.
 
-Build and check it from the repository root:
+## Building
+
+It is the core [`Vignette`](../../vfx-core/src/effects/vignette.rs) as a plugin. Build and check it
+from the repository root:
 
 ```bash
 cargo vfx build -p vignette

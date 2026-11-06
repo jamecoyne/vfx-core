@@ -1,7 +1,6 @@
 # Colour Adjust
 
-Brightness, contrast and saturation, on the GPU. It is the core
-[`ColorAdjust`](../../vfx-core/src/effects/color_adjust.rs) as a plugin for After Effects, OpenFX
+Changes the picture's brightness, contrast and saturation, on the GPU. For After Effects, OpenFX
 (Resolve, Nuke, Natron), Resolume and the preview.
 
 | Parameter | Range | Default |
@@ -14,7 +13,10 @@ Values are used as they are, with nothing clamped, so a float target keeps value
 0. Saturation uses Rec. 709 luma on whatever colour space the host sends, so for a linear chain,
 convert to linear first.
 
-Build and check it like the other plugins, from the repository root:
+## Building
+
+It is the core [`ColorAdjust`](../../vfx-core/src/effects/color_adjust.rs) as a plugin. Build and
+check it from the repository root:
 
 ```bash
 cargo vfx build -p colour-adjust

@@ -1,7 +1,6 @@
 # Gaussian Blur
 
-A separable Gaussian blur, horizontal, vertical or both, on the GPU. It is the core
-[`GaussianBlur`](../../vfx-core/src/effects/blur.rs) as a plugin for After Effects, OpenFX
+Blurs the picture horizontally, vertically or both, on the GPU. For After Effects, OpenFX
 (Resolve, Nuke, Natron), Resolume and the preview.
 
 | Parameter | Range | Default |
@@ -17,7 +16,10 @@ into soft edges.
 Blur Edges lets the blur spread past the frame's edge, which needs a host with regions of definition.
 Hosts without them leave the control out.
 
-Build and check it from the repository root:
+## Building
+
+It is the core [`GaussianBlur`](../../vfx-core/src/effects/blur.rs), a separable Gaussian blur, as
+a plugin. Build and check it from the repository root:
 
 ```bash
 cargo vfx build -p gaussian-blur

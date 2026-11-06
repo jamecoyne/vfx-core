@@ -8,9 +8,6 @@ A file dropped on the window opens as the source. In a browser, a drop goes the 
 picker: video only, the first of several files, and anything else leaves the source as it is and
 shows a message.
 
-On Windows the preview draws with D3D12, which avoids the memory growth seen with NVIDIA's Vulkan
-driver on the NVIDIA setups tested. `WGPU_BACKEND=vulkan` still picks Vulkan.
-
 ## Spout
 
 On Windows the input menu lists the Spout senders running, such as TouchDesigner's Spout Out,
@@ -105,3 +102,8 @@ FPS, MS, worst MS | screen FPS`, then the machine.
 
 In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
 `--effect` and a file, mistakes show in the panel.
+
+## Graphics backend
+
+On Windows the preview draws with D3D12, which avoids the memory growth seen with NVIDIA's Vulkan
+driver on the NVIDIA setups tested. `WGPU_BACKEND=vulkan` picks Vulkan instead.
