@@ -16,8 +16,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    DragEvent, File, HtmlInputElement, HtmlVideoElement, MediaStream, MediaStreamTrack,
-    OffscreenCanvas, OffscreenCanvasRenderingContext2d, Url,
+    CanvasRenderingContext2d, DragEvent, File, HtmlCanvasElement, HtmlInputElement,
+    HtmlVideoElement, MediaStream, MediaStreamTrack, Url,
 };
 
 use crate::effects::MAX_IMAGE_SIDE;
@@ -35,7 +35,8 @@ pub struct WebVideo {
     camera: Option<MediaStream>,
     /// The file's object URL, revoked on drop.
     url: Option<String>,
-    canvas: Option<(OffscreenCanvas, OffscreenCanvasRenderingContext2d)>,
+    /// A page canvas, not an OffscreenCanvas: WebGL2 can't copy from an OffscreenCanvas.
+    canvas: Option<(HtmlCanvasElement, CanvasRenderingContext2d)>,
     /// The video time of the last frame copied, so a paused video isn't copied again.
     last_copied_time: Option<f64>,
     /// The last frame the browser presented, its media time and count, from
@@ -240,8 +241,16 @@ impl WebVideo {
             .as_ref()
             .is_none_or(|(c, _)| (c.width(), c.height()) != (w, h))
         {
-            let canvas = OffscreenCanvas::new(w, h).map_err(js_error_text)?;
-            let context: OffscreenCanvasRenderingContext2d = canvas
+            let canvas: HtmlCanvasElement = web_sys::window()
+                .and_then(|window| window.document())
+                .ok_or("no document")?
+                .create_element("canvas")
+                .map_err(js_error_text)?
+                .dyn_into()
+                .map_err(|_| "not a canvas")?;
+            canvas.set_width(w);
+            canvas.set_height(h);
+            let context: CanvasRenderingContext2d = canvas
                 .get_context("2d")
                 .map_err(js_error_text)?
                 .ok_or("no 2D context")?
@@ -261,7 +270,7 @@ impl WebVideo {
             .map_err(js_error_text)?;
         gpu.queue.copy_external_image_to_texture(
             &wgpu::CopyExternalImageSourceInfo {
-                source: wgpu::ExternalImageSource::OffscreenCanvas(canvas.clone()),
+                source: wgpu::ExternalImageSource::HTMLCanvasElement(canvas.clone()),
                 origin: wgpu::Origin2d::ZERO,
                 flip_y: false,
             },
