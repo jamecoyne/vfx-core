@@ -10,7 +10,7 @@ builds and packages them:
 | After Effects | `vfx-core/wrappers/adobe` (`vfx-ae`) | After Effects 2026 (Premiere untested) | builds and unit tests; checked in After Effects with the earlier per-effect wrappers |
 | OpenFX | `vfx-core/wrappers/ofx` (`vfx-ofx`) | DaVinci Resolve, Nuke, Natron… | VFX Preview (`plugins/vfx-chain`) and segcam Motion pass their mini host checks; Resolve 21 and Natron 2.5 were checked with the earlier wrappers |
 | FFGL | `vfx-core/wrappers/ffgl` (`vfx-ffgl`) | Resolume Avenue / Arena | VFX Preview and segcam Motion pass the mini host (GPU sharing, RAM and software GL); Avenue was checked with the earlier wrappers |
-| Preview app | `vfx-core/hosts/preview` (`vfx-preview`) | desktop and browser (WebGPU) | shows any one effect, with expressions and MP4 export; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
+| Preview app | `vfx-core/hosts/preview` (`vfx-preview`) | desktop and browser (WebGPU, or WebGL2 without it) | shows any one effect, with expressions and MP4 export; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
 
 ## An effect crate
 
