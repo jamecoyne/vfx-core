@@ -72,8 +72,7 @@ stats t=T effect=NAME on=WHERE source=FPS rendered=FPS rendered_ms=MS worst_ms=M
 done frames=N seconds=S effect=NAME on=WHERE source=FPS rendered=FPS rendered_ms=MS worst_ms=MS drawn=FPS screen=FPS
 ```
 
-The values are measurements, so this shows only the keys. Benchmark numbers are in the
-[segcam benchmark notes](../../../plugins/segcam/BENCHMARK.md).
+Measured results are in [BENCHMARK.md](../../../plugins/segcam/BENCHMARK.md).
 
 The keys follow the frames: `source` is the rate they arrive from the decoder, whether they
 are taken or dropped (or `pattern` and `still`), `rendered` the renders the effect finished each second, and

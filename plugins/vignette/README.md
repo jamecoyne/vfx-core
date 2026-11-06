@@ -17,12 +17,11 @@ starts `Softness` inside it. A radius of 0 covers the whole frame.
 
 ## Building
 
-It is the core [`Vignette`](../../vfx-core/src/effects/vignette.rs) as a plugin. Build and check it
-from the repository root:
+From the repository root:
 
 ```bash
 cargo vfx build -p vignette
 cargo test -p vignette
 ```
 
-The [developer guide](../../docs/DEVELOPING.md) covers the layout, the host targets and the checks.
+[Developer guide](../../docs/DEVELOPING.md) · [Source](../../vfx-core/src/effects/vignette.rs)

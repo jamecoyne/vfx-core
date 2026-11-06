@@ -218,19 +218,18 @@ Each plugin writes one-line notes about which render path ran to
 
 ## The preview
 
-The preview hosts one effect at a time: test patterns, images, video files, a webcam or,
-on Windows, a Spout sender go in, a panel made from the effect's parameters drives it, every float and integer
-parameter has an expression box (`sin(time/4)`, `bass * 2`, face tracking), and a video
-renders to MP4 through it. It links the effects it offers, so the same build runs on the
-desktop and in the browser. Its build script lists every effect crate among its
-dependencies, as `Entry::plugin(&segcam_motion::VFX_PLUGIN)` (the crate as its plugins see
-it); `vfx-core/hosts/preview/src/catalog.rs` adds the core effects.
+The preview runs one effect on a test pattern, image, video, webcam or Windows Spout source. It
+builds the control panel from the effect's parameters. Every float and integer parameter has an
+expression box (`sin(time/4)`, `bass * 2`, face tracking), and Record saves the output as a video.
+It links the effects it offers, so the same build runs on the desktop and in the browser. Its
+build script lists every effect crate among its dependencies, as
+`Entry::plugin(&segcam_motion::VFX_PLUGIN)` (the crate as its plugins see it);
+`vfx-core/hosts/preview/src/catalog.rs` adds the core effects.
 
 Another crate's effect can use the preview as a library:
 `vfx_preview::run(vec![Entry::plugin(&my_effect::VFX_PLUGIN)])`.
 
-Spout senders on Windows (TouchDesigner's Spout Out, for one) can be picked as the source;
-[the preview's README](../vfx-core/hosts/preview/README.md) lists its keys, flags and Spout
+[The preview's README](../vfx-core/hosts/preview/README.md) lists its keys, flags and Spout
 details. The browser build uses WebGPU where the browser has it and falls back to WebGL2 without
 it. Record needs WebGPU in the browser. On the desktop a lost GPU device is reopened in place; in
 the browser the page says to reload.

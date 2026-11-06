@@ -18,12 +18,11 @@ Hosts without them leave the control out.
 
 ## Building
 
-It is the core [`GaussianBlur`](../../vfx-core/src/effects/blur.rs), a separable Gaussian blur, as
-a plugin. Build and check it from the repository root:
+From the repository root:
 
 ```bash
 cargo vfx build -p gaussian-blur
 cargo test -p gaussian-blur
 ```
 
-The [developer guide](../../docs/DEVELOPING.md) covers the layout, the host targets and the checks.
+[Developer guide](../../docs/DEVELOPING.md) · [Source](../../vfx-core/src/effects/blur.rs)

@@ -11,20 +11,19 @@ The second layer is picked in the host, as a clip or layer.
 | Amount | 0 to 1 | 1 |
 | Linearize Layer | on or off | off |
 
-The layer's alpha times Amount decides how much of the blended colour lays over the input, so a
-transparent layer leaves the input as it is. Straight alpha in and out.
+Amount scales the layer's alpha. A fully transparent layer leaves the input unchanged. Input and
+output use straight alpha.
 
 Linearize Layer decodes the layer from sRGB first, for a chain that works in linear light. The input
 has already been converted by an earlier stage of the chain, so only the layer needs it.
 
 ## Building
 
-It is the core [`Blend`](../../vfx-core/src/effects/blend.rs) as a plugin. Build and check it from
-the repository root:
+From the repository root:
 
 ```bash
 cargo vfx build -p blend
 cargo test -p blend
 ```
 
-The [developer guide](../../docs/DEVELOPING.md) covers the layout, the host targets and the checks.
+[Developer guide](../../docs/DEVELOPING.md) · [Source](../../vfx-core/src/effects/blend.rs)
