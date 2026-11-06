@@ -36,7 +36,7 @@ pub fn new(root: &Path, name: &str) -> Result<(), String> {
     let text = add_member(&text, &format!("plugins/{name}"))?;
     fs::write(&workspace, text).map_err(|e| e.to_string())?;
 
-    let preview = root.join("vfx-core/examples/preview/Cargo.toml");
+    let preview = root.join("vfx-core/hosts/preview/Cargo.toml");
     let text = fs::read_to_string(&preview).map_err(|e| e.to_string())?;
     let text = add_effect_dependency(&text, name)?;
     fs::write(&preview, text).map_err(|e| e.to_string())?;

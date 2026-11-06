@@ -35,4 +35,4 @@ Recent changes for agents (newest first; prune entries once they are old):
   and features) must pass; CI runs latest stable, whose clippy can be stricter.
 - wgpu is pinned to `=30.0.1`; the Metal interop uses `wgpu-hal` types and must be checked
   when it moves. The web build needs wgpu's `fragile-send-sync-non-atomic-wasm` feature
-  (set in `vfx-core/examples/preview/Cargo.toml`) because effects are `Send`.
+  (set in `vfx-core/hosts/preview/Cargo.toml`) because effects are `Send`.

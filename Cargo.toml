@@ -3,7 +3,7 @@
 # vfx-core/ depends on plugins/ except the preview's list of effects.
 [workspace]
 resolver = "3"
-members = ["vfx-core", "plugins/vfx-chain", "vfx-core/examples/preview", "vfx-core/wrappers/common", "vfx-core/wrappers/build", "vfx-core/wrappers/plugin", "vfx-core/tools/cargo-vfx", "vfx-core/wrappers/adobe", "vfx-core/wrappers/ofx", "vfx-core/wrappers/ffgl", "vfx-core/wrappers/ffgl-common", "plugins/segcam/segcam-motion", "plugins/segcam/segcam-face"]
+members = ["vfx-core", "plugins/vfx-chain", "vfx-core/hosts/preview", "vfx-core/wrappers/common", "vfx-core/wrappers/build", "vfx-core/wrappers/plugin", "vfx-core/tools/cargo-vfx", "vfx-core/wrappers/adobe", "vfx-core/wrappers/ofx", "vfx-core/wrappers/ffgl", "vfx-core/wrappers/ffgl-common", "plugins/segcam/segcam-motion", "plugins/segcam/segcam-face"]
 # Plain `cargo test` builds only the core, so windowing never enters CI on Linux.
 default-members = ["vfx-core"]
 

@@ -12,13 +12,13 @@ use crate::{Effect, MEDIACORE};
 /// Problems, one per line; empty when there are none.
 pub fn check(all: &[Effect], root: &Path) -> Vec<String> {
     let mut problems = Vec::new();
-    let preview = root.join("vfx-core/examples/preview");
+    let preview = root.join("vfx-core/hosts/preview");
     match vfx_build::effect_dependencies(&preview) {
         Ok(linked) => {
             for e in all {
                 if !linked.iter().any(|(name, _)| *name == e.lib()) {
                     problems.push(format!(
-                        "the preview doesn't offer {}: add it to vfx-core/examples/preview/Cargo.toml",
+                        "the preview doesn't offer {}: add it to vfx-core/hosts/preview/Cargo.toml",
                         e.package
                     ));
                 }
