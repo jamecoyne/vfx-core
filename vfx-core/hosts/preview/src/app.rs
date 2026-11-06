@@ -1460,8 +1460,7 @@ fn window_attributes(start: &StartOptions) -> winit::window::WindowAttributes {
 fn new_wgpu_instance(display: winit::event_loop::OwnedDisplayHandle) -> wgpu::Instance {
     #[allow(unused_mut)]
     let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(display));
-    // The pipeline renders to RGBA32F textures, which WebGL can't, so the web build
-    // needs WebGPU.
+    // WebGPU where the browser has it, WebGL2 otherwise (the fallback is in `new`).
     #[cfg(target_arch = "wasm32")]
     {
         descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
