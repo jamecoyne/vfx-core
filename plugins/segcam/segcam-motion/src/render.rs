@@ -556,20 +556,16 @@ pub fn cut_frame_tiles<C: Channel>(
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let tiles = std::sync::Mutex::new(vec![Tile::default(); count]);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if at >= count {
-                        break;
-                    }
-                    let tile = make(order[at]);
-                    if let Ok(mut tiles) = tiles.lock() {
-                        tiles[at] = tile;
-                    }
-                }
-            });
+    vfx_plugin::vfx_host::on_workers(threads, || {
+        loop {
+            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if at >= count {
+                break;
+            }
+            let tile = make(order[at]);
+            if let Ok(mut tiles) = tiles.lock() {
+                tiles[at] = tile;
+            }
         }
     });
     tiles.into_inner().unwrap_or_else(|e| e.into_inner())

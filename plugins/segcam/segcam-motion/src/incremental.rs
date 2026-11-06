@@ -2111,7 +2111,8 @@ mod tests {
         assert!(within_a_level(&a, &b), "the picture after the reopen");
     }
 
-    /// A first open that fails stays failed: with no adapter the CPU is the machine's path.
+    /// A first open that keeps failing leaves the CPU for good once its retries are spent: with no
+    /// adapter the CPU is the machine's path. Until then renders draw on the CPU and keep asking.
     #[test]
     fn failed_first_open_leaves_the_cpu_for_good() {
         let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(|_| {
@@ -2123,6 +2124,15 @@ mod tests {
         };
         on_cpu.use_gpu(true);
         assert!(slot.status().is_err());
+        render(&mut on_cpu, &crossing(), 0);
+        assert!(on_cpu.gpu_wanted, "the first failure was final");
+        let deadline = std::time::Instant::now() + gpu::FIRST_OPEN_TEST_DEADLINE;
+        while !matches!(slot.next_first_open_try(), gpu::DeviceNow::Never) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slot never gave up"
+            );
+        }
         render(&mut on_cpu, &crossing(), 0);
         assert!(!on_cpu.gpu_wanted);
     }
@@ -2174,6 +2184,56 @@ mod tests {
             frame_hash(&rows),
             fold_hash(rows.iter().map(|row| row_hash(row)))
         );
+    }
+
+    /// A Float frame hashes as its bits. Equal bits are the same frame, whatever the values, NaN
+    /// included. Equal values in other bits, 0 and -0 or NaNs with other payloads, are a changed
+    /// frame: that costs the work again, and never keeps work for pixels that changed.
+    #[test]
+    fn frame_hash_of_float_rows_follows_their_bits() {
+        let (w, h) = (5, 3);
+        let mut floats = vec![
+            Argb {
+                alpha: 1.0f32,
+                red: 0.0,
+                green: 0.5,
+                blue: 0.25,
+            };
+            (w * h) as usize
+        ];
+        let hash = |floats: &[Argb<f32>]| frame_hash(&View::from_pixels(floats, w, h).byte_rows());
+        let zero = hash(&floats);
+        floats[7].red = -0.0;
+        assert_ne!(hash(&floats), zero, "-0 in place of 0");
+        floats[7].red = f32::NAN;
+        let nan = hash(&floats);
+        assert_eq!(hash(&floats), nan, "the same NaN");
+        floats[7].red = f32::from_bits(f32::NAN.to_bits() | 1);
+        assert!(floats[7].red.is_nan());
+        assert_ne!(hash(&floats), nan, "a NaN with another payload");
+        floats[7].red = 0.0;
+        assert_eq!(hash(&floats), zero);
+    }
+
+    /// A host's padding after each row is no part of the frame: a view's rows end at its width.
+    #[test]
+    fn frame_hash_leaves_out_row_padding() {
+        let (w, h) = (3, 4);
+        let row = w as usize * size_of::<Argb<u8>>();
+        let stride = row + 8;
+        let packed: Vec<u8> = (0..h as usize * row)
+            .map(|i| (i * 13 % 256) as u8)
+            .collect();
+        let expected = frame_hash(&View::<u8>::new(&packed, w, h, row).byte_rows());
+        let mut padded = vec![0u8; h as usize * stride];
+        for fill in [0x00, 0xff] {
+            for (y, line) in padded.chunks_mut(stride).enumerate() {
+                line[..row].copy_from_slice(&packed[y * row..(y + 1) * row]);
+                line[row..].fill(fill);
+            }
+            let rows = View::<u8>::new(&padded, w, h, stride).byte_rows();
+            assert_eq!(frame_hash(&rows), expected, "padding {fill:#x}");
+        }
     }
 
     /// A source whose [`FrameSource::with_frame`] is costly, and which holds frames in other bytes

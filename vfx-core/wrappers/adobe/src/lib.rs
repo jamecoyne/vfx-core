@@ -596,12 +596,13 @@ fn render_frame(
     // A GPU failure shouldn't take After Effects down or block the render. Pass the
     // image through, and say why once in the log.
     let result = match vfx_host::gpu(&LOG) {
-        Some(gpu) => {
-            catch_unwind(AssertUnwindSafe(|| pipeline::run(gpu, &job))).unwrap_or_else(|_| {
-                warn_once("GPU render failed, passing frames through");
-                canvas.clone()
-            })
-        }
+        Some(device) => catch_unwind(AssertUnwindSafe(|| {
+            pipeline::run(device.gpu(), device.pool_key, &job)
+        }))
+        .unwrap_or_else(|_| {
+            warn_once("GPU render failed, passing frames through");
+            canvas.clone()
+        }),
         None => canvas.clone(),
     };
     let out_stride = stride(output)?;

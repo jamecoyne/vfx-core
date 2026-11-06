@@ -10,6 +10,8 @@ use crate::effects::Effects;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::effects::{self, Output};
 use crate::modulation::{self, Expressions, VariableValues};
+#[cfg(windows)]
+use crate::spout;
 use crate::stats;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{audio, face, script, video};
@@ -95,6 +97,14 @@ struct Preview {
     /// Cameras found at startup.
     #[cfg(not(target_arch = "wasm32"))]
     cameras: Vec<String>,
+    /// A Spout sender as the source, in place of `media`.
+    #[cfg(windows)]
+    spout: Option<spout::Receiver>,
+    /// The Spout senders running, listed again every [`SENDER_LIST_INTERVAL`].
+    #[cfg(windows)]
+    senders: Vec<String>,
+    #[cfg(windows)]
+    senders_listed: Instant,
     /// A video file or the webcam, in the browser.
     #[cfg(target_arch = "wasm32")]
     web_video: Option<web_media::WebVideo>,
@@ -119,6 +129,11 @@ struct Preview {
     last_frame: Instant,
     message: Option<String>,
 }
+
+/// How often the panel's list of Spout senders is read again. Reading it costs a shared memory
+/// lookup, so a sender that starts shows up without a refresh.
+#[cfg(windows)]
+const SENDER_LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The adapter `--gpu` names: `high` or nothing for the high performance one, `low` for the low
 /// power one, anything else the first that can show the window and has that in its name.
@@ -171,8 +186,14 @@ async fn open_device(
         max_buffer_size: supported.max_buffer_size,
         ..wgpu::Limits::default()
     };
+    // Spout input imports D3D11 textures into a Vulkan device through this extension.
+    #[cfg(windows)]
+    let required_features = adapter.features() & wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+    #[cfg(not(windows))]
+    let required_features = wgpu::Features::empty();
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
+            required_features,
             required_limits,
             memory_hints: Gpu::memory_hints(),
             ..wgpu::DeviceDescriptor::default()
@@ -390,6 +411,12 @@ impl Preview {
             effect_report: vfx_core::Report::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cameras: video::cameras(),
+            #[cfg(windows)]
+            spout: None,
+            #[cfg(windows)]
+            senders: spout::senders(),
+            #[cfg(windows)]
+            senders_listed: Instant::now(),
             #[cfg(target_arch = "wasm32")]
             web_video: None,
             #[cfg(target_arch = "wasm32")]
@@ -436,6 +463,10 @@ impl Preview {
             return;
         }
         self.media = None;
+        #[cfg(windows)]
+        {
+            self.spout = None;
+        }
         let loaded = match size {
             None => self.effects.load_image(&self.gpu, path),
             Some(size) => image::open(path).map_err(|e| e.to_string()).map(|img| {
@@ -460,6 +491,10 @@ impl Preview {
     fn open_input(&mut self, input: video::Input, size: Option<(u32, u32)>) {
         // Stops the old video and its sound first.
         self.media = None;
+        #[cfg(windows)]
+        {
+            self.spout = None;
+        }
         let name = input.name();
         let opened = match size {
             None => video::Video::open(input, effects::MAX_IMAGE_SIDE),
@@ -485,6 +520,46 @@ impl Preview {
             Err(e) => Some(format!("Couldn't open {name}: {e}")),
         };
         self.refresh_display_texture();
+    }
+
+    /// Reads the Spout sender `name` as the source; it need not be running yet. Black until its
+    /// first frame, at the size it publishes, so a recording started now goes on.
+    #[cfg(windows)]
+    fn open_spout(&mut self, name: String) {
+        self.media = None;
+        let size = spout::sender_size(&name, effects::MAX_IMAGE_SIDE);
+        let adapter = spout::AdapterId::of(&self.gpu.device.adapter_info());
+        let receiver = spout::Receiver::start(name, adapter, effects::MAX_IMAGE_SIDE);
+        let size = size.unwrap_or(effects::PATTERN_SIZE);
+        self.effects
+            .start_stream(&self.gpu, receiver.source_name(), size, None);
+        self.spout = Some(receiver);
+        self.controls.mirror_for_source(false);
+        self.message = None;
+        self.refresh_display_texture();
+    }
+
+    /// Draws the Spout sender's newest frame into the source, if a new one came in, and returns
+    /// the time that names the frame the effect sees.
+    #[cfg(windows)]
+    fn feed_spout(&mut self) -> Option<f64> {
+        let receiver = self.spout.as_mut()?;
+        if let Some(size) = receiver.next_frame(&self.gpu) {
+            let name = receiver.source_name();
+            if self.effects.source_name() != Some(name.as_str()) || self.effects.size() != size {
+                self.effects.start_stream(&self.gpu, name, size, None);
+            }
+            if let Some(frame) = self.effects.source_frame() {
+                receiver.draw(&self.gpu, frame);
+            }
+        }
+        self.counts.arrived += receiver.take_arrived_count();
+        if let Some(status) = receiver.status_change() {
+            self.message = status;
+        }
+        let time = receiver.frame_time();
+        self.refresh_display_texture();
+        Some(time)
     }
 
     /// The browser's video file or webcam: takes one the browser has just opened, copies a
@@ -684,7 +759,17 @@ impl Preview {
             let face = self.face_values;
             #[cfg(target_arch = "wasm32")]
             let face = modulation::FACE_NONE;
-            self.variables = modulation::variable_values(self.time, None, [0.0; 5], face);
+            // A Spout sender plays like a camera: no end, and its frames name their own time.
+            #[cfg(windows)]
+            let position = self.feed_spout().inspect(|&time| frame_time = time);
+            #[cfg(not(windows))]
+            let position = None;
+            self.variables = modulation::variable_values(
+                self.time,
+                position.map(|p| (p, f64::INFINITY)),
+                [0.0; 5],
+                face,
+            );
         }
 
         let c = &self.controls;
@@ -701,9 +786,11 @@ impl Preview {
         self.record_web_frame();
     }
 
-    /// Whether a video or camera is the source.
+    /// Whether a video, camera or Spout sender is the source.
     fn has_video(&self) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(windows)]
+        return self.media.is_some() || self.spout.is_some();
+        #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
         return self.media.is_some();
         #[cfg(target_arch = "wasm32")]
         return self.web_video.is_some();
@@ -832,6 +919,17 @@ impl Preview {
         }
         if actions.refresh_cameras {
             self.cameras = video::cameras();
+        }
+        #[cfg(windows)]
+        if let Some(sender) = actions.start_sender
+            && let Some(name) = self.senders.get(sender).cloned()
+        {
+            self.open_spout(name);
+        }
+        #[cfg(windows)]
+        if actions.refresh_cameras || self.senders_listed.elapsed() >= SENDER_LIST_INTERVAL {
+            self.senders = spout::senders();
+            self.senders_listed = Instant::now();
         }
         if actions.import_layer
             && let Some(path) = pick_media_file("Import a layer: video or image")
@@ -1085,6 +1183,8 @@ impl Preview {
             recording: self.web_recording.as_ref().map(|r| r.elapsed()),
             record_result: self.record_result.as_deref(),
             cameras,
+            #[cfg(windows)]
+            senders: &self.senders,
             #[cfg(not(target_arch = "wasm32"))]
             face_tracking: self.tracker.is_some(),
             playback,
@@ -1120,6 +1220,10 @@ impl Preview {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 self.media = None;
+            }
+            #[cfg(windows)]
+            {
+                self.spout = None;
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -1696,6 +1800,20 @@ impl Preview {
                 self.open_input(video::Input::Camera(camera, None), start.size);
             }
             Some(script::Source::File(path)) => self.open(path, start.size),
+            #[cfg(windows)]
+            Some(script::Source::Spout(name)) => {
+                // A sender named in full may start after the preview.
+                let sender = spout::sender_name(&self.senders, name).or_else(|e| {
+                    if name.is_empty() {
+                        Err(e)
+                    } else {
+                        Ok(name.clone())
+                    }
+                })?;
+                self.open_spout(sender);
+            }
+            #[cfg(not(windows))]
+            Some(script::Source::Spout(_)) => return Err("Spout input is Windows only".into()),
         }
         if scripted && let Some(message) = self.message.take() {
             return Err(message);
@@ -2121,6 +2239,10 @@ impl Preview {
         } = opened;
         let info = adapter.get_info();
         let old_gpu = std::mem::replace(&mut self.gpu, gpu);
+        #[cfg(windows)]
+        if let Some(receiver) = &mut self.spout {
+            receiver.use_device(spout::AdapterId::of(&info));
+        }
         // Later readers, as a CPU effect that looks for its next device, find this one.
         self.gpu.share();
         // The old surface first: it gives up the window's swap chain, which D3D12 allows one of.

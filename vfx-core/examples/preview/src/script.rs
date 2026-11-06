@@ -19,7 +19,8 @@ vfx-preview [FLAGS] [FILE]
   --mode NAME          the effect's mode: an option of its menu (Swarm, \"Motion matte\")
   --param NAME=VALUE   a parameter by its name; repeatable. Numbers, true/false, an
                        option's name or index, r,g,b,a for colours, x,y for points
-  --input SOURCE       pattern[:NAME|N], camera[:NAME|N], or a video or image path
+  --input SOURCE       pattern[:NAME|N], camera[:NAME|N], spout[:NAME] (Windows), or a video
+                       or image path
   --size WxH           the frame size (patterns, and videos, webcams and stills fitted into it)
   --gpu GPU            high, low, or part of an adapter's name (default high)
   --detect-faces       tick the Expressions panel's Detect faces
@@ -60,6 +61,8 @@ pub enum Source {
     Pattern(String),
     /// A webcam by part of its name or its index; empty for the first.
     Camera(String),
+    /// A Spout sender by its name or part of it; empty for the first running.
+    Spout(String),
     File(PathBuf),
 }
 
@@ -98,7 +101,10 @@ impl Options {
             || self.stats
             || self.stop.is_some()
             || self.quiet
-            || matches!(self.input, Some(Source::Pattern(_) | Source::Camera(_)))
+            || matches!(
+                self.input,
+                Some(Source::Pattern(_) | Source::Camera(_) | Source::Spout(_))
+            )
     }
 }
 
@@ -177,6 +183,7 @@ fn parse_source(text: &str) -> Source {
     match kind {
         "pattern" => Source::Pattern(rest.to_owned()),
         "camera" => Source::Camera(rest.to_owned()),
+        "spout" => Source::Spout(rest.to_owned()),
         _ => Source::File(text.into()),
     }
 }
@@ -499,6 +506,9 @@ mod tests {
             args(&["--input", "camera"]).unwrap().input,
             Some(Source::Camera("".into()))
         );
+        let spout = args(&["--input", "spout:TD out"]).unwrap();
+        assert_eq!(spout.input, Some(Source::Spout("TD out".into())));
+        assert!(spout.scripted());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! A host for trying and demoing effects, one at a time: the preview app as a library.
 //! [`run`] opens a window (or, on the web, the page's canvas) with a control panel for
 //! whichever effect of the catalog is picked. The image is a generated test pattern, or a
-//! PNG / JPEG, a video file or a webcam decoded by ffmpeg; expressions drive the
+//! PNG / JPEG, a video file or a webcam decoded by ffmpeg, or a Spout sender on Windows; expressions drive the
 //! parameters, and Record saves the effect's output to an MP4.
 //!
 //! The repository's preview (`src/main.rs`) runs [`catalog::repository`]. Another crate's
@@ -27,6 +27,8 @@ mod face;
 mod modulation;
 #[cfg(not(target_arch = "wasm32"))]
 mod script;
+#[cfg(windows)]
+mod spout;
 mod stats;
 #[cfg(not(target_arch = "wasm32"))]
 mod video;

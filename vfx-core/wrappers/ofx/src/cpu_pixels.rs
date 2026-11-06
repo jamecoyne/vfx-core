@@ -350,6 +350,65 @@ mod tests {
         assert_eq!(outside.len(), 1, "only where the rows would lie");
     }
 
+    /// Hosts may pad each row, or store rows top down with negative row bytes. The bytes handed
+    /// out are the pixels alone, the same for every layout, so neither padding nor layout reads as
+    /// a changed frame, and they're what `decode` reads.
+    #[test]
+    fn image_bytes_are_the_pixels_whatever_the_row_layout() {
+        let canvas = Rect {
+            x1: 0,
+            y1: 0,
+            x2: 3,
+            y2: 2,
+        };
+        for depth in [Depth::Byte, Depth::Float] {
+            let row = 3 * 4 * depth.bytes_per_channel();
+            // Finite channels, so decoded pixels compare equal.
+            let mut packed: Vec<u8> = match depth {
+                Depth::Float => (0..2 * row / 4)
+                    .flat_map(|i| (i as f32 / 7.0).to_ne_bytes())
+                    .collect(),
+                _ => (0..2 * row).map(|i| (i * 37 % 251) as u8).collect(),
+            };
+            let packed_image = host_image(&mut packed, canvas, depth);
+            let expected = image_bytes(&packed_image, canvas);
+            // SAFETY: the image is live.
+            let expected_pixels = unsafe { decode::<f32>(&packed_image, canvas) };
+
+            const PADDING: usize = 12;
+            let mut padded = vec![0u8; 2 * (row + PADDING)];
+            for y in 0..2 {
+                let at = y * (row + PADDING);
+                padded[at..at + row].copy_from_slice(&packed[y * row..(y + 1) * row]);
+            }
+            for fill in [0x00, 0xa5] {
+                for y in 0..2 {
+                    let at = y * (row + PADDING) + row;
+                    padded[at..at + PADDING].fill(fill);
+                }
+                let image = Image {
+                    row_bytes: (row + PADDING) as isize,
+                    ..host_image(&mut padded, canvas, depth)
+                };
+                assert_eq!(image_bytes(&image, canvas), expected, "padding {fill:#x}");
+                // SAFETY: the image is live.
+                assert_eq!(unsafe { decode::<f32>(&image, canvas) }, expected_pixels);
+            }
+
+            // The bottom row, y1, last in memory, and each row up `row` bytes before it.
+            let mut top_down: Vec<u8> = packed.chunks(row).rev().flatten().copied().collect();
+            let image = Image {
+                // SAFETY: the offset is the start of the last row, inside `top_down`.
+                data: unsafe { top_down.as_mut_ptr().add(row) },
+                row_bytes: -(row as isize),
+                ..host_image(&mut top_down, canvas, depth)
+            };
+            assert_eq!(image_bytes(&image, canvas), expected, "negative row bytes");
+            // SAFETY: the image is live.
+            assert_eq!(unsafe { decode::<f32>(&image, canvas) }, expected_pixels);
+        }
+    }
+
     /// A reused buffer holds the last frame: pixels off this image come out clear all the same.
     #[test]
     fn decode_into_clears_what_the_image_does_not_cover() {
