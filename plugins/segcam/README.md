@@ -16,12 +16,17 @@ cargo vfx build -p segcam-motion
 ```
 
 The plugins land in `target/vfx-plugin`. Install each one as below, then restart the host. On macOS,
-`cargo vfx package -p segcam-motion` makes the two installers first.
+`cargo vfx package -p segcam-motion` makes the two installers first. The macOS builds are unsigned
+for now, so macOS quarantines them. Clear the flag before you open or copy one:
+
+```bash
+xattr -dr com.apple.quarantine path/to/SegcamMotionRust-adobe.pkg
+```
 
 | Host | Windows: copy | macOS | Find it under |
 |---|---|---|---|
-| After Effects | `SegcamMotionRust.aex` to `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore` | open `SegcamMotionRust-adobe.pkg` | Effect, LO.FI.SCI.FI |
-| DaVinci Resolve | `SegcamMotionRust.ofx.bundle` to `C:\Program Files\Common Files\OFX\Plugins` | open `SegcamMotionRust-ofx.pkg` | OpenFX, LO.FI.SCI.FI |
+| After Effects | `SegcamMotionRust.aex` to `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore` | open `SegcamMotionRust-adobe.pkg` | Effect, LO.FI.SCI.FI, segcam |
+| DaVinci Resolve | `SegcamMotionRust.ofx.bundle` to `C:\Program Files\Common Files\OFX\Plugins` | open `SegcamMotionRust-ofx.pkg` | OpenFX, LO.FI.SCI.FI, segcam |
 | Resolume | `SegcamMotionRust.dll` to `Documents\Resolume Avenue\Extra Effects` | `cargo vfx install -p segcam-motion --hosts ffgl` copies it, on Windows too | segcam Motion |
 
 For Resolume Arena, use `Resolume Arena` in the folder name. On Windows, keep `DirectML.dll` next
@@ -30,7 +35,7 @@ administrator once.
 
 ## Using it
 
-Add segcam Motion to a clip or layer and pick an **Output**:
+Add segcam to a clip or layer and pick an **Output**. It starts as Swarm:
 
 | Output | What you get |
 |---|---|
@@ -55,11 +60,13 @@ keep the settings they were made with.
 ## The browser and the preview app
 
 The [browser build](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion) runs segcam with
-nothing to install, in a current Chrome, Edge or Safari with WebGPU. Drop a video on the page, open
-one from the source menu, or pick the webcam there.
+nothing to install, in a current Chrome, Edge or Safari. Where the browser has WebGPU it draws with
+that; without it, the build falls back to WebGL2. Drop a video on the page, open one from the
+source menu, or pick the webcam there.
 
-The preview app runs it on a test pattern, an image, a video file or a webcam, with a panel for every
-control, and records the result to an MP4. It [builds from a clone](../../docs/DEVELOPING.md#building-and-running):
+The preview app runs it on a test pattern, an image, a video file, a webcam or, on Windows, a Spout
+sender such as TouchDesigner's, with a panel for every control, and records the result to an MP4. On
+Windows it draws with D3D12. It [builds from a clone](../../docs/DEVELOPING.md#building-and-running):
 
 ```bash
 cargo vfx preview -p segcam-motion -- clip.mp4
@@ -77,7 +84,8 @@ Apple M1 Pro and up runs it comfortably. Segcam draws on the GPU when there is o
   or Resolume.
 - On Windows, if `DirectML.dll` isn't next to the plugin, faces run on the CPU. Still works, just
   slower.
-- The browser preview has no faces yet.
+- The browser build has no faces yet, and Detect starts on Motion there.
+- Record doesn't work in the browser build on WebGL2 yet. It works on WebGPU.
 - On Windows, the After Effects plugin builds but hasn't been tried in After Effects yet.
 - We recommend a DXV copy of a clip for a show in Resolume. H.264 with few keyframes can drop frames
   after a trigger and at each loop point. Resolume's
@@ -86,7 +94,7 @@ Apple M1 Pro and up runs it comfortably. Segcam draws on the GPU when there is o
 - We recommend keeping Resolve's render cache off for segcam. An export can contain wrong pictures
   when all three of these are on:
   - Playback, Render Cache, User
-  - The clip's Render Cache OFX Filter, segcam Motion
+  - The clip's Render Cache OFX Filter, segcam
   - Use render cached images in the export's Advanced Settings
 
   Resolve's cache can then hold pictures from playback, and a plugin can't tell a render that will

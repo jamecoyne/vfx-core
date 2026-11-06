@@ -1,6 +1,6 @@
-# segcam Motion
+# segcam
 
-segcam Motion finds what **Detect** asks for (what moves, what is bright, or faces and bodies) and
+segcam finds what **Detect** asks for (what moves, what is bright, or faces and bodies) and
 draws it as labelled boxes, mattes or a collage of windows. To install it, read the
 [segcam README](../README.md). How it works and how to check it are in
 [DEVELOPING.md](DEVELOPING.md).
@@ -37,7 +37,7 @@ faces. The browser has no faces yet.
 
 | | Choices or range | Default |
 | --- | --- | --- |
-| Output | Overlay, Motion matte, Box matte, Swarm | Overlay |
+| Output | Overlay, Motion matte, Box matte, Swarm | Swarm |
 | Detect | Motion, Threshold, Faces only | Faces only (Motion in the browser) |
 | Mirror | on or off | off |
 | Sensitivity (Motion) | 0 to 100 percent | 86.4 |
