@@ -105,44 +105,44 @@ readings by name.
 The core API for 1.0 comes from [ADR 7](../plugins/segcam/decisions/0007-core-api.md). A PR that adds
 a trait method, a `Context` field or a `Gpu` function adds a row here, and says so in its
 description. Every new trait method has a default. `Context::at` fills every new field. So old
-targets keep compiling. From 1.0 on, nothing here is removed or renamed.
+targets keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 
-| Item | Where | Since |
-|---|---|---|
-| `Effect` (GPU): `params`, `prepare`, `render`, `layer_inputs`, `layer_name`, `render_layers`, `region` | vfx-core | from the start |
-| `CpuEffect`: `params`, `frames_before` (the frame rate since #57), `render` | vfx-core | from the start |
-| `CpuEffect::keeps_state` | vfx-core | #11 |
-| `DeviceFaults`, `Gpu::faults`, `Gpu::shared_faults`, `Gpu::watch_faults` (the error and loss callbacks of a device, which `Gpu::share` takes over; each device has its own record), `poll_device` (a poll that returns device loss as an error) | vfx-core | #87 |
-| `CpuEffect::clear_history` (forget earlier frames, keeping GPU resources; default `false`, and the host rebuilds the effect) | vfx-core | #100 |
-| `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core | #47 |
-| `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core | #57 |
-| `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core | #59 |
-| `CpuEffect::render_to` and `Target` (a host's GPU frame the effect may draw its output into instead) | vfx-core | #70 |
-| `CpuEffect::can_draw_to_target` (whether a render can use a `Target`, so a host allocates one only then; default `false`) | vfx-core | #88 |
-| `CpuEffect::report`, `Report`, `Reading` (where the last render's work ran and what it found; default empty) | vfx-core | #68 |
-| `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core | from the start |
-| `Context::frame_rate` | vfx-core | #50 |
-| `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core | from the start |
-| `FrameSource`: `with_frame`; `History` | vfx-core | from the start; `fixed` since #31 |
-| `FrameSource::held`; `History::next(before, held)` | vfx-core | #57 |
-| `FrameSource::live` (true for `History`) | vfx-core | #59 |
-| `DeviceFaults::same_device` (whether two records are one device, across wgpu instances), `ReopenBackoff` (when to try for a new device after a loss) | vfx-core | device reopen |
-| `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core | #82 |
-| `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core | from the start |
-| `Gpu::share`, `Gpu::shared` | vfx-core | #47 in browsers; native since #70 |
-| `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core | this PR |
-| Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core | from the start; `ViewMut::bands` since #11, `Argb` as bytemuck `Pod` since #39 |
-| Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core | from the start |
-| `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host | #16; the frame rate since #50 |
-| `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host | #16 |
-| `CpuInstance::frames_held` | vfx-host | #57 |
-| `CpuInstance::values_known` | vfx-host | #59 |
-| `CpuInstance::render_to` | vfx-host | #70 |
-| `CpuInstance::report` | vfx-host | #68 |
-| `CpuInstance::can_draw_to_target` | vfx-host | #88 |
-| `plugin::register`, `plugin`, `gpu` | vfx-host | #10 |
-| `controls::layout` | vfx-host | from the start |
-| `by_rows` (a frame in row bands over a work queue) | vfx-host | #38 |
+| Item | Where |
+|---|---|
+| `Effect` (GPU): `params`, `prepare`, `render`, `layer_inputs`, `layer_name`, `render_layers`, `region` | vfx-core |
+| `CpuEffect`: `params`, `frames_before` (the frame rate), `render` | vfx-core |
+| `CpuEffect::keeps_state` | vfx-core |
+| `DeviceFaults`, `Gpu::faults`, `Gpu::shared_faults`, `Gpu::watch_faults` (the error and loss callbacks of a device, which `Gpu::share` takes over; each device has its own record), `poll_device` (a poll that returns device loss as an error) | vfx-core |
+| `CpuEffect::clear_history` (forget earlier frames, keeping GPU resources; default `false`, and the host rebuilds the effect) | vfx-core |
+| `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core |
+| `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core |
+| `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core |
+| `CpuEffect::render_to` and `Target` (a host's GPU frame the effect may draw its output into instead) | vfx-core |
+| `CpuEffect::can_draw_to_target` (whether a render can use a `Target`, so a host allocates one only then; default `false`) | vfx-core |
+| `CpuEffect::report`, `Report`, `Reading` (where the last render's work ran and what it found; default empty) | vfx-core |
+| `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core |
+| `Context::frame_rate` | vfx-core |
+| `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core |
+| `FrameSource`: `with_frame`; `History` | vfx-core |
+| `FrameSource::held`; `History::next(before, held)` | vfx-core |
+| `FrameSource::live` (true for `History`) | vfx-core |
+| `DeviceFaults::same_device` (whether two records are one device, across wgpu instances), `ReopenBackoff` (when to try for a new device after a loss) | vfx-core |
+| `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core |
+| `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core |
+| `Gpu::share`, `Gpu::shared` | vfx-core |
+| `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core |
+| Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core |
+| Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core |
+| `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host |
+| `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host |
+| `CpuInstance::frames_held` | vfx-host |
+| `CpuInstance::values_known` | vfx-host |
+| `CpuInstance::render_to` | vfx-host |
+| `CpuInstance::report` | vfx-host |
+| `CpuInstance::can_draw_to_target` | vfx-host |
+| `plugin::register`, `plugin`, `gpu` | vfx-host |
+| `controls::layout` | vfx-host |
+| `by_rows` (a frame in row bands over a work queue) | vfx-host |
 
 A target implements `FrameSource` for its frames. It fills a `Context` for each render. It keeps a
 `CpuInstance` if it keeps effects, and it lays out parameters with `controls::layout`. The browser
