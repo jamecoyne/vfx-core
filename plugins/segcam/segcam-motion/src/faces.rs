@@ -328,8 +328,9 @@ mod live {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Sender, channel};
     use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
-    use crate::motion::Blob;
+    use crate::motion::{Blob, SegmentKind};
     use crate::pixel::{Argb, Channel, View};
     use crate::render::FaceParts;
 
@@ -351,10 +352,31 @@ mod live {
             .as_ref()
     }
 
+    /// The worker runs the models at most one part in this many of the time: a detection that took
+    /// `d` is followed by the next no sooner than `d` times this after it started. On a GPU that
+    /// also draws the renders, an integrated one above all, back to back detections leave the
+    /// renders waiting behind them. Where a detection is short beside a frame, this never waits.
+    const DETECTION_PACE: u32 = 2;
+
+    /// Bodies are looked for no more often than once per their detection's time times this; the
+    /// detections between keep the bodies found last. Body detection runs beside the faces on the
+    /// same device, takes longer than they do on an integrated GPU, and bodies move less between
+    /// detections than faces, eyes and mouths. Where it is short beside a frame, every detection
+    /// looks for bodies.
+    const BODY_PACE: u32 = 4;
+
     /// The faces found in one frame, and that frame's pixels.
     struct Detection {
         blobs: Vec<Blob>,
+        /// The parts the render asked for, also when [`BODY_PACE`] left bodies out of this one.
         parts: FaceParts,
+        /// Whether this detection looked for bodies, or keeps the ones held.
+        looked_for_bodies: bool,
+        /// When the detection started on the worker, how long it took and how long its bodies
+        /// took, which pace the next ones.
+        started: Instant,
+        took: Duration,
+        body_time: Option<Duration>,
         pixels: Arc<dyn Any + Send + Sync>,
         width: i32,
         height: i32,
@@ -393,6 +415,10 @@ mod live {
         /// The newest frame asked about, which a picture that holds still isn't asked about again:
         /// it would never stop, and its windows would move with each answer's small differences.
         asked_about: Option<i64>,
+        /// The soonest the next request goes out, by [`DETECTION_PACE`].
+        next_request: Option<Instant>,
+        /// The soonest a request looks for bodies again, by [`BODY_PACE`].
+        next_bodies: Option<Instant>,
         #[cfg(test)]
         pub requests_sent: u32,
     }
@@ -415,10 +441,22 @@ mod live {
                 self.parts = parts;
                 self.held = None;
                 self.asked_about = None;
+                self.next_bodies = None;
             }
             let finished = self.answer.lock().ok().and_then(|mut a| a.take());
-            if let Some(found) = finished.filter(|found| found.parts == parts) {
+            if let Some(mut found) = finished.filter(|found| found.parts == parts) {
+                self.next_request = Some(found.started + found.took * DETECTION_PACE);
+                if let Some(body_time) = found.body_time {
+                    self.next_bodies = Some(found.started + body_time * BODY_PACE);
+                }
                 if let Some(replaced) = self.held.take() {
+                    if !found.looked_for_bodies {
+                        let bodies = replaced
+                            .blobs
+                            .iter()
+                            .filter(|b| b.kind == SegmentKind::Body);
+                        found.blobs.extend(bodies);
+                    }
                     self.spare_frame = Some(replaced.pixels);
                 }
                 self.held = Some(HeldFaces {
@@ -431,7 +469,9 @@ mod live {
                     windows_on: frame,
                 });
             }
-            if self.asked_about != Some(frame) && !self.requested.load(Ordering::Acquire) {
+            let paced = self.next_request.is_some_and(|at| Instant::now() < at);
+            if self.asked_about != Some(frame) && !paced && !self.requested.load(Ordering::Acquire)
+            {
                 self.asked_about = Some(frame);
                 self.request(view, parts, cells);
             }
@@ -494,20 +534,31 @@ mod live {
                 pixels.extend_from_slice(frame.row(y));
             }
             let (width, height) = (frame.width, frame.height);
+            let looked_for_bodies =
+                parts.body && self.next_bodies.is_none_or(|at| Instant::now() >= at);
+            let run_parts = FaceParts {
+                body: looked_for_bodies,
+                ..parts
+            };
             let answer = Arc::clone(&self.answer);
             let requested = Arc::clone(&self.requested);
             let job = move || {
                 if Arc::strong_count(&answer) > 1 {
                     // A panic in a broken runtime counts as no faces, so the request still gets an
                     // answer.
-                    let blobs = catch_unwind(AssertUnwindSafe(|| {
-                        super::find_in(&pixels, width, height, parts, cells)
+                    let started = Instant::now();
+                    let found = catch_unwind(AssertUnwindSafe(|| {
+                        super::find_in(&pixels, width, height, run_parts, cells)
                     }))
                     .unwrap_or_default();
                     if let Ok(mut answer) = answer.lock() {
                         *answer = Some(Detection {
-                            blobs,
+                            blobs: found.blobs,
                             parts,
+                            looked_for_bodies,
+                            started,
+                            took: started.elapsed(),
+                            body_time: found.body_time,
                             pixels: Arc::new(pixels),
                             width,
                             height,
@@ -537,6 +588,7 @@ mod live {
             }
             self.held = None;
             self.asked_about = None;
+            self.next_bodies = None;
         }
 
         #[cfg(test)]
@@ -577,9 +629,35 @@ mod live {
             *self.answer.lock().unwrap() = Some(Detection {
                 blobs,
                 parts,
+                looked_for_bodies: true,
+                started: Instant::now(),
+                took: Duration::ZERO,
+                body_time: None,
                 pixels: Arc::new(pixels),
                 width,
                 height,
+            });
+        }
+
+        /// Leaves an answer as a detection that took `took` would, having looked for bodies or not.
+        #[cfg(test)]
+        pub fn answer_after(
+            &mut self,
+            parts: FaceParts,
+            blobs: Vec<Blob>,
+            took: Duration,
+            looked_for_bodies: bool,
+        ) {
+            *self.answer.lock().unwrap() = Some(Detection {
+                blobs,
+                parts,
+                looked_for_bodies,
+                started: Instant::now(),
+                took,
+                body_time: looked_for_bodies.then_some(took),
+                pixels: Arc::new(()),
+                width: 0,
+                height: 0,
             });
         }
 
@@ -627,7 +705,15 @@ pub fn find<C: Channel>(frame: &View<C>, parts: FaceParts, cells: usize) -> Vec<
     for y in 0..frame.height {
         pixels.extend_from_slice(frame.row(y));
     }
-    find_in(&pixels, frame.width, frame.height, parts, cells)
+    find_in(&pixels, frame.width, frame.height, parts, cells).blobs
+}
+
+/// What [`find_in`] found, and how long its body detection took if it ran one.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct Found {
+    blobs: Vec<Blob>,
+    body_time: Option<std::time::Duration>,
 }
 
 /// [`find`] in a frame of tightly packed rows, once the models have loaded. The models sample the
@@ -639,7 +725,7 @@ fn find_in<C: Channel>(
     height: i32,
     parts: FaceParts,
     cells: usize,
-) -> Vec<Blob> {
+) -> Found {
     use segcam_face::{Image, Kind, Parts, Pixels};
 
     use crate::motion::{NormRect, SegmentKind};
@@ -655,11 +741,11 @@ fn find_in<C: Channel>(
         stride: width.max(0) as usize,
     };
     let Some(mut slot) = models::lock() else {
-        return Vec::new();
+        return Found::default();
     };
     models::keep_working(&mut slot);
     let Some(segmenter) = slot.as_mut() else {
-        return Vec::new();
+        return Found::default();
     };
     let wanted = Parts {
         face: parts.face,
@@ -667,7 +753,7 @@ fn find_in<C: Channel>(
         mouth: parts.mouth,
         body: parts.body,
     };
-    segmenter
+    let blobs = segmenter
         .find(&image, wanted)
         .iter()
         .map(|s| Blob {
@@ -696,7 +782,9 @@ fn find_in<C: Channel>(
                 .landmarks
                 .map(|points| points.map(|(x, y)| (x as f32, y as f32))),
         })
-        .collect()
+        .collect();
+    let body_time = segmenter.body_time().filter(|_| parts.body);
+    Found { blobs, body_time }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -802,6 +890,7 @@ pub fn readings(models_loaded: bool, blobs: &[Blob]) -> Vec<Reading> {
 mod tests {
     use super::*;
     use crate::motion::NormRect;
+    use std::time::Duration;
 
     #[test]
     fn held_faces_count_as_found_on_their_own_frame() {
@@ -837,6 +926,56 @@ mod tests {
         }
         assert_eq!(live.requests_sent, 1);
         drop(models);
+    }
+
+    /// A slow detection holds the next request back, and a quick one doesn't.
+    #[test]
+    fn a_slow_detection_paces_the_next_request() {
+        let _gpu_lock = crate::gpu::gpu_test_lock();
+        let models = lock_models();
+        let pixels = vec![crate::pixel::Argb::<u8>::default(); 16];
+        let view = View::from_pixels(&pixels, 4, 4);
+        let parts = FaceParts {
+            face: true,
+            ..FaceParts::default()
+        };
+        let mut slow = LiveFaces::default();
+        slow.answer_after(parts, Vec::new(), Duration::from_secs(3600), true);
+        slow.exchange(&view, parts, 1, 0, 0);
+        slow.exchange(&view, parts, 1, 1, 0);
+        assert_eq!(slow.requests_sent, 0, "asked while the device is busy");
+        let mut quick = LiveFaces::default();
+        quick.answer_after(parts, Vec::new(), Duration::ZERO, true);
+        quick.exchange(&view, parts, 1, 0, 0);
+        assert_eq!(quick.requests_sent, 1);
+        drop(models);
+    }
+
+    /// A detection that left bodies out keeps the bodies held, and one that looked for them
+    /// replaces them.
+    #[test]
+    fn a_detection_without_bodies_keeps_the_held_ones() {
+        let pixels = vec![crate::pixel::Argb::<u8>::default(); 16];
+        let view = View::from_pixels(&pixels, 4, 4);
+        let parts = FaceParts {
+            face: true,
+            body: true,
+            ..FaceParts::default()
+        };
+        let blob = |kind| Blob {
+            kind,
+            ..Blob::default()
+        };
+        let kinds = |live: &LiveFaces| live.faces_on(1).map(|b| b.kind).collect::<Vec<_>>();
+        let busy = Duration::from_secs(3600);
+        let mut live = LiveFaces::default();
+        live.hold(parts, vec![blob(SegmentKind::Body)], 0, 0);
+        live.answer_after(parts, vec![blob(SegmentKind::Face)], busy, false);
+        live.exchange(&view, parts, 1, 1, 0);
+        assert_eq!(kinds(&live), [SegmentKind::Face, SegmentKind::Body]);
+        live.answer_after(parts, vec![blob(SegmentKind::Face)], busy, true);
+        live.exchange(&view, parts, 1, 1, 0);
+        assert_eq!(kinds(&live), [SegmentKind::Face]);
     }
 
     /// An answer that was on its way when the renders moved elsewhere never attaches.
