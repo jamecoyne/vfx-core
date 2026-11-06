@@ -14,7 +14,7 @@
 //! cargo vfx check                              problems a host would hit, before building
 //! cargo vfx check --quick [-p PACKAGE]...      while iterating: fmt, core clippy, changed tests
 //! cargo vfx check --full                       before a pull request: CI's steps and the harnesses
-//! cargo vfx new NAME                           a new effect crate in vfx-core/effects/NAME
+//! cargo vfx new NAME                           a new effect crate in plugins/NAME
 //! cargo vfx bench CLIP [OPTIONS]               segcam's offline benchmark rows, on any clip
 //! ```
 //!

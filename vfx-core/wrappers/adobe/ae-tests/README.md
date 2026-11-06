@@ -31,7 +31,7 @@ Narrow it with `--cases blur,hdr` and `--variants 32bpc-gpu`.
 3. Renders each project with `aerender`, so opening a saved project is tested too.
    The 32 bpc GPU project renders twice, with Multi-Frame Rendering on and off.
 4. Runs the plugin's pipeline directly on the same input pixels
-   (`vfx-core/effects/vfx-chain/examples/ae_reference.rs`) and compares.
+   (`plugins/vfx-chain/examples/ae_reference.rs`) and compares.
 
 | Check | Passes when |
 |---|---|
