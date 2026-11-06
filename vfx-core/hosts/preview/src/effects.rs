@@ -996,7 +996,7 @@ mod tests {
         let (_turn, lost) = crate::test_gpu();
         let mut effects = Effects::new(&lost);
         effects.keep_output_in_ram(true);
-        let (controls, values) = shown("segcam Motion (Rust)");
+        let (controls, values) = shown("segcam");
         effects.start_stream(&lost, "still".into(), (64, 64), None);
         effects.write_source(&lost, &vec![0.25; 64 * 64 * 4]);
         let picture = render_to_float(&mut effects, &lost, &controls, &values, 0.0);
