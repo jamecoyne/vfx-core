@@ -1,4 +1,4 @@
-# Developing segcam Motion
+# Developing segcam
 
 segcam's motion segmenter as a vfx-core effect, ported from jamecoyne's C++ After Effects effect,
 which isn't in this repository. It is one crate: a `CpuEffect`, exported to After Effects, OpenFX
