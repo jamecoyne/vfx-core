@@ -294,7 +294,7 @@ fn gpu_percent() -> Option<f32> {
 }
 
 /// What a host's user should know about the device, if anything: its loss, or how many errors it
-/// has reported and the first line of the last.
+/// has reported and the last one, its lines joined, since the first line alone only names the kind.
 fn device_fault_text(faults: &DeviceFaults) -> Option<String> {
     if let Some(why) = faults.lost() {
         return Some(format!("GPU lost: {why}"));
@@ -303,7 +303,11 @@ fn device_fault_text(faults: &DeviceFaults) -> Option<String> {
     (count > 0).then(|| {
         format!(
             "GPU errors {count}: {}",
-            last.lines().next().unwrap_or_default()
+            last.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
         )
     })
 }
