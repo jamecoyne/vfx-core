@@ -13,8 +13,8 @@ At a radius of 0 the frame passes through exactly. Hosts hand over straight alph
 on premultiplied colour and divides the alpha out afterwards. Transparent pixels don't bleed colour
 into soft edges.
 
-Blur Edges lets the blur spread past the frame's edge, which needs a host with regions of definition.
-Hosts without them leave the control out.
+Blur Edges lets the blur spread past the frame's edge. It needs a host with regions of definition.
+Hosts without them don't show the control.
 
 ## Building
 

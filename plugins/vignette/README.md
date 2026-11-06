@@ -1,7 +1,7 @@
 # Vignette
 
-Darkens the picture towards its edges, or fades it to any colour away from a centre, on the GPU.
-For After Effects, OpenFX (Resolve, Nuke, Natron), Resolume and the preview.
+Fades the picture towards a colour, away from a centre, on the GPU. The default colour is black, so the
+edges darken. It works in After Effects, OpenFX (Resolve, Nuke, Natron), Resolume and the preview.
 
 | Parameter | Range | Default |
 |---|---|---|
@@ -11,9 +11,9 @@ For After Effects, OpenFX (Resolve, Nuke, Natron), Resolume and the preview.
 | Color | RGBA | black, opaque |
 | Amount | 0 to 1 | 1 |
 
-Distance is measured from the centre and divided by half the frame's diagonal, so a radius of 1
-reaches the corners whatever the frame size or aspect. The fade reaches the colour at the radius and
-starts `Softness` inside it. A radius of 0 covers the whole frame.
+Distance from the centre is divided by half the frame's diagonal. So a radius of 1 reaches the
+corners, whatever the frame size or aspect. The fade reaches the colour at the radius, and it starts
+`Softness` inside that radius. A radius of 0 covers the whole frame.
 
 ## Building
 

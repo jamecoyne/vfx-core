@@ -14,8 +14,8 @@ The second layer is picked in the host, as a clip or layer.
 Amount scales the layer's alpha. A fully transparent layer leaves the input unchanged. Input and
 output use straight alpha.
 
-Linearize Layer decodes the layer from sRGB first, for a chain that works in linear light. The input
-has already been converted by an earlier stage of the chain, so only the layer needs it.
+Linearize Layer decodes the layer from sRGB first. Turn it on in a chain that works in linear light.
+The input is already linear from an earlier stage, so only the layer needs the conversion.
 
 ## Building
 

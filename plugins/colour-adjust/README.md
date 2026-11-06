@@ -9,8 +9,9 @@ Changes the picture's brightness, contrast and saturation, on the GPU. For After
 | Contrast | 0 to 4 | 1 |
 | Saturation | 0 to 4 | 1 |
 
-Float output is not clamped to 0 to 1. Saturation uses Rec. 709 luma on whatever colour space the host sends, so for a linear chain,
-convert to linear first.
+Float output is not clamped to 0 to 1, so values above 1 or below 0 survive in float targets.
+
+Saturation uses Rec. 709 luma on whatever colour space the host sends. For a linear chain, convert to linear first.
 
 ## Building
 
