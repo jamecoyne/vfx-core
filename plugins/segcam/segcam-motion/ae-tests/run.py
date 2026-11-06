@@ -16,8 +16,9 @@ on the same footage. Renders them with aerender and checks:
 Usage: python3 plugins/segcam/segcam-motion/ae-tests/run.py [--clip footage.mp4] [--frames 40]
 
 Default footage is generated: squares crossing a gradient, as a PNG sequence, so every
-input pixel is known. Needs both effects installed, After Effects 2026 (it is started if
-needed), ffmpeg. Results go to target/segcam-ae-tests/; exit status is non-zero on failure.
+input pixel is known. Needs the Rust effect installed (the C++ one is compared when it is),
+After Effects 2026 (it is started if needed), ffmpeg. Runs on macOS and Windows. Results go
+to target/segcam-ae-tests/; exit status is non-zero on failure.
 """
 
 import argparse
@@ -26,20 +27,30 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 import zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[3]
 AE_APP = "Adobe After Effects 2026"
-AERENDER = Path(f"/Applications/{AE_APP}/aerender")
-MEDIACORE = Path("/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore")
+WINDOWS = sys.platform == "win32"
+if WINDOWS:
+    AE_SUPPORT = Path(rf"C:\Program Files\Adobe\{AE_APP}\Support Files")
+    AERENDER = AE_SUPPORT / "aerender.exe"
+    MEDIACORE = Path(r"C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore")
+    # A Windows plugin is a folder holding the .aex and the DLLs it loads beside it.
+    BUNDLES = ("SegcamMotionRust/SegcamMotionRust.aex", "SegcamMotion/SegcamMotion.aex")
+else:
+    AERENDER = Path(f"/Applications/{AE_APP}/aerender")
+    MEDIACORE = Path("/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore")
+    BUNDLES = ("SegcamMotionRust.plugin", "SegcamMotion.plugin")
 FPS = 30
 DEPTHS = [8, 16, 32]
 MODES = ["overlay", "matte", "boxmatte", "swarm"]  # Output popup values 1..4
 EFFECTS = {
-    "rust": ("LOFISCIFI segcam Motion Rust", "SegcamMotionRust.plugin"),
-    "cpp": ("LOFISCIFI segcam Motion", "SegcamMotion.plugin"),
+    "rust": ("LOFISCIFI segcam Motion Rust", BUNDLES[0]),
+    "cpp": ("LOFISCIFI segcam Motion", BUNDLES[1]),
 }
 # 8-bit levels the Rust and C++ effects may differ by.
 TOLERANCE = 1
@@ -159,7 +170,7 @@ if (app.project.close(CloseOptions.PROMPT_TO_SAVE_CHANGES)) {
 
 def build_projects(out, footage, sequence, size, frames, effects):
     spec = {
-        "footage": str(footage),
+        "footage": footage.as_posix(),
         "sequence": sequence,
         "w": size[0],
         "h": size[1],
@@ -167,23 +178,43 @@ def build_projects(out, footage, sequence, size, frames, effects):
         "modes": MODES,
         "depths": DEPTHS,
         "effects": [{"key": k, "match": EFFECTS[k][0]} for k in effects],
-        "out": str(out),
+        "out": out.as_posix(),
     }
     for depth in DEPTHS:
         (out / str(depth)).mkdir(parents=True, exist_ok=True)
     script = out / "projects.jsx"
     script.write_text(JSX % {"spec": json.dumps(spec), "fps": FPS})
-    subprocess.run(
-        ["osascript", "-e",
-         f'with timeout of 900 seconds\n'
-         f'tell application "{AE_APP}" to DoScriptFile "{script}"\n'
-         f'end timeout'],
-        check=True, capture_output=True,
-    )
+    if WINDOWS:
+        run_script_windows(script, [out / f"{d}.aep" for d in DEPTHS])
+    else:
+        subprocess.run(
+            ["osascript", "-e",
+             f'with timeout of 900 seconds\n'
+             f'tell application "{AE_APP}" to DoScriptFile "{script}"\n'
+             f'end timeout'],
+            check=True, capture_output=True,
+        )
     missing = [d for d in DEPTHS if not (out / f"{d}.aep").exists()]
     if missing:
         sys.exit(f"After Effects didn't save projects for {missing} bpc "
                  "(was the save prompt cancelled, or did the script fail?)")
+
+
+def run_script_windows(script, projects, timeout=900):
+    """Runs a script in After Effects on Windows, starting it if needed. `AfterFX.exe -r`
+    hands the script over and returns before it has run, so this waits for the projects the
+    script saves: done when every one exists and none has grown for two seconds."""
+    subprocess.Popen([str(AE_SUPPORT / "AfterFX.exe"), "-r", str(script)])
+    deadline = time.monotonic() + timeout
+    sizes = None
+    while True:
+        current = [p.stat().st_size if p.exists() else None for p in projects]
+        if None not in current and current == sizes:
+            return
+        if time.monotonic() > deadline:
+            return  # the caller names the missing projects
+        sizes = current
+        time.sleep(2)
 
 
 def aerender(out, depth, mfr):

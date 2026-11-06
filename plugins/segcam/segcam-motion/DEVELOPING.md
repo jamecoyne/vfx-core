@@ -190,6 +190,11 @@ renders them with `aerender`, and checks that the Rust effect matches the C++ on
 give identical frames, and that the movers were found. `--clip` uses real footage instead of the
 generated squares.
 
+It runs on macOS and Windows. On Windows the plugin is a folder in MediaCore,
+`C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\SegcamMotionRust\`, holding
+`SegcamMotionRust.aex` and the `DirectML.dll` the face models load beside it. The harness runs its
+project script with `AfterFX.exe -r`. Without the C++ effect installed, the comparison is skipped.
+
 ### OpenFX
 
 ```bash

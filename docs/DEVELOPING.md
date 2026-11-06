@@ -320,9 +320,9 @@ conversions. Each host also has a harness that runs the effects:
 - After Effects. `python3 vfx-core/wrappers/adobe/ae-tests/run.py` builds fixture projects for
   VFX Preview in the running After Effects (8, 16 and 32 bpc, CPU and Metal), renders them with
   `aerender` with MFR on and off, and compares them with `ae_reference`, the same render path
-  without After Effects. `python3 plugins/segcam/segcam-motion/ae-tests/run.py` renders segcam
-  next to segcam's C++ effect. Both test the *installed* plugins and need After Effects, so they
-  aren't in CI.
+  without After Effects (macOS only). `python3 plugins/segcam/segcam-motion/ae-tests/run.py`
+  renders segcam next to segcam's C++ effect, on macOS and Windows. Both test the *installed*
+  plugins and need After Effects, so they aren't in CI.
 - OpenFX. `vfx-core/wrappers/ofx/minihost/run.sh` loads VFX Preview into a small C host built on
   the real OpenFX headers and checks pixels, depths, row order, premultiplication, render scale,
   and regions of definition and interest. `plugins/segcam/segcam-motion/ofx-tests/run.sh` renders
