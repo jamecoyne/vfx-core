@@ -17,17 +17,21 @@ pub enum Tier {
 }
 
 /// CI's core crates: plain Rust and wgpu, built and tested on every OS.
-const CORE: [&str; 7] = [
+const CORE: [&str; 11] = [
     "vfx-core",
     "vfx-host",
     "vfx-build",
     "vfx-chain",
+    "colour-adjust",
+    "gaussian-blur",
+    "vignette",
+    "blend",
     "segcam-motion",
     "segcam-face",
     "cargo-vfx",
 ];
 const WRAPPERS: [&str; 4] = ["vfx-ae", "vfx-ofx", "vfx-ffgl", "vfx-ffgl-common"];
-const HOST_FEATURES: &str = "vfx-chain/ae,vfx-chain/ofx,vfx-chain/ffgl,segcam-motion/ae,segcam-motion/ofx,segcam-motion/ffgl";
+const HOST_FEATURES: &str = "vfx-chain/ae,vfx-chain/ofx,vfx-chain/ffgl,colour-adjust/ae,colour-adjust/ofx,colour-adjust/ffgl,gaussian-blur/ae,gaussian-blur/ofx,gaussian-blur/ffgl,vignette/ae,vignette/ofx,vignette/ffgl,blend/ae,blend/ofx,blend/ffgl,segcam-motion/ae,segcam-motion/ofx,segcam-motion/ffgl";
 const WASM: &str = "wasm32-unknown-unknown";
 
 /// Runs the tier's steps one after another, each logged to `target/checks/NAME.log`.
@@ -111,7 +115,15 @@ fn full(root: &Path, logs: &Path) -> Vec<(String, Command)> {
     // CI builds the plugins and runs the mini hosts on macOS and Windows only.
     if cfg!(any(target_os = "macos", windows)) {
         let mut plugin_crates = WRAPPERS.to_vec();
-        plugin_crates.extend(["vfx-plugin", "vfx-chain", "segcam-motion"]);
+        plugin_crates.extend([
+            "vfx-plugin",
+            "vfx-chain",
+            "colour-adjust",
+            "gaussian-blur",
+            "vignette",
+            "blend",
+            "segcam-motion",
+        ]);
         steps.push(("tests-wrappers".into(), test(&WRAPPERS, &[])));
         steps.push((
             "clippy-wrappers".into(),
