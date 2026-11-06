@@ -553,6 +553,27 @@ static double now(void) {
 #endif
 }
 
+#ifndef _WIN32
+/* The plugin's own device opens on a thread of its own and frames pass through until it's open.
+ * The cases compare the effect's output, so wait for a frame the effect changed first. Windows
+ * waits in its own cases, the first of which checks that pass through. */
+static void wait_for_effect(void) {
+    void *inst = instantiate(64, 48);
+    set(inst, "Brightness", 0.25f);
+    Frame f = frame(64, 48, 64, 48);
+    double started = now();
+    struct timespec pause = {0, 5000000};
+    do {
+        render(inst, &f);
+        if (max_diff(&f) > 1e-3f) break;
+        nanosleep(&pause, NULL);
+    } while (now() - started < 10);
+    if (max_diff(&f) <= 1e-3f) printf("  the effect still passed frames through after 10 s\n");
+    free_frame(&f);
+    call(DEINSTANTIATE_GL, u(0), inst);
+}
+#endif
+
 /* segcam Motion's own checks, from plugins/segcam (its ffgl-tests/run.sh passes the folder). */
 #ifdef SEGCAM_CHECKS
 #include "segcam.h"
@@ -1171,6 +1192,9 @@ int main(int argc, char **argv) {
         call(DEINITIALISE, u(0), NULL);
         return failures ? 1 : 0;
     }
+#endif
+#ifndef _WIN32
+    wait_for_effect();
 #endif
     int ran = 0;
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
