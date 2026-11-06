@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn slugs_name_effects() {
         assert_eq!(slug("segcam Motion"), "segcam-motion");
-        assert_eq!(slug("segcam Motion (Rust)"), "segcam-motion-rust");
+        assert_eq!(slug("segcam"), "segcam");
         assert!(find_slug("segcam-motion").is_some());
         assert!(find_slug("vfx-preview").is_none());
         assert!(find_slug("gaussian-blur").is_some());

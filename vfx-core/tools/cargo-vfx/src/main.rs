@@ -767,8 +767,8 @@ fn preview(chosen: &[&Effect], root: &Path, o: &Options) -> Result<(), String> {
     run(cmd.args(&o.rest))
 }
 
-/// How the preview names an effect on its command line: "segcam Motion (Rust)" is
-/// `segcam-motion-rust`.
+/// How the preview names an effect on its command line: "segcam Motion" is
+/// `segcam-motion`.
 fn slug(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars() {
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn slugs_and_hosts() {
-        assert_eq!(slug("segcam Motion (Rust)"), "segcam-motion-rust");
+        assert_eq!(slug("segcam Motion"), "segcam-motion");
         assert_eq!(slug("VFX Preview"), "vfx-preview");
         assert_eq!(Host::parse("ofx"), Ok(Host::Ofx));
         assert!(Host::parse("vst").is_err());

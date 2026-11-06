@@ -831,6 +831,14 @@ mod tests {
         (controls, values)
     }
 
+    /// segcam with Overlay output, which passes its input through on the first render (its
+    /// default is Swarm).
+    fn segcam_overlay() -> (Controls, ParamValues) {
+        let (controls, mut values) = shown("segcam");
+        values.set("output", ParamValue::Int(0)).unwrap();
+        (controls, values)
+    }
+
     fn render_to_float(
         effects: &mut Effects,
         gpu: &Gpu,
@@ -901,7 +909,7 @@ mod tests {
         let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
-        let (controls, mut values) = shown("segcam Motion (Rust)");
+        let (controls, mut values) = shown("segcam");
         values.set("output", ParamValue::Int(1)).unwrap();
         values.set("detect", ParamValue::Int(0)).unwrap();
         values.set("eyes", ParamValue::Bool(false)).unwrap();
@@ -921,7 +929,7 @@ mod tests {
         let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
-        let (controls, values) = shown("segcam Motion (Rust)");
+        let (controls, values) = segcam_overlay();
         effects.start_stream(&gpu, "clip".into(), (64, 64), None);
         for (f, shade) in [0.25, 0.75, 0.25].into_iter().enumerate() {
             effects.write_source(&gpu, &vec![shade; 64 * 64 * 4]);
@@ -942,7 +950,7 @@ mod tests {
         let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
-        let (controls, values) = shown("segcam Motion (Rust)");
+        let (controls, values) = shown("segcam");
         let size = (64, 64);
         effects.start_stream(&gpu, "still".into(), size, None);
         let render = |effects: &mut Effects, time| {
@@ -977,7 +985,7 @@ mod tests {
         let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
-        let (controls, values) = shown("segcam Motion (Rust)");
+        let (controls, values) = segcam_overlay();
         let pixels: Vec<Argb<u8>> = (0..64 * 64)
             .map(|i: usize| Argb {
                 alpha: 255,
@@ -1020,7 +1028,7 @@ mod tests {
         let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
-        let (controls, values) = shown("segcam Motion (Rust)");
+        let (controls, values) = segcam_overlay();
         for shade in [64, 192] {
             let grey = Argb {
                 alpha: 255,

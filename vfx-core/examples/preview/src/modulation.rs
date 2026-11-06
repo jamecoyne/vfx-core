@@ -862,7 +862,7 @@ mod tests {
     const COLOUR: &str = "Colour Adjust";
     const BLUR: &str = "Gaussian Blur";
     const VIGNETTE: &str = "Vignette";
-    const SEGCAM: &str = "segcam Motion (Rust)";
+    const SEGCAM: &str = "segcam";
 
     #[test]
     fn valid_expressions_override_sliders() {

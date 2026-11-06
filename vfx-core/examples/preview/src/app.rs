@@ -1588,6 +1588,12 @@ impl Preview {
             self.refresh_display_texture();
         }
         match &start.input {
+            // Interactive runs start on the default camera; scripted ones keep the pattern.
+            None if !scripted => {
+                if let Some(name) = video::default_camera(&self.cameras) {
+                    self.open_input(video::Input::Camera(name, None), start.size);
+                }
+            }
             None => {}
             Some(script::Source::Pattern(name)) => {
                 self.controls.pattern = script::pattern_index(name)?

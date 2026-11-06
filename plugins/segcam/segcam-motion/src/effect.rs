@@ -15,10 +15,14 @@ use crate::{
 /// show nothing at all.
 const DETECT_DEFAULT: i32 = if cfg!(target_arch = "wasm32") { 0 } else { 2 };
 
+/// The output starts as Swarm, the look segcam 1.1 has (index 3 of [`OutputMode::NAMES`]).
+const OUTPUT_DEFAULT: i32 = 3;
+
 /// The controls, with segcam's units (percentages are 0-100), ranges and defaults: those of
-/// [`RenderSettings::default`], but Detect and the face parts start as segcam 1.1 does.
+/// [`RenderSettings::default`], but Output starts as Swarm, and Detect and the face parts start
+/// as segcam 1.1 does.
 pub const PARAMS: &[ParamSpec] = &[
-    ParamSpec::choice("output", &OutputMode::NAMES, 0).label("Output"),
+    ParamSpec::choice("output", &OutputMode::NAMES, OUTPUT_DEFAULT).label("Output"),
     ParamSpec::choice(
         "detect",
         &["Motion", "Threshold", "Faces only"],
@@ -270,6 +274,7 @@ mod tests {
     fn default_params_match_segcam_1_1() {
         let mut s = settings_from_params(&ParamValues::new(PARAMS), false);
         let expected = RenderSettings {
+            mode: OutputMode::Swarm,
             detection_mode: DetectionMode::FacesOnly,
             faces: FaceParts {
                 eyes: true,

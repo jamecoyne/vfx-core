@@ -533,7 +533,7 @@ mod tests {
     fn decoded_frame_reaches_history() {
         let (_turn, gpu) = crate::test_gpu();
         let mut controls = crate::controls::Controls::default();
-        controls.effect = find("segcam Motion (Rust)").unwrap();
+        controls.effect = find("segcam").unwrap();
         let values = controls.values().clone();
         let make = catalog::entries()[controls.effect].make;
         let effect = CpuInstance::new(make, true).expect("a CPU effect");
@@ -728,7 +728,7 @@ mod tests {
     fn float_frame_reads_at_8_bit() {
         let (_turn, gpu) = crate::test_gpu();
         let mut controls = crate::controls::Controls::default();
-        controls.effect = find("segcam Motion (Rust)").unwrap();
+        controls.effect = find("segcam").unwrap();
         let values = controls.values().clone();
         let make = catalog::entries()[controls.effect].make;
         let effect = CpuInstance::new(make, true).expect("a CPU effect");

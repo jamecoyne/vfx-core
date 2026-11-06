@@ -85,8 +85,8 @@ cargo vfx install -p segcam-motion    # Resolume; prints the sudo commands for t
 
 The plugins install alongside the C++ effect. In After Effects the bundle is
 `SegcamMotionRust.plugin`, its match name `LOFISCIFI segcam Motion Rust`, and it appears as
-**Effect ▸ LO.FI.SCI.FI ▸ segcam Motion (Rust)**; projects saved with one effect don't switch to the
-other. In OpenFX hosts it is **LO.FI.SCI.FI / segcam Motion (Rust)**, identifier
+**Effect ▸ LO.FI.SCI.FI ▸ segcam**; projects saved with one effect don't switch to the
+other. In OpenFX hosts it is **LO.FI.SCI.FI / segcam**, identifier
 `com.lofiscifi.SegcamMotionRust`; in Resolume, **segcam Motion**, ID `SGCM`. Its logs are
 `~/Library/Logs/SegcamMotionRust-<host>.log` (on Windows, in `%TEMP%`).
 

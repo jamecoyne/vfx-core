@@ -108,6 +108,21 @@ impl Input {
     }
 }
 
+/// The camera a run starts on: a Mac's built-in one ("MacBook Pro Camera", or "FaceTime HD
+/// Camera" on older Macs), never a desk view or an iPhone, else the first camera listed.
+pub fn default_camera(cameras: &[String]) -> Option<String> {
+    let built_in = |name: &&String| {
+        let lower = name.to_lowercase();
+        (lower.contains("macbook") || lower.contains("facetime") || lower.contains("built-in"))
+            && !lower.contains("desk view")
+    };
+    cameras
+        .iter()
+        .find(built_in)
+        .or_else(|| cameras.first())
+        .cloned()
+}
+
 /// The cameras ffmpeg can open, by name.
 pub fn cameras() -> Vec<String> {
     if cfg!(target_os = "linux") {
@@ -696,6 +711,22 @@ impl Drop for SoundPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_camera_is_the_built_in_one() {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let list = names(&[
+            "Jame iphone Camera",
+            "MacBook Pro Desk View Camera",
+            "MacBook Pro Camera",
+        ]);
+        assert_eq!(default_camera(&list).as_deref(), Some("MacBook Pro Camera"));
+        let list = names(&["OBS Virtual Camera", "FaceTime HD Camera"]);
+        assert_eq!(default_camera(&list).as_deref(), Some("FaceTime HD Camera"));
+        let list = names(&["USB Camera", "Other"]);
+        assert_eq!(default_camera(&list).as_deref(), Some("USB Camera"));
+        assert_eq!(default_camera(&[]), None);
+    }
 
     fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
         let until = Instant::now() + Duration::from_secs(10);
