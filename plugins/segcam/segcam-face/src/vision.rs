@@ -1,5 +1,6 @@
 //! Faces, eyes, mouths and bodies through Apple's Vision, as segcam 1.1 finds them.
 
+use std::cmp::Ordering;
 use std::ffi::c_void;
 use std::ptr;
 
@@ -108,7 +109,10 @@ impl VisionSegmenter {
             return &self.segments;
         }
         let (width, height) = self.fill_bgra(image);
-        let found = detect(&mut self.bgra, width, height, faces, parts.body);
+        let mut found = detect(&mut self.bgra, width, height, faces, parts.body);
+        // Vision's order changes between runs on the same frame, and IDs and stacking follow it.
+        found.faces.sort_by(|a, b| biggest_first(&a.rect, &b.rect));
+        found.bodies.sort_by(biggest_first);
         for face in &found.faces {
             self.push_face(face, parts);
         }
@@ -183,6 +187,14 @@ fn padded_part(points: &[(f64, f64)], padding: f64) -> Rect {
         h,
     }
     .clamped()
+}
+
+/// Biggest first, as the motion segments are. Ties go by position.
+fn biggest_first(a: &Rect, b: &Rect) -> Ordering {
+    (b.w * b.h)
+        .total_cmp(&(a.w * a.h))
+        .then(a.x.total_cmp(&b.x))
+        .then(a.y.total_cmp(&b.y))
 }
 
 struct VisionFace {
@@ -348,5 +360,25 @@ unsafe fn read_faces(request: &AnyObject, width: f64, height: f64) -> Vec<Vision
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn biggest_first_ignores_the_order_given() {
+        let rect = |x, w| Rect {
+            x,
+            y: 0.1,
+            w,
+            h: 0.2,
+        };
+        let (big, left, right) = (rect(0.5, 0.4), rect(0.1, 0.2), rect(0.3, 0.2));
+        for mut rects in [[big, left, right], [right, big, left], [left, right, big]] {
+            rects.sort_by(biggest_first);
+            assert_eq!(rects, [big, left, right]);
+        }
     }
 }

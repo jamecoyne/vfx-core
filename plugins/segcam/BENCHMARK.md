@@ -6,11 +6,14 @@ correctness only: its machines are shared, have no real GPU and time too unevenl
 ## Clip
 
 To choose: a 1080p, 59.94 fps clip the project can share, with motion and several faces, 300
-frames. Until then each run names the clip it used, and only runs on the same clip compare.
+frames. Until then each run names the clip it used, and only runs on the same clip compare. "The
+benchmark clip" below is a 1080p, 59.94 fps H.264 clip of 1,103 frames that isn't in this repository.
 
-Offline runs use the decoded frames of the clip as H.264 and Resolume plays the clip in a composition.
-Resolve uses a DNxHR HQ transcode: segcam asks for earlier frames, and an intra frame codec gets any
-frame without decoding the ones before it.
+H.264 or H.265 is the primary test in every host: offline runs use the decoded frames of the clip,
+Resolume plays it in a composition and Resolve plays it on a timeline. A run on an intra frame codec
+such as DNxHR HQ is an added one and states its reason. In Resolve that reason is frame fetches:
+segcam asks for earlier frames, and an intra frame codec gets any frame without decoding the ones
+before it.
 
 ## Presets
 
@@ -23,7 +26,7 @@ Always the first four. Overlay is the core effect, Swarm the mode. Runs compared
 | overlay faces | overlay, plus Face, Eyes, Mouth and Body |
 | show | Output Swarm, Detect Motion, Background 16, Trail 24, Swarm max tiles 100, backdrop Transparent, no face parts |
 | show faces | show, plus Face, Eyes, Mouth and Body |
-| 1.1 look | show faces with Trail 120, analysing at 1.1's rate from the clip's frame rate: `RenderSettings::segcam_1_1_preset`, in the CLI `--preset 1.1 --fps RATE --keep` |
+| 1.1 look | show faces with Background 64 and Trail 120, analysing at 1.1's rate from the clip's frame rate: `RenderSettings::segcam_1_1_preset`, in the CLI `--preset 1.1 --fps RATE --keep` |
 
 A host that gives no frame rate (Resolume) analyses every frame, so its 1.1 look rows say so.
 
@@ -88,7 +91,7 @@ Linux the GPUs `lspci` lists.
 | Ryzen 5 3600, RX 5700 XT 50th Anniversary (display), AMD 26.10.1, Windows 10 22H2 | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output through RAM | not split out | 32.7 ms | 45.6 ms | 26.7 fps | |
 | same | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output kept on the GPU | not split out | 28.9 ms | 41.4 ms | 30.0 fps | the swarm read back, byte for byte (`tests/target.rs`) |
 
-CLI rows: jamecoyne's clip (H.264, 1080p, 59.94 fps), frames 0 to 299, two runs pooled, printed by
+CLI rows: the benchmark clip (H.264, 1080p, 59.94 fps), frames 0 to 299, two runs pooled, printed by
 `cargo vfx bench`. The first two rows are `--cpu`. Faces run on DirectML on the RTX 4070.
 
 Resolume rows: the #26 clip, an 8 s 720p pan over the Apollo 11 crew photo looping in a 1080p
@@ -96,6 +99,34 @@ composition, one run of 3 minutes each, the same build, the first row with `VFX_
 From the FFGL timing log (`VFX_FFGL_TIMING=1`): the medians of its 300-frame batches after the
 first, which holds the face models' load, so the first 40 frames aren't split out. Times run
 from the readback to the frame shown; fps is frames over the run.
+
+## Runs in hosts and on other machines
+
+1080p with the benchmark clip unless a row says otherwise. "Long trail" is Swarm, Detect on Motion,
+Sensitivity 62, Background 64, Trail frames 120, Swarm max tiles 60 and no face parts.
+
+| Machine | Host and settings | Result |
+|---|---|---|
+| Ryzen 5 PRO 4650U laptop, integrated Radeon graphics | preview app, long trail, 60 s, on mains | 59 fps rendered and on screen, worst frame 46 to 51 ms |
+| same | preview app, Swarm, 20 min | 46.5 fps, worst frame 27 ms, memory 796 to 732 MB |
+| same | preview app, long trail with Faces only, Eyes, Mouth and Body, 60 s | 27 fps, no frame over 62 ms |
+| same | Faces only, faces on DirectML | 30 fps, 165% CPU |
+| same | Faces only, faces on the CPU | 49 fps, 365% CPU |
+| M4 MacBook Pro | preview app, long trail, 60 s | 59.9 fps rendered, 60 fps on screen |
+| same | preview app, long trail with faces, 5 min | 59.9 fps, memory flat |
+| same | Resolume Arena 7.28.1, a DXV copy of the clip, Swarm, Detect on Motion, all face parts | about 57 renders/s |
+| same | Resolume Arena 7.28.1, DXV, Swarm, 10 min | nothing over 100 ms |
+| same | Resolume Arena, H.264 with few keyframes | 7 to 8 new frames/s after a trigger, about 33 at each loop point, 41 otherwise |
+| same | Resolve 21, whole clip export to FFV1, Swarm, Detect on Motion, all face parts | about 28 fps |
+| i7-12700K, RTX 4070 | Resolume Arena 7.28.1, Swarm, one instance, Eyes and Mouth, Faces only | 81 renders/s, median 3.8 ms in the plugin's call, memory flat over 5 min |
+| same | Resolume Arena 7.28.1, Swarm, one instance, Eyes and Mouth, Motion | 66 renders/s, median 6.9 ms in the plugin's call |
+| same | Resolve 21.1, long trail, whole clip H.265 export, no render cache, fresh start | 38 fps |
+| same | Resolve 21.1, long trail, playback | 24 to 36 renders/s |
+| same | Resolve 21.1, long trail, export straight after playback in the same session | 30 fps, the same pixels |
+| same | Resolve 21.1, long trail, picture after a pause, reading 183 frames | 3.3 to 4.2 s |
+| same | Resolve 21.1, long trail, picture after a seek | about 3 to 4 s |
+
+No host has been timed yet on an Apple M1 or M2, an Intel Iris Xe, an Intel UHD 770 or a Radeon 680M.
 
 ## GPU thresholds
 

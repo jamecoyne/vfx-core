@@ -117,6 +117,16 @@ impl<'a, C: Channel> View<'a, C> {
     pub fn row(&self, y: i32) -> &'a [Argb<C>] {
         row(self.data, y, self.width, self.stride)
     }
+
+    /// Each row's pixels as bytes, top row first.
+    pub fn byte_rows(&self) -> Vec<&'a [u8]> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        (0..self.height)
+            .map(|y| bytemuck::cast_slice(self.row(y)))
+            .collect()
+    }
 }
 
 /// A picture being drawn into.
@@ -253,6 +263,15 @@ impl Image<'_> {
             Image::F32(v) => (v.width, v.height),
         }
     }
+
+    /// Each row's pixels as bytes, top row first.
+    pub fn byte_rows(&self) -> Vec<&[u8]> {
+        match self {
+            Image::U8(v) => v.byte_rows(),
+            Image::U16(v) => v.byte_rows(),
+            Image::F32(v) => v.byte_rows(),
+        }
+    }
 }
 
 impl ImageMut<'_> {
@@ -324,6 +343,26 @@ pub trait FrameSource {
     /// Calls `f` with frame `index`, or with `None` if that frame isn't there.
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>));
 
+    /// [`Self::with_frame`] for an effect that may find it doesn't need the pixels: `wanted` sees
+    /// frame `index` as rows of the bytes this source holds it in, and `f` runs only if it returns
+    /// true, so a source that converts frames needn't convert this one. A frame that isn't there
+    /// skips `wanted` and calls `f` with `None`.
+    ///
+    /// Equal bytes mean equal pixels, so a hash of them stands for the frame. Equal pixels may
+    /// still come as different bytes, and these bytes need not be the ones `with_frame` shows:
+    /// compare them only with this method's, on the same source.
+    fn with_frame_if_wanted(
+        &mut self,
+        index: usize,
+        wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+        f: &mut dyn FnMut(Option<Image<'_>>),
+    ) {
+        self.with_frame(index, &mut |image| match image {
+            Some(frame) if !wanted(&frame.byte_rows()) => {}
+            image => f(image),
+        });
+    }
+
     /// Whether frames arrive from a live stream, so an effect should draw what it has rather than
     /// hold up the output: true for [`History`], false where a render may be exported and has to
     /// be exact whatever it costs. A live source that is also [fixed](Self::fixed) numbers each
@@ -353,8 +392,16 @@ pub trait FrameSource {
 /// For hosts that hand over one frame at a time (Resolume, the preview): the last few
 /// frames, oldest first, with their allocations recycled at the front. Only the newest are
 /// held in full, as the effect says; a render still counts the rest, which come as `None`.
+/// A host that may hand over the same picture again calls [`History::drop_repeat`] after filling
+/// a frame, so that a repeat isn't counted as a new frame.
 pub struct History<C> {
     frames: VecDeque<Vec<Argb<C>>>,
+    /// The frame that made room for the newest, kept until the next one in case it's a repeat.
+    left: Option<Vec<Argb<C>>>,
+    /// A repeat's buffer, for the next frame.
+    spare: Option<Vec<Argb<C>>>,
+    /// `count` before the newest frame.
+    count_before: usize,
     /// How many frames a render counts, `frames` being the newest of them.
     count: usize,
     width: i32,
@@ -367,6 +414,9 @@ impl<C> Default for History<C> {
     fn default() -> Self {
         Self {
             frames: VecDeque::new(),
+            left: None,
+            spare: None,
+            count_before: 0,
             count: 0,
             width: 0,
             height: 0,
@@ -378,6 +428,8 @@ impl<C> Default for History<C> {
 impl<C: Depth> History<C> {
     pub fn clear(&mut self) {
         self.frames.clear();
+        self.left = None;
+        self.spare = None;
         self.count = 0;
         self.pushed = 0;
     }
@@ -408,20 +460,53 @@ impl<C: Depth> History<C> {
     /// Room for a new frame, the newest, to be filled by the caller. Counts `before` frames
     /// before it and holds the pixels of `held` of them.
     pub fn next(&mut self, before: usize, held: usize) -> &mut [Argb<C>] {
+        self.count_before = self.count;
         self.count = (self.count + 1).min(before + 1);
         let keep = held.min(before) + 1;
         while self.frames.len() > keep {
             self.frames.pop_front();
         }
-        let pixels = if self.frames.len() == keep {
-            self.frames.pop_front().expect("keep is at least 1")
-        } else {
-            vec![Argb::default(); self.width as usize * self.height as usize]
+        let leaving = (self.frames.len() == keep).then(|| self.frames.pop_front());
+        let leaving = leaving.flatten();
+        let reused = self.spare.take().or_else(|| self.left.take());
+        // Without earlier frames there's nothing a repeat could change.
+        let (pixels, left) = match (before, reused, leaving) {
+            (0, reused, leaving) => (reused.or(leaving), None),
+            (_, reused, leaving) => (reused, leaving),
         };
+        self.left = left;
+        let pixels = pixels
+            .unwrap_or_else(|| vec![Argb::default(); self.width as usize * self.height as usize]);
         self.frames.push_back(pixels);
         self.pushed += 1;
         self.frames.back_mut().expect("just pushed")
     }
+
+    /// Takes the newest frame back if it's the same picture as the one before, and says if it did.
+    /// New frames usually differ within the first rows, so this costs little unless it's a repeat.
+    pub fn drop_repeat(&mut self) -> bool {
+        let Some((newest, rest)) = self.frames.make_contiguous().split_last() else {
+            return false;
+        };
+        let Some(previous) = rest.last().or(self.left.as_ref()) else {
+            return false;
+        };
+        if pixel_bytes(newest) != pixel_bytes(previous) {
+            return false;
+        }
+        self.spare = self.frames.pop_back();
+        if let Some(left) = self.left.take() {
+            self.frames.push_front(left);
+        }
+        self.count = self.count_before;
+        self.pushed -= 1;
+        true
+    }
+}
+
+fn pixel_bytes<C: Depth>(pixels: &[Argb<C>]) -> &[u8] {
+    // SAFETY: `Argb` is four channels of a plain number type, with no padding.
+    unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast(), size_of_val(pixels)) }
 }
 
 impl<C: Depth> FrameSource for History<C> {
@@ -473,9 +558,10 @@ mod tests {
         h.next(1, 1).fill(grey(0));
         h.next(1, 1).fill(grey(128));
         assert_eq!(h.len(), 2);
-        assert_eq!(h.frames[1].as_ptr(), first, "the oldest buffer is reused");
         assert_eq!((h.frames[0][0].red, h.frames[1][0].red), (0, 128));
         assert_eq!(h.frame_number(), 2);
+        h.next(1, 1).fill(grey(64));
+        assert_eq!(h.frames[1].as_ptr(), first, "the oldest buffer is reused");
         for _ in 0..5 {
             h.next(3, 3);
         }
@@ -507,6 +593,64 @@ mod tests {
             });
         }
         assert_eq!(read, [None, None, Some(4), Some(5)]);
+    }
+
+    fn newest_values(h: &mut History<u8>) -> Vec<Option<u8>> {
+        let mut read = Vec::new();
+        for index in 0..h.len() {
+            h.with_frame(index, &mut |image| {
+                read.push(image.map(|i| match i {
+                    Image::U8(v) => v.row(0)[0].red,
+                    _ => unreachable!(),
+                }));
+            });
+        }
+        read
+    }
+
+    /// A repeat leaves the history as it was, whether or not the effect holds earlier frames.
+    #[test]
+    fn a_repeat_is_not_a_new_frame() {
+        for held in [0, 1, 3] {
+            let mut h = History::<u8>::default();
+            h.resize(2, 1);
+            let push = |h: &mut History<u8>, v: u8| {
+                h.next(3, held)[0].red = v;
+                h.frames.back_mut().unwrap()[1].red = 0;
+                h.drop_repeat()
+            };
+            assert!(!push(&mut h, 1), "the first frame has nothing before it");
+            for v in 2..7 {
+                assert!(!push(&mut h, v));
+            }
+            let (number, read) = (h.frame_number(), newest_values(&mut h));
+            for _ in 0..3 {
+                assert!(push(&mut h, 6));
+                assert_eq!(
+                    (h.frame_number(), newest_values(&mut h)),
+                    (number, read.clone())
+                );
+            }
+            assert!(!push(&mut h, 7));
+            assert_eq!(h.frame_number(), number + 1);
+            assert_eq!(newest_values(&mut h).last(), Some(&Some(7)));
+        }
+    }
+
+    /// The last pixel alone is enough to make a frame new.
+    #[test]
+    fn a_change_anywhere_is_a_new_frame() {
+        for before in [0, 3] {
+            let mut h = History::<f32>::default();
+            h.resize(2, 2);
+            h.next(before, 0).fill(Argb::default());
+            h.next(before, 0).fill(Argb::default());
+            assert_eq!(h.drop_repeat(), before > 0);
+            let frame = h.next(before, 0);
+            frame.fill(Argb::default());
+            frame[3].blue = 0.001;
+            assert!(!h.drop_repeat());
+        }
     }
 
     #[test]

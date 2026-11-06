@@ -459,6 +459,40 @@ fn tile_enforces_its_minimum_size() {
     assert_eq!((tile.content_rect.w, tile.content_rect.h), (120, 28));
 }
 
+/// A window asked for above the canvas moves down until its title bar is on it, at the same size.
+/// One already clear of the top stays where it was asked for, and so does the picture in it.
+#[test]
+fn a_window_keeps_its_title_bar_on_the_canvas() {
+    let (w, h) = (1920, 1080);
+    let m = SwarmMetrics::new(h);
+    let tile_at = |y: f64| {
+        let blob = Blob {
+            bounds: NormRect {
+                x: 0.25,
+                y,
+                w: 0.25,
+                h: 0.25,
+            },
+            ..Blob::default()
+        };
+        cut_tile(&blob, None::<&View<'_, u8>>, String::new(), w, h, false)
+    };
+    let size = (480, 270);
+    for y in [
+        -0.5,
+        -0.1,
+        0.0,
+        f64::from(m.title_height) / f64::from(h) / 2.0,
+    ] {
+        let tile = tile_at(y);
+        assert_eq!(tile.content_rect.y, m.title_height, "asked for y {y}");
+        assert_eq!((tile.content_rect.w, tile.content_rect.h), size);
+    }
+    let clear = tile_at(0.5);
+    assert_eq!(clear.content_rect.y, 540);
+    assert_eq!((clear.content_rect.w, clear.content_rect.h), size);
+}
+
 fn window_tile(content_rect: PixelRect) -> Tile {
     Tile {
         title: "LO.FI.SCI.FI motion#412.1".into(),

@@ -3,6 +3,10 @@
 The repository's preview: one effect at a time, on a test pattern, an image, a video file
 or a webcam. [docs/DEVELOPING.md](../../../docs/DEVELOPING.md#the-preview) describes it.
 
+A file dropped on the window opens as the source. In a browser, a drop goes the way of the file
+picker: video only, the first of several files, and anything else leaves the source as it is and
+shows a message.
+
 ## Record
 
 Record saves the effect's output as a video file, without the panel: an H.264 MP4 through ffmpeg
@@ -42,6 +46,8 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 | `--stats` | the stats bar on stdout, once a second |
 | `--frames N`, `--seconds N` | exit after that many frames or seconds |
 | `--quiet` | keep the window hidden and render only the effect |
+| `--record FILE` | record the output into an MP4 until the run ends |
+| `--lose-gpu S[:KIND]` | lose the GPU device S seconds in, to test reopening it; repeatable. `destroy`, or `removed` for D3D12's own removal, which goes through wgpu as a driver's loss does (with `WGPU_BACKEND=dx12`) |
 | `--list` | the effects and their parameters |
 
 `--stats` prints one line a second, always with these keys in this order, then a last line
@@ -70,6 +76,8 @@ the shared device is lost or reports an error. `out_of_gpu_memory=true` follows 
 has run out of GPU memory for what it keeps and draws less to keep its rate, and the bar says so too. Under `--quiet` loops are unpaced and each waits for the GPU,
 nothing is presented so `screen` is 0, and a test pattern (which changes every loop) shows
 the effect's throughput in `rendered`.
+
+A lost device is reopened in place, on the same adapter for about 30 s and then on any, trying at 1, 2, 4, 8, 16 and then every 30 s. The source, the settings and a recording go on; the title says so meanwhile. On D3D12 the same adapter can't come back while anything holds the old device. A scripted run with a loss it didn't ask for ends with exit 2, and one whose device isn't back in 60 s too.
 
 The window's bottom bar shows the same, source to screen: `source 60 fps | segcam Motion on
 CPU: rendered 39 fps, 9 ms, worst 24 ms | screen 20 fps`, then the machine. The `done` line's

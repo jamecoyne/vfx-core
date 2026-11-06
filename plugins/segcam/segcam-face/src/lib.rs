@@ -212,6 +212,34 @@ impl Segmenter {
         }
     }
 
+    /// Which of the optional models loaded: the mesh, for eyes and mouths, and bodies. A load during
+    /// a reset can get the detector and miss these, which a later load puts right.
+    pub fn optional_models(&self) -> (bool, bool) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Vision(_) => (true, true),
+            #[cfg(feature = "onnx")]
+            Self::Ort(segmenter, _) => (segmenter.mesh.is_some(), segmenter.bodies.is_some()),
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => (false, false),
+        }
+    }
+
+    /// Whether the models' runs keep failing, as they do once a driver reset takes their device.
+    pub fn failing(&self) -> bool {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Vision(_) => false,
+            #[cfg(feature = "onnx")]
+            Self::Ort(segmenter, _) => {
+                segmenter.detector.failing()
+                    || segmenter.bodies.as_ref().is_some_and(BodyDetector::failing)
+            }
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => false,
+        }
+    }
+
     /// The `parts` in `image`: each face and then its parts, then the bodies.
     pub fn find(&mut self, image: &Image, parts: Parts) -> &[Segment] {
         match self {
@@ -228,6 +256,11 @@ impl Segmenter {
 /// Finds faces in a frame, best first.
 pub trait Detector {
     fn detect(&mut self, image: &Image) -> Vec<Face>;
+
+    /// Whether its last few runs all failed.
+    fn failing(&self) -> bool {
+        false
+    }
 }
 
 /// Face landmarks normalized to the frame, indexed as MediaPipe Face Mesh's.
@@ -238,6 +271,11 @@ pub trait Landmarker {
 /// Finds people in a frame, best first.
 pub trait BodyDetector: Send {
     fn detect(&mut self, image: &Image) -> Vec<Body>;
+
+    /// Whether its last few runs all failed.
+    fn failing(&self) -> bool {
+        false
+    }
 }
 
 /// Turns detections into segments, sized to match segcam 1.1.
