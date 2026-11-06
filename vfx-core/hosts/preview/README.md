@@ -28,7 +28,8 @@ faces itself, as segcam does, still gives the face variables.
 Record saves the effect's output as a video file, without the panel: an H.264 MP4 through ffmpeg
 on the desktop, at 30 fps from the render loop. In a browser it goes through `canvas.captureStream`
 and `MediaRecorder` to a download: H.264 in MP4 where the browser records that (Chrome 126 and
-later, Safari), otherwise WebM. There is no sound in the recording on either.
+later, Safari), otherwise WebM. There is no sound in the recording on either. Record doesn't work
+in the browser on the WebGL2 fallback yet; it needs WebGPU.
 
 ## Keys
 
@@ -70,9 +71,12 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 when `--frames` or `--seconds` ends the run:
 
 ```text
-stats t=18.4 effect=segcam-motion on=cpu source=59.9 rendered=39.4 rendered_ms=8.9 worst_ms=23.5 drawn=0.0 screen=19.7 size=1920x1080 cpu=29.2 app_cpu=239.9 mem_mb=1932 gpu=n/a
-done frames=905 seconds=20.00 effect=segcam-motion on=cpu source=59.9 rendered=37.2 rendered_ms=10.0 worst_ms=2661.5 drawn=0.0 screen=18.6
+stats t=T effect=NAME on=WHERE source=FPS rendered=FPS rendered_ms=MS worst_ms=MS drawn=FPS screen=FPS size=WxH cpu=PCT app_cpu=PCT mem_mb=MB gpu=PCT
+done frames=N seconds=S effect=NAME on=WHERE source=FPS rendered=FPS rendered_ms=MS worst_ms=MS drawn=FPS screen=FPS
 ```
+
+The values are measurements, so this shows only the keys. Benchmark numbers are in the
+[segcam benchmark notes](../../../plugins/segcam/BENCHMARK.md).
 
 The keys follow the frames: `source` is the rate they arrive from the decoder, whether they
 are taken or dropped (or `pattern` and `still`), `rendered` the renders the effect finished each second, and
@@ -95,8 +99,8 @@ the effect's throughput in `rendered`.
 
 A lost device is reopened in place, on the same adapter for about 30 s and then on any, trying at 1, 2, 4, 8, 16 and then every 30 s. The source, the settings and a recording go on; the title says so meanwhile. On D3D12 the same adapter can't come back while anything holds the old device. A scripted run with a loss it didn't ask for ends with exit 2, and one whose device isn't back in 60 s too.
 
-The window's bottom bar shows the same, source to screen: `source 60 fps | segcam Motion on
-CPU: rendered 39 fps, 9 ms, worst 24 ms | screen 20 fps`, then the machine. The `done` line's
+The window's bottom bar shows the same, source to screen: `source FPS | segcam on CPU: rendered
+FPS, MS, worst MS | screen FPS`, then the machine. The `done` line's
 worst above is the face models loading in the first render.
 
 In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
