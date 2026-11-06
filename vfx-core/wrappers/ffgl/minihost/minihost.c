@@ -808,14 +808,16 @@ static void case_device_reopen(void) {
      * is logged, and one once the first try is due, which may land while that try is opening. */
     void *during = NULL, *during_try = NULL;
     /* No call that a device open could reach may wait for one: the gap's instances setting up, and
-     * the lost instance's renders from shortly before its first try on. The renders right after
-     * the loss are left out, since the RAM path has one-off costs of its own there. The bound is
-     * far above a frame this small through RAM and below the time a device takes to open. A gap
-     * instance's setup and first render get three times a healthy one's, at least the bound, and
-     * so does the render that finishes the new device's setup and builds the effect on it. */
+     * every render of the lost instance from the one that finds the loss on. The bound is far above
+     * a frame this small through RAM and below the time a device takes to open. A render can still
+     * be slowed by the open without waiting for it: while the open's thread creates the Vulkan
+     * device, the driver holds back every GL and Vulkan wait in the process, the host's included,
+     * for about 40 to 60 ms on an RTX 4070, a fraction of the whole open. A gap instance's setup and
+     * first render get three times a healthy one's, at least the bound, and so does the render that
+     * finishes the new device's setup and builds the effect on it. */
     const double bound = 0.1;
     const double setup_bound = 3 * setup > bound ? 3 * setup : bound;
-    double lost_at = 0, worst = 0, worst_setup = 0, worst_early = 0;
+    double lost_at = 0, worst = 0, worst_setup = 0;
     /* Read when the first render sets up the shared images; the new device stays. The first try
      * is a second after the loss. */
     int rendered = 0;
@@ -824,12 +826,10 @@ static void case_device_reopen(void) {
         CHECK(render(lost, &f), "render %d", rendered);
         double took = now() - started;
         back = logged_message("shared frames back on a new device");
-        int try_due = lost_at && now() - lost_at >= 0.9;
         if (back && took > worst_setup) worst_setup = took;
-        if (try_due && !back && took > worst) worst = took;
-        if (lost_at && !try_due && took > worst_early) worst_early = took;
         _putenv_s("VFX_FFGL_LOSE_DEVICE_AFTER", "");
         if (!lost_at && logged_message("warning: GPU device lost")) lost_at = now();
+        if (lost_at && !back && took > worst) worst = took;
         if (lost_at && !during) {
             started = now();
             during = instantiate(63, 37);
@@ -870,8 +870,8 @@ static void case_device_reopen(void) {
     }
     if (lost_at) {
         printf("  worst call a device open could reach: %.1f ms, a setup on the way back %.1f ms "
-               "(healthy %.1f ms), a render in the 0.9 s after the loss %.1f ms\n",
-               worst * 1000, worst_setup * 1000, setup * 1000, worst_early * 1000);
+               "(healthy %.1f ms)\n",
+               worst * 1000, worst_setup * 1000, setup * 1000);
         CHECK(worst < bound, "a call waited %.1f ms, over the %.0f ms bound", worst * 1000, bound * 1000);
         CHECK(worst_setup < setup_bound, "a setup on the way back took %.1f ms, over %.0f ms",
               worst_setup * 1000, setup_bound * 1000);
@@ -1043,36 +1043,33 @@ static void segcam_device_reopen(void) {
     }
     CHECK(call(DEINSTANTIATE_GL, u(0), ram).u == 0, "delete the RAM instance");
     int back_frames = 0;
-    double waited_at = 0, worst_render = 0, worst_early = 0;
+    double waited_at = 0, worst_render = 0;
     for (int n = 0; n < 3000 && back_frames < 60; n++) {
         f.input = textures[n & 1];
         double time = n / 30.0;
         CHECK(call(SET_TIME, ptr(&time), inst).u == 0, "set time failed");
         double started = now();
         CHECK(render(inst, &f), "render %d failed", n);
-        /* What the host's render thread waits for through the reopen, from shortly before the
-         * first try, a second after the loss, on. The 0.9 s count from the render after the one
-         * whose failure the log shows, a little after the loss itself. The renders before are left
-         * out, since the RAM path has one-off costs of its own there. */
+        /* What the host's render thread waits for through the reopen: every render from the one
+         * whose present finds the loss on. */
         double took = now() - started;
-        if (waited_at && now() - waited_at >= 0.9 && took > worst_render) worst_render = took;
-        if (waited_at && now() - waited_at < 0.9 && took > worst_early) worst_early = took;
         _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "");
         if (!waited_at && logged_message("shared GPU render failed, using RAM")) waited_at = now();
+        if (waited_at && took > worst_render) worst_render = took;
         if (logged_message("shared frames back on a new device")) back_frames++;
         Sleep(2);
     }
     /* A render that waited for the new device to open would take a RAM render plus what was left
      * of the open. The bound is three RAM renders, at least 100 ms as in device_reopen, since a
-     * render that overlaps the open on its thread can take tens of ms with nothing waiting. The
-     * one render that finishes the setup on the render thread adds the time the log line gives. */
+     * render that overlaps the open's Vulkan device creation is held back by the driver (see
+     * device_reopen) with nothing waiting. The one render that finishes the setup on the render
+     * thread adds the time the log line gives. */
     double open_ms = 0, finish_ms = 0;
     int timed = logged_entry("shared frames back on a new device: ", &open_ms)
                 && logged_entry(" ms on a thread, ", &finish_ms);
     printf("  worst render through the reopen: %.1f ms, the open on its thread: %.0f ms, finishing "
-           "it on the render thread: %.0f ms, a render in the 0.9 s after the loss: %.1f ms, a forced "
-           "RAM render: %.1f ms\n",
-           worst_render * 1000, open_ms, finish_ms, worst_early * 1000, ram_worst * 1000);
+           "it on the render thread: %.0f ms, a forced RAM render: %.1f ms\n",
+           worst_render * 1000, open_ms, finish_ms, ram_worst * 1000);
     CHECK(waited_at, "the present never found the loss");
     CHECK(back_frames >= 60, "no new device after the loss");
     CHECK(timed, "no time for the open in the log");
