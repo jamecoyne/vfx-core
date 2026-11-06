@@ -23,73 +23,86 @@ order, with the same rounding. With the same settings, the two render byte ident
 
 ## How it renders
 
-It asks for the frames of the **Background** analyses before the current one, plus **Trail frames**
-less one in Swarm mode and what the analysis adds (see below), through `CpuEffect::frames_before`.
-It keeps each frame's grid, motion and tiles until they age out (`src/incremental.rs`), with a hash
-of the frame's pixels. A check reads each frame a render depends on and finds an edit upstream
-however far back it is. Only a frame whose pixels changed is analysed again, along with the motion
-and tiles that depend on it. A check hashes a frame's bytes as the host holds them and converts only a
-frame it needs (`FrameSource::with_frame_if_wanted`).
+### Frames and the cache
 
-While Resolve streams, a render reads the current frame and those it hasn't analysed. An edit is
-caught when that frame is rendered, or at the next check: the first two renders after a pause or a
-jump. A frame the host couldn't hand over counts as empty for that render and is read again next
-time. In the OpenFX mini host, renders forwards, backwards, shuffled and cold give the same output
-(see [OpenFX](#openfx)). After Effects makes a new effect per render, and Multi Frame Rendering on
-and off give the same frames.
+`CpuEffect::frames_before` asks for the frames of the **Background** analyses before the current
+one, plus **Trail frames** minus one in Swarm, plus what the analysis rate adds (below).
+`src/incremental.rs` keeps each frame's grid, motion and tiles until they age out, keyed by a hash
+of the frame's bytes as the host holds them. A check hashes every frame the render depends on, so an
+upstream edit is found however far back it is. Only frames whose hash changed are analysed again,
+with the motion and tiles that depend on them. `FrameSource::with_frame_if_wanted` lets the check
+hash a frame without converting it, and only frames that need analysis get converted.
 
-Resolve playback is the exception. After 8 single steps in a row, a stream that skips a frame counts
-as playback and doesn't go back for the frames Resolve dropped. It keeps up, and its pictures can
-differ from an export. A step over 16 frames out of a run renders exact, since that frame stays on
-screen when paused. Nothing a plugin can read separates playback from a render Resolve will save,
-and its render cache can carry playback pictures into an export (the limit is in the
-[segcam README](../README.md#known-limits), the reasoning in
-[ADR 3](../decisions/0003-editing-promise.md)).
+While Resolve streams, a render reads the current frame and the frames not yet analysed. An edit is
+caught when its frame renders, or at the next full check, which runs on the first two renders after
+a pause or a jump. A frame the host couldn't hand over counts as empty for that render and is read
+again on the next. In the OpenFX mini host, renders run forwards, backwards, shuffled and cold give
+the same output ([OpenFX](#openfx)). After Effects makes a new effect per render, and Multi Frame
+Rendering on and off give the same frames.
 
-Where the host says the frame rate (OpenFX, After Effects, a video in the preview), it analyses the
-frames whose number divides by round(rate / 60), at most 4: every frame below 90 fps, every 2nd
-below 150, every 3rd below 210, every 4th from there. The frames between show the last analysis:
-its boxes and IDs, and no new windows. Background counts these analyses. Resolume says no frame
-rate, and there every frame is analysed. Outside Swarm a render reads back to the analysis the frame
-shows; when the host can't hand it over, the frame analyses itself. With faces on, a render reads
-one analysis more, to get the analysis whose faces it reuses.
+### Resolve playback
 
-Faces run on every 2nd analysis, the even frame numbers below 90 fps. The analysis between shows the
-faces of the one before, with their IDs. It finds its own faces only when the host doesn't hand that
+The OpenFX wrapper (`vfx-core/wrappers/ofx/src/lib.rs`) treats a stream as playback after 8 single
+steps in a row followed by a skipped frame. Playback doesn't fetch the frames Resolve dropped, since
+a dropped frame costs far more to fetch than a decoded one, so playback output can differ from an
+export. A step of more than 16 frames out of a run is a stop, and that render does the full check,
+since its frame stays on screen while paused. No host property separates playback from a render
+Resolve will save, and Resolve's render cache can carry playback pictures into an export. The user
+facing limit is in the [segcam README](../README.md#known-limits), the reasoning in
+[ADR 3](../decisions/0003-editing-promise.md).
+
+### Analysis rate
+
+With a known frame rate (OpenFX, After Effects, a video in the preview), the analysed frames are
+those whose number is a multiple of `round(rate / 60)`, capped at 4: every frame below 90 fps,
+every 2nd below 150, every 3rd below 210 and every 4th above. Frames between show the last analysis,
+its boxes and IDs, with no new windows. **Background** counts analyses, not frames. Resolume gives no
+frame rate, so every frame is analysed there. Outside Swarm a render reads back to the analysis its
+frame shows, and when the host can't hand that frame over, the render analyses its own frame. With
+faces on, a render reads one analysis further back, for the analysis whose faces it reuses.
+
+### Faces
+
+Faces run on every 2nd analysis: the even frame numbers, below 90 fps. The analysis between reuses
+the previous one's faces and IDs, and runs its own detection only when the host doesn't hand that
 frame over.
 
-On Windows, the models load on a thread of their own. A line on stderr says which device they run on.
-A short trial at the start times DirectML and the CPU. It picks DirectML if its time is within 1.5
-times that of the fastest. The CPU shares its cores with everything else during a render, so the
-trial allows for that. `SEGCAM_FACE_DEVICE=cpu`, or a DXGI adapter number, skips the trial.
+On Windows the models load on their own thread and log the device they run on to stderr. A short
+trial at startup times DirectML against the CPU and picks DirectML when it is within 1.5x of the
+faster, because the CPU shares its cores with the render. `SEGCAM_FACE_DEVICE` (`cpu`, or a DXGI
+adapter index) skips the trial (`plugins/segcam/segcam-face/src/runtime.rs`).
 
-In Resolume and the preview, detection runs beside the renders. Faces can arrive a few frames late.
-Each new window shows the frame its face was found in. A slow device finds faces less often, which
-leaves the GPU more time for the renders.
+In live hosts (Resolume and the preview, `plan.live`), detection runs beside the renders through
+`LiveFaces::exchange` in `src/faces.rs`. Faces can arrive a few frames late, each new window shows
+the frame its face was found in, and a slow device detects less often instead of the render waiting.
+
+### Live hosts
 
 Resolume and the preview hand frames over one at a time and hold only the current one in full
-(`CpuEffect::frames_held`). Earlier frames live on as their grids, segments and the tiles the pile
-still draws, and a setting changed live reaches new windows only. A picture that holds exactly
-still counts as one frame there (`History::drop_repeat`), and its windows stay until it changes.
+(`CpuEffect::frames_held`). Earlier frames survive only as their grids, segments and the
+tiles the pile still draws, so a setting changed live reaches new windows only. A picture that holds
+exactly still counts as one frame (`History::drop_repeat`), and its windows stay until it changes.
 
-In Resolume on Windows, a swarm drawn on the GPU stays there. The plugin shares the device its frames
-are on, and the swarm draws into a frame Resolume shows from (`CpuEffect::render_to`). There is no
-copy back. The swarm always draws on the GPU in this path. The share of windows below which it would
-draw on the CPU was set by the cost of that copy back. The output is byte for byte the swarm read
-back. A frame drawn on the CPU, while the device opens or after a fault, goes through RAM as before.
+In Resolume on Windows the swarm draws straight into the frame Resolume shows
+(`CpuEffect::render_to`) on the device the plugin shares with Resolume, with no readback. On this
+path the swarm always draws on the GPU, since the window coverage threshold for the CPU draw was set
+by the readback's cost. The output is byte identical to the swarm read back. A frame drawn on the
+CPU, while the device opens or after a fault, goes through RAM.
 
-A lost GPU device is replaced. Renders draw on the CPU in the meantime. A new device opens on a
-backoff of 1, 2, 4, 8, 16 and then every 30 s. It tries the same adapter for about 30 s, then any.
+### Device loss
 
-A first open can fail, for example with no adapter or only a software one. The plugin then tries
-again at 1, 2, 4, 8 and 16 s, because a driver reset can look like any of these. After that it draws
-on the CPU for good. Each try holds the D3D12 device lock. Face models that load during a reset wait
-behind the tries, and face models that keep failing reload on the same backoff. In Resolume on
-Windows, the plugin opens the new shared device off the render thread.
+A lost device is replaced while renders draw on the CPU. Reopening backs off at 1, 2, 4, 8 and 16 s,
+then every 30 s, on the same adapter for about 30 s and then on any. A failed first open (no adapter,
+or only a software adapter) retries at 1, 2, 4, 8 and 16 s, since a driver reset can look like
+either, then stays on the CPU. Each try holds the D3D12 device lock, so face models loading during a
+reset wait behind it, and face models that keep failing reload on the same backoff. In Resolume on
+Windows the new shared device opens off the render thread.
+
+### Detection and drawing
 
 Detection runs on the CPU: a connected component labeller over a grid, 192 columns by default, fed
-one frame at a time. Swarm's drawing runs on the GPU when there is one and its windows cover enough
-of the frame ([GPU thresholds](../BENCHMARK.md#gpu-thresholds)), and on the CPU otherwise.
+one frame at a time. Swarm draws on the GPU when there is one and its windows cover enough of the
+frame ([GPU thresholds](../BENCHMARK.md#gpu-thresholds)), and on the CPU otherwise.
 
 ## Building
 

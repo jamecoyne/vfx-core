@@ -33,8 +33,8 @@ black.
 macOS. Windows and Linux use ONNX Runtime models.
 
 Resolume and the preview never wait for faces. They draw without them until the models are up. Each
-render then uses the newest faces. Other hosts may be exporting. Their renders wait for the models
-and find each frame's own faces.
+render then uses the newest faces. In After Effects and Resolve a render may be part of an export,
+so it waits for the models and finds that frame's own faces.
 
 The browser has no faces yet.
 

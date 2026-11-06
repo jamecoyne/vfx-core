@@ -57,7 +57,7 @@ those. **Mirror** flips the picture for a selfie camera. Every control is listed
 [Parameters](segcam-motion/README.md#parameters).
 
 In After Effects, and in Resolve when paused or exporting at normal speed, a frame renders the same
-however you get to it. Resolve playback skips the frames Resolve drops to keep up, and its pictures
+however you get to it. During playback, Resolve skips any dropped frames to keep up, so playback
 can differ from an export. A change to an earlier frame of the clip shows on the next render after
 you pause or jump, and when an export starts.
 
@@ -94,9 +94,10 @@ Apple M1 Pro and up runs it comfortably. Segcam draws on the GPU when there is o
 - The browser build has no faces yet, and Detect starts on Motion there.
 - Record doesn't work in the browser build on WebGL2 yet. It works on WebGPU.
 - On Windows, the After Effects plugin builds but hasn't been tried in After Effects yet.
-- We recommend a DXV copy of a clip for a show in Resolume. H.264 with few keyframes can drop frames
-  after a trigger and at each loop point. Resolume's [own guidance](https://resolume.com/support/en/rendering-to-dxv)
-  is DXV. Its Alley app converts a clip.
+- We recommend a DXV copy of a clip for a show in Resolume. Resolume decodes DXV on the GPU and
+  H.264 on the CPU, and H.264 with few keyframes can drop frames after a trigger and at each loop
+  point. Resolume [recommends DXV](https://resolume.com/support/en/preparing-media) too, and its
+  Alley app converts a clip.
 - We recommend keeping Resolve's render cache off for segcam. An export can contain wrong pictures
   when all three of these are on:
   - Playback, Render Cache, User
