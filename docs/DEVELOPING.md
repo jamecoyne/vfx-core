@@ -44,11 +44,11 @@ ffgl = ["vfx-plugin/ffgl"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-vfx-core = { path = "../.." }
-vfx-plugin = { path = "../../wrappers/plugin" }
+vfx-core = { path = "../../vfx-core" }
+vfx-plugin = { path = "../../vfx-core/wrappers/plugin" }
 
 [build-dependencies]
-vfx-build = { path = "../../wrappers/build" }
+vfx-build = { path = "../../vfx-core/wrappers/build" }
 ```
 
 ```rust
@@ -229,10 +229,11 @@ it); `vfx-core/hosts/preview/src/catalog.rs` adds the core effects.
 Another crate's effect can use the preview as a library:
 `vfx_preview::run(vec![Entry::plugin(&my_effect::VFX_PLUGIN)])`.
 
-On Windows the preview draws with D3D12, where NVIDIA's Vulkan driver grows the preview's memory
-for as long as it renders. `WGPU_BACKEND=vulkan` still picks Vulkan. The browser build uses WebGPU
-where the browser has it and falls back to WebGL2 without it. Record needs WebGPU in the browser.
-A lost GPU device is reopened in place, and Spout senders on Windows (TouchDesigner's Spout Out, for
+On Windows the preview draws with D3D12, which avoids the memory growth seen with NVIDIA's Vulkan
+driver on the NVIDIA setups tested. `WGPU_BACKEND=vulkan` still picks Vulkan. The browser build uses
+WebGPU where the browser has it and falls back to WebGL2 without it. Record needs WebGPU in the
+browser. On the desktop a lost GPU device is reopened in place; in the browser the page says to
+reload. Spout senders on Windows (TouchDesigner's Spout Out, for
 one) can be picked as the source; [the preview's README](../vfx-core/hosts/preview/README.md) lists
 its keys, flags and Spout details.
 

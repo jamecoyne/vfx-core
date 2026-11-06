@@ -131,11 +131,13 @@ runs the core checks, and the effect through vfx-core's `CpuEffect` interface:
 
 `segcam-motion` takes the same options as the C++ effect's CLI, and the two can be compared on any
 clip. Its Background default is 64 where the C++ CLI's is 16, and its Trail frames default is 60
-where the C++ CLI's is 24. Pass both to compare Swarm:
+where the C++ CLI's is 24. Pass both to compare Swarm, and `--cpu` to draw it on the CPU, the
+reference the C++ matches:
 
 ```bash
+cargo build --release -p segcam-motion --bin segcam-motion
 ffmpeg -i in.mov -vf scale=960:540 -f rawvideo -pix_fmt argb - |
-  target/release/segcam-motion 960 540 --mode swarm --background 16 --trail 24 |
+  target/release/segcam-motion 960 540 --mode swarm --background 16 --trail 24 --cpu |
   ffmpeg -f rawvideo -pix_fmt argb -s 960x540 -r 30 -i - -pix_fmt yuv420p out.mp4
 ```
 

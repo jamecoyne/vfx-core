@@ -16,12 +16,19 @@ cargo vfx build -p segcam-motion
 ```
 
 The plugins land in `target/vfx-plugin`. Install each one as below, then restart the host. On macOS,
-`cargo vfx package -p segcam-motion` makes the two installers first. The macOS builds are unsigned
-for now, so macOS quarantines them. Clear the flag before you open or copy one:
+`cargo vfx package -p segcam-motion` makes the two installers first.
+
+The macOS release downloads are unsigned for now, and macOS quarantines what a browser downloads.
+A quarantined Resolume bundle hangs Arena at start. With the host closed, clear the flag on a
+downloaded installer or bundle before you open or copy it:
 
 ```bash
 xattr -dr com.apple.quarantine path/to/SegcamMotionRust-adobe.pkg
+xattr -dr com.apple.quarantine path/to/SegcamMotionRust.bundle
 ```
+
+The Resolume bundle goes in `~/Documents/Resolume Arena/Extra Effects` (or `Resolume Avenue`).
+Plugins built from source here aren't quarantined.
 
 | Host | Windows: copy | macOS | Find it under |
 |---|---|---|---|
@@ -46,8 +53,8 @@ Add segcam to a clip or layer and pick an **Output**. It starts as Swarm:
 
 **Detect** picks what counts as a section: Motion, Threshold (brighter than **Level**, or darker
 with **Invert**) or Faces only. **Face**, **Eyes**, **Mouth** and **Body** enable detection of
-those. **Mirror** flips the picture for a selfie camera. Every control is listed in the
-[segcam Motion README](segcam-motion/README.md).
+those. **Mirror** flips the picture for a selfie camera. Every control is listed under
+[Parameters](segcam-motion/README.md#parameters).
 
 In After Effects, and in Resolve when paused or exporting at normal speed, a frame renders the same
 however you get to it. Resolve playback skips the frames Resolve drops to keep up, and its pictures

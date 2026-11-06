@@ -31,8 +31,8 @@ black.
 and ONNX Runtime models on Windows and Linux. Resolume and the preview never wait for faces: they
 draw without them until the models are up, and each render then takes the newest faces there are.
 Other hosts may be exporting, and their renders wait for the models and find each frame's own
-faces. The browser has no faces yet. On a slow GPU, faces and bodies are found less often instead of
-slowing the picture down.
+faces. The browser has no faces yet. In live playback, on a slow GPU, faces and bodies are found
+less often to leave the GPU more time for the picture; exports still find every frame's faces.
 
 ## Parameters
 

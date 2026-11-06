@@ -8,8 +8,8 @@ A file dropped on the window opens as the source. In a browser, a drop goes the 
 picker: video only, the first of several files, and anything else leaves the source as it is and
 shows a message.
 
-On Windows the preview draws with D3D12. NVIDIA's Vulkan driver grows the preview's memory for as
-long as it renders, and D3D12 stays level. `WGPU_BACKEND=vulkan` still picks Vulkan.
+On Windows the preview draws with D3D12, which avoids the memory growth seen with NVIDIA's Vulkan
+driver on the NVIDIA setups tested. `WGPU_BACKEND=vulkan` still picks Vulkan.
 
 ## Spout
 
@@ -97,11 +97,11 @@ has run out of GPU memory for what it keeps and draws less to keep its rate, and
 nothing is presented so `screen` is 0, and a test pattern (which changes every loop) shows
 the effect's throughput in `rendered`.
 
-A lost device is reopened in place, on the same adapter for about 30 s and then on any, trying at 1, 2, 4, 8, 16 and then every 30 s. The source, the settings and a recording go on; the title says so meanwhile. On D3D12 the same adapter can't come back while anything holds the old device. A scripted run with a loss it didn't ask for ends with exit 2, and one whose device isn't back in 60 s too.
+On the desktop a lost device is reopened in place, on the same adapter for about 30 s and then on any, trying at 1, 2, 4, 8, 16 and then every 30 s. The source, the settings and a recording go on; the title says so meanwhile. On D3D12 the same adapter can't come back while anything holds the old device. A scripted run with a loss it didn't ask for ends with exit 2, and one whose device isn't back in 60 s too. In the browser a lost device ends
+a recording and the page says to reload.
 
 The window's bottom bar shows the same, source to screen: `source FPS | segcam on CPU: rendered
-FPS, MS, worst MS | screen FPS`, then the machine. The `done` line's
-worst above is the face models loading in the first render.
+FPS, MS, worst MS | screen FPS`, then the machine.
 
 In a scripted run, a mistake in a flag prints one line and exits with code 2. With only
 `--effect` and a file, mistakes show in the panel.
