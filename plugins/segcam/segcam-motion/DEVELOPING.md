@@ -4,10 +4,9 @@ segcam's motion segmenter as a vfx-core effect, ported from jamecoyne's C++ Afte
 which isn't in this repository. It is one crate: a `CpuEffect`, exported to After Effects, OpenFX
 and FFGL with `vfx_plugin::export!(cpu: SegcamMotion)` and offered by the preview app.
 
-Its CPU path computes what the C++ core computes the same way (the same `f32` and `f64` arithmetic
-in the same order, the same rounding), and with the same settings the two render byte identical
-frames (see [Checking it](#checking-it)). The GPU draw, faces and the current defaults came after
-the port.
+Its CPU path does the same arithmetic as the C++ core. The `f32` and `f64` operations run in the same
+order, with the same rounding. With the same settings, the two render byte identical frames. See
+[Checking it](#checking-it). The GPU draw, faces and the current defaults came after the port.
 
 | file | |
 | --- | --- |
@@ -55,33 +54,38 @@ rate, and there every frame is analysed. Outside Swarm a render reads back to th
 shows; when the host can't hand it over, the frame analyses itself. With faces on, a render reads
 one analysis more, to get the analysis whose faces it reuses.
 
-Faces run on every 2nd analysis, the even frame numbers below 90 fps: the analysis between shows the
-faces of the one before, with their IDs, or finds its own when the host doesn't hand that frame
-over. On Windows the models load on a thread of their own, and a line on stderr says which device
-they run on. A short trial at the start times DirectML and the CPU, and picks DirectML if it comes
-within 1.5 times of the fastest, since in a render the CPU shares its cores with everything else.
-`SEGCAM_FACE_DEVICE=cpu`, or a DXGI adapter number, skips the trial. In Resolume and the preview detection runs beside the renders. Faces can arrive a few
-frames late, each new window showing the frame its face was found in, and a slow device finds faces
-less often instead of slowing the renders.
+Faces run on every 2nd analysis, the even frame numbers below 90 fps. The analysis between shows the
+faces of the one before, with their IDs. It finds its own faces only when the host doesn't hand that
+frame over.
+
+On Windows, the models load on a thread of their own. A line on stderr says which device they run on.
+A short trial at the start times DirectML and the CPU. It picks DirectML if its time is within 1.5
+times that of the fastest. The CPU shares its cores with everything else during a render, so the
+trial allows for that. `SEGCAM_FACE_DEVICE=cpu`, or a DXGI adapter number, skips the trial.
+
+In Resolume and the preview, detection runs beside the renders. Faces can arrive a few frames late.
+Each new window shows the frame its face was found in. A slow device finds faces less often, and the
+renders don't slow down.
 
 Resolume and the preview hand frames over one at a time and hold only the current one in full
 (`CpuEffect::frames_held`). Earlier frames live on as their grids, segments and the tiles the pile
 still draws, and a setting changed live reaches new windows only. A picture that holds exactly
 still counts as one frame there (`History::drop_repeat`), and its windows stay until it changes.
 
-In Resolume on Windows a swarm drawn on the GPU stays there: the plugin shares the device its frames
-are on, and the swarm draws into a frame Resolume shows from (`CpuEffect::render_to`), with no copy
-back. There the swarm always draws on the GPU, since the share of windows below which it draws on
-the CPU was set by the cost of the copy back. The output is byte for byte the swarm read back, and a
-frame drawn on the CPU (while the device opens, or after a fault) goes through RAM as before.
+In Resolume on Windows, a swarm drawn on the GPU stays there. The plugin shares the device its frames
+are on, and the swarm draws into a frame Resolume shows from (`CpuEffect::render_to`). There is no
+copy back. The swarm always draws on the GPU in this path. The share of windows below which it would
+draw on the CPU was set by the cost of that copy back. The output is byte for byte the swarm read
+back. A frame drawn on the CPU, while the device opens or after a fault, goes through RAM as before.
 
-A lost GPU device is replaced. Renders draw on the CPU meanwhile, and a new device opens on a backoff
-of 1, 2, 4, 8, 16 and then every 30 s, on the same adapter for about 30 s and then on any. A first open
-that fails, finding no adapter or only a software one included, tries again at 1, 2, 4, 8 and 16 s,
-since a driver reset can look like any of these, and draws on the CPU for good after that. Each try
-holds the D3D12 device lock, so face models that load during a reset wait behind the tries. Face models
-that keep failing reload on the same backoff. In Resolume on Windows the plugin opens the new shared
-device off the render thread.
+A lost GPU device is replaced. Renders draw on the CPU in the meantime. A new device opens on a
+backoff of 1, 2, 4, 8, 16 and then every 30 s. It tries the same adapter for about 30 s, then any.
+
+A first open can fail, for example with no adapter or only a software one. The plugin then tries
+again at 1, 2, 4, 8 and 16 s, because a driver reset can look like any of these. After that it draws
+on the CPU for good. Each try holds the D3D12 device lock. Face models that load during a reset wait
+behind the tries, and face models that keep failing reload on the same backoff. In Resolume on
+Windows, the plugin opens the new shared device off the render thread.
 
 Detection runs on the CPU: a connected component labeller over a grid, 192 columns by default, fed
 one frame at a time. Swarm's drawing runs on the GPU when there is one and its windows cover enough
@@ -109,11 +113,14 @@ cargo vfx preview -p segcam-motion -- clip.mp4
 ```
 
 opens the preview on segcam, with test patterns, images, video files or a webcam. On the web build,
-add `?effect=segcam-motion` to the page's address. The preview hands it one frame per render: a new
-time adds the input to its history, the same time renders that frame again with the current
-parameters, and an earlier time (a seek back) starts over. On the desktop it waits for each frame's
-readback, and an MP4 export sees every frame. A browser can't wait on the GPU, and there the output
-runs a frame or two behind.
+add `?effect=segcam-motion` to the page's address.
+
+The preview hands segcam one frame per render. A new time adds the input to its history. The same
+time renders that frame again with the current parameters. An earlier time, such as a seek back,
+starts over.
+
+On the desktop, the preview waits for each frame's readback, so an MP4 export sees every frame. A
+browser can't wait on the GPU. There, the output runs a frame or two behind.
 
 ## Checking it
 

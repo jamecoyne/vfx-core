@@ -12,27 +12,34 @@ draws it as labelled boxes, mattes or a collage of windows. To install it, read 
   colour can be switched.
 - **Motion matte**: the layer cut out by the motion mask itself, softened from the grid.
 - **Box matte**: the layer cut out by the segments' boxes.
-- **Swarm**: a desktop collage. Every segment of every recent frame becomes a frozen tile of the
-  frame it was cut from, drawn as a macOS window (title bar, buttons, rounded corners and shadow),
-  newest on top. A window stays until **Swarm max tiles** newer ones push it out. **Trail frames**
-  is how far back windows can come from.
+- **Swarm**: a desktop collage. Each segment in a recent frame becomes a frozen tile of the frame it
+  was cut from. The tiles are drawn as macOS windows, with a title bar, buttons, rounded corners and
+  a shadow. The newest is on top. A window stays until **Swarm max tiles** newer ones push it out.
+  **Trail frames** sets how far back windows can come from.
 
 **Mirror** flips the picture and the boxes for a selfie camera.
 
 **Detect** picks Motion, Threshold or Faces only. Threshold finds areas brighter than **Level**, or
-darker with **Invert**, and **Auto level** picks the level for each frame. Its segments are labelled
-`blob#…`. Faces only runs no motion or threshold detection: the segments are the ticked face parts,
-Motion matte comes out empty and Box matte cuts by the face boxes.
+darker with **Invert**. **Auto level** picks the level for each frame. Its segments are labelled
+`blob#…`.
+
+Faces only runs no motion or threshold detection. The segments are the ticked face parts. Motion
+matte comes out empty, and Box matte cuts by the face boxes.
 
 **Swarm backdrop** puts the windows on a transparent canvas (the default), the source frame, or
 black.
 
-**Face**, **Eyes**, **Mouth** and **Body** enable detection of those, with Apple's Vision on macOS
-and ONNX Runtime models on Windows and Linux. Resolume and the preview never wait for faces: they
-draw without them until the models are up, and each render then takes the newest faces there are.
-Other hosts may be exporting, and their renders wait for the models and find each frame's own
-faces. The browser has no faces yet. In live playback, on a slow GPU, faces and bodies are found
-less often to leave the GPU more time for the picture; exports still find every frame's faces.
+**Face**, **Eyes**, **Mouth** and **Body** turn on detection of those. Apple's Vision does the work on
+macOS. Windows and Linux use ONNX Runtime models.
+
+Resolume and the preview never wait for faces. They draw without them until the models are up. Each
+render then uses the newest faces. Other hosts may be exporting. Their renders wait for the models
+and find each frame's own faces.
+
+The browser has no faces yet.
+
+On a slow GPU, live playback finds faces and bodies less often, so the picture keeps its rate.
+Exports still find every frame's faces.
 
 ## Parameters
 
