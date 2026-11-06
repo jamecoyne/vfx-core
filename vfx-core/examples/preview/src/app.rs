@@ -181,10 +181,16 @@ async fn open_device(
     // Effects draw on this device, and segcam's atlas grows with the trail: as much of a binding
     // as the adapter allows, or the atlas stops at wgpu's default.
     let supported = adapter.limits();
+    // WebGL2 can't meet wgpu's default limits.
+    let base = if adapter.get_info().backend == wgpu::Backend::Gl {
+        wgpu::Limits::downlevel_webgl2_defaults().using_resolution(supported.clone())
+    } else {
+        wgpu::Limits::default()
+    };
     let required_limits = wgpu::Limits {
         max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
         max_buffer_size: supported.max_buffer_size,
-        ..wgpu::Limits::default()
+        ..base
     };
     // Spout input imports D3D11 textures into a Vulkan device through this extension.
     #[cfg(windows)]
@@ -318,7 +324,7 @@ impl Preview {
     /// can't block on the GPU; the native build blocks on it with pollster.
     async fn new(
         window: Arc<Window>,
-        instance: wgpu::Instance,
+        #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))] mut instance: wgpu::Instance,
         gpu_choice: Option<String>,
         #[cfg(not(target_arch = "wasm32"))] display: winit::event_loop::OwnedDisplayHandle,
     ) -> Result<Self, String> {
@@ -327,6 +333,14 @@ impl Preview {
         let web_pending = web_media::Pending::default();
         #[cfg(target_arch = "wasm32")]
         web_media::listen_for_dropped_files(&web_pending);
+        // A browser can offer navigator.gpu and still have no WebGPU adapter; WebGL2 draws there.
+        #[cfg(target_arch = "wasm32")]
+        if !wgpu::util::is_browser_webgpu_supported().await {
+            instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::GL,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+        }
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| format!("couldn't create a surface: {e}"))?;
