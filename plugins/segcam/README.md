@@ -1,7 +1,7 @@
 # segcam
 
 segcam picks out sections of a shot (what moves, what is bright, faces and bodies) and turns them
-into labelled boxes, mattes, or Swarm: a collage of frozen tiles drawn as macOS windows that trail
+into labelled boxes, mattes, or Swarm: a collage of frozen tiles drawn as macOS style windows that trail
 the subject.
 
 ## Install

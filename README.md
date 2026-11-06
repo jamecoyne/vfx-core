@@ -17,7 +17,7 @@ Resolume, with a preview app that also runs in the browser.
 
 segcam finds what moves in a shot, and faces and bodies. It draws them as labelled boxes, as mattes
 that cut out the moving parts, or as Swarm. Swarm is a collage of frozen tiles, drawn as macOS
-windows that trail the subject. segcam started as a macOS app. The plugins:
+style windows that trail the subject. segcam started as a macOS app. The plugins:
 
 | Host | Plugin | macOS | Windows |
 |---|---|---|---|

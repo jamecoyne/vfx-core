@@ -13,7 +13,7 @@ draws it as labelled boxes, mattes or a collage of windows. To install it, read 
 - **Motion matte**: the layer cut out by the motion mask itself, softened from the grid.
 - **Box matte**: the layer cut out by the segments' boxes.
 - **Swarm**: a desktop collage. Each segment in a recent frame becomes a frozen tile of the frame it
-  was cut from. The tiles are drawn as macOS windows, with a title bar, buttons, rounded corners and
+  was cut from. The tiles are drawn as macOS style windows, with a title bar, buttons, rounded corners and
   a shadow. The newest is on top. A window stays until **Swarm max tiles** newer ones push it out.
   **Trail frames** sets how far back windows can come from.
 
