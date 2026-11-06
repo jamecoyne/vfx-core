@@ -578,7 +578,13 @@ impl<C> ClipFrames<'_, C> {
             timing::RenderTimes::add(&mut t.fetch, started);
         }
         match fetched {
-            Ok(Some(image)) => self.fetched = Some((index, image)),
+            Ok(Some(image)) => {
+                if let Some(t) = &mut self.times {
+                    t.fetched_image
+                        .get_or_insert(timing::ImageShape::of(&image.image));
+                }
+                self.fetched = Some((index, image));
+            }
             Ok(None) => {
                 self.error.get_or_insert(STAT_FAILED);
             }

@@ -8,6 +8,8 @@ use std::io::Write;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::image::{Depth, Image};
+
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VFX_OFX_TIMING").is_some_and(|v| v != "0"))
@@ -27,6 +29,28 @@ pub struct RenderTimes {
     /// The effect's work inside its frame callbacks, for earlier frames and for the current one.
     pub earlier_frames: Duration,
     pub current_frame: Duration,
+    /// The first image the host handed over, which says what each fetch costs it in memory.
+    pub fetched_image: Option<ImageShape>,
+}
+
+/// An image's depth, size and row stride.
+#[derive(Clone, Copy)]
+pub struct ImageShape {
+    pub depth: Depth,
+    pub width: usize,
+    pub height: usize,
+    pub row_bytes: isize,
+}
+
+impl ImageShape {
+    pub fn of(image: &Image) -> Self {
+        Self {
+            depth: image.depth,
+            width: image.bounds.width(),
+            height: image.bounds.height(),
+            row_bytes: image.row_bytes,
+        }
+    }
 }
 
 impl RenderTimes {
@@ -60,7 +84,7 @@ pub fn log(line: &RenderLine, t: &RenderTimes) {
     let text = format!(
         "at {at:.3} s frame {} asked {} unchanged {} dropped {}: fetch {} {:.1} ms, rows {} {:.1} ms, \
          convert {} {:.1} ms, effect earlier {:.1} ms, current {:.1} ms, between {:.1} ms, \
-         output {:.1} ms, total {:.1} ms",
+         output {:.1} ms, total {:.1} ms, image {}",
         line.frame,
         line.frames_asked,
         u8::from(line.earlier_unchanged),
@@ -76,6 +100,10 @@ pub fn log(line: &RenderLine, t: &RenderTimes) {
         ms(between),
         ms(line.output),
         ms(line.render + line.output),
+        t.fetched_image.map_or("none".to_string(), |i| format!(
+            "{:?} {}x{} row {} B",
+            i.depth, i.width, i.height, i.row_bytes
+        )),
     );
     let path = std::env::temp_dir().join("vfx-ofx-timing.log");
     // Timing must never disturb a render, so write errors are ignored.
