@@ -143,7 +143,8 @@ only items (`unfinished`, `share`, `shared`) are the only platform conditional p
 
 One Cargo workspace (`Cargo.toml` at the root) in two folders: `vfx-core/`, the toolchain,
 and `plugins/`, every effect crate built with it. Nothing in `vfx-core/` depends on `plugins/`
-except the preview's list of effects.
+except the preview's list of effects and, on Windows and Linux, its face tracker (segcam-face,
+behind the preview's `tracker` feature).
 
 ```
 vfx-core/
@@ -169,10 +170,14 @@ vfx-core/
     src/catalog.rs      the effects it offers (effect crates listed by build.rs)
     web/                index.html and build.sh for the WebGPU build
 plugins/
-  vfx-chain/            VFX Preview, the chain of core effects: the sample plugin
+  colour-adjust/        Colour Adjust: the core ColorAdjust effect as a plugin (own README)
+  gaussian-blur/        Gaussian Blur (own README)
+  vignette/             Vignette (own README)
+  blend/                Blend (own README)
+  vfx-chain/            VFX Preview, the four core effects above as one chain: the sample plugin
     examples/ae_reference.rs   its After Effects render path without After Effects
   segcam/
-    segcam-motion/      segcam Motion, ported from C++ (own README)
+    segcam-motion/      segcam, ported from C++ (own README)
       ae-tests/ ofx-tests/ ffgl-tests/   host checks against the C++ effect and its CLI
     segcam-face/        faces, eyes, mouths and bodies for segcam (own README)
 .github/workflows/      ci.yml (tests, every plugin), pages.yml (web preview), release.yml
@@ -223,6 +228,13 @@ it); `vfx-core/hosts/preview/src/catalog.rs` adds the core effects.
 
 Another crate's effect can use the preview as a library:
 `vfx_preview::run(vec![Entry::plugin(&my_effect::VFX_PLUGIN)])`.
+
+On Windows the preview draws with D3D12, where NVIDIA's Vulkan driver grows the preview's memory
+for as long as it renders. `WGPU_BACKEND=vulkan` still picks Vulkan. The browser build uses WebGPU
+where the browser has it and falls back to WebGL2 without it. Record needs WebGPU in the browser.
+A lost GPU device is reopened in place, and Spout senders on Windows (TouchDesigner's Spout Out, for
+one) can be picked as the source; [the preview's README](../vfx-core/hosts/preview/README.md) lists
+its keys, flags and Spout details.
 
 ## Releases
 
