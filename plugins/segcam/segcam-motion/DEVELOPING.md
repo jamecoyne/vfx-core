@@ -1,7 +1,6 @@
 # Developing segcam
 
-segcam's motion segmenter as a vfx-core effect, ported from jamecoyne's C++ After Effects effect,
-which isn't in this repository. It is one crate: a `CpuEffect`, exported to After Effects, OpenFX
+segcam's motion segmenter as a vfx-core effect, ported from jamecoyne's C++ After Effects effect. It is one crate: a `CpuEffect`, exported to After Effects, OpenFX
 and FFGL with `vfx_plugin::export!(cpu: SegcamMotion)` and offered by the preview app.
 
 Its CPU path does the same arithmetic as the C++ core. The `f32` and `f64` operations run in the same
@@ -112,12 +111,16 @@ cargo vfx package -p segcam-motion    # macOS installers for After Effects and O
 cargo vfx install -p segcam-motion    # Resolume; prints the sudo commands for the others
 ```
 
-The plugins install alongside the C++ effect. In After Effects the bundle is
-`SegcamMotionRust.plugin`, its match name `LOFISCIFI segcam Motion Rust`, and it appears as
-**Effect ▸ LO.FI.SCI.FI ▸ segcam**; projects saved with one effect don't switch to the
-other. In OpenFX hosts it is **LO.FI.SCI.FI / segcam**, identifier
-`com.lofiscifi.SegcamMotionRust`; in Resolume, **segcam Motion**, ID `SGCM`. Its logs are
-`~/Library/Logs/SegcamMotionRust-<host>.log` (on Windows, in `%TEMP%`).
+In every host it shows as **segcam**: **Effect ▸ LO.FI.SCI.FI ▸ segcam** in After Effects and
+**LO.FI.SCI.FI / segcam** in OpenFX hosts. Resolume shows its short name, **segcam Motion**, since
+FFGL hosts cut names at 16 bytes.
+
+Saved projects find the plugin by its identifiers, which never change once shipped: the After
+Effects match name `LOFISCIFI segcam Motion Rust`, the OpenFX identifier
+`com.lofiscifi.SegcamMotionRust` and the FFGL code `SGCM`. They differ from jamecoyne's C++
+effect's, so both install side by side and a project keeps whichever of the two it was saved with.
+The files are named `SegcamMotionRust`, and its logs are `~/Library/Logs/SegcamMotionRust-<host>.log`
+(on Windows, in `%TEMP%`).
 
 ## In the preview app
 
@@ -133,7 +136,7 @@ time renders that frame again with the current parameters. An earlier time, such
 starts over.
 
 On the desktop, the preview waits for each frame's readback, so an MP4 export sees every frame. A
-browser can't wait on the GPU. There, the output runs a frame or two behind.
+browser can't wait on the GPU, so its output runs a frame or two behind.
 
 ## Checking it
 
