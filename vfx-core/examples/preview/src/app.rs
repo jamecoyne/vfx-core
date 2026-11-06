@@ -1452,6 +1452,13 @@ fn new_wgpu_instance(display: winit::event_loop::OwnedDisplayHandle) -> wgpu::In
     {
         descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
     }
+    // D3D12 on Windows, where wgpu would otherwise pick Vulkan first: NVIDIA's Vulkan driver keeps
+    // a block of its own that grows for as long as the preview renders (#58), and D3D12 stays
+    // level. WGPU_BACKEND=vulkan still picks Vulkan.
+    #[cfg(windows)]
+    {
+        descriptor.backends = wgpu::Backends::DX12;
+    }
     // The D3D12 validation layer changes what DirectML finds in the same process, so it is on
     // only with WGPU_VALIDATION=1. Face models run beside this device.
     #[cfg(not(target_arch = "wasm32"))]
