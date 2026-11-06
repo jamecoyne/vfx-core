@@ -16,6 +16,7 @@ pub mod vision;
 pub mod yunet;
 
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub use picodet::Body;
 pub use yunet::Face;
@@ -240,6 +241,20 @@ impl Segmenter {
         }
     }
 
+    /// How long finding bodies took in the last [`Segmenter::find`] that looked for them. The body
+    /// detector runs beside the faces. None before the first such find, and from Vision, which
+    /// finds everything in one request.
+    pub fn body_time(&self) -> Option<Duration> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Vision(_) => None,
+            #[cfg(feature = "onnx")]
+            Self::Ort(segmenter, _) => segmenter.body_time,
+            #[cfg(not(any(target_os = "macos", feature = "onnx")))]
+            _ => None,
+        }
+    }
+
     /// The `parts` in `image`: each face and then its parts, then the bodies.
     pub fn find(&mut self, image: &Image, parts: Parts) -> &[Segment] {
         match self {
@@ -284,6 +299,8 @@ pub struct FaceSegmenter<D, M, B> {
     pub mesh: Option<M>,
     pub bodies: Option<B>,
     segments: Vec<Segment>,
+    /// How long the body detector took in the last find that ran it.
+    pub body_time: Option<Duration>,
 }
 
 /// Face boxes are square, as tall as YuNet's box and moved down by this fraction of its height.
@@ -323,6 +340,7 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
             mesh,
             bodies,
             segments: Vec::new(),
+            body_time: None,
         }
     }
 
@@ -331,6 +349,7 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
         self.segments.clear();
         let mut bodies = self.bodies.take();
         let mut found = Vec::new();
+        let mut body_time = None;
         let mut find_faces = || {
             if parts.face || parts.eyes || parts.mouth {
                 for face in &self.detector.detect(image) {
@@ -344,8 +363,10 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
                     // A body detector's panic costs this frame's bodies, never the faces, and the
                     // detector is kept for the next frame.
                     let mut detect = || {
+                        let started = Instant::now();
                         let detect = std::panic::AssertUnwindSafe(|| bodies.detect(image));
                         found = std::panic::catch_unwind(detect).unwrap_or_default();
+                        body_time = Some(started.elapsed());
                     };
                     match &*BODY_WORKER {
                         Some(worker) => worker.in_place_scope(|scope| {
@@ -364,6 +385,9 @@ impl<D: Detector, M: Landmarker, B: BodyDetector> FaceSegmenter<D, M, B> {
         // The body detector goes back before a face detector's panic carries on to the caller,
         // which would otherwise lose it for the rest of the process.
         self.bodies = bodies;
+        if body_time.is_some() {
+            self.body_time = body_time;
+        }
         if let Err(panic) = finding {
             std::panic::resume_unwind(panic);
         }
