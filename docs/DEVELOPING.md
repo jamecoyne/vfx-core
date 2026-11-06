@@ -64,7 +64,7 @@ Hosts find a plugin in saved projects by `id`, `ae-match-name` and `ffgl-code`. 
 keep them. The build script checks them against each host's limits: lengths, characters and a GUID.
 Every `cargo vfx` command checks that no two effects share one.
 
-A parameter's `name` is its saved identifier too. After Effects' disk IDs are hashes of it. Its
+A parameter's `name` is also its saved identifier: After Effects' disk IDs are hashes of it. Its
 `label` is what hosts show, and it can change.
 
 The target crates read the effect's `ParamSpec`s and map them onto each host. That covers groups,
@@ -80,31 +80,29 @@ An effect's `region` tells hosts how far it reads past each pixel, and whether i
 A `CpuEffect` with slow setup can do that work in `values_known`. OpenFX and FFGL call it before the
 first render.
 
-A `CpuEffect` that keeps work between renders says so with `keeps_state`. OpenFX, FFGL and the
-preview then keep one per instance (`vfx_host::CpuInstance`). `CpuInstance` also rebuilds the effect
+A `CpuEffect` that keeps work between renders returns `true` from `keeps_state`. OpenFX, FFGL and
+the preview then keep one per instance (`vfx_host::CpuInstance`). `CpuInstance` also rebuilds the effect
 after a panic. After Effects never keeps one.
 
 When a host's frames stop following on, it calls `clear_history`. That happens on a seek back, a clip
 loop or a resize. An effect that holds GPU resources implements `clear_history`, so those resources
-survive. Without it, the effect is rebuilt.
+survive. Without it, the host drops the effect and makes a new one at that point.
 
 Either way, every frame must match a fresh effect's. That holds even after earlier frames change
-upstream, or after a host misses one. Test it with `vfx_host::contract::check`, as
-`plugins/segcam/segcam-motion` does.
+upstream, or after a host misses one. Test it with `vfx_host::contract::check`.
 
-An effect that can work from what it kept says how few frames a host that keeps its own history must
-hold in full. It does this with `frames_held`.
+`frames_held` is how many of the `frames_before` a host that hands frames over one at a time must
+hold in full. An effect that keeps state can work from what it kept and return fewer.
 
-A `CpuEffect` can report with `report`. The report covers where its last render drew, where its face
-models run, and any named readings. Use it when the work runs somewhere a host can't see, or when the
-effect finds things a host could use. The preview's bar shows the first two. Its expressions match
+`report` returns where a `CpuEffect`'s last render drew, where its face models run, and any named
+readings. Implement it when the work runs somewhere a host can't see, or when the effect finds
+things a host could use. The preview's bar shows the first two. Its expressions match
 readings by name.
 
 ## What a host implements
 
-The core API for 1.0 comes from [ADR 7](../plugins/segcam/decisions/0007-core-api.md). A PR that adds
-a trait method, a `Context` field or a `Gpu` function adds a row here, and says so in its
-description. Every new trait method has a default and `Context::at` fills every new field, so old targets
+This is the core API for 1.0. A PR that adds a trait method, a `Context` field or a `Gpu` function
+adds a row here, and says so in its description. Every new trait method has a default and `Context::at` fills every new field, so old targets
 keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 
 | Item | Where |
@@ -196,7 +194,9 @@ plugins/
 ## Building and running
 
 Needs a current stable Rust (egui needs 1.95+; CI uses latest stable). The desktop preview needs
-`ffmpeg` and `ffprobe` on PATH, for video files, webcams and Record. It needs `ffplay` for sound.
+`ffmpeg` and `ffprobe` on PATH, for video files, webcams and Record, and `ffplay` for sound. They
+aren't bundled: get them from [ffmpeg.org](https://ffmpeg.org/download.html), `brew install ffmpeg`
+or `winget install ffmpeg`.
 macOS bundles are universal, so add the targets once:
 
 ```bash
@@ -230,7 +230,7 @@ Each plugin writes a line of notes about which render path ran to
 
 The preview runs one effect on a test pattern, image, video, webcam or Windows Spout source. It
 builds the control panel from the effect's parameters. Every float and integer parameter has an
-expression box (`sin(time/4)`, `bass * 2`, face tracking). Record saves the output as a video.
+expression box (`sin(time/4)`, `bass * 2`, face tracking). Record saves the live output as a video.
 
 The preview links the effects it offers, so the same build runs on the desktop and in the browser.
 Its build script lists every effect crate as a dependency. For segcam Motion, the entry is
@@ -270,8 +270,9 @@ as the run's artifacts, without a release. For each effect:
 | `<file>-<version>-Windows-Setup.exe` | Windows installer: OpenFX and Resolume, After Effects optional |
 | `<file>-<version>-Windows.zip` | the same Windows files, to copy by hand |
 
-macOS signing and notarization run when these repository secrets are set (Settings →
-Secrets and variables → Actions); without them the packages are unsigned:
+macOS signing and notarization run when the repository owner sets these secrets (Settings,
+Secrets and variables, Actions). A fork sets its own to sign its own builds. Without them the
+packages are unsigned:
 
 - `MACOS_CERTIFICATES_P12`: a base64 `.p12` holding the Developer ID Application and
   Developer ID Installer certificates, and `MACOS_CERTIFICATES_PASSWORD`, its password.
@@ -362,6 +363,7 @@ conversions. Each host also has a harness that runs the effects:
 - After Effects 26.5 on macOS passes the VFX Preview and segcam Motion harnesses. Natron was last
   checked with the earlier wrappers, which were one per effect.
 - Premiere Pro is untested. Signing and notarization have never run.
-- OpenFX GPU rendering (Resolve's Metal extension) and an FFGL thumbnail aren't done.
+- OpenFX frames cross through RAM. Effects can still draw on the GPU, but taking the host's GPU frames
+  (Resolve's Metal extension) isn't done, and neither is an FFGL thumbnail.
 - Hosts with no target yet: TouchDesigner (a Custom TOP), and EffectCraft, whose only plugin API
   is CPU WebAssembly, a fit for CPU effects.
