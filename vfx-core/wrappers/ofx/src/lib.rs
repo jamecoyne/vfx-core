@@ -531,8 +531,8 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
     Ok(())
 }
 
-/// Hands a CPU effect the source frames it reads, oldest first, each fetched and
-/// converted when asked for and released straight after.
+/// Hands a CPU effect the source frames it reads, oldest first, each fetched when asked for,
+/// converted only if its pixels are, and released when the next is fetched or the render ends.
 struct ClipFrames<'a, C> {
     clip: Clip,
     /// The clip's first frame; earlier ones don't exist.
@@ -541,6 +541,9 @@ struct ClipFrames<'a, C> {
     first_frame_time: f64,
     canvas: Rect,
     error: Option<OfxStatus>,
+    /// The image fetched last and its frame, kept so that hashing a frame and then converting it
+    /// fetches it once. Only one is held: a host may give out few.
+    fetched: Option<(usize, FetchedImage)>,
     /// Where each frame is decoded.
     decoded_pixels: &'a mut Vec<Argb<C>>,
     /// The frame `decoded_pixels` holds, which isn't fetched again if asked for again.
@@ -551,34 +554,61 @@ struct ClipFrames<'a, C> {
     frames_dropped: bool,
 }
 
-impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
-    fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<vfx_core::cpu::Image<'_>>)) {
+impl<C> ClipFrames<'_, C> {
+    /// Leaves frame `index`'s image in `fetched`, or nothing there if the frame can't be had.
+    fn fetch(&mut self, index: usize) {
+        if self.fetched.as_ref().is_some_and(|(i, _)| *i == index) {
+            return;
+        }
+        self.fetched = None;
         let time = self.first_frame_time + index as f64;
         if time < self.clip_start_time {
-            f(None);
             return;
         }
-        let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
-        if self.decoded_index == Some(index) {
-            f(Some(C::image(View::from_pixels(self.decoded_pixels, w, h))));
-            return;
-        }
-        self.decoded_index = None;
         match fetch_image(self.clip, time) {
-            Ok(Some(frame)) => {
-                // SAFETY: the fetched image stays alive through the closure.
-                unsafe { cpu_pixels::decode_into(&frame.image, self.canvas, self.decoded_pixels) };
-                self.decoded_index = Some(index);
-                f(Some(C::image(View::from_pixels(self.decoded_pixels, w, h))));
-            }
+            Ok(Some(image)) => self.fetched = Some((index, image)),
             Ok(None) => {
                 self.error.get_or_insert(STAT_FAILED);
-                f(None);
             }
             Err(e) => {
                 self.error.get_or_insert(e);
-                f(None);
             }
+        }
+    }
+}
+
+impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
+    fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<vfx_core::cpu::Image<'_>>)) {
+        let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
+        if self.decoded_index != Some(index) {
+            self.decoded_index = None;
+            self.fetch(index);
+            let Some((_, frame)) = &self.fetched else {
+                f(None);
+                return;
+            };
+            // SAFETY: `fetched` holds the image alive.
+            unsafe { cpu_pixels::decode_into(&frame.image, self.canvas, self.decoded_pixels) };
+            self.decoded_index = Some(index);
+        }
+        f(Some(C::image(View::from_pixels(self.decoded_pixels, w, h))));
+    }
+
+    /// `wanted` sees the host's own rows: a check that finds a frame unchanged never converts it.
+    fn with_frame_if_wanted(
+        &mut self,
+        index: usize,
+        wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+        f: &mut dyn FnMut(Option<vfx_core::cpu::Image<'_>>),
+    ) {
+        self.fetch(index);
+        let Some((_, frame)) = &self.fetched else {
+            f(None);
+            return;
+        };
+        // SAFETY: `fetched` holds the image alive through the call.
+        if unsafe { cpu_pixels::with_image_bytes(&frame.image, self.canvas, wanted) } {
+            self.with_frame(index, f);
         }
     }
 
@@ -917,6 +947,7 @@ impl CpuRender<'_> {
                 first_frame_time: self.first_frame_time,
                 canvas,
                 error: None,
+                fetched: None,
                 decoded_pixels,
                 decoded_index: None,
                 earlier_frames_unchanged: self.stream.continues,

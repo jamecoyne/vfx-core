@@ -86,7 +86,13 @@ fn renders_match_faces_off_during_the_load_and_show_faces_after() {
         "the models were up before the first render: the test proves nothing"
     );
 
-    // Detection runs beside the renders, so faces arrive some renders after the load.
+    // Detection runs beside the renders, so faces arrive some renders after the load. Faces only,
+    // since motion windows stack above faces and can cover them whole.
+    let faces_only = |mut values: ParamValues| {
+        values.set("detect", ParamValue::Int(2)).unwrap();
+        values
+    };
+    let (swarm, without) = (faces_only(swarm), faces_only(without));
     let started = Instant::now();
     loop {
         assert!(started.elapsed() < LIMIT, "no faces after the load");

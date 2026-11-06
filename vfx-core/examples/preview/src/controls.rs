@@ -1,6 +1,8 @@
 //! The control panel: the input, which effect is shown, and that effect's parameters,
 //! drawn from its own parameter list. Only one effect runs at a time.
 
+use std::time::Duration;
+
 use egui::{Color32, RichText, Ui};
 use vfx_core::{ParamKind, ParamSpec, ParamValue, ParamValues};
 
@@ -167,8 +169,8 @@ pub struct PanelStatus<'a> {
     /// The source is a video file, so the Play sound box applies.
     pub video: bool,
     pub sound_on: bool,
-    /// Whether Record is on.
-    pub recording: bool,
+    /// How long Record has been on, while it is.
+    pub recording: Option<Duration>,
     /// How the last recording ended: saved, discarded or failed.
     pub record_result: Option<&'a str>,
     pub cameras: &'a [String],
@@ -596,9 +598,10 @@ pub fn panel(
         });
 
         section(ui, "Record", true, |ui| {
-            let (text, hint) = if status.recording {
+            let (text, hint) = if let Some(elapsed) = status.recording {
                 (
-                    "Recording",
+                    // Monospace, so the label stays still as the digits change.
+                    RichText::new(format!("Recording {}", recording_length(elapsed))).monospace(),
                     if cfg!(target_arch = "wasm32") {
                         "Click again to stop and download the file."
                     } else {
@@ -607,15 +610,15 @@ pub fn panel(
                 )
             } else {
                 (
-                    "Record",
+                    RichText::new("Record"),
                     "Saves the effect's output, with its layers and expressions, to a video file.",
                 )
             };
-            let mut button = egui::Button::new(RichText::new(text).strong()).min_size(egui::vec2(
+            let mut button = egui::Button::new(text.strong()).min_size(egui::vec2(
                 ui.available_width(),
                 ui.spacing().interact_size.y,
             ));
-            if status.recording {
+            if status.recording.is_some() {
                 button = button.fill(Color32::from_rgb(190, 50, 50));
             }
             if ui.add(button).clicked() {
@@ -630,9 +633,44 @@ pub fn panel(
     actions
 }
 
+/// A recording's length as `m:ss`, or `h:mm:ss` from an hour up, as a show can run that long.
+pub fn recording_length(length: Duration) -> String {
+    let seconds = length.as_secs();
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// A finished file's length, to the nearest second. The running time counts whole seconds, which
+/// would read most of a second short of the file.
+pub fn final_recording_length(length: Duration) -> String {
+    recording_length(length + Duration::from_millis(500))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_length_is_the_nearest_second() {
+        let text = |millis| final_recording_length(Duration::from_millis(millis));
+        assert_eq!(text(6200), "0:06");
+        assert_eq!(text(6900), "0:07");
+    }
+
+    #[test]
+    fn recording_length_reads_as_a_clock() {
+        let text = |seconds| recording_length(Duration::from_secs(seconds));
+        assert_eq!(text(0), "0:00");
+        assert_eq!(text(9), "0:09");
+        assert_eq!(text(75), "1:15");
+        assert_eq!(text(3599), "59:59");
+        assert_eq!(text(3600), "1:00:00");
+        assert_eq!(text(36_061), "10:01:01");
+    }
 
     #[test]
     fn keys_reach_the_shown_effects_parameters() {

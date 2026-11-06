@@ -698,6 +698,58 @@ static void case_pending_gl_error(void) {
     }
 }
 
+/* A device lost, by destroy(), which goes another way through wgpu than a driver's loss: frames stay
+ * right through RAM, and the instance goes back to shared frames on a new device. */
+static void case_device_reopen(void) {
+    _putenv_s("VFX_FFGL_PATH", "ram");
+    void *ram = instantiate(63, 37);
+    _putenv_s("VFX_FFGL_PATH", "");
+    Frame f = frame(63, 37, 80, 48);
+    float *reference = malloc((size_t)f.w * f.h * 4 * sizeof(float));
+    CHECK(render(ram, &f), "forced RAM reference render");
+    memcpy(reference, f.out, (size_t)f.w * f.h * 4 * sizeof(float));
+    _putenv_s("VFX_FFGL_LOSE_DEVICE_AFTER", "20");
+    void *lost = instantiate(63, 37);
+    /* An instance made while the device is out, which mustn't wait for it. */
+    void *during = NULL;
+    /* Read when the first render sets up the shared images; the new device stays. The first try
+     * is a second after the loss. */
+    int rendered = 0;
+    for (; rendered < 2000 && !logged_message("shared frames back on a new device"); rendered++) {
+        CHECK(render(lost, &f), "render %d", rendered);
+        _putenv_s("VFX_FFGL_LOSE_DEVICE_AFTER", "");
+        if (!during && logged_message("warning: GPU device lost")) {
+            during = instantiate(63, 37);
+            CHECK(render(during, &f), "render of an instance made in the gap");
+        }
+        float worst = 0;
+        for (int k = 0; k < f.w * f.h * 4; k++) {
+            float diff = fabsf(reference[k] - f.out[k]);
+            if (diff > worst) worst = diff;
+        }
+        CHECK(worst < 1e-4f, "render %d differs from RAM: %g", rendered, worst);
+        CHECK(glGetError() == GL_NO_ERROR, "render %d left a GL error", rendered);
+        Sleep(2);
+    }
+    for (int i = 0; i < 10; i++) {
+        CHECK(render(lost, &f), "render %d after the new device", i);
+        float worst = 0;
+        for (int k = 0; k < f.w * f.h * 4; k++) {
+            float diff = fabsf(reference[k] - f.out[k]);
+            if (diff > worst) worst = diff;
+        }
+        CHECK(worst < 1e-4f, "render %d on the new device differs from RAM: %g", i, worst);
+    }
+    free(reference);
+    free_frame(&f);
+    CHECK(call(DEINSTANTIATE_GL, u(0), lost).u == 0, "delete after the new device");
+    if (during) CHECK(call(DEINSTANTIATE_GL, u(0), during).u == 0, "delete the gap's instance");
+    call(DEINSTANTIATE_GL, u(0), ram);
+    if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
+        CHECK(logged_message("shared frames back on a new device"), "no new device after the loss");
+    }
+}
+
 /* A frame whose GPU wait runs out, as on a GPU that hangs without being lost: the instance goes on
  * through RAM with the right pixels, and deleting it returns. */
 static void case_gpu_wait(void) {
@@ -737,6 +789,50 @@ static void case_gpu_wait(void) {
 }
 #endif
 
+#if defined(SEGCAM_CHECKS) && defined(_WIN32)
+/* A CPU effect's output on the GPU, with the loss found by the present: frames go through RAM until
+ * a new device is up, and renders go on across it. A panic there fails a render and starts the effect
+ * over. */
+static void segcam_device_reopen(void) {
+    _putenv_s("SEGCAM_GPU", "1");
+    _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "30");
+    int w = 1920, h = 1080;
+    void *inst = instantiate(w, h);
+    segcam_options(inst, 3, 0);
+    Frame f = frame(w, h, w, h);
+    GLuint textures[2] = {segcam_texture(w, h, 0), segcam_texture(w, h, 1)};
+    GLuint original = f.input;
+    int waited = 0, back_frames = 0, picture = 0;
+    double worst_render = 0;
+    for (int n = 0; n < 3000 && back_frames < 60; n++) {
+        f.input = textures[n & 1];
+        double time = n / 30.0;
+        CHECK(call(SET_TIME, ptr(&time), inst).u == 0, "set time failed");
+        double started = now();
+        CHECK(render(inst, &f), "render %d failed", n);
+        /* From the loss on: what the host's render thread waits for through a reopen. */
+        if (waited && now() - started > worst_render) worst_render = now() - started;
+        _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "");
+        if (!waited && logged_message("shared GPU render failed, using RAM")) waited = 1;
+        if (logged_message("shared frames back on a new device")) {
+            back_frames++;
+            for (int i = 0; i < w * h; i++) if (f.out[i * 4 + 3] > 0) { picture = 1; break; }
+        }
+        Sleep(2);
+    }
+    printf("  worst render from the loss on: %.1f ms\n", worst_render * 1000);
+    CHECK(waited, "the present never found the loss");
+    CHECK(back_frames >= 60, "no new device after the loss");
+    CHECK(picture, "no picture on the new device");
+    CHECK(!logged_message("CPU render failed"), "a render panicked after the new device");
+    CHECK(call(DEINSTANTIATE_GL, u(0), inst).u == 0, "delete after the new device");
+    glDeleteTextures(2, textures);
+    f.input = original;
+    free_frame(&f);
+    CHECK(glGetError() == GL_NO_ERROR, "GL error after the new device");
+}
+#endif
+
 typedef struct { const char *name; void (*run)(void); } Case;
 static Case cases[] = {
 #ifdef _WIN32
@@ -745,6 +841,7 @@ static Case cases[] = {
     /* Before gpu_wait, whose failed renders this one's log check would find. */
     {"pending_gl_error", case_pending_gl_error},
     {"gpu_wait", case_gpu_wait},
+    {"device_reopen", case_device_reopen},
 #endif
     {"info", case_info}, {"passthrough", case_passthrough}, {"brightness", case_brightness},
     {"padding", case_padding}, {"blur", case_blur}, {"vignette", case_vignette},
@@ -796,6 +893,14 @@ int main(int argc, char **argv) {
         call(DEINITIALISE, u(0), NULL);
         return result;
     }
+#ifdef _WIN32
+    if (segcam && !strcmp(only, "segcam-device-reopen")) {
+        segcam_device_reopen();
+        printf("segcam-device-reopen: %d failure(s)\n", failures);
+        call(DEINITIALISE, u(0), NULL);
+        return failures ? 1 : 0;
+    }
+#endif
     if (segcam && (!strcmp(only, "segcam") || !strcmp(only, "all") || !strcmp(only, "segcam-timing"))) {
         if (strcmp(only, "segcam-timing")) { case_segcam(); case_state(); }
         if (strcmp(only, "segcam")) segcam_timing();

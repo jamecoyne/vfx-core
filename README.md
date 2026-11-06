@@ -6,7 +6,7 @@ Resolume, with a preview app that also runs in the browser.
 <!-- Hero: a short GIF of segcam's window swarm goes here. -->
 
 [Download](https://github.com/jamecoyne/vfx-core/releases) ·
-[Try it in your browser](https://jamecoyne.github.io/vfx-core/) ·
+[Try segcam in your browser](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion) ·
 [Developer guide](docs/DEVELOPING.md) ·
 [Report a bug](https://github.com/jamecoyne/vfx-core/issues)
 

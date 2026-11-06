@@ -5,8 +5,9 @@
 //! The page's canvas holds the panel as well, so it can't be the one recorded. Nothing here reads
 //! the picture back, so recording leaves an effect drawing straight into its output frame.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use js_sys::{Array, Reflect};
 use vfx_core::{Frame, Gpu};
@@ -16,7 +17,9 @@ use web_sys::{
     Blob, BlobEvent, BlobPropertyBag, Event, HtmlAnchorElement, HtmlCanvasElement, MediaRecorder,
     MediaRecorderOptions, RecordingState, Url,
 };
+use web_time::Instant;
 
+use crate::controls::final_recording_length;
 use crate::effects::FullscreenPass;
 
 /// In order of preference, with the extension each saves as. H.264 in MP4 first: it plays
@@ -37,6 +40,16 @@ const URL_LIFETIME_MS: i32 = 60_000;
 
 /// How long a recorder that reported an error gets to hand over its last data and stop.
 const AFTER_ERROR_MS: i32 = 250;
+
+/// How often a picture that stands still is drawn again. The browser records a canvas only when
+/// it is drawn, so without this a paused source makes a file of one frame, far shorter than the
+/// time recorded.
+const REPEAT_STILL_PICTURE: Duration = Duration::from_millis(100);
+
+/// How many pictures are drawn before the recorder starts, about 0.1 s at 60 fps. Safari's stream
+/// gives black for the first 3 draws of a new canvas, however far apart they are, and those would
+/// open the file. The rest is margin, as this can't read the stream's pictures to see them change.
+const DRAWS_BEFORE_RECORDING: u32 = 6;
 
 const OPAQUE_COPY_WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -65,6 +78,8 @@ pub struct WebRecorder {
     pass: FullscreenPass,
     recorder: MediaRecorder,
     file: Rc<PendingFile>,
+    last_draw: Cell<Instant>,
+    draws_left_before_recording: Cell<u32>,
     pub size: (u32, u32),
 }
 
@@ -80,6 +95,8 @@ struct PendingFile {
     mime_type: String,
     extension: &'static str,
     finished: Finished,
+    /// When the recorder started, so this reads the file's length.
+    started: Cell<Instant>,
 }
 
 fn error(e: JsValue) -> String {
@@ -152,6 +169,7 @@ impl WebRecorder {
             mime_type: mime_type.to_owned(),
             extension,
             finished,
+            started: Cell::new(Instant::now()),
         });
         let on_data = {
             let file = file.clone();
@@ -172,19 +190,35 @@ impl WebRecorder {
             Closure::<dyn FnMut(Event)>::new(move |event: Event| file.recorder_failed(&event))
         };
         recorder.set_onerror(Some(on_error.into_js_value().unchecked_ref()));
-        // Handed over a second at a time, so a long recording isn't one huge buffer to the end.
-        recorder.start_with_time_slice(1000).map_err(error)?;
         Ok(Self {
             surface,
             pass,
             recorder,
             file,
+            last_draw: Cell::new(Instant::now()),
+            draws_left_before_recording: Cell::new(DRAWS_BEFORE_RECORDING),
             size,
         })
     }
 
-    /// Draws a new picture into the recorded canvas.
+    /// How long this has been recording.
+    pub fn elapsed(&self) -> Duration {
+        if self.draws_left_before_recording.get() > 0 {
+            return Duration::ZERO;
+        }
+        self.file.started.get().elapsed()
+    }
+
+    /// Whether a picture that hasn't changed should be drawn again, to get the recorder started
+    /// or to keep the recording going.
+    pub fn still_picture_due(&self) -> bool {
+        self.draws_left_before_recording.get() > 0
+            || self.last_draw.get().elapsed() >= REPEAT_STILL_PICTURE
+    }
+
+    /// Draws a picture into the recorded canvas.
     pub fn draw(&self, gpu: &Gpu, picture: &Frame) {
+        self.last_draw.set(Instant::now());
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -203,6 +237,24 @@ impl WebRecorder {
         self.pass.draw(&mut encoder, &bind, &view);
         gpu.queue.submit(Some(encoder.finish()));
         gpu.queue.present(frame);
+        self.count_draw_before_recording();
+    }
+
+    /// Starts the recorder on the last of the draws it waits for.
+    fn count_draw_before_recording(&self) {
+        let left = self.draws_left_before_recording.get();
+        if left == 0 {
+            return;
+        }
+        self.draws_left_before_recording.set(left - 1);
+        if left == 1 {
+            self.file.started.set(Instant::now());
+            // Handed over a second at a time, so a long recording isn't one huge buffer to the end.
+            if let Err(e) = self.recorder.start_with_time_slice(1000) {
+                *self.file.failure.borrow_mut() = Some(error(e));
+                self.file.save_once();
+            }
+        }
     }
 
     /// Stops, then saves the file once the browser has handed over the last of it. A recorder
@@ -264,6 +316,7 @@ impl PendingFile {
         recorder.set_onstop(None);
         recorder.set_onerror(None);
         let failure = self.failure.borrow_mut().take();
+        let length = final_recording_length(self.started.get().elapsed());
         let outcome = if self.chunks.borrow().is_empty() {
             match failure {
                 Some(why) => format!("Recording failed: {why}"),
@@ -271,9 +324,11 @@ impl PendingFile {
             }
         } else {
             match (self.save(), failure) {
-                (Ok(name), None) => format!("Saved {name} to your downloads"),
+                (Ok(name), None) => format!("Saved {name} to your downloads, {length} long"),
                 (Ok(name), Some(why)) => {
-                    format!("Recording stopped: {why}. Saved {name} to your downloads")
+                    format!(
+                        "Recording stopped: {why}. Saved {name} to your downloads, {length} long"
+                    )
                 }
                 (Err(e), _) => format!("Couldn't save the recording: {e}"),
             }

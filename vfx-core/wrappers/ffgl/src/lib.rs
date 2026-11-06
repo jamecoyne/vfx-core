@@ -168,7 +168,7 @@ struct Instance {
     interop_disabled: bool,
     /// The frame a CPU effect may draw its output into, on the interop's device.
     #[cfg(target_os = "windows")]
-    gpu_output_frame: Option<vfx_core::Frame>,
+    gpu_output_frame: Option<shared::OutputFrame>,
 }
 
 /// `VFX_FFGL_PATH=ram`: every frame through RAM, the zero-copy paths off.
@@ -543,6 +543,7 @@ unsafe fn process_cpu(
             cpu.history.next(frames_before, frames_held),
         )
     };
+    cpu.history.drop_repeat();
     let read_time = started.elapsed();
     let ctx = Context {
         frame: cpu.history.frame_number(),
@@ -558,7 +559,7 @@ unsafe fn process_cpu(
     let target = (instance.interop.current())
         .zip(instance.gpu_output_frame.as_ref())
         .filter(|_| gpu_output_ready)
-        .map(|(interop, frame)| vfx_core::Target::new(interop.gpu(), frame));
+        .map(|(interop, output)| vfx_core::Target::new(interop.gpu(), output.frame()));
     #[cfg(not(target_os = "windows"))]
     let target = None;
     let effect = &cpu.effect;
@@ -575,14 +576,16 @@ unsafe fn process_cpu(
     let render_time = started.elapsed() - read_time;
     #[cfg(target_os = "windows")]
     if on_gpu {
+        instance.interop.force_loss_before_present_for_tests();
         let presented = (instance.interop.current())
             .zip(instance.gpu_output_frame.as_ref())
-            .map(|(interop, frame)| {
+            .map(|(interop, output)| {
                 // SAFETY: the context is current with the host's framebuffer bound, and the effect
-                // drew `frame` on the interop's device.
-                catch_unwind(AssertUnwindSafe(|| unsafe { interop.present(frame) })).unwrap_or_else(
-                    |_| Err(shared::InteropError::Failed("the render panicked".into())),
-                )
+                // drew the frame on the interop's device.
+                catch_unwind(AssertUnwindSafe(|| unsafe {
+                    interop.present(output.frame())
+                }))
+                .unwrap_or_else(|_| Err(shared::InteropError::Failed("the render panicked".into())))
             });
         if let Some(Err(e)) = presented {
             // This frame exists only on the GPU, so the input stands in for it. The next ones go
@@ -674,16 +677,7 @@ unsafe fn prepare_gpu_output(
         instance.gpu_output_frame = None;
         return false;
     };
-    let frame = &mut instance.gpu_output_frame;
-    if frame.as_ref().is_none_or(|f| (f.width, f.height) != size) {
-        let (w, h) = size;
-        *frame = Some(vfx_core::Frame::new(
-            interop.gpu(),
-            w,
-            h,
-            pipeline::FRAME_FORMAT,
-        ));
-    }
+    shared::OutputFrame::keep_or_make(&mut instance.gpu_output_frame, interop.gpu(), size);
     true
 }
 

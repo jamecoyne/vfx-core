@@ -49,6 +49,22 @@ however you get to it. Resolve playback skips the frames Resolve drops to keep u
 can differ from an export. A change to an earlier frame of the clip shows on the next render after
 you pause or jump, and when an export starts.
 
+In Resolume, settings you change while it plays reach new windows only. Windows already on screen
+keep the settings they were made with.
+
+## The browser and the preview app
+
+The [browser build](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion) runs segcam with
+nothing to install, in a current Chrome, Edge or Safari with WebGPU. Drop a video on the page, open
+one from the source menu, or pick the webcam there.
+
+The preview app runs it on a test pattern, an image, a video file or a webcam, with a panel for every
+control, and records the result to an MP4. It [builds from a clone](../../docs/DEVELOPING.md#building-and-running):
+
+```bash
+cargo vfx preview -p segcam-motion -- clip.mp4
+```
+
 ## What it needs
 
 Integrated graphics from 2020 or later (Intel UHD 770 or Iris Xe, AMD Radeon 680M, any Apple M1 or
@@ -62,6 +78,11 @@ Apple M1 Pro and up runs it comfortably. Segcam draws on the GPU when there is o
 - On Windows, if `DirectML.dll` isn't next to the plugin, faces run on the CPU. Still works, just
   slower.
 - The browser preview has no faces yet.
+- On Windows, the After Effects plugin builds but hasn't been tried in After Effects yet.
+- We recommend a DXV copy of a clip for a show in Resolume. H.264 with few keyframes can drop frames
+  after a trigger and at each loop point. Resolume's
+  [own guidance](https://resolume.com/support/en/rendering-to-dxv) is DXV, and its Alley app converts
+  a clip.
 - We recommend keeping Resolve's render cache off for segcam. An export can contain wrong pictures
   when all three of these are on:
   - Playback, Render Cache, User
@@ -71,7 +92,7 @@ Apple M1 Pro and up runs it comfortably. Segcam draws on the GPU when there is o
   Resolve's cache can then hold pictures from playback, and a plugin can't tell a render that will
   be saved from playback. New projects have all three off.
 - Under a constant retime, a Resolve export depends on the order Resolve opens frames in, and two
-  exports can differ.
+  exports can differ. Speed ramps have not been tested.
 
 ## For developers
 
