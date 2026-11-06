@@ -8,6 +8,9 @@ A file dropped on the window opens as the source. In a browser, a drop goes the 
 picker: video only, the first of several files, and anything else leaves the source as it is and
 shows a message.
 
+On Windows the preview draws with D3D12. NVIDIA's Vulkan driver grows the preview's memory for as
+long as it renders, and D3D12 stays level. `WGPU_BACKEND=vulkan` still picks Vulkan.
+
 ## Spout
 
 On Windows the input menu lists the Spout senders running, such as TouchDesigner's Spout Out,
@@ -60,7 +63,7 @@ cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
 | `--frames N`, `--seconds N` | exit after that many frames or seconds |
 | `--quiet` | keep the window hidden and render only the effect |
 | `--record FILE` | record the output into an MP4 until the run ends |
-| `--lose-gpu S[:KIND]` | lose the GPU device S seconds in, to test reopening it; repeatable. `destroy`, or `removed` for D3D12's own removal, which goes through wgpu as a driver's loss does (with `WGPU_BACKEND=dx12`) |
+| `--lose-gpu S[:KIND]` | lose the GPU device S seconds in, to test reopening it; repeatable. `destroy`, or `removed` for D3D12's own removal, which goes through wgpu as a driver's loss does (D3D12 only) |
 | `--list` | the effects and their parameters |
 
 `--stats` prints one line a second, always with these keys in this order, then a last line
