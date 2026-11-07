@@ -343,6 +343,8 @@ conversions. Each host also has a harness that runs the effects:
 - GPU effects get one device per plugin, with instances pooled. Building pipelines is the expensive
   part of a render, so prepared instances are kept per device and size, and each render borrows one.
   Concurrent renders (After Effects MFR, OpenFX hosts) each borrow their own.
+- CPU effects don't declare Multi-Frame Rendering in After Effects. Each render checks out the
+  earlier frames it reads, and they run far slower with concurrent renders than in order.
 - CPU effects read host frames where they are. After Effects' buffers are read at their own depth,
   without copies. OpenFX frames are converted one at a time. Resolume and the preview hand over one
   frame at a time and keep a history of recent frames, in full as far as the effect's
