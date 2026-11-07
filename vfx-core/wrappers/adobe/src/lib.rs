@@ -695,7 +695,7 @@ fn cpu_pre_render(
 ) -> Result<(), ae::Error> {
     let values = params::read(params, specs())?;
     let ctx = context(in_data);
-    // Slow setup starts here, so the render doesn't wait in it.
+    // Slow setup starts here, so a render and Multi-Frame Rendering's other threads don't wait in it.
     let wanted = cpu_instance()?.with(|effect| {
         effect.values_known(&values);
         effect.frames_before(&values, ctx.frame_rate)
@@ -804,9 +804,8 @@ fn view<C: CpuDepth>(layer: &ae::Layer) -> Option<View<'_, C>> {
     })
 }
 
-/// The CPU effect for one render. After Effects never keeps one between renders: CPU effects
-/// render in order, without Multi-Frame Rendering, but its cache still asks for any frame
-/// ([`vfx_host::CpuInstance`]).
+/// The CPU effect for one render. After Effects never keeps one between renders: its cache
+/// and Multi-Frame Rendering ask for any frame, on any thread ([`vfx_host::CpuInstance`]).
 fn cpu_instance() -> Result<vfx_host::CpuInstance, ae::Error> {
     vfx_host::CpuInstance::new(vfx_host::plugin().make, false)
         .ok_or(ae::Error::BadCallbackParameter)

@@ -309,17 +309,12 @@ fn after_effects(meta: &Metadata, target_os: &str) {
     if cpu {
         flags |= OutFlags::WideTimeInput;
     }
-    // 32 bpc float requires SmartFX. GPU effects lease their own instance per render, so
-    // Multi-Frame Rendering is safe and pays for them. CPU effects check out the earlier
-    // frames they read in every render and run far slower with concurrent renders than in
-    // order, so they leave threaded rendering off and After Effects renders them in order.
-    // GPU-native rendering exists for Metal, so macOS GPU effects only.
+    // 32 bpc float requires SmartFX. Each render leases its own instance, so Multi-Frame
+    // Rendering is safe. GPU-native rendering exists for Metal, so macOS GPU effects only.
     let mut flags2 = OutFlags2::FloatColorAware
         | OutFlags2::SupportsSmartRender
+        | OutFlags2::SupportsThreadedRendering
         | OutFlags2::SupportsGetFlattenedSequenceData;
-    if !cpu {
-        flags2 |= OutFlags2::SupportsThreadedRendering;
-    }
     if !cpu && target_os == "macos" {
         flags2 |= OutFlags2::SupportsGpuRenderF32;
     }

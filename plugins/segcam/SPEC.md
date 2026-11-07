@@ -52,7 +52,7 @@ Status: done (on `main`), PR (written, in review), todo.
 
 | | Resolve (OpenFX) | After Effects | Resolume (FFGL) |
 |---|---|---|---|
-| Frames in | one per render, earlier frames on request, may skip when behind | checked out before the render, a fresh effect per render, renders in order (no MFR) | one per call, forward, GL texture |
+| Frames in | one per render, earlier frames on request, may skip when behind | checked out before the render, a fresh effect per render, renders in parallel (MFR) | one per call, forward, GL texture |
 | Depth | float | 8, 16 and 32 bit | 8 bit |
 | Kept state | a cache under F3, F4 | none between renders (each is fresh) | kept for the run; holds the current frame in full, and of earlier frames what the trail draws, so a setting changed live reaches new windows only |
 | Frame number | timeline frame | time divided by frame length | frames received, back to 0 on a seek back or resize |
