@@ -14,6 +14,7 @@ on the same footage. Renders them with aerender and checks:
             input, so a pass-through can't pass
 
 Usage: python3 plugins/segcam/segcam-motion/ae-tests/run.py [--clip footage.mp4] [--frames 40]
+(`python` or `py` on Windows)
 
 Default footage is generated: squares crossing a gradient, as a PNG sequence, so every
 input pixel is known. Needs the Rust effect installed (the C++ one is compared when it is),
@@ -212,7 +213,9 @@ def run_script_windows(script, projects, timeout=900):
         if None not in current and current == sizes:
             return
         if time.monotonic() > deadline:
-            return  # the caller names the missing projects
+            # The caller names the missing projects.
+            print(f"After Effects didn't finish the project script within {timeout} s")
+            return
         sizes = current
         time.sleep(2)
 

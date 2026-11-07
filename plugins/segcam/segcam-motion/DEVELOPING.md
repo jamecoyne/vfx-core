@@ -184,11 +184,11 @@ With the plugin installed (and the C++ effect, for the comparison):
 python3 plugins/segcam/segcam-motion/ae-tests/run.py
 ```
 
-builds 8, 16 and 32 bpc projects in After Effects, with a comp per output mode for each effect,
-renders them with `aerender`, and checks that the Rust effect matches the C++ one within a level (at
-16 and 32 bpc After Effects dithers its 8 bit TIFF output), that Multi Frame Rendering on and off
-give identical frames, and that the movers were found. `--clip` uses real footage instead of the
-generated squares.
+(`python` or `py` on Windows) builds 8, 16 and 32 bpc projects in After Effects, with a comp per
+output mode for each effect, renders them with `aerender`, and checks that the Rust effect matches
+the C++ one within a level (at 16 and 32 bpc After Effects dithers its 8 bit TIFF output), that
+Multi Frame Rendering on and off give identical frames, and that the movers were found. `--clip`
+uses real footage instead of the generated squares.
 
 It runs on macOS and Windows. On Windows the plugin is a folder in MediaCore,
 `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\SegcamMotionRust\`, holding
