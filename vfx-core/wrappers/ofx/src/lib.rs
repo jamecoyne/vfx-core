@@ -103,6 +103,7 @@ fn dispatch(
 ) -> Result<OfxStatus, OfxStatus> {
     let cpu = vfx_host::plugin().kind == Kind::Cpu;
     Ok(if action == ACTION_LOAD {
+        timing::open_log();
         if host::fetch_suites() {
             STAT_OK
         } else {
@@ -556,7 +557,7 @@ struct ClipFrames<'a, C> {
     frames_dropped: bool,
     /// The index of the frame being rendered, which [`timing`] times apart from earlier ones.
     current_index: usize,
-    /// Where `VFX_OFX_TIMING` is set.
+    /// `Some` only when timing is enabled.
     times: Option<timing::RenderTimes>,
 }
 
@@ -566,16 +567,16 @@ impl<C> ClipFrames<'_, C> {
         if self.fetched.as_ref().is_some_and(|(i, _)| *i == index) {
             return;
         }
-        self.fetched = None;
+        self.release();
         let time = self.first_frame_time + index as f64;
         if time < self.clip_start_time {
             return;
         }
-        let started = std::time::Instant::now();
+        let started = timing::start(&self.times);
         let fetched = fetch_image(self.clip, time);
         if let Some(t) = &mut self.times {
             t.fetches += 1;
-            timing::RenderTimes::add(&mut t.fetch, started);
+            timing::add(&mut t.fetch, started);
         }
         match fetched {
             Ok(Some(image)) => {
@@ -593,6 +594,19 @@ impl<C> ClipFrames<'_, C> {
             }
         }
     }
+
+    /// Gives the held image back to the host, which may keep every image it gave out until then.
+    fn release(&mut self) {
+        let Some(held) = self.fetched.take() else {
+            return;
+        };
+        let started = timing::start(&self.times);
+        drop(held);
+        if let Some(t) = &mut self.times {
+            t.releases += 1;
+            timing::add(&mut t.release, started);
+        }
+    }
 }
 
 impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
@@ -605,23 +619,23 @@ impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
                 f(None);
                 return;
             };
-            let started = std::time::Instant::now();
+            let started = timing::start(&self.times);
             // SAFETY: `fetched` holds the image alive.
             unsafe { cpu_pixels::decode_into(&frame.image, self.canvas, self.decoded_pixels) };
             self.decoded_index = Some(index);
             if let Some(t) = &mut self.times {
                 t.conversions += 1;
-                timing::RenderTimes::add(&mut t.conversion, started);
+                timing::add(&mut t.conversion, started);
             }
         }
-        let started = std::time::Instant::now();
+        let started = timing::start(&self.times);
         f(Some(C::image(View::from_pixels(self.decoded_pixels, w, h))));
         if let Some(t) = &mut self.times {
             let stage = match index == self.current_index {
                 true => &mut t.current_frame,
                 false => &mut t.earlier_frames,
             };
-            timing::RenderTimes::add(stage, started);
+            timing::add(stage, started);
         }
     }
 
@@ -637,12 +651,12 @@ impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
             f(None);
             return;
         };
-        let started = std::time::Instant::now();
+        let started = timing::start(&self.times);
         // SAFETY: `fetched` holds the image alive through the call.
         let convert = unsafe { cpu_pixels::with_image_bytes(&frame.image, self.canvas, wanted) };
         if let Some(t) = &mut self.times {
             t.row_reads += 1;
-            timing::RenderTimes::add(&mut t.row_read, started);
+            timing::add(&mut t.row_read, started);
         }
         if convert {
             self.with_frame(index, f);
@@ -992,7 +1006,7 @@ impl CpuRender<'_> {
                 current_index: self.frame_count - 1,
                 times: timing::enabled().then(timing::RenderTimes::default),
             };
-            let started = std::time::Instant::now();
+            let started = timing::start(&frames.times);
             let (w, h) = (canvas.width() as i32, canvas.height() as i32);
             output_pixels.clear();
             output_pixels.resize(canvas.width() * canvas.height(), Argb::default());
@@ -1000,14 +1014,16 @@ impl CpuRender<'_> {
             let rendered =
                 self.effect
                     .render(&mut frames, self.frame_count, view, self.values, self.ctx);
+            // The host can free what it holds for this render before the output is written.
+            frames.release();
             if rendered.is_err() {
                 return Some(STAT_FAILED);
             }
-            let render = started.elapsed();
-            let started = std::time::Instant::now();
+            let render = started.map(|s| s.elapsed());
+            let started = timing::start(&frames.times);
             // SAFETY: the render window is clipped to the output and canvas bounds.
             unsafe { cpu_pixels::encode(output_pixels, canvas, self.output, self.window) };
-            if let Some(times) = &frames.times {
+            if let (Some(times), Some(render), Some(started)) = (&frames.times, render, started) {
                 let line = timing::RenderLine {
                     frame: self.ctx.frame,
                     frames_asked: self.frame_count,
