@@ -1,21 +1,6 @@
-# vfx-core
-
-Video effects written once in Rust and shipped as plugins for After Effects, DaVinci Resolve and
-Resolume, with a preview app that also runs in the browser.
-
-<!-- Hero: a short GIF of segcam's window swarm goes here. -->
-
-[Download](https://github.com/jamecoyne/vfx-core/releases) ·
-[Try segcam in your browser](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion) ·
-[Developer guide](docs/DEVELOPING.md) ·
-[Report a bug](https://github.com/jamecoyne/vfx-core/issues)
-
-> The segcam plugin is on its way. Until the release, try segcam in the browser preview or build it
-> from source.
-
 ## segcam
 
-segcam finds what moves in a shot, and faces and bodies. It draws them as labelled boxes, as mattes
+Segcam finds what moves in a shot, and faces and bodies. It draws them as labelled boxes, as mattes
 that cut out the moving parts, or as Swarm. Swarm is a collage of frozen tiles, drawn as macOS
 style windows that trail the subject. segcam started as a macOS app. The plugins:
 
@@ -31,6 +16,8 @@ It runs on integrated graphics from 2020 or later (Intel UHD 770 or Iris Xe, AMD
 Apple M1 or newer) with a 6 core CPU. Swarm draws on the GPU when there is one.
 
 [segcam's controls, install steps and limits](plugins/segcam/README.md)
+
+# Installation
 
 ## Effects in this repository
 
@@ -48,14 +35,23 @@ Each effect is one plugin crate under [`plugins/`](plugins). The toolchain, the 
 preview app are in [`vfx-core/`](vfx-core), and the preview is at
 [`vfx-core/hosts/preview`](vfx-core/hosts/preview).
 
-## Make your own effect
+# vfx-core
 
-You need a current stable Rust. From a clone of this repository:
+VFX-core is our cross platform library and build chain for creating video effects. The app formally targets and has been tested against After Effects, DaVinci Resolve and, Resolume, but should be supported in any application that reads OpenFX, FFGL, webGL, or adobe plugins. VFX-core also includes a preview app to view or demo your tool.
+
+<!-- Hero: a short GIF of segcam's window swarm goes here. -->
+
+[Download](https://github.com/jamecoyne/vfx-core/releases) ·
+[Try segcam in your browser](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion) ·
+[Developer guide](docs/DEVELOPING.md) ·
+[Report a bug](https://github.com/jamecoyne/vfx-core/issues)
+
+## Creating your own effect with the VFX-core crate
 
 ```bash
-cargo vfx new my-glow                    # a CPU effect to start from, already in the preview
-cargo vfx preview -p my-glow             # open it in the preview; drop a video on it
-cargo vfx build -p my-glow               # plugins for every host, in target/vfx-plugin/
+cargo vfx new my-effect                   # a CPU effect to start from, already in the preview
+cargo vfx preview -p my-effect           # open it in the preview; drop a video on it
+cargo vfx build -p my-effect               # plugins for every host, in target/vfx-plugin/
 ```
 
 An effect is one crate. It implements `Effect` (GPU, on [wgpu](https://wgpu.rs)) or `CpuEffect`
@@ -65,7 +61,7 @@ the design. Coding agents start at [AGENTS.md](AGENTS.md).
 
 ## Credits
 
-Made by jamecoyne and its [contributors](https://github.com/jamecoyne/vfx-core/graphs/contributors).
+Made by LO.FI.SCI.FI and friends [contributors](https://github.com/jamecoyne/vfx-core/graphs/contributors).
 Face detection uses YuNet, MediaPipe Face Mesh and PicoDet ([models and licenses](plugins/segcam/segcam-face/models/README.md)).
 
 Licensed under MIT or Apache 2.0, whichever you prefer.
