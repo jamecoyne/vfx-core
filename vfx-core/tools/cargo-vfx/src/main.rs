@@ -571,6 +571,7 @@ fn package(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), Str
             &m.version,
             location,
         )?;
+        notarize_pkg(&pkg)?;
         println!("{}", pkg.display());
     }
     Ok(())
@@ -609,16 +610,44 @@ fn sign_and_notarize(bundle: &Path, out: &Path) -> Result<(), String> {
             .args(["-c", "-k", "--keepParent"])
             .arg(bundle)
             .arg(&zip))?;
-        run(Command::new("xcrun")
-            .args(["notarytool", "submit"])
-            .arg(&zip)
-            .args(["--keychain-profile", &profile, "--wait"]))?;
+        let result = notarize(&zip, &profile);
+        let _ = fs::remove_file(zip);
+        result?;
         run(Command::new("xcrun")
             .args(["stapler", "staple"])
             .arg(bundle))?;
-        let _ = fs::remove_file(zip);
     }
     Ok(())
+}
+
+/// Notarizes and staples an installer, so Gatekeeper opens it without a warning once
+/// downloaded. The bundle inside is notarized too, for copies made without the installer.
+fn notarize_pkg(pkg: &Path) -> Result<(), String> {
+    let Some(profile) = std::env::var("NOTARY_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    if std::env::var("INSTALLER_IDENTITY")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(
+            "NOTARY_PROFILE needs INSTALLER_IDENTITY: Apple only notarizes signed installers"
+                .into(),
+        );
+    }
+    notarize(pkg, &profile)?;
+    run(Command::new("xcrun").args(["stapler", "staple"]).arg(pkg))
+}
+
+/// Submits a zip or a signed `.pkg` to Apple's notary service and waits for its verdict.
+fn notarize(file: &Path, profile: &str) -> Result<(), String> {
+    run(Command::new("xcrun")
+        .args(["notarytool", "submit"])
+        .arg(file)
+        .args(["--keychain-profile", profile, "--wait"]))
 }
 
 /// A component package that installs `bundle` into `location`, never relocated to a copy
