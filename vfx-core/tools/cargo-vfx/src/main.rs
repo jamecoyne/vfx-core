@@ -369,9 +369,40 @@ fn build(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<PathB
         build_mac(e, o, target, out)
     } else if cfg!(target_os = "windows") {
         build_windows(e, o, target, out)
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        build_linux(e, o, target, out)
     } else {
-        Err("plugins build on macOS and Windows".into())
+        Err("plugins build on macOS, Windows and x86-64 Linux".into())
     }
+}
+
+/// Linux has OpenFX hosts only (Resolve, Nuke, Natron): no After Effects, and no FFGL host
+/// that runs there, so other hosts are skipped.
+fn build_linux(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<PathBuf>, String> {
+    let m = &e.meta;
+    if !o.hosts.contains(&Host::Ofx) {
+        return Err("on Linux, plugins build for OpenFX only (--hosts ofx)".into());
+    }
+    for host in o.hosts.iter().filter(|h| **h != Host::Ofx) {
+        eprintln!("note: no {} plugin on Linux, skipped", host.feature());
+    }
+    let ofx = Options {
+        hosts: vec![Host::Ofx],
+        command: o.command.clone(),
+        packages: Vec::new(),
+        rest: Vec::new(),
+        ..*o
+    };
+    cargo_build(e, &ofx, None)?;
+    let so = target.join(profile(o)).join(format!("lib{}.so", e.lib()));
+    // The OpenFX bundle layout, with the shared library renamed .ofx under Linux-x86-64.
+    let bundle = out.join(format!("{}.ofx.bundle", m.file));
+    let _ = fs::remove_dir_all(&bundle);
+    let dir = bundle.join("Contents").join("Linux-x86-64");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    fs::copy(&so, dir.join(format!("{}.ofx", m.file))).map_err(|err| err.to_string())?;
+    println!("{}", bundle.display());
+    Ok(vec![bundle])
 }
 
 fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<PathBuf>, String> {

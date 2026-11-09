@@ -16,13 +16,15 @@ if [ ! -f "$include/ofxCore.h" ]; then
 fi
 effect="${EFFECT:-vfx-chain}"
 lib="${effect//-/_}"
+linux=()
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*) plugin="$target/debug/$lib.dll" host="$target/ofx-minihost/minihost.exe" ;;
+  Linux) plugin="$target/debug/lib$lib.so" host="$target/ofx-minihost/minihost" linux=(-D_GNU_SOURCE -ldl) ;;
   *) plugin="$target/debug/lib$lib.dylib" host="$target/ofx-minihost/minihost" ;;
 esac
 
 cargo build -p "$effect" --lib --features ofx --quiet
 mkdir -p "$target/ofx-minihost"
 "${CC:-cc}" -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type -O1 \
-  -I"$include" "$here/minihost.c" -o "$host"
+  -I"$include" "$here/minihost.c" -o "$host" ${linux[@]+"${linux[@]}"}
 "$host" "$plugin" "${1:-all}"

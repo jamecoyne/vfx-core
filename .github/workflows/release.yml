@@ -1,18 +1,27 @@
 name: release
 
-# Builds every plugin on GitHub's macOS and Windows runners. Pushing a version tag
-# (v1.2.3) puts the files on a draft release to check and publish; running it by hand
-# (Actions → release → Run workflow) leaves them as the run's artifacts.
+# Builds the plugins on GitHub's macOS, Windows and Linux runners. Pushing a version tag
+# puts the files on a draft release to check and publish: v1.2.3 builds every effect,
+# segcam-v1.2.3 builds segcam alone. Running it by hand (Actions → release → Run workflow)
+# leaves the files as the run's artifacts, for the effects named in its `crates` box.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "segcam-v*"]
   workflow_dispatch:
+    inputs:
+      crates:
+        description: Effect crates to build, space separated (empty builds every effect)
+        default: ""
 
 permissions:
   contents: write
 
 env:
-  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+  # The tag (or `dev`), and the crates to build (empty: every effect crate). Each job's
+  # `crates and version` step turns them into CRATES and VERSION (1.2.3, no prefix).
+  TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+  CRATES: >-
+    ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'segcam-v') && 'segcam-motion' || inputs.crates || '' }}
 
 jobs:
   macos:
@@ -57,14 +66,17 @@ jobs:
             echo "NOTARY_PROFILE=vfx-notary" >> "$GITHUB_ENV"
           fi
 
-      # Every effect crate: an After Effects and an OpenFX installer, and Resolume's bundle.
+      - name: Crates and version
+        run: ./.github/release-env.sh
+
+      # Each effect crate: an After Effects and an OpenFX installer, and Resolume's bundle.
       - name: Build the installers
         run: |
-          cargo vfx package
+          cargo vfx package $(printf -- '-p %s ' $CRATES)
           mkdir -p dist
-          for crate in $(cargo vfx list | awk '{print $1}'); do
+          for crate in $CRATES; do
             eval "$(cargo vfx env -p "$crate")"
-            name="$PLUGIN_FILE-${VERSION#v}-macOS"
+            name="$PLUGIN_FILE-$VERSION-macOS"
             cp "target/vfx-plugin/$PLUGIN_FILE-adobe.pkg" "dist/$name-AfterEffects.pkg"
             cp "target/vfx-plugin/$PLUGIN_FILE-ofx.pkg" "dist/$name-OpenFX.pkg"
             ditto -c -k --keepParent "target/vfx-plugin/$PLUGIN_FILE.bundle" "dist/$name-Resolume.zip"
@@ -86,11 +98,15 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 
+      - name: Crates and version
+        shell: bash
+        run: ./.github/release-env.sh
+
       - name: Build each effect's plugins, installer and zip
         shell: bash
         run: |
-          for crate in $(cargo vfx list | awk '{print $1}'); do
-            EFFECT="$crate" VERSION="${VERSION#v}" ./vfx-core/wrappers/package-win.sh
+          for crate in $CRATES; do
+            EFFECT="$crate" ./vfx-core/wrappers/package-win.sh
           done
 
       - uses: actions/upload-artifact@v4
@@ -101,9 +117,53 @@ jobs:
             target/vfx-plugin/*-Windows.zip
           if-no-files-found: error
 
+  # OpenFX plugins for Linux hosts (Resolve, Nuke, Natron), built on AlmaLinux 8 so they
+  # load on glibc 2.28 and newer (the VFX Reference Platform's Rocky and Alma Linux 8 and 9).
+  # segcam's frames are checked against its CLI with the bundled binary itself.
+  linux:
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # ONNX Runtime's build script downloads its library over native TLS.
+      - name: OpenSSL headers
+        run: dnf install -y openssl-devel
+
+      - name: Crates and version
+        run: ./.github/release-env.sh
+
+      - name: Build each effect's OpenFX bundle
+        run: |
+          mkdir -p dist
+          for crate in $CRATES; do
+            cargo vfx build -p "$crate" --hosts ofx
+            eval "$(cargo vfx env -p "$crate")"
+            so="target/vfx-plugin/$PLUGIN_FILE.ofx.bundle/Contents/Linux-x86-64/$PLUGIN_FILE.ofx"
+            echo "$so needs: $(objdump -T "$so" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+            tar -C target/vfx-plugin -czf "dist/$PLUGIN_FILE-$VERSION-Linux-OpenFX.tar.gz" "$PLUGIN_FILE.ofx.bundle"
+          done
+
+      - name: segcam in the OpenFX mini host, against its CLI
+        if: contains(env.CRATES, 'segcam-motion')
+        run: |
+          git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
+          export PATH="/opt/python/cp312-cp312/bin:$PATH"
+          OFX_INCLUDE="$RUNNER_TEMP/openfx/include" SEGCAM_TEST_DIR="$RUNNER_TEMP/segcam-ofx" \
+            PLUGIN="$PWD/target/vfx-plugin/SegcamMotionRust.ofx.bundle/Contents/Linux-x86-64/SegcamMotionRust.ofx" \
+            ./plugins/segcam/segcam-motion/ofx-tests/run.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-Linux
+          path: dist/*
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: [macos, windows]
+    needs: [macos, windows, linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
