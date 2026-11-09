@@ -221,7 +221,18 @@ acts on every effect crate; output goes to `target/vfx-plugin/`.
 | Tests | `cargo test -p vfx-core -p vfx-host -p vfx-chain -p colour-adjust -p gaussian-blur -p vignette -p blend -p segcam-motion` | headless GPU and CPU tests |
 
 `cargo vfx package` signs and notarizes only when `SIGN_IDENTITY`, `NOTARY_PROFILE` and
-`INSTALLER_IDENTITY` are set; without them the packages are unsigned (fine locally).
+`INSTALLER_IDENTITY` are set; without them the packages are unsigned (fine locally). With
+all three, the bundles and the `.pkg` installers are both notarized and stapled. To sign
+with your own Developer ID certificates (`security find-identity -v` lists them), store
+notarization credentials once, then package:
+
+```bash
+xcrun notarytool store-credentials vfx-notary --apple-id YOUR_APPLE_ID --team-id TEAM_ID
+SIGN_IDENTITY="Developer ID Application: NAME (TEAM_ID)" \
+INSTALLER_IDENTITY="Developer ID Installer: NAME (TEAM_ID)" \
+NOTARY_PROFILE=vfx-notary cargo vfx package
+```
+
 Each plugin writes a line of notes about which render path ran to
 `~/Library/Logs/<file>-AfterEffects.log`, `<file>-OpenFX.log` or `<file>-FFGL.log`
 (on Windows, the same names in `%TEMP%`).
