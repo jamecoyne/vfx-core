@@ -1,5 +1,12 @@
 ## Segcam
 
+<!-- Hero: a short GIF of segcam's window swarm goes here. -->
+
+[Download](https://github.com/jamecoyne/vfx-core/releases) ·
+[Try segcam in your browser](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion) ·
+[Developer guide](docs/DEVELOPING.md) ·
+[Report a bug](https://github.com/jamecoyne/vfx-core/issues)
+
 Segcam finds what moves in a shot, and faces and bodies. It draws them as labelled boxes, as mattes
 that cut out the moving parts, or as Swarm. Swarm is a collage of frozen tiles, drawn as macOS
 style windows that trail the subject. segcam started as a macOS app. The plugins:
@@ -24,12 +31,6 @@ Apple M1 or newer) with a 6 core CPU. Swarm draws on the GPU when there is one.
 
 VFX-core is our cross platform library and build chain for creating video effects. The app formally targets and has been tested against After Effects, DaVinci Resolve and, Resolume, but should be supported in any application that reads OpenFX, FFGL, webGL, or adobe plugins. VFX-core also includes a preview app to view or demo your tool.
 
-<!-- Hero: a short GIF of segcam's window swarm goes here. -->
-
-[Download](https://github.com/jamecoyne/vfx-core/releases) ·
-[Try segcam in your browser](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion) ·
-[Developer guide](docs/DEVELOPING.md) ·
-[Report a bug](https://github.com/jamecoyne/vfx-core/issues)
 
 ## Creating your own effect with the VFX-core crate
 
