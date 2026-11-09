@@ -9,15 +9,21 @@
 
 Segcam finds what moves in a shot, and faces and bodies. It draws them as labelled boxes, as mattes
 that cut out the moving parts, or as Swarm. Swarm is a collage of frozen tiles, drawn as macOS
-style windows that trail the subject. segcam started as a macOS app. The plugins:
+style windows that trail the subject. segcam started as a macOS app. Downloads for
+[v0.1.0](https://github.com/jamecoyne/vfx-core/releases/tag/v0.1.0):
 
-| Host | Plugin | macOS | Windows |
+| Host | Plugin | macOS (signed and notarized) | Windows |
 |---|---|---|---|
-| After Effects | After Effects | installer | zip |
-| DaVinci Resolve | OpenFX | installer | zip |
-| Resolume Avenue and Arena | FFGL | zip | zip |
+| After Effects | After Effects | [installer](https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-macOS-AfterEffects.pkg) | [installer][win-setup] or [zip][win-zip] |
+| DaVinci Resolve | OpenFX | [installer](https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-macOS-OpenFX.pkg) | [installer][win-setup] or [zip][win-zip] |
+| Resolume Avenue and Arena | FFGL | [zip](https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-macOS-Resolume.zip) | [installer][win-setup] or [zip][win-zip] |
 
-On Windows, copy the plugin into the folder its zip's readme names, then restart the host.
+[win-setup]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-Windows-Setup.exe
+[win-zip]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-Windows.zip
+
+On Windows, one installer covers all three hosts (After Effects is optional in it); the zip holds
+the same files, to copy into the folders its `INSTALL.txt` names. The Windows files are unsigned, so
+SmartScreen asks before running the installer. Restart the host after installing.
 
 It runs on integrated graphics from 2020 or later (Intel UHD 770 or Iris Xe, AMD Radeon 680M, any
 Apple M1 or newer) with a 6 core CPU. Swarm draws on the GPU when there is one.
