@@ -65,7 +65,7 @@ preview app are in [`vfx-core/`](vfx-core), and the preview is at
 
 ## Credits
 
-Made by LO.FI.SCI.FI and friends [contributors](https://github.com/jamecoyne/vfx-core/graphs/contributors).
+[Made by LO.FI.SCI.FI and friends.](https://github.com/jamecoyne/vfx-core/graphs/contributors)
 Face detection uses YuNet, MediaPipe Face Mesh and PicoDet ([models and licenses](plugins/segcam/segcam-face/models/README.md)).
 
 Licensed under MIT or Apache 2.0, whichever you prefer.
