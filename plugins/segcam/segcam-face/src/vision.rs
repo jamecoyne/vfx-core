@@ -1,13 +1,17 @@
 //! Faces, eyes, mouths and bodies through Apple's Vision, as segcam 1.1 finds them.
 
 use std::cmp::Ordering;
-use std::ffi::c_void;
-use std::ptr;
+use std::ptr::{self, NonNull};
 
-use objc2::encode::{Encode, Encoding, RefEncode};
 use objc2::msg_send;
 use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject};
+use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
+use objc2_core_video::{
+    CVPixelBuffer, CVPixelBufferCreateWithBytes, kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+};
+// Links Vision, whose classes are looked up by name below.
+use objc2_vision as _;
 
 use crate::{Image, Kind, MIN_PART, Parts, Rect, Segment};
 
@@ -17,76 +21,6 @@ const MAX_WIDTH: usize = 1280;
 const FACE_PADDING: f64 = 0.05;
 const EYE_PADDING: f64 = 0.4;
 const MOUTH_PADDING: f64 = 0.15;
-/// `'BGRA'`.
-const PIXEL_FORMAT_BGRA: u32 = 0x4247_5241;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGPoint {
-    x: f64,
-    y: f64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGSize {
-    w: f64,
-    h: f64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGRect {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-}
-
-// SAFETY: these match CoreGraphics' layouts and type encodings.
-unsafe impl Encode for CGPoint {
-    const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
-}
-unsafe impl RefEncode for CGPoint {
-    const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
-}
-unsafe impl Encode for CGSize {
-    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
-}
-unsafe impl Encode for CGRect {
-    const ENCODING: Encoding = Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
-}
-
-/// CoreVideo's opaque pixel buffer.
-#[repr(C)]
-struct CVBuffer {
-    _private: [u8; 0],
-}
-
-// SAFETY: matches CoreVideo's `CVBufferRef` encoding.
-unsafe impl RefEncode for CVBuffer {
-    const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("__CVBuffer", &[]));
-}
-
-#[link(name = "Vision", kind = "framework")]
-unsafe extern "C" {}
-
-#[link(name = "CoreVideo", kind = "framework")]
-unsafe extern "C" {
-    fn CVPixelBufferCreateWithBytes(
-        allocator: *const c_void,
-        width: usize,
-        height: usize,
-        format: u32,
-        base: *mut c_void,
-        bytes_per_row: usize,
-        release: *const c_void,
-        release_context: *const c_void,
-        attributes: *const c_void,
-        out: *mut *mut CVBuffer,
-    ) -> i32;
-    fn CVPixelBufferRelease(buffer: *mut CVBuffer);
-}
 
 /// Turns Vision's faces, landmarks and people into segments.
 #[derive(Default)]
@@ -213,11 +147,49 @@ struct Found {
 /// Vision's box, flipped to a top-left origin.
 fn flipped(b: CGRect) -> Rect {
     Rect {
-        x: b.x,
-        y: 1.0 - b.y - b.h,
-        w: b.w,
-        h: b.h,
+        x: b.origin.x,
+        y: 1.0 - b.origin.y - b.size.height,
+        w: b.size.width,
+        h: b.size.height,
     }
+}
+
+/// A BGRA pixel buffer over `bgra`, or `None` if `bgra` is short.
+///
+/// # Safety
+///
+/// `bgra` must outlive the buffer and all that retain it, and stay unwritten.
+unsafe fn pixel_buffer(
+    bgra: &mut [u8],
+    width: usize,
+    height: usize,
+) -> Option<CFRetained<CVPixelBuffer>> {
+    if bgra.len() < width.checked_mul(height)?.checked_mul(4)? {
+        return None;
+    }
+    let mut buffer = ptr::null_mut();
+    // SAFETY: `bgra` holds `height` rows of `width * 4` bytes, checked above, and
+    // outlives the buffer. With no release callback, CoreVideo leaves the memory
+    // to the caller.
+    let status = unsafe {
+        CVPixelBufferCreateWithBytes(
+            None,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            NonNull::from(bgra).cast(),
+            width * 4,
+            None,
+            ptr::null_mut(),
+            None,
+            NonNull::from(&mut buffer),
+        )
+    };
+    if status != kCVReturnSuccess {
+        return None;
+    }
+    // SAFETY: a Create function returns the buffer retained once, for the caller.
+    NonNull::new(buffer).map(|buffer| unsafe { CFRetained::from_raw(buffer) })
 }
 
 /// Runs 1.1's requests on one frame: face landmarks and whole-body human rectangles.
@@ -233,25 +205,14 @@ fn detect(bgra: &mut [u8], width: usize, height: usize, faces: bool, bodies: boo
         return Found::default();
     }
     autoreleasepool(|_| {
-        // SAFETY: the pixel buffer borrows `bgra`, which outlives the requests, and every result
-        // is read before the buffer is released.
+        // SAFETY: `bgra` outlives the pool, so it outlives the buffer and anything
+        // that retains it, and nothing writes to it until `detect` returns.
+        let Some(buffer) = (unsafe { pixel_buffer(bgra, width, height) }) else {
+            return Found::default();
+        };
+        // SAFETY: the selectors and types match Vision's headers, and every result
+        // is read before the pool drains.
         unsafe {
-            let mut buffer: *mut CVBuffer = ptr::null_mut();
-            let status = CVPixelBufferCreateWithBytes(
-                ptr::null(),
-                width,
-                height,
-                PIXEL_FORMAT_BGRA,
-                bgra.as_mut_ptr().cast(),
-                width * 4,
-                ptr::null(),
-                ptr::null(),
-                ptr::null(),
-                &mut buffer,
-            );
-            if status != 0 || buffer.is_null() {
-                return Found::default();
-            }
             let face_request: Retained<AnyObject> = msg_send![face_class, new];
             let body_request: Retained<AnyObject> = msg_send![body_class, new];
             let _: () = msg_send![&body_request, setUpperBodyOnly: false];
@@ -259,7 +220,7 @@ fn detect(bgra: &mut [u8], width: usize, height: usize, faces: bool, bodies: boo
             let options: Retained<AnyObject> =
                 msg_send![AnyClass::get(c"NSDictionary").unwrap(), dictionary];
             let handler: Retained<AnyObject> =
-                msg_send![handler, initWithCVPixelBuffer: buffer, options: &*options];
+                msg_send![handler, initWithCVPixelBuffer: &*buffer, options: &*options];
             let requests: Retained<AnyObject> =
                 msg_send![AnyClass::get(c"NSMutableArray").unwrap(), array];
             if faces {
@@ -270,7 +231,7 @@ fn detect(bgra: &mut [u8], width: usize, height: usize, faces: bool, bodies: boo
             }
             let mut error: *mut AnyObject = ptr::null_mut();
             let ok: bool = msg_send![&handler, performRequests: &*requests, error: &mut error];
-            let found = if ok {
+            if ok {
                 Found {
                     faces: if faces {
                         read_faces(&face_request, width as f64, height as f64)
@@ -285,9 +246,7 @@ fn detect(bgra: &mut [u8], width: usize, height: usize, faces: bool, bodies: boo
                 }
             } else {
                 Found::default()
-            };
-            CVPixelBufferRelease(buffer);
-            found
+            }
         }
     })
 }
@@ -339,10 +298,7 @@ unsafe fn read_faces(request: &AnyObject, width: f64, height: f64) -> Vec<Vision
                         return Vec::new();
                     };
                     let n: usize = msg_send![&region, pointCount];
-                    let size = CGSize {
-                        w: width,
-                        h: height,
-                    };
+                    let size = CGSize { width, height };
                     let points: *const CGPoint = msg_send![&region, pointsInImageOfSize: size];
                     if points.is_null() {
                         return Vec::new();
@@ -366,6 +322,26 @@ unsafe fn read_faces(request: &AnyObject, width: f64, height: f64) -> Vec<Vision
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_core_video::{
+        CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
+    };
+
+    #[test]
+    fn pixel_buffer_wraps_bgra() {
+        let mut bgra = vec![0u8; 4 * 2 * 4];
+        // SAFETY: `bgra` outlives `buffer` and is not written while it lives.
+        let buffer = unsafe { pixel_buffer(&mut bgra, 4, 2) }.unwrap();
+        assert_eq!(CVPixelBufferGetWidth(&buffer), 4);
+        assert_eq!(CVPixelBufferGetHeight(&buffer), 2);
+        assert_eq!(CVPixelBufferGetBytesPerRow(&buffer), 16);
+    }
+
+    #[test]
+    fn pixel_buffer_refuses_short_bgra() {
+        let mut bgra = vec![0u8; 4 * 2 * 4 - 1];
+        // SAFETY: no buffer is made.
+        assert!(unsafe { pixel_buffer(&mut bgra, 4, 2) }.is_none());
+    }
 
     #[test]
     fn biggest_first_ignores_the_order_given() {
