@@ -341,9 +341,10 @@ impl Atlas {
                 );
                 let most_bytes = self.limits.bytes.min(self.ceiling);
                 let most_layers = most_bytes / self.bytes(size, 1);
-                let wanted = match size == self.size {
-                    true => self.layers * 2,
-                    false => self.layers,
+                let wanted = if size == self.size {
+                    self.layers * 2
+                } else {
+                    self.layers
                 };
                 let layers = u64::from(wanted.min(self.limits.layers)).min(most_layers) as u32;
                 if layers < self.layers || (layers == self.layers && size == self.size) {
@@ -777,6 +778,9 @@ pub struct SwarmPass {
     /// The shadow's corner table, with the scale it was made for.
     corner: Option<(f64, wgpu::TextureView)>,
     frame: Option<FrameTexture>,
+    /// The frame's rows side by side for its upload, kept so each draw
+    /// doesn't allocate a canvas.
+    frame_texels: Vec<u8>,
     /// Bound where a draw reads no frame of that kind.
     no_frame: wgpu::TextureView,
     no_frame_16: wgpu::TextureView,
@@ -846,6 +850,7 @@ impl SwarmPass {
             composite: None,
             corner: None,
             frame: None,
+            frame_texels: Vec::new(),
             targets: None,
             instances: None,
             readback_timeout: READBACK_TIMEOUT,
@@ -884,15 +889,15 @@ impl SwarmPass {
         for tile in tiles {
             let rect = tile.clipped_rect;
             let (w, h) = (rect.w as u32, rect.h as u32);
-            let pixels = match tile.pixels.is_empty() {
-                true => None,
-                false => atlases.tiles.place(device, queue, w, h),
-            };
+            let has_pixels = !tile.pixels.is_empty();
+            let pixels = has_pixels
+                .then(|| atlases.tiles.place(device, queue, w, h))
+                .flatten();
             let bar = TitleBar::cached_or_new(tile, &m);
             let bar_at = atlases
                 .bars
                 .place(device, queue, bar.width as u32, bar_height);
-            let (Some(bar_at), true) = (bar_at, pixels.is_some() || tile.pixels.is_empty()) else {
+            let (Some(bar_at), true) = (bar_at, pixels.is_some() == has_pixels) else {
                 if let Some(at) = pixels {
                     atlases.tiles.free(at, w);
                 }
@@ -1251,13 +1256,14 @@ impl SwarmPass {
         }
         let texture = &self.frame.as_ref().expect("made above").texture;
         let row = frame.width as usize * size_of::<Argb<C>>();
-        let mut texels = Vec::with_capacity(row * frame.height as usize);
+        self.frame_texels.clear();
         for y in 0..frame.height {
-            texels.extend_from_slice(bytemuck::cast_slice(frame.row(y)));
+            self.frame_texels
+                .extend_from_slice(bytemuck::cast_slice(frame.row(y)));
         }
         self.shared.queue.write_texture(
             texture.as_image_copy(),
-            &texels,
+            &self.frame_texels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(row as u32),
@@ -1394,11 +1400,11 @@ impl SwarmPass {
 
     /// The readback of the targets [`Self::ensure_targets`] made, in `format`.
     fn ensure_readback(&mut self, format: wgpu::TextureFormat) {
-        let size = self.targets.as_ref().expect("the caller made them").size;
         let targets = self.targets.as_ref().expect("the caller made them");
         if matches!(&targets.readback, Some(r) if r.format == format) {
             return;
         }
+        let size = targets.size;
         use wgpu::TextureUsages as U;
         let texture = self.canvas_texture(
             "segcam swarm pass packed",
@@ -2312,6 +2318,56 @@ mod tests {
             );
         }
         println!("compilers loaded: {}", loaded_compilers());
+    }
+
+    #[test]
+    #[ignore = "SWARM_PASS_ADAPTER and SWARM_PASS_BACKEND pick the GPU"]
+    fn grown_atlas_keeps_its_tiles() {
+        let _lock = gpu::gpu_test_lock();
+        let (_, device, queue) = open(wgpu::Limits::default());
+        let (w, h) = (1920, 1080);
+        let shadow = shadow_kernel(SwarmMetrics::new(h).scale);
+        let s = RenderSettings {
+            mode: OutputMode::Swarm,
+            max_tiles: 1000,
+            trail_frames: 120,
+            ..RenderSettings::default()
+        };
+        let tiles = trail_tiles::<u8>((w, h), 120, 9, false);
+        let windows = visible(&tiles, (w, h), s.max_tiles);
+        let shared = SwarmPipelines::new(&device, &queue);
+        let draw = |pass: &mut SwarmPass, slots: &[Slot]| {
+            let mut drawn = vec![Argb::<u8>::default(); (w * h) as usize];
+            pass.draw(
+                &mut ViewMut::from_pixels(&mut drawn, w, h),
+                windows.iter().map(|&(i, tile)| (tile, slots[i])),
+                None,
+                &s,
+                &shadow,
+                Occlusion::Depth,
+            )
+            .expect("the draw comes back");
+            drawn
+        };
+
+        // Every growth step copies layers that tiles are already in.
+        let mut grown = SwarmPass::new(shared.clone());
+        let frames: Vec<_> = tiles
+            .chunks(9)
+            .map(|frame| grown.upload_tiles(frame, h).expect("the atlas grows"))
+            .collect();
+        let layers = lock(&grown.atlases).tiles.layers;
+        assert!(layers >= 16, "the atlas grew to {layers} layers");
+        let slots: Vec<Slot> = frames.iter().flat_map(|f| f.slots.clone()).collect();
+        let from_grown = draw(&mut grown, &slots);
+
+        // Here the tiles go into an atlas that is already large enough.
+        let mut large = SwarmPass::new(shared);
+        drop(large.upload_tiles(&tiles, h).expect("the atlas grows"));
+        let placed = large.upload_tiles(&tiles, h).expect("the atlas has room");
+        assert_eq!(lock(&large.atlases).tiles.layers, layers);
+        let from_large = draw(&mut large, &placed.slots);
+        assert!(from_grown == from_large, "a tile changed as the atlas grew");
     }
 
     fn test_atlas(size: (u32, u32), limits: AtlasLimits) -> (wgpu::Device, wgpu::Queue, Atlas) {
