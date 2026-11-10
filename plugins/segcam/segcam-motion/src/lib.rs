@@ -18,6 +18,8 @@ pub mod motion;
 pub mod pixel;
 pub mod render;
 pub mod swarm;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod swarm_pass;
 
 pub use effect::SegcamMotion;
 pub use incremental::IncrementalRenderer;
