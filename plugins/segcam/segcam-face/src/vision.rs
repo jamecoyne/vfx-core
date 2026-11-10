@@ -154,7 +154,8 @@ fn flipped(b: CGRect) -> Rect {
     }
 }
 
-/// A BGRA pixel buffer over `bgra`, or `None` if `bgra` is short.
+/// A BGRA pixel buffer over `bgra`, or `None` if `bgra` is shorter than
+/// `width * height * 4` bytes or CoreVideo fails.
 ///
 /// # Safety
 ///
@@ -164,13 +165,14 @@ unsafe fn pixel_buffer(
     width: usize,
     height: usize,
 ) -> Option<CFRetained<CVPixelBuffer>> {
-    if bgra.len() < width.checked_mul(height)?.checked_mul(4)? {
+    let bytes_per_row = width.checked_mul(4)?;
+    if bgra.len() < bytes_per_row.checked_mul(height)? {
         return None;
     }
     let mut buffer = ptr::null_mut();
-    // SAFETY: `bgra` holds `height` rows of `width * 4` bytes, checked above, and
-    // outlives the buffer. With no release callback, CoreVideo leaves the memory
-    // to the caller.
+    // SAFETY: `bgra` holds `height` rows of `bytes_per_row` bytes, checked above,
+    // and the caller keeps it alive. With no release callback, CoreVideo leaves
+    // the memory to the caller.
     let status = unsafe {
         CVPixelBufferCreateWithBytes(
             None,
@@ -178,7 +180,7 @@ unsafe fn pixel_buffer(
             height,
             kCVPixelFormatType_32BGRA,
             NonNull::from(bgra).cast(),
-            width * 4,
+            bytes_per_row,
             None,
             ptr::null_mut(),
             None,
@@ -205,8 +207,9 @@ fn detect(bgra: &mut [u8], width: usize, height: usize, faces: bool, bodies: boo
         return Found::default();
     }
     autoreleasepool(|_| {
-        // SAFETY: `bgra` outlives the pool, so it outlives the buffer and anything
-        // that retains it, and nothing writes to it until `detect` returns.
+        // SAFETY: `bgra` outlives the pool, which releases the buffer and its
+        // handler, and nothing writes to it until `detect` returns. Vision is
+        // trusted to keep no reference past its handler.
         let Some(buffer) = (unsafe { pixel_buffer(bgra, width, height) }) else {
             return Found::default();
         };
@@ -323,17 +326,38 @@ unsafe fn read_faces(request: &AnyObject, width: f64, height: f64) -> Vec<Vision
 mod tests {
     use super::*;
     use objc2_core_video::{
-        CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
+        CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
+        CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
+        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
     };
 
     #[test]
     fn pixel_buffer_wraps_bgra() {
         let mut bgra = vec![0u8; 4 * 2 * 4];
+        let start = bgra.as_ptr();
         // SAFETY: `bgra` outlives `buffer` and is not written while it lives.
         let buffer = unsafe { pixel_buffer(&mut bgra, 4, 2) }.unwrap();
         assert_eq!(CVPixelBufferGetWidth(&buffer), 4);
         assert_eq!(CVPixelBufferGetHeight(&buffer), 2);
         assert_eq!(CVPixelBufferGetBytesPerRow(&buffer), 16);
+        assert_eq!(
+            CVPixelBufferGetPixelFormatType(&buffer),
+            kCVPixelFormatType_32BGRA
+        );
+        let read_only = CVPixelBufferLockFlags::ReadOnly;
+        // SAFETY: a read only lock on a live buffer, released below.
+        assert_eq!(
+            unsafe { CVPixelBufferLockBaseAddress(&buffer, read_only) },
+            kCVReturnSuccess
+        );
+        let base = CVPixelBufferGetBaseAddress(&buffer);
+        // SAFETY: the lock taken above.
+        unsafe { CVPixelBufferUnlockBaseAddress(&buffer, read_only) };
+        assert_eq!(
+            base.cast_const().cast::<u8>(),
+            start,
+            "CoreVideo copied the bytes"
+        );
     }
 
     #[test]

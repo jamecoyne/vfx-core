@@ -26,10 +26,15 @@ ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, fea
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CFCGTypes"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "objc2",
+    "CFCGTypes",
+] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = [
     "std",
     "objc2",
+    "CVBase",
     "CVBuffer",
     "CVImageBuffer",
     "CVPixelBuffer",
