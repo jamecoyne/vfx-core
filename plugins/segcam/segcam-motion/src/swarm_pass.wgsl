@@ -242,3 +242,9 @@ fn fs_pack_16(@builtin(position) position: vec4<f32>) -> @location(0) vec4<u32> 
     let v = clamp(host_pixel(position), vec4(0.0), vec4(1.0));
     return vec4<u32>(v * 32768.0 + 0.5);
 }
+
+// The composited pixel for a frame that stores red, green, blue, alpha.
+@fragment
+fn fs_frame(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    return host_pixel(position).yzwx;
+}

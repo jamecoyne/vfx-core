@@ -10,7 +10,7 @@ use segcam_motion::motion::Segmentation;
 use segcam_motion::render::{OutputMode, draw_output};
 use segcam_motion::swarm::{SwarmMetrics, Tile, shadow_kernel};
 use segcam_motion::swarm_pass::scene::{self, Difference};
-use segcam_motion::swarm_pass::{Occlusion, Placement, SwarmPass};
+use segcam_motion::swarm_pass::{AtlasAllocation, Occlusion, Slot, SwarmPass, SwarmPipelines};
 use segcam_motion::{Argb, Channel, RenderSettings, View, ViewMut};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -35,7 +35,7 @@ async fn draw<C: Channel>(
     device: &wgpu::Device,
     pass: &mut SwarmPass,
     out: &mut [Argb<C>],
-    windows: &[(&Tile, Placement)],
+    windows: &[(&Tile, Slot)],
     frame: &[Argb<C>],
     s: &RenderSettings,
     occlusion: Occlusion,
@@ -55,6 +55,7 @@ async fn draw<C: Channel>(
     let mapped = Arc::new(AtomicBool::new(false));
     let done = mapped.clone();
     pass.readback()
+        .expect("the submit made it")
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |result| {
             result.expect("the readback maps");
@@ -66,8 +67,20 @@ async fn draw<C: Channel>(
             yield_to_browser().await;
         }
     }
-    pass.copy_mapped(&mut ViewMut::from_pixels(out, w, h));
+    pass.copy_mapped(&mut ViewMut::from_pixels(out, w, h))
+        .expect("the readback is mapped");
     started.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Puts `tiles` in the atlases, waiting out the browser's answers on growing.
+async fn upload(pass: &mut SwarmPass, tiles: &[Tile], canvas_height: i32) -> AtlasAllocation {
+    loop {
+        if let Some(allocation) = pass.upload_tiles(tiles, canvas_height) {
+            return allocation;
+        }
+        assert!(pass.atlas_growing(), "the atlas holds the tiles");
+        yield_to_browser().await;
+    }
 }
 
 /// Adds a table row per swarm case at depth `C` to `report`, and returns the
@@ -83,8 +96,8 @@ async fn compare<C: Channel>(
     for (name, s) in scene::cases() {
         let tiles = scene::trail_tiles::<C>(CANVAS, 12, 3, s.mirror);
         let frame = scene::frame_pixels::<C>(w, h, 12);
-        let mut pass = SwarmPass::new(device, queue, 8, 2);
-        let placed = pass.upload(&tiles, h).expect("the atlas holds the tiles");
+        let mut pass = SwarmPass::new(SwarmPipelines::new(device, queue));
+        let placed = upload(&mut pass, &tiles, h).await;
         let visible = scene::visible(&tiles, CANVAS, s.max_tiles);
         let mut expected = vec![Argb::<C>::default(); (w * h) as usize];
         draw_output(
@@ -95,7 +108,7 @@ async fn compare<C: Channel>(
             12,
             visible.iter().map(|(_, tile)| *tile),
         );
-        let windows: Vec<_> = visible.iter().map(|&(i, tile)| (tile, placed[i])).collect();
+        let windows: Vec<_> = visible.iter().map(|&(i, tile)| (tile, placed.slots[i])).collect();
         for occlusion in [Occlusion::None, Occlusion::Depth] {
             draw(
                 device, &mut pass, &mut drawn, &windows, &frame, &s, occlusion,
@@ -122,7 +135,7 @@ async fn compare<C: Channel>(
 async fn time(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    (max_tiles, per_frame, layers): (i32, i32, u32),
+    (max_tiles, per_frame): (i32, i32),
     report: &mut String,
 ) {
     let (w, h) = CANVAS;
@@ -142,9 +155,9 @@ async fn time(
         .filter(|(index, _)| visible.binary_search(index).is_ok())
         .map(|(_, tile)| tile)
         .collect();
-    let mut pass = SwarmPass::new(device, queue, layers, 2);
-    let placed = pass.upload(&shown, h).expect("the atlas holds the tiles");
-    let windows: Vec<_> = shown.iter().zip(placed).collect();
+    let mut pass = SwarmPass::new(SwarmPipelines::new(device, queue));
+    let placed = upload(&mut pass, &shown, h).await;
+    let windows: Vec<_> = shown.iter().zip(placed.slots.iter().copied()).collect();
     let mut out = vec![Argb::<u8>::default(); (w * h) as usize];
     for occlusion in [Occlusion::None, Occlusion::Depth] {
         let mut times = Vec::new();
@@ -254,7 +267,7 @@ pub async fn start() -> Result<(), JsValue> {
         show(&report);
     }
     report += "| depth | windows | path | median | worst |\n";
-    for scene in [(60, 3, 4), (1000, 9, 25)] {
+    for scene in [(60, 3), (1000, 9)] {
         time(&device, &queue, scene, &mut report).await;
         show(&report);
     }
