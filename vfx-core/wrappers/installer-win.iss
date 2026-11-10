@@ -61,19 +61,31 @@ Name: "ofx"; Description: "DaVinci Resolve, Nuke, Natron (OpenFX)"; Types: recom
 Name: "ffgl"; Description: "Resolume Avenue and Arena (FFGL)"; Types: recommended
 #endif
 #if FileExists(AddBackslash(Source) + PluginFile + ".aex")
-Name: "adobe"; Description: "After Effects and Premiere Pro (not tested on Windows yet)"
+Name: "adobe"; Description: "After Effects and Premiere Pro"
 #endif
 
 [Files]
 #if DirExists(AddBackslash(Source) + PluginFile + ".ofx.bundle")
 Source: "{#Source}\{#PluginFile}.ofx.bundle\*"; DestDir: "{#OfxPlugins}\{#PluginFile}.ofx.bundle"; Components: ofx; Flags: recursesubdirs createallsubdirs ignoreversion
 #endif
+; windows-dlls holds the DirectX Shader Compiler with its licenses, which the FFGL DLL and the
+; .aex load from their own folder; the OFX bundle carries its own copy in Contents\Win64.
+#define HasDlls DirExists(AddBackslash(Source) + "windows-dlls")
 #if FileExists(AddBackslash(Source) + PluginFile + ".dll")
 Source: "{#Source}\{#PluginFile}.dll"; DestDir: "{#Documents}\Resolume Avenue\Extra Effects"; Components: ffgl; Check: ForAvenue; Flags: ignoreversion
 Source: "{#Source}\{#PluginFile}.dll"; DestDir: "{#Documents}\Resolume Arena\Extra Effects"; Components: ffgl; Check: ForArena; Flags: ignoreversion
+  #if HasDlls
+; Every effect's plugin shares Extra Effects, so these are counted and removed, without
+; asking, with the last effect that installed them.
+Source: "{#Source}\windows-dlls\*"; DestDir: "{#Documents}\Resolume Avenue\Extra Effects"; Components: ffgl; Check: ForAvenue; Flags: ignoreversion sharedfile uninsnosharedfileprompt
+Source: "{#Source}\windows-dlls\*"; DestDir: "{#Documents}\Resolume Arena\Extra Effects"; Components: ffgl; Check: ForArena; Flags: ignoreversion sharedfile uninsnosharedfileprompt
+  #endif
 #endif
 #if FileExists(AddBackslash(Source) + PluginFile + ".aex")
 Source: "{#Source}\{#PluginFile}.aex"; DestDir: "{#MediaCore}\{#PluginFile}"; Components: adobe; Flags: ignoreversion
+  #if HasDlls
+Source: "{#Source}\windows-dlls\*"; DestDir: "{#MediaCore}\{#PluginFile}"; Components: adobe; Flags: ignoreversion
+  #endif
 #endif
 
 [Code]
