@@ -195,9 +195,9 @@ fn test(packages: &[&str], extra: &[&str]) -> Command {
     cmd
 }
 
-/// bash for the harness scripts. On Windows that is Git for Windows' own: a plain `bash`
-/// would find WSL's in System32 first.
-fn bash() -> Command {
+/// bash for the harness scripts and `fetch-dxc.sh`. On Windows that is Git for Windows'
+/// own: a plain `bash` would find WSL's in System32 first.
+pub fn bash() -> Command {
     if cfg!(windows)
         && let Ok(out) = Command::new("git").arg("--exec-path").output()
     {

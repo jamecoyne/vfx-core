@@ -27,7 +27,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use vfx_build::Metadata;
 
@@ -256,7 +256,7 @@ fn dispatch(o: &Options) -> Result<(), String> {
         }
         "build" => {
             for e in &chosen {
-                build(e, o, &target, &out)?;
+                build(e, o, &root, &target, &out)?;
             }
             Ok(())
         }
@@ -270,11 +270,11 @@ fn dispatch(o: &Options) -> Result<(), String> {
         "install" => {
             for e in &chosen {
                 warn_installed(e, o);
-                install(e, o, &target, &out)?;
+                install(e, o, &root, &target, &out)?;
             }
             Ok(())
         }
-        "preview" => preview(&chosen, &root, o),
+        "preview" => preview(&chosen, &root, &target, o),
         "check" => report(check::check(&all, &root), all.len()),
         other => Err(format!("unknown command `{other}`\n{USAGE}")),
     }
@@ -363,12 +363,18 @@ fn profile(o: &Options) -> &'static str {
 }
 
 /// Builds the effect and wraps the binary into each host's bundle. Returns the bundles.
-fn build(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<PathBuf>, String> {
+fn build(
+    e: &Effect,
+    o: &Options,
+    root: &Path,
+    target: &Path,
+    out: &Path,
+) -> Result<Vec<PathBuf>, String> {
     fs::create_dir_all(out).map_err(|err| err.to_string())?;
     if cfg!(target_os = "macos") {
         build_mac(e, o, target, out)
     } else if cfg!(target_os = "windows") {
-        build_windows(e, o, target, out)
+        build_windows(e, o, root, target, out)
     } else {
         Err("plugins build on macOS and Windows".into())
     }
@@ -495,12 +501,15 @@ fn newest_rsrc(profile_dir: &Path, package: &str, file: &str) -> Result<PathBuf,
 fn build_windows(
     e: &Effect,
     o: &Options,
+    root: &Path,
     target: &Path,
     out: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let m = &e.meta;
     cargo_build(e, o, None)?;
     let dll = target.join(profile(o)).join(format!("{}.dll", e.lib()));
+    fetch_dxc(root, target)?;
+    let dxc = dxc_unpacked(target);
     let mut bundles = Vec::new();
     for host in &o.hosts {
         let path = match host {
@@ -517,6 +526,7 @@ fn build_windows(
                     fs::copy(target.join(profile(o)).join(name), dir.join(name))
                         .map_err(|err| format!("{name}: {err}"))?;
                 }
+                copy_beside(&dxc, &dir)?;
                 println!("{}", bundle.display());
                 bundles.push(bundle);
                 continue;
@@ -527,7 +537,80 @@ fn build_windows(
         println!("{}", path.display());
         bundles.push(path);
     }
+    // The FFGL DLL and the .aex share the output folder, and so the compiler. The effect's
+    // `windows-dlls` go in the OFX bundle only: Resolume and the Adobe hosts ship a new enough
+    // DirectML.dll in their program folder, which Windows searches first; Resolve's is too old.
+    if o.hosts.iter().any(|h| *h != Host::Ofx) {
+        copy_beside(&dxc, out)?;
+    }
     Ok(bundles)
+}
+
+/// `fetch-dxc.sh`'s exit status when the downloaded zip isn't the pinned one.
+const DXC_SHA_MISMATCH: i32 = 3;
+
+/// Runs `fetch-dxc.sh`, which downloads the pinned release once, checks its sha256 and
+/// unpacks it into `target/dxc/files`. A local build goes on without the compiler (wgpu then
+/// uses FXC) when it can't be fetched, offline or without Git Bash; only a zip that doesn't
+/// match the pin stops it. package-win.sh and CI run the script themselves and stay strict.
+fn fetch_dxc(root: &Path, target: &Path) -> Result<(), String> {
+    let script = root.join("vfx-core").join("wrappers").join("fetch-dxc.sh");
+    // Git Bash reads C:/ paths; backslashes would need quoting.
+    let target_arg = target.to_string_lossy().replace('\\', "/");
+    let status = tiers::bash()
+        .arg(&script)
+        .arg(&target_arg)
+        .stdout(Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => return Ok(()),
+        Ok(s) if s.code() == Some(DXC_SHA_MISMATCH) => {
+            return Err(format!(
+                "{}: the DXC download doesn't match its sha256",
+                script.display()
+            ));
+        }
+        Ok(s) => eprintln!("warning: {} failed ({s})", script.display()),
+        Err(err) => eprintln!("warning: {}: {err}", script.display()),
+    }
+    // A failed run can leave the folder half unpacked.
+    let _ = fs::remove_dir_all(target.join("dxc").join("files"));
+    eprintln!(
+        "warning: no DirectX Shader Compiler beside the build, so wgpu compiles D3D12 shaders with FXC"
+    );
+    Ok(())
+}
+
+/// The compiler's files from the last [`fetch_dxc`], or none.
+fn dxc_unpacked(target: &Path) -> Vec<PathBuf> {
+    let Ok(dir) = fs::read_dir(target.join("dxc").join("files")) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = dir.filter_map(Result::ok).map(|e| e.path()).collect();
+    files.sort();
+    files
+}
+
+/// Copies `files` into `dir`, leaving a file that is already the same alone: Windows can't
+/// overwrite a DLL a running preview or host has loaded.
+fn copy_beside(files: &[PathBuf], dir: &Path) -> Result<(), String> {
+    for file in files {
+        let dest = dir.join(file.file_name().unwrap_or_default());
+        if same_contents(file, &dest) {
+            continue;
+        }
+        fs::copy(file, &dest).map_err(|err| format!("{}: {err}", file.display()))?;
+    }
+    Ok(())
+}
+
+fn same_contents(a: &Path, b: &Path) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {
+            matches!((fs::read(a), fs::read(b)), (Ok(x), Ok(y)) if x == y)
+        }
+        _ => false,
+    }
 }
 
 /// macOS installers for the system-wide hosts, signed and notarized when asked.
@@ -705,7 +788,7 @@ fn pkgbuild(
 
 /// Resolume plugins install per user; After Effects and OpenFX plugins go in system
 /// folders, which need the user's password, so for those this prints the command.
-fn install(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), String> {
+fn install(e: &Effect, o: &Options, root: &Path, target: &Path, out: &Path) -> Result<(), String> {
     let m = &e.meta;
     if o.hosts.contains(&Host::Ffgl) {
         let ffgl = Options {
@@ -715,7 +798,10 @@ fn install(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), Str
             rest: Vec::new(),
             ..*o
         };
-        let bundle = build(e, &ffgl, target, out)?.remove(0);
+        let bundle = build(e, &ffgl, root, target, out)?.remove(0);
+        // On Windows the plugin is a bare DLL, so the shader compiler build fetched goes into
+        // Extra Effects next to it. None on macOS.
+        let dxc = dxc_unpacked(target);
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
@@ -732,6 +818,7 @@ fn install(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), Str
             let _ = fs::remove_dir_all(&dest);
             let _ = fs::remove_file(&dest);
             copy_all(&bundle, &dest)?;
+            copy_beside(&dxc, &dir)?;
             println!("installed {}", dest.display());
             installed = true;
         }
@@ -786,7 +873,20 @@ fn copy_all(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// The preview app, opened on the effect. It links every effect in its catalog.
-fn preview(chosen: &[&Effect], root: &Path, o: &Options) -> Result<(), String> {
+fn preview(chosen: &[&Effect], root: &Path, target: &Path, o: &Options) -> Result<(), String> {
+    if cfg!(target_os = "windows") {
+        // vfx-preview.exe loads the shader compiler from its own folder, like the plugins.
+        // Once both DLLs are there, a second preview needn't fetch.
+        let dir = target.join("release");
+        if !["dxcompiler.dll", "dxil.dll"]
+            .iter()
+            .all(|f| dir.join(f).is_file())
+        {
+            fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+            fetch_dxc(root, target)?;
+            copy_beside(&dxc_unpacked(target), &dir)?;
+        }
+    }
     let mut cmd = Command::new(env_or("CARGO", "cargo"));
     cmd.current_dir(root)
         .args(["run", "-p", "vfx-preview", "--release", "--"]);

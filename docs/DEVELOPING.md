@@ -129,6 +129,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core |
 | `Gpu::share`, `Gpu::shared` | vfx-core |
 | `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core |
+| `Gpu::backend_options` (wgpu backend options for every instance: on Windows, D3D12 compiles with the `dxcompiler.dll` and `dxil.dll` shipped beside the binary, else FXC) | vfx-core |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core |
 | `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host |
@@ -280,6 +281,15 @@ as the run's artifacts, without a release. For each effect:
 | `<file>-<version>-macOS-Resolume.zip` | the FFGL bundle, for Extra Effects |
 | `<file>-<version>-Windows-Setup.exe` | Windows installer: OpenFX and Resolume, After Effects optional |
 | `<file>-<version>-Windows.zip` | the same Windows files, to copy by hand |
+
+Every Windows plugin ships `dxcompiler.dll` and `dxil.dll` next to its binary, with DXC's
+licenses: without them wgpu compiles the D3D12 shaders with FXC, which takes seconds before
+an effect draws on the GPU. `vfx-core/wrappers/fetch-dxc.sh` downloads them from a pinned
+[DXC release](https://github.com/microsoft/DirectXShaderCompiler/releases), checked by
+sha256, rather than taking whatever Windows SDK the machine has. `package-win.sh` stops when
+it can't fetch them; `cargo vfx build`, `install` and `preview` put them next to what they
+build too and go on without them, so local builds offline still work. To move to a newer
+DXC, change its tag, zip and sha256 there.
 
 macOS signing and notarization run when the repository owner sets these secrets (Settings,
 Secrets and variables, Actions). A fork sets its own to sign its own builds. Without them the

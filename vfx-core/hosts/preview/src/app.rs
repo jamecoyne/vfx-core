@@ -1479,6 +1479,7 @@ fn new_wgpu_instance(display: winit::event_loop::OwnedDisplayHandle) -> wgpu::In
         descriptor.flags =
             (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION).with_env();
         descriptor.backends = wgpu::Backends::from_env().unwrap_or(descriptor.backends);
+        descriptor.backend_options = Gpu::backend_options();
     }
     wgpu::Instance::new(descriptor)
 }
