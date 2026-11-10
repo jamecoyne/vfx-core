@@ -330,9 +330,9 @@ conversions. Each host also has a harness that runs the effects:
 - After Effects. `python3 vfx-core/wrappers/adobe/ae-tests/run.py` builds fixture projects for
   VFX Preview in the running After Effects (8, 16 and 32 bpc, CPU and Metal), renders them with
   `aerender` with MFR on and off, and compares them with `ae_reference`, the same render path
-  without After Effects. `python3 plugins/segcam/segcam-motion/ae-tests/run.py` renders segcam
-  next to segcam's C++ effect. Both test the *installed* plugins and need After Effects, so they
-  aren't in CI.
+  without After Effects (macOS only). `python3 plugins/segcam/segcam-motion/ae-tests/run.py`
+  renders segcam next to segcam's C++ effect, on macOS and Windows (`python` or `py` there).
+  Both test the *installed* plugins and need After Effects, so they aren't in CI.
 - OpenFX. `vfx-core/wrappers/ofx/minihost/run.sh` loads VFX Preview into a small C host built on
   the real OpenFX headers and checks pixels, depths, row order, premultiplication, render scale,
   and regions of definition and interest. `plugins/segcam/segcam-motion/ofx-tests/run.sh` renders
@@ -380,10 +380,13 @@ conversions. Each host also has a harness that runs the effects:
 
 ## Known gaps
 
-- After Effects on Windows: the `.aex` builds in CI but hasn't been tried in After Effects.
-- After Effects 26.5 on macOS passes the VFX Preview and segcam Motion harnesses. Natron was last
-  checked with the earlier wrappers, which were one per effect.
-- Premiere Pro is untested. Signing and notarization have never run.
+- After Effects 26.5 on macOS passes the VFX Preview and segcam Motion harnesses. On Windows,
+  After Effects 2026 passes the segcam Motion harness and renders segcam by hand, through `aerender`
+  and the render queue; the VFX Preview harness is macOS only. Natron was last checked with the
+  earlier wrappers, which were one per effect.
+- Premiere Pro 2026 on Windows loads the same `.aex` and plays and exports segcam, but has no
+  SmartFX: CPU effects get no earlier frames there, so segcam shows faces only. Signing and
+  notarization have never run.
 - OpenFX frames cross through RAM. Effects can still draw on the GPU, but taking the host's GPU frames
   (Resolve's Metal extension) isn't done, and neither is an FFGL thumbnail.
 - Hosts with no target yet: TouchDesigner (a Custom TOP), and EffectCraft, whose only plugin API
