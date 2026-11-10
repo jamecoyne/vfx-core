@@ -27,7 +27,7 @@ const MIRRORED: u32 = 2u;
 const LIVE: u32 = 4u;
 
 @group(0) @binding(0) var<uniform> g: Globals;
-// Tile and frame texels hold ARGB bytes, so `.gba` is the colour and `.r` alpha.
+// Tile and frame texels hold ARGB bytes: `.gba` is the colour, `.r` alpha.
 @group(0) @binding(1) var tiles: texture_2d_array<f32>;
 @group(0) @binding(2) var bars: texture_2d_array<f32>;
 @group(0) @binding(3) var corner: texture_2d<f32>;

@@ -1189,10 +1189,9 @@ mod tests {
         (adapter, device, queue)
     }
 
-    /// Draws every case at depth `C` on the CPU and with render passes, and
-    /// prints how far apart the pictures are. Fails only on a picture that is
-    /// wrong, not on one that misses SPEC F8: over 1 pixel in 100 off by more
-    /// than a level.
+    /// Prints how far each case at depth `C` is from the CPU picture. Fails
+    /// at over 1 pixel in 100 off by more than a level, which is a wrong
+    /// picture; missing SPEC F8 is only printed.
     fn compare_pictures<C: Channel>(device: &wgpu::Device, queue: &wgpu::Queue) {
         let bits = 8 * size_of::<C>();
         for (w, h) in [(320, 180), (640, 360), (1920, 1080)] {
