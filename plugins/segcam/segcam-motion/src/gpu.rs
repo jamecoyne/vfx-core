@@ -644,6 +644,7 @@ fn new_instance() -> wgpu::Instance {
         // is on only with WGPU_VALIDATION=1.
         flags: (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION)
             .with_env(),
+        backend_options: vfx_core::Gpu::backend_options(),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     })
 }

@@ -142,6 +142,7 @@ impl Gpu {
         // take over the host's current one.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
+            backend_options: Self::backend_options(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = instance
@@ -161,6 +162,23 @@ impl Gpu {
             .await
             .map_err(|e| GpuError(e.to_string()))?;
         Ok(Self::from_parts(device, queue))
+    }
+
+    /// Backend options for every wgpu instance a host or effect makes. On Windows, D3D12 compiles
+    /// shaders with the DXC shipped beside the binary that holds this code (`dxcompiler.dll`, and
+    /// `dxil.dll`, which it loads by name), found by that binary's own path: a host such as Resolve
+    /// or After Effects doesn't search a plugin's folder. Without them D3D12 falls back to FXC, with
+    /// one line on stderr; FXC takes seconds to compile segcam's pipelines, which draws on the CPU
+    /// until they are built. wgpu's `DynamicDxc` would fail the whole D3D12 backend on a missing
+    /// DLL instead of falling back, so the DLL is checked first. `WGPU_DX12_COMPILER` overrides.
+    pub fn backend_options() -> wgpu::BackendOptions {
+        wgpu::BackendOptions {
+            dx12: wgpu::Dx12BackendOptions {
+                shader_compiler: dx12_shader_compiler(),
+                ..wgpu::Dx12BackendOptions::from_env_or_default()
+            },
+            ..wgpu::BackendOptions::from_env_or_default()
+        }
     }
 
     /// Allocator block sizes for a device that stays open for a whole show, in place of wgpu's
@@ -233,6 +251,117 @@ impl Gpu {
 
 type GpuParts = (wgpu::Device, wgpu::Queue, DeviceFaults);
 
+/// The D3D12 shader compiler [`Gpu::backend_options`] picks, once per process.
+fn dx12_shader_compiler() -> wgpu::Dx12Compiler {
+    static CHOSEN: std::sync::OnceLock<wgpu::Dx12Compiler> = std::sync::OnceLock::new();
+    CHOSEN
+        .get_or_init(|| {
+            if let Some(chosen) = wgpu::Dx12Compiler::from_env() {
+                return chosen;
+            }
+            #[cfg(windows)]
+            match dxc::beside_this_binary() {
+                Ok(dxc_path) => wgpu::Dx12Compiler::DynamicDxc { dxc_path },
+                Err(why) => {
+                    eprintln!("vfx-core: D3D12 shaders compile with FXC, which is slow: {why}");
+                    wgpu::Dx12Compiler::Fxc
+                }
+            }
+            #[cfg(not(windows))]
+            wgpu::Dx12Compiler::Auto
+        })
+        .clone()
+}
+
+/// The DXC a plugin or host ships beside its binary.
+#[cfg(windows)]
+pub(crate) mod dxc {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::PathBuf;
+
+    /// The compiler's file name, which packaging puts in the folder of the binary that links
+    /// vfx-core (the plugin's `.ofx`, `.aex`, `.dll` or the preview's `.exe`).
+    pub const COMPILER: &str = "dxcompiler.dll";
+    /// The validator and signer the compiler loads by name, beside it.
+    pub const VALIDATOR: &str = "dxil.dll";
+
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
+    const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x2;
+    const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
+
+    unsafe extern "system" {
+        fn GetModuleHandleExW(flags: u32, address: *const u16, module: *mut *mut c_void) -> i32;
+        fn GetModuleFileNameW(module: *mut c_void, name: *mut u16, size: u32) -> u32;
+        fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+    }
+
+    /// The folder of the binary this code is in.
+    fn this_binarys_folder() -> Result<PathBuf, String> {
+        let mut module = std::ptr::null_mut();
+        let mut name = vec![0u16; 32 * 1024];
+        // SAFETY: Win32 calls on local buffers; the address is a function in this binary.
+        let len = unsafe {
+            if GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                this_binarys_folder as *const u16,
+                &mut module,
+            ) == 0
+            {
+                return Err("this binary's module wasn't found".into());
+            }
+            GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) as usize
+        };
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&name[..len]));
+        path.parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{} has no folder", path.display()))
+    }
+
+    /// Loads `path`, so a later load by its file name finds this copy.
+    fn load(path: &std::path::Path) -> bool {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a null-terminated path. The library stays loaded for the process.
+        !unsafe {
+            LoadLibraryExW(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_WITH_ALTERED_SEARCH_PATH,
+            )
+        }
+        .is_null()
+    }
+
+    /// The absolute path of a `dxcompiler.dll` beside this binary that loads, with its `dxil.dll`
+    /// loaded first.
+    pub fn beside_this_binary() -> Result<String, String> {
+        in_folder(&this_binarys_folder()?)
+    }
+
+    /// [`beside_this_binary`] for `folder`. Both files are needed: without the validator, DXC's
+    /// shaders go unsigned, which D3D12 refuses.
+    pub(crate) fn in_folder(folder: &std::path::Path) -> Result<String, String> {
+        let compiler = folder.join(COMPILER);
+        let validator = folder.join(VALIDATOR);
+        for needed in [&compiler, &validator] {
+            if !needed.exists() {
+                return Err(format!("no {} in {}", needed.display(), folder.display()));
+            }
+        }
+        if !load(&validator) {
+            return Err(format!("{} didn't load", validator.display()));
+        }
+        if !load(&compiler) {
+            return Err(format!("{} didn't load", compiler.display()));
+        }
+        compiler
+            .into_os_string()
+            .into_string()
+            .map_err(|path| format!("{} isn't Unicode", path.display()))
+    }
+}
+
 // Browsers' wgpu objects stay on their thread.
 #[cfg(target_arch = "wasm32")]
 thread_local! {
@@ -256,6 +385,49 @@ impl std::error::Error for GpuError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without `dxcompiler.dll` beside the binary, D3D12 compiles with FXC and still opens; wgpu
+    /// alone would leave D3D12 out of the instance.
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_dxc_falls_back_to_fxc_and_d3d12_still_opens() {
+        if let Ok(path) = dxc::beside_this_binary() {
+            eprintln!("{path} is beside the tests: skipped");
+            return;
+        }
+        let options = Gpu::backend_options();
+        if std::env::var_os("WGPU_DX12_COMPILER").is_none() {
+            assert!(matches!(
+                options.dx12.shader_compiler,
+                wgpu::Dx12Compiler::Fxc
+            ));
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            backend_options: options,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12));
+        assert!(!adapters.is_empty(), "D3D12 has no adapter, WARP included");
+    }
+
+    /// The compiler alone isn't enough: without its validator the D3D12 path takes FXC.
+    #[cfg(windows)]
+    #[test]
+    fn dxc_needs_both_its_files() {
+        let folder = std::env::temp_dir().join(format!("vfx-dxc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let missing = dxc::in_folder(&folder).unwrap_err();
+        assert!(missing.contains(dxc::COMPILER), "{missing}");
+        // Not a DLL: the check for the other file comes before anything loads.
+        std::fs::write(folder.join(dxc::COMPILER), b"not a DLL").unwrap();
+        let missing = dxc::in_folder(&folder).unwrap_err();
+        assert!(missing.contains(dxc::VALIDATOR), "{missing}");
+        std::fs::write(folder.join(dxc::VALIDATOR), b"not a DLL").unwrap();
+        let unloadable = dxc::in_folder(&folder).unwrap_err();
+        assert!(unloadable.contains("didn't load"), "{unloadable}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
 
     #[test]
     fn backoff_doubles_up_to_the_longest_wait() {

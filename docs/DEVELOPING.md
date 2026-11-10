@@ -129,6 +129,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core |
 | `Gpu::share`, `Gpu::shared` | vfx-core |
 | `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core |
+| `Gpu::backend_options` (wgpu backend options for every instance: on Windows, D3D12 compiles with the `dxcompiler.dll` and `dxil.dll` shipped beside the binary, else FXC) | vfx-core |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core |
 | `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host |
