@@ -22,3 +22,11 @@ objc2 = "0.6.5"
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLTexture", "MTLResource", "MTLTypes", "objc2-io-surface"] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString", "CFBase"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVPixelBuffer"] }
+objc2-open-gl = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CGLCurrent",
+    "CGLTypes",
+    "IOSurface",
+    "objc2-io-surface",
+] }
