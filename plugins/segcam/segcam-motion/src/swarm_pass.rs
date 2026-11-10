@@ -3,7 +3,9 @@
 //! bar from texture atlases; [`crate::gpu`] stays the drawer the effect uses.
 
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use vfx_core::wgpu;
@@ -562,6 +564,7 @@ impl SwarmPass {
     /// Draws the swarm of `windows` (visible tiles, oldest first) into `out`,
     /// as [`crate::gpu::Drawer::draw_swarm`] does. `frame` is the current
     /// frame, for the source backdrop and live windows.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn draw<'t, C: Channel>(
         &mut self,
         out: &mut ViewMut<C>,
@@ -572,8 +575,79 @@ impl SwarmPass {
         occlusion: Occlusion,
     ) -> Result<DrawTime, DrawError> {
         let started = Instant::now();
+        let size = (out.width, out.height);
+        let submitted = self.submit(size, windows, frame, s, shadow, occlusion);
+        let submit = started.elapsed();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.readback()
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        let wait = wgpu::PollType::Wait {
+            submission_index: Some(submitted),
+            timeout: None,
+        };
+        vfx_core::poll_device(&self.device, wait).map_err(DrawError::Poll)?;
+        match rx.recv() {
+            Ok(mapped) => mapped.map_err(DrawError::Readback)?,
+            Err(_) => return Err(DrawError::Poll(vfx_core::PollFailure::DeviceLost)),
+        }
+        let wait = started.elapsed() - submit;
+
+        self.copy_mapped(out);
+        let copy = started.elapsed() - submit - wait;
+        Ok(DrawTime { submit, wait, copy })
+    }
+
+    /// The buffer the last [`Self::submit`] copies its output into.
+    ///
+    /// Panics before the first submit.
+    pub fn readback(&self) -> &wgpu::Buffer {
+        &self
+            .targets
+            .as_ref()
+            .expect("a draw was submitted")
+            .readback
+    }
+
+    /// Copies the mapped [`Self::readback`] into `out`, the canvas of the last
+    /// submit, and unmaps it.
+    pub fn copy_mapped<C: Channel>(&self, out: &mut ViewMut<C>) {
+        let targets = self.targets.as_ref().expect("a draw was submitted");
+        {
+            let mapped = targets.readback.slice(..).get_mapped_range();
+            let mapped: &[u8] = &mapped.expect("the caller mapped the readback");
+            let row = out.width as usize * size_of::<Argb<C>>();
+            let threads =
+                vfx_plugin::vfx_host::worker_threads().clamp(1, out.height.max(1) as usize);
+            let bands = std::sync::Mutex::new(out.bands(threads));
+            vfx_plugin::vfx_host::on_workers(threads, || {
+                while let Some(mut band) = bands.lock().ok().and_then(|mut bands| bands.pop()) {
+                    for y in band.rows() {
+                        let at = y as usize * targets.padded_row as usize;
+                        let bytes: &mut [u8] = bytemuck::cast_slice_mut(band.row_mut(y));
+                        bytes.copy_from_slice(&mapped[at..at + row]);
+                    }
+                }
+            });
+        }
+        targets.readback.unmap();
+    }
+
+    /// Submits the draw of `windows` over a canvas of `(w, h)` at depth `C`,
+    /// with its output copied into [`Self::readback`].
+    pub fn submit<'t, C: Channel>(
+        &mut self,
+        (w, h): (i32, i32),
+        windows: impl IntoIterator<Item = (&'t Tile, Placement)>,
+        frame: Option<&View<C>>,
+        s: &RenderSettings,
+        shadow: &ShadowKernel,
+        occlusion: Occlusion,
+    ) -> wgpu::SubmissionIndex {
         let depth = depth_index::<C>();
-        let (w, h) = (out.width, out.height);
         let m = SwarmMetrics::new(h);
         self.prepare::<C>();
 
@@ -728,37 +802,7 @@ impl SwarmPass {
                 depth_or_array_layers: 1,
             },
         );
-        let submitted = self.queue.submit(Some(encoder.finish()));
-        let submit = started.elapsed();
-
-        let slice = targets.readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        let wait = wgpu::PollType::Wait {
-            submission_index: Some(submitted),
-            timeout: None,
-        };
-        vfx_core::poll_device(&self.device, wait).map_err(DrawError::Poll)?;
-        match rx.recv() {
-            Ok(mapped) => mapped.map_err(DrawError::Readback)?,
-            Err(_) => return Err(DrawError::Poll(vfx_core::PollFailure::DeviceLost)),
-        }
-        let wait = started.elapsed() - submit;
-
-        {
-            let mapped = slice.get_mapped_range().expect("the slice was just mapped");
-            let row = w as usize * size_of::<Argb<C>>();
-            for y in 0..h {
-                let at = y as usize * targets.padded_row as usize;
-                let bytes: &mut [u8] = bytemuck::cast_slice_mut(out.row_mut(y));
-                bytes.copy_from_slice(&mapped[at..at + row]);
-            }
-        }
-        targets.readback.unmap();
-        let copy = started.elapsed() - submit - wait;
-        Ok(DrawTime { submit, wait, copy })
+        self.queue.submit(Some(encoder.finish()))
     }
 
     /// A vertex buffer of at least `bytes`.
@@ -953,52 +997,16 @@ impl SwarmPass {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-    use crate::gpu::{self, Drawer};
-    use crate::motion::{Blob, NormRect, Segmentation};
-    use crate::render::{OutputMode, Pile, PileEntry, PixelRect, draw_output, intersect};
-    use crate::swarm::{TITLE_PREFIX, cut_tile, shadow_kernel};
-
-    /// A device on the adapter whose name contains `SWARM_PASS_ADAPTER`, on
-    /// the backend `SWARM_PASS_BACKEND` names (D3D12 unless set).
-    fn open(limits: wgpu::Limits) -> (wgpu::Adapter, wgpu::Device, wgpu::Queue) {
-        let backends = match std::env::var("SWARM_PASS_BACKEND").as_deref() {
-            Ok("gl") => wgpu::Backends::GL,
-            Ok("vulkan") => wgpu::Backends::VULKAN,
-            _ => wgpu::Backends::DX12,
-        };
-        let wanted = std::env::var("SWARM_PASS_ADAPTER")
-            .unwrap_or_default()
-            .to_lowercase();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            flags: wgpu::InstanceFlags::from_build_config().with_env(),
-            backend_options: wgpu::BackendOptions::from_env_or_default(),
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapters = pollster::block_on(instance.enumerate_adapters(backends));
-        let names: Vec<_> = adapters.iter().map(|a| a.get_info().name).collect();
-        let adapter = adapters
-            .into_iter()
-            .find(|a| a.get_info().name.to_lowercase().contains(&wanted))
-            .unwrap_or_else(|| panic!("no adapter named {wanted:?} among {names:?}"));
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("segcam swarm pass test"),
-            required_limits: limits,
-            ..wgpu::DeviceDescriptor::default()
-        }))
-        .expect("the adapter opens a device");
-        let info = adapter.get_info();
-        println!("adapter: {} on {:?}", info.name, info.backend);
-        (adapter, device, queue)
-    }
+/// The scenes the trial's tests and its web page draw and compare.
+#[doc(hidden)]
+pub mod scene {
+    use crate::motion::{Blob, NormRect};
+    use crate::pixel::{Argb, Channel, View};
+    use crate::render::{OutputMode, Pile, PileEntry, RenderSettings, SwarmBackground};
+    use crate::swarm::{TITLE_PREFIX, Tile, cut_tile};
 
     /// A textured gradient that drifts with `n`.
-    fn frame_pixels<C: Channel>(w: i32, h: i32, n: i32) -> Vec<Argb<C>> {
+    pub fn frame_pixels<C: Channel>(w: i32, h: i32, n: i32) -> Vec<Argb<C>> {
         let mut pixels = Vec::with_capacity((w * h) as usize);
         for y in 0..h {
             for x in 0..w {
@@ -1017,7 +1025,7 @@ mod tests {
 
     /// Tiles of `per_frame` segments crossing the canvas over `frames`
     /// frames, oldest first: the trails a show stacks.
-    fn trail_tiles<C: Channel>(
+    pub fn trail_tiles<C: Channel>(
         (w, h): (i32, i32),
         frames: i32,
         per_frame: i32,
@@ -1047,7 +1055,7 @@ mod tests {
     }
 
     /// The pile's visible tiles, oldest first, with their index in `tiles`.
-    fn visible(tiles: &[Tile], (w, h): (i32, i32), max_tiles: i32) -> Vec<(usize, &Tile)> {
+    pub fn visible(tiles: &[Tile], (w, h): (i32, i32), max_tiles: i32) -> Vec<(usize, &Tile)> {
         let mut pile = Pile::new(w, h, max_tiles);
         for (index, tile) in tiles.iter().enumerate() {
             pile.push(PileEntry {
@@ -1061,14 +1069,14 @@ mod tests {
 
     /// How far two pictures are apart, in 8-bit levels.
     #[derive(Debug, Default)]
-    struct Difference {
-        max: f32,
-        over_half: usize,
-        over_one: usize,
-        pixels: usize,
+    pub struct Difference {
+        pub max: f32,
+        pub over_half: usize,
+        pub over_one: usize,
+        pub pixels: usize,
     }
 
-    fn difference<C: Channel>(a: &[Argb<C>], b: &[Argb<C>]) -> Difference {
+    pub fn difference<C: Channel>(a: &[Argb<C>], b: &[Argb<C>]) -> Difference {
         let mut d = Difference {
             pixels: a.len(),
             ..Difference::default()
@@ -1092,7 +1100,7 @@ mod tests {
     }
 
     /// The swarm cases `tests/gpu.rs` holds the compute path to.
-    fn cases() -> Vec<(&'static str, RenderSettings)> {
+    pub fn cases() -> Vec<(&'static str, RenderSettings)> {
         let swarm = RenderSettings {
             mode: OutputMode::Swarm,
             max_tiles: 30,
@@ -1133,6 +1141,52 @@ mod tests {
                 },
             ),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::scene::{cases, difference, frame_pixels, trail_tiles, visible};
+    use super::*;
+    use crate::gpu::{self, Drawer};
+    use crate::motion::Segmentation;
+    use crate::render::{OutputMode, PixelRect, draw_output, intersect};
+    use crate::swarm::shadow_kernel;
+
+    /// A device on the adapter whose name contains `SWARM_PASS_ADAPTER`, on
+    /// the backend `SWARM_PASS_BACKEND` names (D3D12 unless set).
+    fn open(limits: wgpu::Limits) -> (wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+        let backends = match std::env::var("SWARM_PASS_BACKEND").as_deref() {
+            Ok("gl") => wgpu::Backends::GL,
+            Ok("vulkan") => wgpu::Backends::VULKAN,
+            _ => wgpu::Backends::DX12,
+        };
+        let wanted = std::env::var("SWARM_PASS_ADAPTER")
+            .unwrap_or_default()
+            .to_lowercase();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags: wgpu::InstanceFlags::from_build_config().with_env(),
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+        let names: Vec<_> = adapters.iter().map(|a| a.get_info().name).collect();
+        let adapter = adapters
+            .into_iter()
+            .find(|a| a.get_info().name.to_lowercase().contains(&wanted))
+            .unwrap_or_else(|| panic!("no adapter named {wanted:?} among {names:?}"));
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("segcam swarm pass test"),
+            required_limits: limits,
+            ..wgpu::DeviceDescriptor::default()
+        }))
+        .expect("the adapter opens a device");
+        let info = adapter.get_info();
+        println!("adapter: {} on {:?}", info.name, info.backend);
+        (adapter, device, queue)
     }
 
     /// Draws every case at depth `C` on the CPU and with render passes, and
