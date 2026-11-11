@@ -1,7 +1,6 @@
 //! The swarm drawn with render passes, which every device has: WebGL2 has no
 //! compute shaders. One instanced quad per window samples its tile and title
-//! bar from texture atlases. Still beside [`crate::gpu`], the drawer the
-//! effect uses.
+//! bar from texture atlases.
 
 use std::fmt;
 use std::pin::Pin;
@@ -25,9 +24,10 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 
 const STRAIGHT: u32 = 1;
 const MIRRORED: u32 = 2;
-const LIVE: u32 = 4;
+const LIVE_WINDOWS: u32 = 4;
 
 /// How long a draw waits for the GPU before it fails.
+#[cfg(not(target_arch = "wasm32"))]
 const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
@@ -37,7 +37,8 @@ pub enum DrawError {
     MappedRange(wgpu::MapRangeError),
     /// The map's callback didn't run within the timeout.
     MapTimeout,
-    /// No draw with a readback was submitted, or its buffer was given up.
+    /// No draw with a readback of this canvas was submitted, or its buffer
+    /// was given up.
     NoReadback,
     /// The queue had no staging memory for the frame.
     NoStagingMemory,
@@ -49,7 +50,7 @@ impl fmt::Display for DrawError {
             Self::Poll(e) => write!(f, "{e}"),
             Self::Map(e) => write!(f, "{e}"),
             Self::MappedRange(e) => write!(f, "{e}"),
-            Self::MapTimeout => write!(f, "the readback never finished"),
+            Self::MapTimeout => write!(f, "the readback timed out"),
             Self::NoReadback => write!(f, "no draw is waiting to be read back"),
             Self::NoStagingMemory => write!(f, "no staging memory for the frame"),
         }
@@ -114,7 +115,7 @@ impl FreeRuns {
     }
 
     /// The start of `len` free cells in a row, which stop being free.
-    fn take(&mut self, len: u32) -> Option<u32> {
+    fn allocate(&mut self, len: u32) -> Option<u32> {
         let i = self.0.iter().position(|&(_, n)| n >= len)?;
         let (start, n) = self.0[i];
         if n == len {
@@ -125,7 +126,7 @@ impl FreeRuns {
         Some(start)
     }
 
-    fn give(&mut self, start: u32, len: u32) {
+    fn deallocate(&mut self, start: u32, len: u32) {
         if len == 0 {
             return;
         }
@@ -181,8 +182,8 @@ struct Shelf {
     columns: FreeRuns,
 }
 
-/// Not in use until the GPU answers: native backends at once, browsers some
-/// time later.
+/// A larger texture, in use once its error scopes report no error: on
+/// native backends at once, in browsers some time later.
 struct PendingGrowth {
     texture: wgpu::Texture,
     size: (u32, u32),
@@ -228,6 +229,9 @@ impl Atlas {
     /// The GL backend makes a one layer texture a plain 2D one, which a 2D
     /// array binding refuses.
     const MIN_LAYERS: u32 = 2;
+    /// A full atlas doubles its layers up to this many more, so a large one
+    /// doesn't hold twice what its tiles need.
+    const MOST_LAYERS_ADDED: u32 = 8;
     const GROWTH_RETRY_AFTER: Duration = Duration::from_secs(60);
 
     fn new(
@@ -290,7 +294,7 @@ impl Atlas {
 
     fn place_in_shelves(&mut self, width: u32, rows: u32) -> Option<[u32; 3]> {
         for shelf in self.shelves.iter_mut().filter(|s| s.height == rows) {
-            if let Some(x) = shelf.columns.take(width) {
+            if let Some(x) = shelf.columns.allocate(width) {
                 return Some([x, shelf.y, shelf.layer]);
             }
         }
@@ -298,9 +302,9 @@ impl Atlas {
             return None;
         }
         let (layer, y) = (0..self.layers)
-            .find_map(|layer| Some((layer, self.rows[layer as usize].take(rows)?)))?;
+            .find_map(|layer| Some((layer, self.rows[layer as usize].allocate(rows)?)))?;
         let mut columns = FreeRuns::new(self.size.0);
-        let x = columns.take(width)?;
+        let x = columns.allocate(width)?;
         self.shelves.push(Shelf {
             layer,
             y,
@@ -316,15 +320,15 @@ impl Atlas {
         let Some(i) = self.shelves.iter().position(held) else {
             return;
         };
-        self.shelves[i].columns.give(at[0], width.max(1));
+        self.shelves[i].columns.deallocate(at[0], width.max(1));
         if self.shelves[i].columns.is_whole(self.size.0) {
             let shelf = self.shelves.swap_remove(i);
-            self.rows[shelf.layer as usize].give(shelf.y, shelf.height);
+            self.rows[shelf.layer as usize].deallocate(shelf.y, shelf.height);
         }
     }
 
     /// Makes the layers large enough for `width` x `rows`, or where they
-    /// are, twice as many. `false` when the atlas is at its limit, the GPU
+    /// are, adds layers. `false` when the atlas is at its limit, the GPU
     /// refused, or its answer is still to come.
     fn grow(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, rows: u32) -> bool {
         loop {
@@ -345,7 +349,7 @@ impl Atlas {
                 let most_bytes = self.limits.bytes.min(self.ceiling);
                 let most_layers = most_bytes / self.bytes(size, 1);
                 let wanted = if size == self.size {
-                    self.layers * 2
+                    self.layers + self.layers.min(Self::MOST_LAYERS_ADDED)
                 } else {
                     self.layers
                 };
@@ -379,6 +383,7 @@ impl Atlas {
                 self.bytes(grown.size, grown.layers),
             );
             if let Some(e) = refusal {
+                grown.texture.destroy();
                 // Half the step next. Under an eighth of the atlas it isn't
                 // worth a copy.
                 let step = (asked - held) / 2;
@@ -407,10 +412,12 @@ impl Atlas {
             );
             queue.submit(Some(encoder.finish()));
             for rows in &mut self.rows {
-                rows.give(self.size.1, grown.size.1 - self.size.1);
+                rows.deallocate(self.size.1, grown.size.1 - self.size.1);
             }
             for shelf in &mut self.shelves {
-                shelf.columns.give(self.size.0, grown.size.0 - self.size.0);
+                shelf
+                    .columns
+                    .deallocate(self.size.0, grown.size.0 - self.size.0);
             }
             self.rows
                 .extend((self.layers..grown.layers).map(|_| FreeRuns::new(grown.size.1)));
@@ -424,7 +431,7 @@ impl Atlas {
     }
 
     /// Texels in shelves, of the texels the atlas has.
-    fn filled(&self) -> (u64, u64) {
+    fn usage(&self) -> (u64, u64) {
         let width = u64::from(self.size.0);
         let rows: u64 = self.shelves.iter().map(|s| u64::from(s.height)).sum();
         let held = width * u64::from(self.size.1) * u64::from(self.layers);
@@ -442,9 +449,9 @@ struct Atlases {
 #[derive(Clone, Copy, Debug)]
 pub struct Slot {
     /// `None` where the tile had no frame to be cut from.
-    pixels: Option<[u32; 3]>,
-    pixels_width: u32,
-    bar: [u32; 3],
+    tile_at: Option<[u32; 3]>,
+    tile_width: u32,
+    bar_at: [u32; 3],
     bar_width: i32,
 }
 
@@ -458,10 +465,10 @@ impl Drop for AtlasAllocation {
     fn drop(&mut self) {
         let mut atlases = self.atlases.lock().unwrap_or_else(|e| e.into_inner());
         for slot in &self.slots {
-            if let Some(at) = slot.pixels {
-                atlases.tiles.free(at, slot.pixels_width);
+            if let Some(at) = slot.tile_at {
+                atlases.tiles.free(at, slot.tile_width);
             }
-            atlases.bars.free(slot.bar, slot.bar_width as u32);
+            atlases.bars.free(slot.bar_at, slot.bar_width as u32);
         }
     }
 }
@@ -490,12 +497,12 @@ struct Globals {
     _padding: u32,
 }
 
-/// Must match `Instance` in swarm_pass.wgsl.
+/// Must match `WindowInstance` in swarm_pass.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct Instance {
+struct WindowInstance {
     window: [i32; 4],
-    stored: [i32; 4],
+    clipped: [i32; 4],
     tile: [i32; 4],
     bar: [i32; 4],
     order: u32,
@@ -539,6 +546,14 @@ fn depth_index<C: Channel>() -> u32 {
         1 => 0,
         2 => 1,
         _ => 2,
+    }
+}
+
+/// What a canvas of `depth` is blended in unless told otherwise.
+fn own_composite(depth: u32) -> Composite {
+    match depth {
+        0 => Composite::Unorm8,
+        _ => Composite::HalfFloat,
     }
 }
 
@@ -607,15 +622,11 @@ impl SwarmPipelines {
         })
     }
 
-    /// Builds the pipelines a draw with a readback at depth `C` uses, which
-    /// the first such draw otherwise does.
+    /// Builds the pipelines of a draw with a readback at depth `C` in that
+    /// depth's own composite, which the first such draw otherwise does.
     pub fn prepare<C: Channel>(&self) {
         let depth = depth_index::<C>();
-        let composite = match depth {
-            0 => Composite::Unorm8,
-            _ => Composite::HalfFloat,
-        };
-        self.compose(composite.format());
+        self.compose(own_composite(depth).format());
         let (format, entry) = host_output(depth);
         self.output(format, entry);
     }
@@ -626,11 +637,11 @@ impl SwarmPipelines {
         instanced: bool,
         format: wgpu::TextureFormat,
         blend: Option<wgpu::BlendState>,
-        occluders: Option<(wgpu::CompareFunction, bool)>,
+        depth_buffer: Option<(wgpu::CompareFunction, bool)>,
     ) -> wgpu::RenderPipeline {
         // An output reads the composite, which the compose pipelines draw
         // into and so can't have bound.
-        let groups: &[Option<&wgpu::BindGroupLayout>] = match occluders {
+        let groups: &[Option<&wgpu::BindGroupLayout>] = match depth_buffer {
             Some(_) => &[Some(&self.draw_layout)],
             None => &[Some(&self.draw_layout), Some(&self.composed_layout)],
         };
@@ -645,7 +656,7 @@ impl SwarmPipelines {
             0 => Sint32x4, 1 => Sint32x4, 2 => Sint32x4, 3 => Sint32x4, 4 => Uint32
         ];
         let instances = [Some(wgpu::VertexBufferLayout {
-            array_stride: size_of::<Instance>() as u64,
+            array_stride: size_of::<WindowInstance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &ATTRIBUTES,
         })];
@@ -660,7 +671,7 @@ impl SwarmPipelines {
                     buffers: if instanced { &instances } else { &[] },
                 },
                 primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: occluders.map(|(compare, write)| wgpu::DepthStencilState {
+                depth_stencil: depth_buffer.map(|(compare, write)| wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
                     depth_write_enabled: Some(write),
                     depth_compare: Some(compare),
@@ -739,7 +750,7 @@ struct Targets {
     size: (u32, u32),
     format: wgpu::TextureFormat,
     composed: wgpu::TextureView,
-    occluders: wgpu::TextureView,
+    depth_buffer: wgpu::TextureView,
     composed_bind: wgpu::BindGroup,
     readback: Option<Readback>,
 }
@@ -811,13 +822,11 @@ pub struct SwarmPass {
     targets: Option<Targets>,
     /// Windows oldest first, then the same newest first.
     instances: Option<(wgpu::Buffer, u64)>,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    readback_timeout: Duration,
 }
 
 impl SwarmPass {
-    /// A phone's browser may end the page rather than refuse an allocation,
-    /// so an atlas there stops at what 1080p needs at long trails.
+    /// The most bytes an atlas holds: less in a browser, where a phone may
+    /// end the page rather than refuse an allocation.
     const ATLAS_BYTES: u64 = if cfg!(target_arch = "wasm32") {
         256 << 20
     } else {
@@ -876,7 +885,6 @@ impl SwarmPass {
             frame: None,
             targets: None,
             instances: None,
-            readback_timeout: READBACK_TIMEOUT,
             shared,
         }
     }
@@ -888,10 +896,7 @@ impl SwarmPass {
     }
 
     fn composite_at(&self, depth: u32) -> Composite {
-        self.composite.unwrap_or(match depth {
-            0 => Composite::Unorm8,
-            _ => Composite::HalfFloat,
-        })
+        self.composite.unwrap_or(own_composite(depth))
     }
 
     /// Puts a frame's tiles in the atlases: their pixels as the CPU cut them
@@ -902,26 +907,21 @@ impl SwarmPass {
         let m = SwarmMetrics::new(canvas_height);
         let bar_height = chrome::TITLE_BAR_HEIGHT as u32;
         let mut atlases = lock(&self.atlases);
-        // Dropped on the way out where a tile finds no room, which gives the
-        // earlier tiles' room back.
-        let mut allocation = AtlasAllocation {
-            atlases: self.atlases.clone(),
-            slots: Vec::with_capacity(tiles.len()),
-        };
+        let mut slots = Vec::with_capacity(tiles.len());
         let mut placed_all = true;
         for tile in tiles {
             let rect = tile.clipped_rect;
             let (w, h) = (rect.w as u32, rect.h as u32);
             let has_pixels = !tile.pixels.is_empty();
-            let pixels = has_pixels
+            let tile_at = has_pixels
                 .then(|| atlases.tiles.place(device, queue, w, h))
                 .flatten();
             let bar = TitleBar::cached_or_new(tile, &m);
             let bar_at = atlases
                 .bars
                 .place(device, queue, bar.width as u32, bar_height);
-            let (Some(bar_at), true) = (bar_at, pixels.is_some() == has_pixels) else {
-                if let Some(at) = pixels {
+            let (Some(bar_at), true) = (bar_at, tile_at.is_some() == has_pixels) else {
+                if let Some(at) = tile_at {
                     atlases.tiles.free(at, w);
                 }
                 if let Some(at) = bar_at {
@@ -930,7 +930,7 @@ impl SwarmPass {
                 placed_all = false;
                 break;
             };
-            if let Some(at) = pixels {
+            if let Some(at) = tile_at {
                 let texels = bytemuck::cast_slice(&tile.pixels);
                 write_layer(queue, &atlases.tiles.texture, at, (w, h), texels);
             }
@@ -938,14 +938,21 @@ impl SwarmPass {
             let size = (bar.width as u32, bar_height);
             let texels = bytemuck::cast_slice(&texels);
             write_layer(queue, &atlases.bars.texture, bar_at, size, texels);
-            allocation.slots.push(Slot {
-                pixels,
-                pixels_width: w,
-                bar: bar_at,
+            slots.push(Slot {
+                tile_at,
+                tile_width: w,
+                bar_at,
                 bar_width: bar.width,
             });
         }
         drop(atlases);
+        // Made with the lock released, since dropping it takes the lock:
+        // that is how the earlier tiles' room comes back where one found
+        // none.
+        let allocation = AtlasAllocation {
+            atlases: self.atlases.clone(),
+            slots,
+        };
         placed_all.then_some(allocation)
     }
 
@@ -957,9 +964,9 @@ impl SwarmPass {
     }
 
     /// Texels in use and texels held, for the tile atlas and the bar atlas.
-    pub fn atlas_use(&self) -> [(u64, u64); 2] {
+    pub fn atlas_usage(&self) -> [(u64, u64); 2] {
         let atlases = lock(&self.atlases);
-        [atlases.tiles.filled(), atlases.bars.filled()]
+        [atlases.tiles.usage(), atlases.bars.usage()]
     }
 
     /// Draws the swarm of `windows` (visible tiles, oldest first) into `out`,
@@ -1005,12 +1012,12 @@ impl SwarmPass {
             });
         let wait = wgpu::PollType::Wait {
             submission_index: Some(submitted),
-            timeout: Some(self.readback_timeout),
+            timeout: Some(READBACK_TIMEOUT),
         };
         vfx_core::poll_device(&self.shared.device, wait).map_err(DrawError::Poll)?;
         // Another drawer's poll may be the one that calls back, a moment
         // later.
-        match rx.recv_timeout(self.readback_timeout) {
+        match rx.recv_timeout(READBACK_TIMEOUT) {
             Ok(mapped) => mapped.map_err(DrawError::Map),
             Err(_) => Err(DrawError::MapTimeout),
         }
@@ -1021,14 +1028,19 @@ impl SwarmPass {
         Some(&self.targets.as_ref()?.readback.as_ref()?.buffer)
     }
 
-    /// Copies the mapped [`Self::readback`] into `out`, the canvas of the last
-    /// submit, and unmaps it.
+    /// Copies the mapped [`Self::readback`] into `out` and unmaps it. An
+    /// error where `out` isn't the canvas of the last submit.
     pub fn copy_mapped<C: Channel>(&self, out: &mut ViewMut<C>) -> Result<(), DrawError> {
         let targets = self.targets.as_ref().ok_or(DrawError::NoReadback)?;
         let readback = targets.readback.as_ref().ok_or(DrawError::NoReadback)?;
-        {
-            let mapped = readback.buffer.slice(..).get_mapped_range();
-            let mapped: &[u8] = &mapped.map_err(DrawError::MappedRange)?;
+        let same_canvas = targets.size == (out.width as u32, out.height as u32)
+            && readback.format == host_output(depth_index::<C>()).0;
+        if !same_canvas {
+            return Err(DrawError::NoReadback);
+        }
+        let mapped = readback.buffer.slice(..).get_mapped_range();
+        let copied = mapped.map_err(DrawError::MappedRange).map(|mapped| {
+            let mapped: &[u8] = &mapped;
             let row = out.width as usize * size_of::<Argb<C>>();
             let threads =
                 vfx_plugin::vfx_host::worker_threads().clamp(1, out.height.max(1) as usize);
@@ -1042,9 +1054,9 @@ impl SwarmPass {
                     }
                 }
             });
-        }
+        });
         readback.buffer.unmap();
-        Ok(())
+        copied
     }
 
     /// Submits the draw of `windows` over a canvas of `(w, h)` at depth `C`,
@@ -1165,17 +1177,17 @@ impl SwarmPass {
     ) -> Result<Draw, DrawError> {
         let depth = depth_index::<C>();
         let m = SwarmMetrics::new(h);
-        let mut instances: Vec<Instance> = (0..)
+        let mut instances: Vec<WindowInstance> = (0..)
             .zip(windows)
             .map(|(order, (tile, slot))| {
                 let window = window_rect(tile.content_rect, m.title_height);
-                let stored = tile.clipped_rect;
-                let [x, y, layer] = slot.pixels.unwrap_or_default().map(|v| v as i32);
-                let [bar_x, bar_y, bar_layer] = slot.bar.map(|v| v as i32);
-                Instance {
+                let clipped = tile.clipped_rect;
+                let [x, y, layer] = slot.tile_at.unwrap_or_default().map(|v| v as i32);
+                let [bar_x, bar_y, bar_layer] = slot.bar_at.map(|v| v as i32);
+                WindowInstance {
                     window: [window.x, window.y, window.w, window.h],
-                    stored: [stored.x, stored.y, stored.w, stored.h],
-                    tile: [x, y, layer, i32::from(slot.pixels.is_some())],
+                    clipped: [clipped.x, clipped.y, clipped.w, clipped.h],
+                    tile: [x, y, layer, i32::from(slot.tile_at.is_some())],
                     bar: [bar_x, bar_y, bar_layer, slot.bar_width],
                     order,
                 }
@@ -1202,7 +1214,7 @@ impl SwarmPass {
             flags |= MIRRORED;
         }
         if live {
-            flags |= LIVE;
+            flags |= LIVE_WINDOWS;
         }
         let globals = Globals {
             canvas: [w, h],
@@ -1401,9 +1413,9 @@ impl SwarmPass {
                 U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
             )
             .create_view(&Default::default());
-        let occluders = self
+        let depth_buffer = self
             .canvas_texture(
-                "segcam swarm pass occluders",
+                "segcam swarm pass depth_buffer",
                 size,
                 DEPTH_FORMAT,
                 U::RENDER_ATTACHMENT,
@@ -1422,7 +1434,7 @@ impl SwarmPass {
                 }],
             }),
             composed,
-            occluders,
+            depth_buffer,
             readback: None,
         });
     }
@@ -1514,7 +1526,7 @@ fn compose_windows(
             },
         })],
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-            view: &targets.occluders,
+            view: &targets.depth_buffer,
             depth_ops: Some(wgpu::Operations {
                 load: wgpu::LoadOp::Clear(1.0),
                 store: wgpu::StoreOp::Discard,
@@ -1533,7 +1545,7 @@ fn compose_windows(
     if draw.count == 0 {
         return;
     }
-    let oldest_first = u64::from(draw.count) * size_of::<Instance>() as u64;
+    let oldest_first = u64::from(draw.count) * size_of::<WindowInstance>() as u64;
     if occlusion == Occlusion::Depth {
         pass.set_pipeline(&compose.body);
         pass.set_vertex_buffer(0, draw.instances.slice(oldest_first..2 * oldest_first));
@@ -1859,7 +1871,7 @@ mod tests {
 
     #[test]
     #[ignore = "SWARM_PASS_ADAPTER and SWARM_PASS_BACKEND pick the GPU"]
-    fn draw_is_close_to_cpu_picture() {
+    fn draw_matches_cpu_render() {
         let _lock = gpu::gpu_test_lock();
         let (_, device, queue) = open(wgpu::Limits::default());
         compare_all_depths(&device, &queue);
@@ -1867,7 +1879,7 @@ mod tests {
 
     #[test]
     #[ignore = "SWARM_PASS_ADAPTER picks the GPU; set SWARM_PASS_BACKEND=gl"]
-    fn draw_fits_webgl2_limits() {
+    fn draw_under_webgl2_limits() {
         let _lock = gpu::gpu_test_lock();
         let (adapter, device, queue) = open(wgpu::Limits::downlevel_webgl2_defaults());
         println!("{:?}", adapter.get_downlevel_capabilities().flags);
@@ -2052,7 +2064,7 @@ mod tests {
                 part(|t| t.copy),
             );
         }
-        let [(tile_texels, tile_room), (bar_texels, bar_room)] = pass.atlas_use();
+        let [(tile_texels, tile_room), (bar_texels, bar_room)] = pass.atlas_usage();
         println!(
             "atlas for {count} windows: tiles {tile_texels} of {tile_room} texels, title bars \
              {bar_texels} of {bar_room} texels"
@@ -2061,7 +2073,7 @@ mod tests {
 
     #[test]
     #[ignore = "a timed run on the PC's slot; SWARM_PASS_ADAPTER picks the GPU"]
-    fn draw_time_against_compute() {
+    fn bench_draw() {
         let _lock = gpu::gpu_test_lock();
         let (_, device, queue) = open(wgpu::Limits {
             max_storage_buffer_binding_size: 1 << 30,
@@ -2130,7 +2142,7 @@ mod tests {
 
     #[test]
     #[ignore = "SWARM_PASS_ADAPTER and SWARM_PASS_BACKEND pick the GPU"]
-    fn draw_into_frame_equals_draw_with_readback() {
+    fn submit_into_matches_draw() {
         let _lock = gpu::gpu_test_lock();
         let (_, device, queue) = open(wgpu::Limits::default());
         let gpu = vfx_core::Gpu::from_parts(device.clone(), queue.clone());
@@ -2271,7 +2283,7 @@ mod tests {
 
     #[test]
     #[ignore = "a timed run on the PC's slot; SWARM_PASS_ADAPTER picks the GPU"]
-    fn draw_into_frame_time_against_compute() {
+    fn bench_draw_into_frame() {
         let _lock = gpu::gpu_test_lock();
         let (_, device, queue) = open(wgpu::Limits {
             max_storage_buffer_binding_size: 1 << 30,
@@ -2304,7 +2316,7 @@ mod tests {
 
     #[test]
     #[ignore = "a timed run on the PC's slot; WGPU_DX12_COMPILER picks the compiler"]
-    fn pipeline_build_time_against_compute() {
+    fn bench_pipeline_build() {
         let _lock = gpu::gpu_test_lock();
         let (_, device, queue) = open(wgpu::Limits::default());
         println!("| pipelines | build |");
@@ -2353,7 +2365,7 @@ mod tests {
 
     #[test]
     #[ignore = "SWARM_PASS_ADAPTER and SWARM_PASS_BACKEND pick the GPU"]
-    fn grown_atlas_keeps_its_tiles() {
+    fn grow_preserves_tiles() {
         let _lock = gpu::gpu_test_lock();
         let (_, device, queue) = open(wgpu::Limits::default());
         let (w, h) = (1920, 1080);
@@ -2414,21 +2426,20 @@ mod tests {
     }
 
     #[test]
-    fn free_runs_join_neighbours() {
+    fn free_runs_coalesce() {
         let mut runs = FreeRuns::new(100);
-        let taken = [30, 30, 40].map(|len| runs.take(len));
+        let taken = [30, 30, 40].map(|len| runs.allocate(len));
         assert_eq!(taken, [Some(0), Some(30), Some(60)]);
-        assert_eq!(runs.take(1), None);
-        runs.give(0, 30);
-        runs.give(60, 40);
-        assert_eq!(runs.take(50), None, "the free runs are apart");
-        runs.give(30, 30);
+        assert_eq!(runs.allocate(1), None);
+        runs.deallocate(0, 30);
+        runs.deallocate(60, 40);
+        assert_eq!(runs.allocate(50), None, "the free runs are apart");
+        runs.deallocate(30, 30);
         assert!(runs.is_whole(100));
     }
 
     #[test]
-    fn atlas_places_rects_apart() {
-        let _lock = gpu::gpu_test_lock();
+    fn place_no_overlap() {
         let limits = AtlasLimits {
             side: 2048,
             layers: 2,
@@ -2458,35 +2469,51 @@ mod tests {
     }
 
     #[test]
-    fn atlas_grows_to_its_limits() {
-        let _lock = gpu::gpu_test_lock();
+    fn grow_widens_in_place() {
+        let limits = AtlasLimits {
+            side: 1024,
+            layers: 8,
+            bytes: u64::MAX,
+        };
+        let (device, queue, mut atlas) = test_atlas((256, 256), limits);
+        let first = atlas.place(&device, &queue, 200, 200);
+        let wide = atlas.place(&device, &queue, 1000, 40);
+        assert!(wide.is_some());
+        assert_eq!((atlas.size, atlas.layers), ((1024, 256), 2));
+        let beside = atlas.place(&device, &queue, 800, 200);
+        assert_eq!((first, beside), (Some([0, 0, 0]), Some([200, 0, 0])));
+    }
+
+    #[test]
+    fn grow_stops_at_limits() {
         let limits = AtlasLimits {
             side: 1024,
             layers: 8,
             bytes: 1024 * 1024 * 4 * 6,
         };
         let (device, queue, mut atlas) = test_atlas((256, 256), limits);
-        let first = atlas.place(&device, &queue, 200, 200);
-        // Wider than a layer: the layers grow and the first rect keeps its
-        // place, with the new columns beside it free.
-        let wide = atlas.place(&device, &queue, 1000, 40);
-        assert_eq!((atlas.size, atlas.layers), ((1024, 256), 2));
-        let beside = atlas.place(&device, &queue, 800, 200);
-        assert_eq!((first, beside), (Some([0, 0, 0]), Some([200, 0, 0])));
-        let mut placed = vec![(first, 200), (wide, 1000), (beside, 800)];
-        // Higher than a layer, then more than the layers hold.
-        while let Some(at) = atlas.place(&device, &queue, 1024, 1024) {
-            placed.push((Some(at), 1024));
+        let mut placed = 0;
+        while atlas.place(&device, &queue, 1024, 1024).is_some() {
+            placed += 1;
         }
-        assert_eq!(atlas.size, (1024, 1024));
-        assert_eq!(atlas.layers, 6, "the byte limit allows six of eight layers");
-        assert_eq!(
-            atlas.place(&device, &queue, 1025, 16),
-            None,
-            "past the side"
-        );
+        assert_eq!((atlas.size, atlas.layers), ((1024, 1024), 6));
+        assert_eq!(placed, 6, "the byte limit allows six of eight layers");
+        let past_side = atlas.place(&device, &queue, 1025, 16);
+        assert_eq!(past_side, None);
+    }
+
+    #[test]
+    fn free_returns_all_rows() {
+        let limits = AtlasLimits {
+            side: 1024,
+            layers: 4,
+            bytes: u64::MAX,
+        };
+        let (device, queue, mut atlas) = test_atlas((1024, 1024), limits);
+        let sizes = [(200, 200), (1000, 40), (800, 200), (1024, 1024), (30, 500)];
+        let placed = sizes.map(|(w, h)| (atlas.place(&device, &queue, w, h), w));
         for (at, width) in placed {
-            atlas.free(at.expect("placed above"), width);
+            atlas.free(at.expect("four layers hold these"), width);
         }
         assert!(atlas.shelves.is_empty());
         assert!(atlas.rows.iter().all(|rows| rows.is_whole(1024)));
@@ -2495,8 +2522,7 @@ mod tests {
     /// A trail's churn: each frame's tiles go in and the oldest frame's come
     /// out, for 20,000 frames.
     #[test]
-    fn atlas_stays_bounded_over_a_long_trail() {
-        let _lock = gpu::gpu_test_lock();
+    fn atlas_bounded_under_churn() {
         let limits = AtlasLimits {
             side: 2048,
             layers: 256,

@@ -24,7 +24,7 @@ struct Globals {
 
 const STRAIGHT: u32 = 1u;
 const MIRRORED: u32 = 2u;
-const LIVE: u32 = 4u;
+const LIVE_WINDOWS: u32 = 4u;
 
 @group(0) @binding(0) var<uniform> g: Globals;
 // Tile and frame texels hold ARGB bytes: `.gba` is the colour, `.r` alpha.
@@ -35,9 +35,9 @@ const LIVE: u32 = 4u;
 @group(0) @binding(5) var frame_16: texture_2d<u32>;
 @group(1) @binding(0) var composed: texture_2d<f32>;
 
-struct Instance {
+struct WindowInstance {
     @location(0) window: vec4<i32>,
-    @location(1) stored: vec4<i32>,
+    @location(1) clipped: vec4<i32>,
     // Atlas x, y and layer, then whether the tile has pixels.
     @location(2) tile: vec4<i32>,
     // Atlas x, y and layer, then the bar's width.
@@ -48,7 +48,7 @@ struct Instance {
 struct Varyings {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) window: vec4<i32>,
-    @location(1) @interpolate(flat) stored: vec4<i32>,
+    @location(1) @interpolate(flat) clipped: vec4<i32>,
     @location(2) @interpolate(flat) tile: vec4<i32>,
     @location(3) @interpolate(flat) bar: vec4<i32>,
 }
@@ -64,15 +64,15 @@ fn unit_corner(vertex: u32) -> vec2<f32> {
 }
 
 // Newer windows are nearer, so the depth test rejects what they cover.
-fn varyings(pixel: vec2<f32>, i: Instance) -> Varyings {
+fn varyings(pixel: vec2<f32>, i: WindowInstance) -> Varyings {
     let ndc = pixel / vec2<f32>(g.canvas) * vec2(2.0, -2.0) + vec2(-1.0, 1.0);
     let z = 1.0 - f32(i.order + 1u) / f32(g.window_count + 1u);
-    return Varyings(vec4(ndc, z, 1.0), i.window, i.stored, i.tile, i.bar);
+    return Varyings(vec4(ndc, z, 1.0), i.window, i.clipped, i.tile, i.bar);
 }
 
 // The window and as far as its shadow reaches.
 @vertex
-fn vs_window(@builtin(vertex_index) vertex: u32, i: Instance) -> Varyings {
+fn vs_window(@builtin(vertex_index) vertex: u32, i: WindowInstance) -> Varyings {
     let reach = f32(g.reach);
     let origin = vec2<f32>(i.window.xy) - reach;
     let size = vec2<f32>(i.window.zw) + 2.0 * reach;
@@ -88,7 +88,7 @@ fn between_corners(len: i32) -> vec2<f32> {
 
 // The pixels the mask covers whole: two bands that cross, leaving the corners.
 @vertex
-fn vs_body(@builtin(vertex_index) vertex: u32, i: Instance) -> Varyings {
+fn vs_body(@builtin(vertex_index) vertex: u32, i: WindowInstance) -> Varyings {
     let size = vec2<f32>(i.window.zw);
     var low = vec2(0.0);
     var high = size;
@@ -148,10 +148,10 @@ fn window_color(v: Varyings, p: vec2<i32>) -> vec3<f32> {
         return bar_at(v.bar, local);
     }
     var color = vec3(0.0);
-    let at = p - v.stored.xy;
-    if has(LIVE) {
+    let at = p - v.clipped.xy;
+    if has(LIVE_WINDOWS) {
         color = frame_at(p).rgb;
-    } else if v.tile.w != 0 && all(at >= vec2(0)) && all(at < v.stored.zw) {
+    } else if v.tile.w != 0 && all(at >= vec2(0)) && all(at < v.clipped.zw) {
         color = textureLoad(tiles, v.tile.xy + at, v.tile.z, 0).gba;
     }
     if local.y == g.title_height {

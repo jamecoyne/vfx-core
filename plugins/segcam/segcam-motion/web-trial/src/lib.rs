@@ -74,12 +74,17 @@ async fn draw<C: Channel>(
 }
 
 /// Puts `tiles` in the atlases, waiting out the browser's answers on growing.
-async fn upload(pass: &mut SwarmPass, tiles: &[Tile], canvas_height: i32) -> AtlasAllocation {
+/// `None` if the atlases are full.
+async fn upload(
+    pass: &mut SwarmPass,
+    tiles: &[Tile],
+    canvas_height: i32,
+) -> Option<AtlasAllocation> {
     loop {
-        if let Some(allocation) = pass.upload_tiles(tiles, canvas_height) {
+        let allocation = pass.upload_tiles(tiles, canvas_height);
+        if allocation.is_some() || !pass.atlas_growing() {
             return allocation;
         }
-        assert!(pass.atlas_growing(), "the atlas holds the tiles");
         yield_to_browser().await;
     }
 }
@@ -98,7 +103,9 @@ async fn compare<C: Channel>(
         let tiles = scene::trail_tiles::<C>(CANVAS, 12, 3, s.mirror);
         let frame = scene::frame_pixels::<C>(w, h, 12);
         let mut pass = SwarmPass::new(SwarmPipelines::new(device, queue));
-        let placed = upload(&mut pass, &tiles, h).await;
+        let placed = upload(&mut pass, &tiles, h)
+            .await
+            .expect("the atlases hold 36 tiles");
         let visible = scene::visible(&tiles, CANVAS, s.max_tiles);
         let mut expected = vec![Argb::<C>::default(); (w * h) as usize];
         draw_output(
@@ -109,7 +116,10 @@ async fn compare<C: Channel>(
             12,
             visible.iter().map(|(_, tile)| *tile),
         );
-        let windows: Vec<_> = visible.iter().map(|&(i, tile)| (tile, placed.slots[i])).collect();
+        let windows: Vec<_> = visible
+            .iter()
+            .map(|&(i, tile)| (tile, placed.slots[i]))
+            .collect();
         for occlusion in [Occlusion::None, Occlusion::Depth] {
             draw(
                 device, &mut pass, &mut drawn, &windows, &frame, &s, occlusion,
@@ -133,7 +143,7 @@ async fn compare<C: Channel>(
 
 /// Adds the median and worst time of 100 draws of a 120 frame trail, of
 /// which at most `max_tiles` windows stay, to `report`.
-async fn time(
+async fn report_timings(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     (max_tiles, per_frame): (i32, i32),
@@ -157,7 +167,16 @@ async fn time(
         .map(|(_, tile)| tile)
         .collect();
     let mut pass = SwarmPass::new(SwarmPipelines::new(device, queue));
-    let placed = upload(&mut pass, &shown, h).await;
+    let Some(placed) = upload(&mut pass, &shown, h).await else {
+        let [(_, tile_room), (_, bar_room)] = pass.atlas_usage();
+        let _ = writeln!(
+            report,
+            "| 8 bit | {} | not drawn: the atlases are full at {tile_room} tile texels and \
+             {bar_room} title bar texels |",
+            shown.len()
+        );
+        return;
+    };
     let windows: Vec<_> = shown.iter().zip(placed.slots.iter().copied()).collect();
     let mut out = vec![Argb::<u8>::default(); (w * h) as usize];
     for occlusion in [Occlusion::None, Occlusion::Depth] {
@@ -175,6 +194,13 @@ async fn time(
             times[times.len() - 1]
         );
     }
+    let [(tile_texels, tile_room), (bar_texels, bar_room)] = pass.atlas_usage();
+    let _ = writeln!(
+        report,
+        "atlas for {} windows: tiles {tile_texels} of {tile_room} texels, title bars \
+         {bar_texels} of {bar_room} texels",
+        windows.len()
+    );
 }
 
 fn document() -> Result<web_sys::Document, JsValue> {
@@ -183,14 +209,14 @@ fn document() -> Result<web_sys::Document, JsValue> {
         .ok_or_else(|| "the page has no document".into())
 }
 
-fn show(report: &str) {
+fn set_report(report: &str) {
     if let Some(log) = document().ok().and_then(|d| d.get_element_by_id("report")) {
         log.set_text_content(Some(report));
     }
 }
 
 /// Paints an 8-bit ARGB picture of the canvas size on the page's 2D canvas.
-fn paint(pixels: &[Argb<u8>]) -> Result<(), JsValue> {
+fn put_image(pixels: &[Argb<u8>]) -> Result<(), JsValue> {
     let canvas = document()?
         .get_element_by_id("picture")
         .ok_or("the page has no picture canvas")?
@@ -252,28 +278,44 @@ pub async fn start() -> Result<(), JsValue> {
     for format in [F::Rgba8Unorm, F::Rgba16Float, F::Rgba16Uint, F::Rgba32Float] {
         let _ = writeln!(report, "{format:?} is a render target: {}", renders(format));
     }
+    let float_blend = adapter
+        .features()
+        .contains(wgpu::Features::FLOAT32_BLENDABLE);
+    let _ = writeln!(report, "wgpu offers 32 bit float blending: {float_blend}");
+    let probe = document()?
+        .create_element("canvas")?
+        .dyn_into::<web_sys::HtmlCanvasElement>()?
+        .get_context("webgl2")?
+        .ok_or("the browser has no WebGL2")?
+        .dyn_into::<web_sys::WebGl2RenderingContext>()?;
+    let extension = probe.get_extension("EXT_float_blend")?;
+    let _ = writeln!(
+        report,
+        "the browser has EXT_float_blend: {}",
+        extension.is_some()
+    );
     report += "| depth | canvas | case | occlusion | largest difference | over half a level | \
                over one level |\n";
-    show(&report);
+    set_report(&report);
 
     let picture = compare::<u8>(&device, &queue, &mut report).await;
-    paint(&picture)?;
-    show(&report);
+    put_image(&picture)?;
+    set_report(&report);
     if renders(F::Rgba16Float) && renders(F::Rgba16Uint) {
         compare::<u16>(&device, &queue, &mut report).await;
-        show(&report);
+        set_report(&report);
     }
     if renders(F::Rgba16Float) && renders(F::Rgba32Float) {
         compare::<f32>(&device, &queue, &mut report).await;
-        show(&report);
+        set_report(&report);
     }
     report += "| depth | windows | path | median | worst |\n";
-    for scene in [(60, 3), (1000, 9)] {
-        time(&device, &queue, scene, &mut report).await;
-        show(&report);
+    for scene in [(60, 3), (300, 9), (1000, 9)] {
+        report_timings(&device, &queue, scene, &mut report).await;
+        set_report(&report);
     }
     report += "done\n";
-    show(&report);
+    set_report(&report);
     let request = web_sys::RequestInit::new();
     request.set_method("POST");
     request.set_body(&JsValue::from_str(&report));
