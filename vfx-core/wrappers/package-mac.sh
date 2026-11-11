@@ -69,8 +69,9 @@ SH
 cleanup ofx "/Library/OFX/Plugins/SegcamMotionRust.ofx.bundle"
 cleanup adobe "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/SegcamMotionRust.plugin"
 # Resolume's v0.1.0 bundle has the same FFGL ID as segcam.bundle from the zip, and Resolume
-# keeps the one it loads first. So where the signed in user already put segcam.bundle, the
-# old one goes; where segcam.bundle isn't there yet, v0.1.0 stays as Resolume's only segcam.
+# keeps the one it loads first (seen once on the Mac, not checked further). So where the
+# signed in user already put segcam.bundle, the old one goes; where segcam.bundle isn't
+# there yet, v0.1.0 stays as Resolume's only segcam.
 mkdir -p "$work/scripts-resolume"
 cat >"$work/scripts-resolume/preinstall" <<'SH'
 #!/bin/sh
@@ -111,7 +112,7 @@ for crate in "${crates[@]}"; do
     choices+="  <pkg-ref id=\"$PLUGIN_ID.cleanup.ofx\" version=\"$version\">cleanup-ofx.pkg</pkg-ref>
   <pkg-ref id=\"$PLUGIN_ID.cleanup.adobe\" version=\"$version\">cleanup-adobe.pkg</pkg-ref>
   <pkg-ref id=\"$PLUGIN_ID.cleanup.resolume\" version=\"$version\">cleanup-resolume.pkg</pkg-ref>
-  <choice id=\"ofx\" title=\"DaVinci Resolve, Nuke and Natron (OpenFX)\" description=\"Adds $PLUGIN_NAME to DaVinci Resolve, Nuke and Natron.\" start_selected=\"$ofx_found\">
+  <choice id=\"ofx\" title=\"Resolve, Nuke and Natron (OpenFX)\" description=\"Adds $PLUGIN_NAME to DaVinci Resolve, Nuke and Natron.\" start_selected=\"$ofx_found\">
     <pkg-ref id=\"$PLUGIN_ID.cleanup.ofx\"/>
     <pkg-ref id=\"$PLUGIN_ID.cleanup.resolume\"/>
     <pkg-ref id=\"$PLUGIN_ID.ofx\"/>
