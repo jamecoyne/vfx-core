@@ -26,10 +26,6 @@ const STRAIGHT: u32 = 1;
 const MIRRORED: u32 = 2;
 const LIVE_WINDOWS: u32 = 4;
 
-/// How long a draw waits for the GPU before it fails.
-#[cfg(not(target_arch = "wasm32"))]
-const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
-
 #[derive(Debug)]
 pub enum DrawError {
     Poll(vfx_core::PollFailure),
@@ -460,7 +456,7 @@ struct Atlases {
 }
 
 /// Where a tile's pixels and title bar sit in the atlases: x, y and layer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Slot {
     /// `None` where the tile had no frame to be cut from.
     tile_at: Option<[u32; 3]>,
@@ -770,12 +766,49 @@ struct Targets {
 }
 
 /// The canvas as the host stores it, and the buffer it is read back through.
-struct Readback {
+pub struct Readback {
+    size: (u32, u32),
     format: wgpu::TextureFormat,
     packed: wgpu::TextureView,
     texture: wgpu::Texture,
     buffer: wgpu::Buffer,
     padded_row: u32,
+}
+
+impl Readback {
+    /// The buffer a draw's output is copied into, for the caller to map.
+    pub fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+
+    /// Copies the mapped buffer into `out` and unmaps it. An error where
+    /// `out` isn't the canvas it was made for.
+    pub fn copy_into<C: Channel>(&self, out: &mut ViewMut<C>) -> Result<(), DrawError> {
+        let same_canvas = self.size == (out.width as u32, out.height as u32)
+            && self.format == host_output(depth_index::<C>()).0;
+        if !same_canvas {
+            return Err(DrawError::NoReadback);
+        }
+        let mapped = self.buffer.slice(..).get_mapped_range();
+        let copied = mapped.map_err(DrawError::MappedRange).map(|mapped| {
+            let mapped: &[u8] = &mapped;
+            let row = out.width as usize * size_of::<Argb<C>>();
+            let threads =
+                vfx_plugin::vfx_host::worker_threads().clamp(1, out.height.max(1) as usize);
+            let bands = Mutex::new(out.bands(threads));
+            vfx_plugin::vfx_host::on_workers(threads, || {
+                while let Some(mut band) = bands.lock().ok().and_then(|mut bands| bands.pop()) {
+                    for y in band.rows() {
+                        let at = y as usize * self.padded_row as usize;
+                        let bytes: &mut [u8] = bytemuck::cast_slice_mut(band.row_mut(y));
+                        bytes.copy_from_slice(&mapped[at..at + row]);
+                    }
+                }
+            });
+        });
+        self.buffer.unmap();
+        copied
+    }
 }
 
 /// The frame as a texture, for the source backdrop and live windows.
@@ -836,6 +869,9 @@ pub struct SwarmPass {
     targets: Option<Targets>,
     /// Windows oldest first, then the same newest first.
     instances: Option<(wgpu::Buffer, u64)>,
+    /// How long a draw waits for the GPU before it fails.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    readback_timeout: Duration,
 }
 
 impl SwarmPass {
@@ -899,8 +935,13 @@ impl SwarmPass {
             frame: None,
             targets: None,
             instances: None,
+            readback_timeout: Duration::from_secs(1),
             shared,
         }
+    }
+
+    pub fn set_readback_timeout(&mut self, timeout: Duration) {
+        self.readback_timeout = timeout;
     }
 
     /// Blends in `composite`, or with `None` in what the canvas depth takes
@@ -1030,12 +1071,12 @@ impl SwarmPass {
             });
         let wait = wgpu::PollType::Wait {
             submission_index: Some(submitted),
-            timeout: Some(READBACK_TIMEOUT),
+            timeout: Some(self.readback_timeout),
         };
         vfx_core::poll_device(&self.shared.device, wait).map_err(DrawError::Poll)?;
         // Another drawer's poll may be the one that calls back, a moment
         // later.
-        match rx.recv_timeout(READBACK_TIMEOUT) {
+        match rx.recv_timeout(self.readback_timeout) {
             Ok(mapped) => mapped.map_err(DrawError::Map),
             Err(_) => Err(DrawError::MapTimeout),
         }
@@ -1051,30 +1092,24 @@ impl SwarmPass {
     pub fn copy_mapped<C: Channel>(&self, out: &mut ViewMut<C>) -> Result<(), DrawError> {
         let targets = self.targets.as_ref().ok_or(DrawError::NoReadback)?;
         let readback = targets.readback.as_ref().ok_or(DrawError::NoReadback)?;
-        let same_canvas = targets.size == (out.width as u32, out.height as u32)
-            && readback.format == host_output(depth_index::<C>()).0;
-        if !same_canvas {
-            return Err(DrawError::NoReadback);
+        readback.copy_into(out)
+    }
+
+    /// Takes the readback of the last [`Self::submit`] out, for a caller
+    /// that maps it across renders; the next submit makes another.
+    pub fn take_readback(&mut self) -> Option<Readback> {
+        self.targets.as_mut()?.readback.take()
+    }
+
+    /// Gives back an unmapped readback from [`Self::take_readback`], if the
+    /// canvas is still the one it was made for and has none.
+    pub fn restore_readback(&mut self, readback: Readback) {
+        if let Some(targets) = &mut self.targets
+            && targets.size == readback.size
+            && targets.readback.is_none()
+        {
+            targets.readback = Some(readback);
         }
-        let mapped = readback.buffer.slice(..).get_mapped_range();
-        let copied = mapped.map_err(DrawError::MappedRange).map(|mapped| {
-            let mapped: &[u8] = &mapped;
-            let row = out.width as usize * size_of::<Argb<C>>();
-            let threads =
-                vfx_plugin::vfx_host::worker_threads().clamp(1, out.height.max(1) as usize);
-            let bands = Mutex::new(out.bands(threads));
-            vfx_plugin::vfx_host::on_workers(threads, || {
-                while let Some(mut band) = bands.lock().ok().and_then(|mut bands| bands.pop()) {
-                    for y in band.rows() {
-                        let at = y as usize * readback.padded_row as usize;
-                        let bytes: &mut [u8] = bytemuck::cast_slice_mut(band.row_mut(y));
-                        bytes.copy_from_slice(&mapped[at..at + row]);
-                    }
-                }
-            });
-        });
-        readback.buffer.unmap();
-        copied
     }
 
     /// Submits the draw of `windows` over a canvas of `(w, h)` at depth `C`,
@@ -1490,6 +1525,7 @@ impl SwarmPass {
         });
         let targets = self.targets.as_mut().expect("the caller made them");
         targets.readback = Some(Readback {
+            size,
             format,
             packed: texture.create_view(&Default::default()),
             texture,
