@@ -254,8 +254,12 @@ begin
   if CurPageID = wpSelectComponents then
     PreselectApps;
   if CurPageID = wpFinished then
+  begin
     WizardForm.FinishedLabel.Caption :=
       '{#AppName} is installed. Restart any open apps, then find it here:' + #13#10 + WhereToFind;
+    // The label keeps the height of Inno's own text unless told.
+    WizardForm.FinishedLabel.AdjustHeight;
+  end;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
