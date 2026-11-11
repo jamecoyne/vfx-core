@@ -63,7 +63,7 @@ Name: "custom"; Description: "Custom"; Flags: iscustom
 
 ; A plugin is installed when its app is chosen, and an example when the example is too.
 [Components]
-Name: "ofx"; Description: "DaVinci Resolve, Nuke and Natron (OpenFX)"
+Name: "ofx"; Description: "Resolve, Nuke and Natron (OpenFX)"
 Name: "arena"; Description: "Resolume Arena"
 Name: "avenue"; Description: "Resolume Avenue"
 Name: "adobe"; Description: "After Effects and Premiere Pro"
@@ -132,12 +132,27 @@ begin
     or RegKeyExists(HKLM64, 'SOFTWARE\Adobe\Premiere Pro');
 end;
 
-// App is 'Resolume Arena' or 'Resolume Avenue', found by its program folder: v0.1.1 made
-// a Documents folder for Avenue on PCs without it. Resolume makes its Documents folder on
-// first start, so one that hasn't started yet finds the plugins there when it does.
+// True when Root holds an uninstall entry whose DisplayName starts with Prefix.
+function UninstallEntryExists(Root: Integer; Prefix: String): Boolean;
+var
+  Keys: TArrayOfString;
+  Name: String;
+  I: Integer;
+begin
+  Result := False;
+  if RegGetSubkeyNames(Root, 'Software\Microsoft\Windows\CurrentVersion\Uninstall', Keys) then
+    for I := 0 to GetArrayLength(Keys) - 1 do
+      if RegQueryStringValue(Root, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\'
+        + Keys[I], 'DisplayName', Name) and (Pos(Prefix, Name) = 1) then
+        Result := True;
+end;
+
+// App is 'Resolume Arena' or 'Resolume Avenue', found by its uninstall entry or its folder in
+// Program Files, not by its Documents folder: v0.1.1 made one for Avenue on PCs without it.
 function ResolumeFound(App: String): Boolean;
 begin
-  Result := ProgramFolderExists(App);
+  Result := ProgramFolderExists(App) or UninstallEntryExists(HKLM64, App)
+    or UninstallEntryExists(HKLM32, App) or UninstallEntryExists(HKCU, App);
 end;
 
 // The components an earlier install of this AppId chose, or '' for a first install.
@@ -164,10 +179,9 @@ begin
       Result := Copy(ParamStr(I), Length('/COMPONENTS=') + 1, MaxInt);
 end;
 
-// Apps, a component list from v0.1.1 or later, in this Setup's names. v0.1.1 had a
-// component for the lead effect itself, and one for both Resolumes, which now means the
-// Resolumes installed.
-function CurrentNames(Apps: String): String;
+// Maps v0.1.1 component names to this Setup's: ffgl to the Resolumes found, the lead
+// effect's own component dropped.
+function MigratedComponents(Apps: String): String;
 begin
   Result := ',' + Lowercase(Apps) + ',';
   StringChangeEx(Result, ',{#LowerCase(LeadFile)},', ',', True);
@@ -181,6 +195,14 @@ begin
     Delete(Result, 1, 1);
   while (Result <> '') and (Result[Length(Result)] = ',') do
     Delete(Result, Length(Result), 1);
+end;
+
+// True when a component list names an app, not only examples.
+function HasApp(Apps: String): Boolean;
+begin
+  Apps := ',' + Apps + ',';
+  Result := (Pos(',ofx,', Apps) > 0) or (Pos(',arena,', Apps) > 0)
+    or (Pos(',avenue,', Apps) > 0) or (Pos(',adobe,', Apps) > 0);
 end;
 
 function AppChosen: Boolean;
@@ -213,10 +235,8 @@ end;
 var
   AppsPreselected: Boolean;
 
-// Preselects what the command line or an earlier install chose, or else the apps Setup
-// found, once. Inno sets the list from the type after InitializeWizard, restores an earlier
-// choice only when its type still exists (v0.1.1's recommended and full are gone), and skips
-// names it doesn't know. So this runs when the page first shows, or in a silent install.
+// Preselects the command line's components, or an earlier install's with the apps found
+// when it named none, or the apps found; once, when the page shows or Setup runs silent.
 procedure PreselectApps;
 var
   Apps: String;
@@ -225,14 +245,16 @@ begin
     Exit;
   AppsPreselected := True;
   Apps := CommandLineComponents;
-  if Apps = '' then
-  begin
-    Apps := CurrentNames(PreviousComponents);
-    if Apps = '' then
-      Apps := FoundApps;
-  end
+  if Apps <> '' then
+    Apps := MigratedComponents(Apps)
   else
-    Apps := CurrentNames(Apps);
+  begin
+    Apps := MigratedComponents(PreviousComponents);
+    if Apps = '' then
+      Apps := FoundApps
+    else if not HasApp(Apps) then
+      Apps := FoundApps + ',' + Apps;
+  end;
   if Apps <> '' then
     WizardSelectComponents(Apps);
 end;
@@ -255,8 +277,14 @@ begin
     PreselectApps;
   if CurPageID = wpFinished then
   begin
-    WizardForm.FinishedLabel.Caption :=
-      '{#AppName} is installed. Restart any open apps, then find it here:' + #13#10 + WhereToFind;
+    // When Windows must restart, Inno's text about it stays and the apps follow.
+    if WizardForm.YesRadio.Visible then
+      WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10
+        + 'Then find {#AppName} here:' + #13#10 + WhereToFind
+    else
+      WizardForm.FinishedLabel.Caption :=
+        '{#AppName} is installed. Restart any open apps, then find it here:' + #13#10
+        + WhereToFind;
     // The label keeps the height of Inno's own text unless told.
     WizardForm.FinishedLabel.AdjustHeight;
   end;
@@ -284,7 +312,7 @@ end;
 
 procedure InitializeWizard;
 begin
-  if not OfxAppFound then MarkNotFound('DaVinci Resolve, Nuke and Natron (OpenFX)');
+  if not OfxAppFound then MarkNotFound('Resolve, Nuke and Natron (OpenFX)');
   if not ResolumeFound('Resolume Arena') then MarkNotFound('Resolume Arena');
   if not ResolumeFound('Resolume Avenue') then MarkNotFound('Resolume Avenue');
   if not AdobeAppFound then MarkNotFound('After Effects and Premiere Pro');
