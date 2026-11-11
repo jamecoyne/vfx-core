@@ -176,7 +176,6 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
         Err(e) => panic!("{e}"),
     }
     gpu.use_gpu(true);
-    gpu.set_gpu_min_coverage(0.0);
     let mut a = vec![Argb::<C>::default(); (w * h) as usize];
     let mut b = a.clone();
     for n in 0..frames.len() {

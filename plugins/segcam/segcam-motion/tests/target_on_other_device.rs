@@ -50,7 +50,7 @@ fn target_on_unshared_device_is_declined() {
         .set("output", ParamValue::Int(3))
         .expect("segcam's output parameter");
     let target = Frame::new(&host, W as u32, H as u32, wgpu::TextureFormat::Rgba32Float);
-    let mut effect = SegcamMotion::with_gpu_min_coverage(0.0);
+    let mut effect = SegcamMotion::with_gpu(true);
     let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
     for n in 0..12 {
         let ctx = Context {

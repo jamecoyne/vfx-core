@@ -2185,7 +2185,7 @@ mod tests {
             "| depth | windows | path | median | worst | submit | wait | copy | fragments per \
              pixel |"
         );
-        // From under the switch points in `incremental.rs` to the 591 stacked windows.
+        // From coverage 0.16 to the 591 stacked windows.
         let scenes = [
             (8, 1),
             (20, 1),

@@ -82,9 +82,8 @@ tiles the pile still draws, so a setting changed live reaches new windows only. 
 exactly still counts as one frame (`History::drop_repeat`), and its windows stay until it changes.
 
 In Resolume on Windows the swarm draws straight into the frame Resolume shows
-(`CpuEffect::render_to`) on the device the plugin shares with Resolume, with no readback. On this
-path the swarm always draws on the GPU, since the window coverage threshold for the CPU draw was set
-by the readback's cost. The output is byte identical to the swarm read back. A frame drawn on the
+(`CpuEffect::render_to`) on the device the plugin shares with Resolume, with no readback. The
+output is byte identical to the swarm read back. A frame drawn on the
 CPU, while the device opens or after a fault, goes through RAM.
 
 ### Device loss

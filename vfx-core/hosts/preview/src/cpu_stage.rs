@@ -648,13 +648,13 @@ mod tests {
         gpu.share();
         segcam_motion::gpu::status().expect("segcam draws on the shared device");
         let (w, h) = (320usize, 180usize);
-        let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu_min_coverage(0.0)));
+        let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu(true)));
         let stage = || {
             let effect = CpuInstance::new(make, true).expect("a CPU effect");
             CpuStage::new(&gpu, effect, (w as u32, h as u32))
         };
         let (mut drawn, mut in_ram) = (stage(), stage());
-        let mut values = ParamValues::new(SegcamMotion::with_gpu_min_coverage(0.0).params());
+        let mut values = ParamValues::new(SegcamMotion::with_gpu(true).params());
         for (name, value) in [
             ("output", ParamValue::Int(3)),
             ("detect", ParamValue::Int(0)),

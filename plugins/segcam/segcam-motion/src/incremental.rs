@@ -120,8 +120,6 @@ pub struct IncrementalRenderer {
     gpu_wanted: bool,
     /// Suppresses repeat logs of the same message.
     last_reported_fault: Option<String>,
-    /// See [`Self::set_gpu_min_coverage`].
-    gpu_min_coverage: Option<f64>,
     /// The last render's draw hasn't been read back from the GPU yet (browsers).
     unfinished: bool,
     /// `None` before the first render.
@@ -231,23 +229,6 @@ struct BudgetedReads {
     deferred: Vec<i64>,
 }
 
-/// Below these coverages a read back canvas draws on the CPU; BENCHMARK.md
-/// gives the crossings. Coverage is window pixels with shadow over canvas
-/// pixels, overlaps included.
-#[cfg(not(target_arch = "wasm32"))]
-const GPU_MIN_COVERAGE_8_BIT: f64 = 0.5;
-#[cfg(not(target_arch = "wasm32"))]
-const GPU_MIN_COVERAGE_16_BIT: f64 = 1.15;
-#[cfg(not(target_arch = "wasm32"))]
-const GPU_MIN_COVERAGE_FLOAT: f64 = 1.5;
-// The browser CPU path runs on one thread, so the GPU draws every swarm there.
-#[cfg(target_arch = "wasm32")]
-const GPU_MIN_COVERAGE_8_BIT: f64 = 0.0;
-#[cfg(target_arch = "wasm32")]
-const GPU_MIN_COVERAGE_16_BIT: f64 = 0.0;
-#[cfg(target_arch = "wasm32")]
-const GPU_MIN_COVERAGE_FLOAT: f64 = 0.0;
-
 /// What a frame without a cached analysis draws from.
 static NO_SEGMENTS: Segmentation = Segmentation {
     blobs: Vec::new(),
@@ -282,12 +263,6 @@ impl IncrementalRenderer {
     /// The drawer, once a render has drawn on the GPU.
     pub fn drawer(&self) -> Option<&Drawer> {
         self.drawer.as_deref()
-    }
-
-    /// Minimum window coverage for drawing on the GPU; 0 always draws there. Defaults depend on
-    /// canvas depth.
-    pub fn set_gpu_min_coverage(&mut self, min_coverage: f64) {
-        self.gpu_min_coverage = Some(min_coverage);
     }
 
     /// Whether the last render is still waiting on the GPU (see
@@ -1070,33 +1045,18 @@ impl IncrementalRenderer {
             self.draw_cpu(s, count, number, frame, out);
             return Ok(());
         }
-        // Choose by this render's windows alone, so cached and cold renders match. The thresholds
-        // reflect readback cost, so drawing directly into a host frame always uses the GPU.
         let (w, h) = (out.width, out.height);
-        let canvas_pixels = i64::from(w) * i64::from(h);
-        let default = match size_of::<C>() {
-            1 => GPU_MIN_COVERAGE_8_BIT,
-            2 => GPU_MIN_COVERAGE_16_BIT,
-            _ => GPU_MIN_COVERAGE_FLOAT,
-        };
         let into_target = self.can_draw_into_target::<C>(drawer, (w, h));
-        let min_coverage_permille = match into_target {
-            true => 0,
-            false => (self.gpu_min_coverage.unwrap_or(default) * 1000.0).round() as i64,
-        };
         let m = SwarmMetrics::new(h);
         let shadow = swarm::shadow_kernel(m.scale);
         let pile = build_pile(&self.kept, s, count, number, w, h);
         let mut visible: Vec<PileEntry> = pile.visible_entries().collect();
         self.atlas
             .leave_out_dropped(&mut visible, self.source_is_live);
-        let window_pixel_count = window_pixels(visible.iter().map(|p| p.tile), &m, &shadow, w, h);
-        let enough_windows = window_pixel_count * 1000 >= canvas_pixels * min_coverage_permille;
         let live = self.source_is_live;
-        if !enough_windows
-            || !self
-                .atlas
-                .place(&self.kept, &visible, drawer, (w, h), live)?
+        if !self
+            .atlas
+            .place(&self.kept, &visible, drawer, (w, h), live)?
         {
             let motion = cached_analysis(&self.kept, number, &analysis_key(s, number, first))
                 .unwrap_or(&NO_SEGMENTS);
@@ -1346,25 +1306,6 @@ fn build_pile<'a>(
         }
     }
     pile
-}
-
-/// The pixels the swarm's windows draw: each with its shadow, clipped to the canvas, overlaps
-/// counted.
-fn window_pixels<'t>(
-    tiles: impl Iterator<Item = &'t Tile>,
-    m: &SwarmMetrics,
-    shadow: &swarm::ShadowKernel,
-    width: i32,
-    height: i32,
-) -> i64 {
-    let canvas = PixelRect::new(0, 0, width, height);
-    tiles
-        .map(|t| {
-            let window = swarm::window_rect(t.content_rect, m.title_height);
-            let r = crate::render::intersect(shadow.shadow_rect(window), canvas);
-            i64::from(r.w) * i64::from(r.h)
-        })
-        .sum()
 }
 
 /// The cache key of `frame` in a render whose frames start at `first`.
@@ -2205,7 +2146,6 @@ mod tests {
     fn on_device(dev: &Arc<gpu::GpuContext>) -> IncrementalRenderer {
         let mut on_gpu = IncrementalRenderer::default();
         on_gpu.use_drawer(gpu::Drawer::new(dev.clone()).expect("a drawer on a working device"));
-        on_gpu.set_gpu_min_coverage(0.0);
         on_gpu
     }
 
@@ -2267,7 +2207,6 @@ mod tests {
             ..Default::default()
         };
         on_gpu.use_gpu(true);
-        on_gpu.set_gpu_min_coverage(0.0);
         for n in 0..7 {
             render(&mut cpu, &frames, n);
             render(&mut on_gpu, &frames, n);
@@ -3062,7 +3001,6 @@ mod tests {
             ..Default::default()
         };
         state.use_gpu(true);
-        state.set_gpu_min_coverage(0.0);
         render_converting(&mut state, &frames, n);
         let (on_first, converted) = render_converting(&mut state, &frames, n);
         assert_eq!(converted, [n], "nothing changed");
@@ -3314,7 +3252,6 @@ mod tests {
         let initial_texels = drawer.atlas_texels().0;
         let mut on_gpu = IncrementalRenderer::default();
         on_gpu.use_drawer(drawer);
-        on_gpu.set_gpu_min_coverage(0.0);
         for n in 0..frames.len() {
             render(&mut on_gpu, &frames, n);
         }
@@ -3356,7 +3293,6 @@ mod tests {
         drawer.limit_tile_atlas(64, 2);
         let mut state = IncrementalRenderer::default();
         state.use_drawer(drawer);
-        state.set_gpu_min_coverage(0.0);
         let s = RenderSettings {
             mode: OutputMode::Swarm,
             background_frames: 4,
@@ -3395,7 +3331,6 @@ mod tests {
         drawer.limit_tile_atlas(64, 2);
         let mut state = IncrementalRenderer::default();
         state.use_drawer(drawer);
-        state.set_gpu_min_coverage(0.0);
         let s = swarm_settings();
         let needed = crate::previous_frames_needed(&s) as usize;
         let mut history = vfx_core::cpu::History::<u8>::default();
@@ -3428,7 +3363,6 @@ mod tests {
         drawer.limit_tile_atlas(64, 2);
         let mut on_gpu = IncrementalRenderer::default();
         on_gpu.use_drawer(drawer);
-        on_gpu.set_gpu_min_coverage(0.0);
         for n in 0..frames.len() {
             let (a, b) = (
                 render(&mut cpu, &frames, n),

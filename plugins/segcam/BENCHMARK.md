@@ -154,6 +154,7 @@ atlas.
 | 16 bit | 60 | 1.17 | 5.50 ms | 2.17 ms | 5.55 ms |
 | 16 bit | 100 | 1.95 | 8.75 ms | 2.34 ms | 5.48 ms |
 | 16 bit | 591 | 47.79 | 204.90 ms | 3.27 ms | 9.20 ms |
+| float | 20 | 0.39 | 1.74 ms | 4.25 ms | 8.57 ms |
 | float | 60 | 1.17 | 3.46 ms | 4.38 ms | 9.33 ms |
 | float | 100 | 1.95 | 5.24 ms | 4.49 ms | 9.54 ms |
 | float | 49 | 2.75 | 7.62 ms | 4.41 ms | 8.38 ms |
@@ -163,12 +164,9 @@ atlas.
 Drawn straight into an RGBA8 host frame, with no readback: 0.15 ms at 49 windows and 0.36 ms at
 591 on the RTX 4070, 1.63 ms and 5.41 ms on the UHD 770.
 
-CPU and GPU cross at about 0.16 (RTX 4070) and 0.75 (UHD 770) at 8 bit, 0.33 and 1.15 at 16 bit,
-1.65 and 3.0 in float. Below `GPU_MIN_COVERAGE_8_BIT` (0.5), `GPU_MIN_COVERAGE_16_BIT` (1.15) and
-`GPU_MIN_COVERAGE_FLOAT` (1.5) in `src/incremental.rs` a read back canvas draws on the CPU; a draw
-into a host frame always takes the GPU. The 16 bit one is the UHD 770's crossing, so above it the
-GPU is the faster on both cards. The CPU rows can differ by up to a factor of two between runs of
-the same scene, so the crossings are ranges.
+With a GPU every Swarm render draws on it; at low coverage that costs at most about 7 ms more than
+the CPU would (UHD 770, float, 20 windows: 8.57 against 1.74 ms). The CPU rows can differ by up to a
+factor of two between runs of the same scene.
 
 `tests/gpu.rs` allows 1 pixel in 10,000, at least 4, off by over half a level. The 1080p clip's
 cases measured at most 8 of 2,073,600 on an RTX 4070.
