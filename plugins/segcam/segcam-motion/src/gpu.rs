@@ -50,7 +50,8 @@ impl GpuContext {
         self.faults.errors()
     }
 
-    /// Makes the device report a validation error: a buffer mapped for reading and writing.
+    /// Makes the device report a validation error: a buffer mapped for reading and
+    /// writing.
     #[cfg(test)]
     pub(crate) fn misuse(&self) {
         use wgpu::BufferUsages as U;
@@ -618,7 +619,8 @@ impl GpuContext {
     }
 }
 
-/// Per effect instance GPU state: the swarm's atlases and targets, and the fault history.
+/// Per effect instance GPU state: the swarm's atlases and targets, and the
+/// fault history.
 pub struct Drawer {
     // Drops before `dev`: it holds the device too, and a retired device has
     // to go last, on `retire`'s thread.
@@ -646,7 +648,8 @@ pub struct Drawer {
     superseded_draws: u32,
 }
 
-/// A submitted draw awaiting readback: what it drew, its readback and map state.
+/// A submitted draw awaiting readback: what it drew, its readback and map
+/// state.
 #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
 struct InFlightDraw {
     key: u64,
@@ -753,8 +756,8 @@ impl Drawer {
         self.pass.atlas_growing()
     }
 
-    /// A tile atlas of `side` texels square that grows to `layers` layers and no further,
-    /// for a new drawer.
+    /// A tile atlas of `side` texels square that grows to `layers` layers and no
+    /// further, for a new drawer.
     #[cfg(test)]
     pub(crate) fn limit_tile_atlas(&mut self, side: u32, layers: u32) {
         self.pass.limit_tile_atlas(side, layers);
@@ -796,8 +799,9 @@ impl Drawer {
         Ok(())
     }
 
-    /// Puts a frame's tiles in the atlases: their pixels as the CPU cut them and their title
-    /// bars for a `canvas` (width, height). `None` if an atlas is full or still growing.
+    /// Puts a frame's tiles in the atlases: their pixels as the CPU cut them and
+    /// their title bars for a `canvas` (width, height). `None` if an atlas is full
+    /// or still growing.
     pub fn upload_tiles(
         &mut self,
         tiles: &[Tile],
@@ -854,9 +858,10 @@ impl Drawer {
         Ok(())
     }
 
-    /// [`Drawer::draw_swarm`] without waiting: the draw is submitted and mapped, and this
-    /// render is left [`unfinished`](Self::unfinished). The next render that asks for the
-    /// same draw reads it back into `out`; one that asks for another drops it.
+    /// [`Drawer::draw_swarm`] without waiting: the draw is submitted and mapped,
+    /// and this render is left [`unfinished`](Self::unfinished). The next render
+    /// that asks for the same draw reads it back into `out`; one that asks for
+    /// another drops it.
     #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn draw_swarm_deferred<'t, C: Channel>(
         &mut self,
@@ -941,9 +946,10 @@ impl Drawer {
         Ok(())
     }
 
-    /// Draws the swarm as [`Drawer::draw_swarm`] does, into `target`, a host's frame on this
-    /// device the size of the canvas, with no readback: the host's work that shows `target`
-    /// comes after it on the same queue, so nothing here waits. An 8-bit canvas only.
+    /// Draws the swarm as [`Drawer::draw_swarm`] does, into `target`, a host's
+    /// frame on this device the size of the canvas, with no readback: the host's
+    /// work that shows `target` comes after it on the same queue, so nothing here
+    /// waits. An 8-bit canvas only.
     pub fn draw_swarm_into<'t, C: Channel>(
         &mut self,
         target: &vfx_core::Frame,
@@ -985,7 +991,8 @@ mod tests {
         std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default()
     }
 
-    /// A drawer and a 30 window scene to draw with it: the tiles, their slots and the kernel.
+    /// A drawer and a 30 window scene to draw with it: the tiles, their slots and
+    /// the kernel.
     fn drawer_with_scene() -> (Drawer, Vec<Tile>, AtlasAllocation, Arc<ShadowKernel>) {
         use crate::swarm_pass::scene::{trail_tiles, visible};
         let opened = open(&adapter_choice()).or_else(|_| open("fallback"));
@@ -1013,7 +1020,8 @@ mod tests {
         }
     }
 
-    /// The draw a browser makes, with the polls its event loop would run in between.
+    /// The draw a browser makes, with the polls its event loop would run in
+    /// between.
     #[test]
     fn deferred_swarm_draw_matches_waiting_draw() {
         let _lock = gpu_test_lock();

@@ -2217,9 +2217,10 @@ mod tests {
         state.drawer().map_or(0, |d| d.faults)
     }
 
-    /// Whether `b` is as near `a`, the CPU's picture, as SPEC F8 holds an 8-bit swarm drawn on
-    /// the GPU to: every channel within 6 levels, and of 10,000 pixels at most 300 off at all and
-    /// 30 off by over a level (at least 4 of each, for small canvases).
+    /// Whether `b` is as near `a`, the CPU's picture, as SPEC F8 holds an 8-bit
+    /// swarm drawn on the GPU to: every channel within 6 levels, and of 10,000
+    /// pixels at most 300 off at all and 30 off by over a level (at least 4 of
+    /// each, for small canvases).
     fn within_gpu_bound(a: &[Argb<u8>], b: &[Argb<u8>]) -> bool {
         let apart = |(p, q): (&Argb<u8>, &Argb<u8>)| {
             let channels = [
