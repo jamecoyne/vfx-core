@@ -104,12 +104,12 @@ In Resolve the effect is in the Effects library under Open FX, Filters, $PLUGIN_
 
 zip_host Resolume "$PLUGIN_NAME for Resolume Arena and Avenue (FFGL), Windows 64 bit, version $version
 
+Resolume makes its Documents folder the first time it starts.
 Copy $PLUGIN_FILE.dll into
 Documents\\Resolume Arena\\Extra Effects
 (Documents\\Resolume Avenue\\Extra Effects for Avenue).
 $with_dxc
 Delete SegcamMotionRust.dll from that folder if it is there: it is v0.1.0.
-Resolume makes its Documents folder the first time it starts.
 Then restart Resolume. The effect is in the Effects browser as $PLUGIN_SHORT_NAME." \
   "$out/$PLUGIN_FILE.dll" "${dxc_files[@]}"
 
@@ -123,25 +123,21 @@ MediaCore\\SegcamMotionRust if it is there: it is v0.1.0.
 Then restart After Effects. The effect is in the Effect menu under $PLUGIN_CATEGORY." \
   "$out/$PLUGIN_FILE.aex" "${dxc_files[@]}"
 
-# The installer's effects: segcam's component is fixed, the others are examples to choose.
+# The installer's effects: segcam installs for every app chosen, the others are examples to
+# choose.
 effects="$out/effects.iss"
 template="$(cygpath -w "$here/installer-effect-win.iss")"
 {
   for crate in "${crates[@]}"; do
     identity "$crate"
-    component="${PLUGIN_FILE,,}"
-    [ "$crate" = "$lead" ] || component="examples\\$component"
     echo "#define PluginFile \"$PLUGIN_FILE\""
-    echo "#define PluginName \"$PLUGIN_NAME\""
-    echo "#define Component \"$component\""
     if [ "$crate" = "$lead" ]; then
-      echo "#define Lead"
       echo "#include \"$template\""
-      echo "#undef Lead"
-      echo "[Components]"
-      echo "Name: \"examples\"; Description: \"Example effects\"; Types: full"
     else
+      echo "#define Component \"examples\\${PLUGIN_FILE,,}\""
+      echo "#define PluginName \"$PLUGIN_NAME\""
       echo "#include \"$template\""
+      echo "#undef Component"
     fi
   done
 } >"$effects"
@@ -149,7 +145,8 @@ template="$(cygpath -w "$here/installer-effect-win.iss")"
 identity "$lead"
 name="$PLUGIN_FILE-$version-Windows-Setup"
 "$iscc" -Q "-DVersion=$version" "-DSource=$(cygpath -w "$out")" "-DEffects=$(cygpath -w "$effects")" \
-  "-DAppName=$PLUGIN_NAME" "-DPublisher=$PLUGIN_CATEGORY" "-DAppGuid=$WINDOWS_INSTALLER_ID" \
+  "-DAppName=$PLUGIN_NAME" "-DLeadFile=$PLUGIN_FILE" "-DPublisher=$PLUGIN_CATEGORY" \
+  "-DCategory=$PLUGIN_CATEGORY" "-DAppGuid=$WINDOWS_INSTALLER_ID" \
   ${TEST_ROOT:+"-DTestRoot=$TEST_ROOT"} "-O$(cygpath -w "$out")" "-F$name" \
   "$(cygpath -w "$here/installer-win.iss")"
 echo "$out/$name.exe"
