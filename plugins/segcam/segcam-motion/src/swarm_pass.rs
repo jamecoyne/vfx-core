@@ -559,10 +559,14 @@ fn depth_index<C: Channel>() -> u32 {
     }
 }
 
-/// What a canvas of `depth` is blended in unless told otherwise.
-fn own_composite(depth: u32) -> Composite {
+/// What a canvas of `depth` is blended in on `device` unless told otherwise:
+/// 8-bit canvases in 8 bits, the others in 32-bit float where the device
+/// blends it and in half float where it doesn't.
+fn own_composite(device: &wgpu::Device, depth: u32) -> Composite {
+    let float_blend = wgpu::Features::FLOAT32_BLENDABLE;
     match depth {
         0 => Composite::Unorm8,
+        _ if device.features().contains(float_blend) => Composite::Float,
         _ => Composite::HalfFloat,
     }
 }
@@ -636,7 +640,7 @@ impl SwarmPipelines {
     /// depth's own composite, which the first such draw otherwise does.
     pub fn prepare<C: Channel>(&self) {
         let depth = depth_index::<C>();
-        self.compose(own_composite(depth).format());
+        self.compose(own_composite(&self.device, depth).format());
         let (format, entry) = host_output(depth);
         self.output(format, entry);
     }
@@ -945,13 +949,14 @@ impl SwarmPass {
     }
 
     /// Blends in `composite`, or with `None` in what the canvas depth takes
-    /// by itself: 8 bit for 8-bit canvases and half float for the others.
+    /// by itself on this device.
     pub fn set_composite(&mut self, composite: Option<Composite>) {
         self.composite = composite;
     }
 
     fn composite_at(&self, depth: u32) -> Composite {
-        self.composite.unwrap_or(own_composite(depth))
+        self.composite
+            .unwrap_or(own_composite(&self.shared.device, depth))
     }
 
     /// Puts a frame's tiles in the atlases: their pixels as the CPU cut them
@@ -2273,12 +2278,12 @@ mod tests {
         use wgpu::TextureFormat::{Rgba8Unorm, Rgba32Float};
         // The same values in the frame's format.
         let exact = 1e-6;
-        // One side rounds to 8 bits, or the 16-bit readback to its own, and
-        // the other keeps the composite's value.
+        // One side rounds to its 8 or 16 bits and the other keeps the
+        // composite's value.
         let (level_8, level_16) = (0.6 / 255.0, 0.6 / 32768.0);
         compare_into_frame::<u8>(&gpu, Rgba8Unorm, None, exact);
         compare_into_frame::<u8>(&gpu, Rgba8Unorm, Some(Composite::HalfFloat), exact);
-        compare_into_frame::<u8>(&gpu, Rgba32Float, None, level_8);
+        compare_into_frame::<u8>(&gpu, Rgba32Float, None, exact);
         compare_into_frame::<u16>(&gpu, Rgba8Unorm, None, level_8);
         compare_into_frame::<u16>(&gpu, Rgba32Float, None, level_16);
         compare_into_frame::<f32>(&gpu, Rgba8Unorm, None, level_8);

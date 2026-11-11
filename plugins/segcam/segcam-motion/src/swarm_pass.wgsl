@@ -223,13 +223,19 @@ fn fs_backdrop(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
     return c;
 }
 
-// The composited pixel as the host stores it: (alpha, red, green, blue).
+// The composited pixel as the host stores it: (alpha, red, green, blue). An
+// 8-bit canvas is rounded here as the CPU rounds, so every target, whatever
+// its format and its own rounding, gets the same levels.
 fn host_pixel(position: vec4<f32>) -> vec4<f32> {
     let c = textureLoad(composed, vec2<i32>(position.xy), 0);
+    var pixel = c.argb;
     if has(STRAIGHT) && c.a > 0.0 && c.a < 1.0 {
-        return vec4(c.a, c.rgb / c.a);
+        pixel = vec4(c.a, c.rgb / c.a);
     }
-    return c.argb;
+    if g.depth == 0u {
+        pixel = floor(clamp(pixel, vec4(0.0), vec4(1.0)) * 255.0 + 0.5) / 255.0;
+    }
+    return pixel;
 }
 
 @fragment

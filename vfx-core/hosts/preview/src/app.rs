@@ -194,9 +194,12 @@ async fn open_device(
     };
     // Spout input imports D3D11 textures into a Vulkan device through this extension.
     #[cfg(windows)]
-    let required_features = adapter.features() & wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+    let interop = adapter.features() & wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
     #[cfg(not(windows))]
-    let required_features = wgpu::Features::empty();
+    let interop = wgpu::Features::empty();
+    // Effects blend in 32-bit float targets where the adapter can.
+    let float_blend = adapter.features() & wgpu::Features::FLOAT32_BLENDABLE;
+    let required_features = interop | float_blend;
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             required_features,
