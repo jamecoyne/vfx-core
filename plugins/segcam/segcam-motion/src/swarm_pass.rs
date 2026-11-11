@@ -42,6 +42,12 @@ pub enum DrawError {
     NoReadback,
     /// The queue had no staging memory for the frame.
     NoStagingMemory,
+    /// The canvas is larger than the device's largest texture.
+    CanvasTooLarge {
+        width: u32,
+        height: u32,
+        limit: u32,
+    },
 }
 
 impl fmt::Display for DrawError {
@@ -53,6 +59,14 @@ impl fmt::Display for DrawError {
             Self::MapTimeout => write!(f, "the readback timed out"),
             Self::NoReadback => write!(f, "no draw is waiting to be read back"),
             Self::NoStagingMemory => write!(f, "no staging memory for the frame"),
+            Self::CanvasTooLarge {
+                width,
+                height,
+                limit,
+            } => write!(
+                f,
+                "a {width} x {height} canvas is over the GPU's {limit} texels a side"
+            ),
         }
     }
 }
@@ -866,7 +880,7 @@ impl SwarmPass {
         let bars = Atlas::new(
             device,
             "segcam title bar atlas",
-            F::Rgba32Float,
+            F::Rgba8Unorm,
             (1024, 256),
             limits,
         );
@@ -934,7 +948,11 @@ impl SwarmPass {
                 let texels = bytemuck::cast_slice(&tile.pixels);
                 write_layer(queue, &atlases.tiles.texture, at, (w, h), texels);
             }
-            let texels: Vec<[f32; 4]> = bar.pixels.iter().map(|c| [c.r, c.g, c.b, 1.0]).collect();
+            let texels: Vec<[u8; 4]> = bar
+                .pixels
+                .iter()
+                .map(|c| [c.r, c.g, c.b, 1.0].map(u8::from_unit))
+                .collect();
             let size = (bar.width as u32, bar_height);
             let texels = bytemuck::cast_slice(&texels);
             write_layer(queue, &atlases.bars.texture, bar_at, size, texels);
@@ -1175,6 +1193,15 @@ impl SwarmPass {
         s: &RenderSettings,
         shadow: &ShadowKernel,
     ) -> Result<Draw, DrawError> {
+        let limit = self.shared.device.limits().max_texture_dimension_2d;
+        let (width, height) = (w as u32, h as u32);
+        if width > limit || height > limit {
+            return Err(DrawError::CanvasTooLarge {
+                width,
+                height,
+                limit,
+            });
+        }
         let depth = depth_index::<C>();
         let m = SwarmMetrics::new(h);
         let mut instances: Vec<WindowInstance> = (0..)
@@ -2094,13 +2121,15 @@ mod tests {
         time_draws::<f32>(&device, &queue, 60, 3, false, 300);
     }
 
-    /// The pixels of `frame`, an RGBA8 frame, as the host stores a canvas.
+    /// The texels of `frame`, RGBA8 or RGBA32F, as red, green, blue and alpha
+    /// units.
     fn read_frame(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         frame: &vfx_core::Frame,
-    ) -> Vec<Argb<u8>> {
-        let row = (frame.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    ) -> Vec<[f32; 4]> {
+        let texel = frame.format.block_copy_size(None).expect("a colour format");
+        let row = (frame.width * texel).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: u64::from(row) * u64::from(frame.height),
@@ -2126,18 +2155,77 @@ mod tests {
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("the device answers");
         let mapped = buffer.slice(..).get_mapped_range().expect("it mapped");
-        mapped
-            .chunks(row as usize)
-            .flat_map(|row| &row[..frame.width as usize * 4])
-            .collect::<Vec<_>>()
-            .chunks(4)
-            .map(|p| Argb {
-                alpha: *p[3],
-                red: *p[0],
-                green: *p[1],
-                blue: *p[2],
-            })
-            .collect()
+        let used = (frame.width * texel) as usize;
+        let mut texels = Vec::with_capacity((frame.width * frame.height) as usize);
+        for row in mapped.chunks(row as usize) {
+            if frame.format == wgpu::TextureFormat::Rgba32Float {
+                let units: &[[f32; 4]] = bytemuck::cast_slice(&row[..used]);
+                texels.extend_from_slice(units);
+            } else {
+                let bytes: &[[u8; 4]] = bytemuck::cast_slice(&row[..used]);
+                texels.extend(bytes.iter().map(|t| t.map(u8::to_unit)));
+            }
+        }
+        texels
+    }
+
+    /// Holds [`SwarmPass::submit_into`] a frame of `format` to
+    /// [`SwarmPass::draw`] for each swarm case at depth `C`, within
+    /// `tolerance` units a channel.
+    fn compare_into_frame<C: Channel>(
+        gpu: &vfx_core::Gpu,
+        format: wgpu::TextureFormat,
+        composite: Option<Composite>,
+        tolerance: f32,
+    ) {
+        let (w, h) = (640, 360);
+        let shadow = shadow_kernel(SwarmMetrics::new(h).scale);
+        let target = vfx_core::Frame::new(gpu, w as u32, h as u32, format);
+        for (name, s) in cases() {
+            let tiles = trail_tiles::<C>((w, h), 12, 3, s.mirror);
+            let windows = visible(&tiles, (w, h), s.max_tiles);
+            let pixels = frame_pixels::<C>(w, h, 12);
+            let frame = View::from_pixels(&pixels, w, h);
+            let mut pass = SwarmPass::new(SwarmPipelines::new(&gpu.device, &gpu.queue));
+            pass.set_composite(composite);
+            let placed = pass
+                .upload_tiles(&tiles, h)
+                .expect("the atlas holds the tiles");
+            let slots = || windows.iter().map(|&(i, tile)| (tile, placed.slots[i]));
+            let mut read_back = vec![Argb::<C>::default(); (w * h) as usize];
+            pass.draw(
+                &mut ViewMut::from_pixels(&mut read_back, w, h),
+                slots(),
+                Some(&frame),
+                &s,
+                &shadow,
+                Occlusion::Depth,
+            )
+            .expect("the draw comes back");
+            pass.submit_into(
+                &target,
+                slots(),
+                Some(&frame),
+                &s,
+                &shadow,
+                Occlusion::Depth,
+            )
+            .expect("the draw is accepted");
+            let in_frame = read_frame(&gpu.device, &gpu.queue, &target);
+            let apart = read_back
+                .iter()
+                .zip(&in_frame)
+                .flat_map(|(p, t)| {
+                    let units = [p.red, p.green, p.blue, p.alpha].map(C::to_unit);
+                    std::array::from_fn::<f32, 4, _>(|i| (units[i] - t[i]).abs())
+                })
+                .fold(0.0, f32::max);
+            let bits = 8 * size_of::<C>();
+            assert!(
+                apart <= tolerance,
+                "{bits} bit {name} into {format:?}, composite {composite:?}: {apart} units apart"
+            );
+        }
     }
 
     #[test]
@@ -2145,46 +2233,59 @@ mod tests {
     fn submit_into_matches_draw() {
         let _lock = gpu::gpu_test_lock();
         let (_, device, queue) = open(wgpu::Limits::default());
-        let gpu = vfx_core::Gpu::from_parts(device.clone(), queue.clone());
-        let (w, h) = (640, 360);
+        let gpu = vfx_core::Gpu::from_parts(device, queue);
+        use wgpu::TextureFormat::{Rgba8Unorm, Rgba32Float};
+        // The same values in the frame's format.
+        let exact = 1e-6;
+        // One side rounds to 8 bits, or the 16-bit readback to its own, and
+        // the other keeps the composite's value.
+        let (level_8, level_16) = (0.6 / 255.0, 0.6 / 32768.0);
+        compare_into_frame::<u8>(&gpu, Rgba8Unorm, None, exact);
+        compare_into_frame::<u8>(&gpu, Rgba8Unorm, Some(Composite::HalfFloat), exact);
+        compare_into_frame::<u8>(&gpu, Rgba32Float, None, level_8);
+        compare_into_frame::<u16>(&gpu, Rgba8Unorm, None, level_8);
+        compare_into_frame::<u16>(&gpu, Rgba32Float, None, level_16);
+        compare_into_frame::<f32>(&gpu, Rgba8Unorm, None, level_8);
+        compare_into_frame::<f32>(&gpu, Rgba32Float, None, exact);
+    }
+
+    #[test]
+    #[ignore = "SWARM_PASS_ADAPTER and SWARM_PASS_BACKEND pick the GPU"]
+    fn canvas_over_texture_limit_is_refused() {
+        let _lock = gpu::gpu_test_lock();
+        let (_, device, queue) = open(wgpu::Limits {
+            max_texture_dimension_2d: 2048,
+            ..wgpu::Limits::default()
+        });
+        let (w, h) = (2560, 1440);
         let shadow = shadow_kernel(SwarmMetrics::new(h).scale);
-        let target =
-            vfx_core::Frame::new(&gpu, w as u32, h as u32, wgpu::TextureFormat::Rgba8Unorm);
-        for (name, s) in cases() {
-            let tiles = trail_tiles::<u8>((w, h), 12, 3, s.mirror);
-            let windows = visible(&tiles, (w, h), s.max_tiles);
-            let pixels = frame_pixels::<u8>(w, h, 12);
-            let frame = View::from_pixels(&pixels, w, h);
-            let mut pass = SwarmPass::new(SwarmPipelines::new(&device, &queue));
-            let placed = pass
-                .upload_tiles(&tiles, h)
-                .expect("the atlas holds the tiles");
-            let slots = || windows.iter().map(|&(i, tile)| (tile, placed.slots[i]));
-            for composite in [None, Some(Composite::HalfFloat)] {
-                pass.set_composite(composite);
-                let mut read_back = vec![Argb::<u8>::default(); (w * h) as usize];
-                pass.draw(
-                    &mut ViewMut::from_pixels(&mut read_back, w, h),
-                    slots(),
-                    Some(&frame),
-                    &s,
-                    &shadow,
-                    Occlusion::Depth,
-                )
-                .expect("the draw comes back");
-                pass.submit_into(
-                    &target,
-                    slots(),
-                    Some(&frame),
-                    &s,
-                    &shadow,
-                    Occlusion::Depth,
-                )
-                .expect("the draw is accepted");
-                let in_frame = read_frame(&device, &queue, &target);
-                assert!(read_back == in_frame, "{name}, composite {composite:?}");
-            }
-        }
+        let s = cases().remove(0).1;
+        let tiles = trail_tiles::<u8>((w, h), 2, 3, false);
+        let mut pass = SwarmPass::new(SwarmPipelines::new(&device, &queue));
+        let placed = pass
+            .upload_tiles(&tiles, h)
+            .expect("these tiles are under the limit");
+        let mut out = vec![Argb::<u8>::default(); (w * h) as usize];
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let drawn = pass.draw(
+            &mut ViewMut::from_pixels(&mut out, w, h),
+            tiles.iter().zip(placed.slots.iter().copied()),
+            None,
+            &s,
+            &shadow,
+            Occlusion::Depth,
+        );
+        let refused = DrawError::CanvasTooLarge {
+            width: 2560,
+            height: 1440,
+            limit: 2048,
+        };
+        assert_eq!(
+            drawn.err().map(|e| e.to_string()),
+            Some(refused.to_string())
+        );
+        let error = pollster::block_on(validation.pop());
+        assert!(error.is_none(), "the device saw {error:?}");
     }
 
     /// Times `draws` draws of one 1080p scene into an RGBA8 frame on `gpu`,
