@@ -132,12 +132,35 @@ Sensitivity 62, Background 64, Trail frames 120, Swarm max tiles 60 and no face 
 
 No host has been timed yet on an Apple M1 or M2, an Intel Iris Xe, an Intel UHD 770 or a Radeon 680M.
 
-## GPU thresholds
+## Swarm draw
 
-`GPU_MIN_COVERAGE_8_BIT` (0.5) and `GPU_MIN_COVERAGE_DEEPER` (1.5) in `src/incremental.rs` sit a
-little above where CPU and GPU drawing cross. On an RTX 4070 at 1080p the CPU took about 2.7 ms per
-canvas of window pixels at 8 bit and 2.2 ms in float; the GPU took about 1.2 ms and 3.6 ms whatever
-the windows.
+The Swarm draw alone at 1080p, median of 300 draws: `swarm_pass::tests::bench_draw` and
+`bench_draw_into_frame` (ignored, `SWARM_PASS_ADAPTER` picks the GPU), D3D12, i7-12700K. The GPU
+columns are a render pass with the depth buffer and the canvas read back; the 8 bit blend for 8 bit
+canvases, 32-bit float for the deeper ones. Coverage is window pixels with shadow over canvas pixels,
+what `incremental.rs` switches on. Tiles are already in the atlas, so a frame's new tiles add their
+upload.
+
+| Depth | Windows | Coverage | CPU | RTX 4070 | UHD 770 |
+|---|---|---|---|---|---|
+| 8 bit | 20 | 0.39 | 2.29 ms | 1.03 ms | 3.55 ms |
+| 8 bit | 100 | 1.95 | 8.89 ms | 1.07 ms | 3.54 ms |
+| 8 bit | 591 | 47.79 | 177.83 ms | 1.31 ms | 7.59 ms |
+| 16 bit | 20 | 0.39 | 2.38 ms | 2.00 ms | 5.49 ms |
+| 16 bit | 100 | 1.95 | 8.75 ms | 2.34 ms | 5.48 ms |
+| 16 bit | 591 | 47.79 | 204.90 ms | 3.27 ms | 9.20 ms |
+| float | 20 | 0.39 | 1.74 ms | 4.25 ms | 8.57 ms |
+| float | 100 | 1.95 | 5.24 ms | 4.49 ms | 9.54 ms |
+| float | 591 | 47.79 | 118.22 ms | 5.59 ms | 11.82 ms |
+
+Drawn straight into an RGBA8 host frame, with no readback: 0.15 ms at 49 windows and 0.36 ms at
+591 on the RTX 4070, 1.63 ms and 5.41 ms on the UHD 770.
+
+`GPU_MIN_COVERAGE_8_BIT` (0.5) and `GPU_MIN_COVERAGE_DEEPER` (1.5) in `src/incremental.rs` choose
+the CPU below these coverages when the canvas is read back; a draw into a host frame always takes
+the GPU. CPU and GPU cross at about 0.16 (RTX 4070) and 0.75 (UHD 770) at 8 bit, 0.33 and 1.15 at
+16 bit, 1.65 and 3.0 in float. 1.5 sits between the 16 bit and the float crossings, and either
+depth loses at most about 4.5 ms a draw near it. The CPU rows vary by up to 30% between runs.
 
 `tests/gpu.rs` allows 1 pixel in 10,000, at least 4, off by over half a level. The 1080p clip's
 cases measured at most 8 of 2,073,600 on an RTX 4070.
