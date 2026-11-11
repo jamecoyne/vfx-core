@@ -3460,8 +3460,10 @@ name = "vfx-core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "libloading",
  "pollster 1.0.1",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
