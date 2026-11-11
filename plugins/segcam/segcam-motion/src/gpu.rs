@@ -593,8 +593,9 @@ fn open_on(_choice: &str, _lost_adapter: Option<&str>) -> Result<GpuContext, NoG
 }
 
 impl GpuContext {
-    /// The swarm's pipelines on `device`. The 8-bit ones are built here, in
-    /// the background open, so the first 8-bit render doesn't build them.
+    /// A context on `device` with the 8-bit swarm pipelines built, and on a
+    /// host's device the ones that draw into its RGBA8 and RGBA32F frames, so
+    /// the first render doesn't build them.
     fn build(
         device: wgpu::Device,
         queue: wgpu::Queue,
@@ -604,6 +605,9 @@ impl GpuContext {
     ) -> Self {
         let swarm = SwarmPipelines::new(&device, &queue);
         swarm.prepare::<u8>();
+        if host_shared {
+            swarm.prepare_frame_outputs();
+        }
         GpuContext {
             swarm,
             device,
@@ -616,8 +620,10 @@ impl GpuContext {
 
 /// Per effect instance GPU state: the swarm's atlases and targets, and the fault history.
 pub struct Drawer {
-    dev: Arc<GpuContext>,
+    // Drops before `dev`: it holds the device too, and a retired device has
+    // to go last, on `retire`'s thread.
     pass: SwarmPass,
+    dev: Arc<GpuContext>,
     /// The largest buffer the device makes, which a readback has to fit.
     max_buffer_bytes: u64,
     /// The device's error count when this render began.

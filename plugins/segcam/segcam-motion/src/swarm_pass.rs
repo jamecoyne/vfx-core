@@ -235,7 +235,7 @@ fn atlas_texture(
 /// the texture states its view and this rule goes.
 fn atlas_layers(size: (u32, u32), wanted: u32, most: u32) -> u32 {
     let layers = wanted.max(2);
-    if size.0 != size.1 || layers % 6 != 0 {
+    if size.0 != size.1 || !layers.is_multiple_of(6) {
         layers
     } else if layers < most {
         layers + 1
@@ -662,6 +662,17 @@ impl SwarmPipelines {
         self.compose(own_composite(&self.device, depth).format());
         let (format, entry) = host_output(depth);
         self.output(format, entry);
+    }
+
+    /// Builds the pipelines that copy a composite into an RGBA8 or RGBA32F
+    /// host frame, which the first draw into such a frame otherwise does.
+    pub fn prepare_frame_outputs(&self) {
+        for format in [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba32Float,
+        ] {
+            self.output(format, "fs_frame");
+        }
     }
 
     fn pipeline(
@@ -2562,7 +2573,7 @@ mod tests {
                 "{layers} layers of a square atlas draw a wrong picture: {d:?}"
             );
             assert!(
-                layers % 6 != 0,
+                !layers.is_multiple_of(6),
                 "a square atlas of {layers} layers is a cube map array on GL"
             );
         }
