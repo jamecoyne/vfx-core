@@ -506,7 +506,6 @@ fn window_tile(content_rect: PixelRect) -> Tile {
             (content_rect.w * content_rect.h) as usize
         ],
         hidden: false,
-        title_bar: None,
     }
 }
 

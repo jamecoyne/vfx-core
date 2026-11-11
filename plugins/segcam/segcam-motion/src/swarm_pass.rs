@@ -1021,7 +1021,7 @@ impl SwarmPass {
             let tile_at = has_pixels
                 .then(|| atlases.tiles.place(device, queue, w, h))
                 .flatten();
-            let bar = TitleBar::cached_or_new(tile, &m);
+            let bar = TitleBar::new(tile, &m);
             let bar_at = atlases
                 .bars
                 .place(device, queue, bar.width as u32, bar_height);

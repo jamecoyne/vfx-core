@@ -4,8 +4,6 @@
 //! real one (`chrome.rs`). The title bar is laid out at 1x and sampled up or down for other
 //! canvas sizes.
 
-use std::borrow::Cow;
-
 use crate::chrome::{self, Glyph};
 use crate::font;
 use crate::motion::Blob;
@@ -20,7 +18,7 @@ use crate::render::{
 pub type TilePixel = Argb<u8>;
 
 /// One frozen tile of the collage: the pixels of the frame it was cut from, at the size it is
-/// drawn, already clipped to the canvas, with its title bar above it.
+/// drawn, already clipped to the canvas. Its title bar is made where it is drawn.
 #[derive(Clone, Debug, Default)]
 pub struct Tile {
     /// Where the picture sits on the canvas, before clipping.
@@ -32,8 +30,6 @@ pub struct Tile {
     pub title: String,
     /// Buried under a later tile or past the pile's end: still counted, never drawn.
     pub hidden: bool,
-    /// Its title bar, made when it was cut, so renders that draw it again needn't.
-    pub title_bar: Option<TitleBar>,
 }
 
 /// Everything a tile paints: its picture and the title bar above it, as one opaque rect.
@@ -98,7 +94,6 @@ pub fn cut_tile<C: Channel>(
         title,
         ..Tile::default()
     };
-    tile.title_bar = Some(TitleBar::new(&tile, &m));
     let Some(frame) = frame.filter(|f| !f.is_empty()) else {
         return tile;
     };
@@ -560,7 +555,7 @@ pub fn draw_window<C: Channel>(
     shadow: &ShadowKernel,
     straight_alpha: bool,
 ) {
-    let bar = TitleBar::cached_or_new(tile, m);
+    let bar = TitleBar::new(tile, m);
     let rows = out.rows();
     let canvas = PixelRect::new(0, rows.start, out.width, rows.len() as i32);
     let plan = WindowPlan::new(tile, m, shadow, canvas);
@@ -604,14 +599,6 @@ impl TitleBar {
         Self {
             width,
             pixels: render_title_bar(width, &tile.title),
-        }
-    }
-
-    /// The tile's own bar if it was made at this width, which makes it the same bar.
-    pub fn cached_or_new<'t>(tile: &'t Tile, m: &SwarmMetrics) -> Cow<'t, Self> {
-        match &tile.title_bar {
-            Some(bar) if bar.width == Self::width(tile, m) => Cow::Borrowed(bar),
-            _ => Cow::Owned(Self::new(tile, m)),
         }
     }
 
@@ -899,12 +886,12 @@ pub fn draw_swarm<'t, C: Channel>(
     let shadow = shadow_kernel(m.scale);
     let shadow = &*shadow;
     let canvas = PixelRect::new(0, 0, out.width, out.height);
-    let windows: Vec<(&Tile, Cow<TitleBar>, WindowPlan)> = tiles
+    let windows: Vec<(&Tile, TitleBar, WindowPlan)> = tiles
         .into_iter()
         .map(|t| {
             (
                 t,
-                TitleBar::cached_or_new(t, &m),
+                TitleBar::new(t, &m),
                 WindowPlan::new(t, &m, shadow, canvas),
             )
         })

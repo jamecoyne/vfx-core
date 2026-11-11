@@ -760,7 +760,6 @@ impl IncrementalRenderer {
                 if !visible.contains(&(frame, index)) {
                     tile.hidden = true;
                     tile.pixels = Vec::new();
-                    tile.title_bar = None;
                 }
             }
         }
