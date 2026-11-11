@@ -39,6 +39,8 @@ pub enum DrawError {
     MapTimeout,
     /// No draw with a readback was submitted, or its buffer was given up.
     NoReadback,
+    /// The queue had no staging memory for the frame.
+    NoStagingMemory,
 }
 
 impl fmt::Display for DrawError {
@@ -49,6 +51,7 @@ impl fmt::Display for DrawError {
             Self::MappedRange(e) => write!(f, "{e}"),
             Self::MapTimeout => write!(f, "the readback never finished"),
             Self::NoReadback => write!(f, "no draw is waiting to be read back"),
+            Self::NoStagingMemory => write!(f, "no staging memory for the frame"),
         }
     }
 }
@@ -756,6 +759,28 @@ struct FrameTexture {
     depth: u32,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    /// The frame's rows on their way into the texture, `padded_row` bytes
+    /// apart.
+    staging: wgpu::Buffer,
+    padded_row: u32,
+}
+
+impl FrameTexture {
+    /// Records the copy of the staged rows into the texture.
+    fn copy_staged(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_row),
+                    rows_per_image: None,
+                },
+            },
+            self.texture.as_image_copy(),
+            self.texture.size(),
+        );
+    }
 }
 
 /// One draw's uploads, ready for its passes.
@@ -764,6 +789,8 @@ struct Draw {
     instances: wgpu::Buffer,
     count: u32,
     source_backdrop: bool,
+    /// Whether the frame's rows were staged for this draw.
+    reads_frame: bool,
     clear: wgpu::Color,
 }
 
@@ -778,9 +805,6 @@ pub struct SwarmPass {
     /// The shadow's corner table, with the scale it was made for.
     corner: Option<(f64, wgpu::TextureView)>,
     frame: Option<FrameTexture>,
-    /// The frame's rows side by side for its upload, kept so each draw
-    /// doesn't allocate a canvas.
-    frame_texels: Vec<u8>,
     /// Bound where a draw reads no frame of that kind.
     no_frame: wgpu::TextureView,
     no_frame_16: wgpu::TextureView,
@@ -850,7 +874,6 @@ impl SwarmPass {
             composite: None,
             corner: None,
             frame: None,
-            frame_texels: Vec::new(),
             targets: None,
             instances: None,
             readback_timeout: READBACK_TIMEOUT,
@@ -954,7 +977,7 @@ impl SwarmPass {
     ) -> Result<DrawTime, DrawError> {
         let started = Instant::now();
         let size = (out.width, out.height);
-        let submitted = self.submit(size, windows, frame, s, shadow, occlusion);
+        let submitted = self.submit(size, windows, frame, s, shadow, occlusion)?;
         let submit = started.elapsed();
 
         let mapped = self.wait_for_readback(submitted);
@@ -1034,13 +1057,13 @@ impl SwarmPass {
         s: &RenderSettings,
         shadow: &ShadowKernel,
         occlusion: Occlusion,
-    ) -> wgpu::SubmissionIndex {
+    ) -> Result<wgpu::SubmissionIndex, DrawError> {
         let depth = depth_index::<C>();
         let shared = self.shared.clone();
         let compose = shared.compose(self.composite_at(depth).format());
         let (format, entry) = host_output(depth);
         let output = shared.output(format, entry);
-        let draw = self.prepare_draw((w, h), windows, frame, s, shadow);
+        let draw = self.prepare_draw((w, h), windows, frame, s, shadow)?;
         let size = (w as u32, h as u32);
         self.ensure_targets(size, compose.format);
         self.ensure_readback(format);
@@ -1048,6 +1071,9 @@ impl SwarmPass {
         let readback = targets.readback.as_ref().expect("ensure_readback made it");
 
         let mut encoder = shared.device.create_command_encoder(&Default::default());
+        if let Some(frame) = self.frame.as_ref().filter(|_| draw.reads_frame) {
+            frame.copy_staged(&mut encoder);
+        }
         compose_windows(
             &mut encoder,
             &compose,
@@ -1073,7 +1099,7 @@ impl SwarmPass {
                 depth_or_array_layers: 1,
             },
         );
-        shared.queue.submit(Some(encoder.finish()))
+        Ok(shared.queue.submit(Some(encoder.finish())))
     }
 
     /// Submits the draw of `windows` at depth `C` into `target`, a frame on
@@ -1091,16 +1117,19 @@ impl SwarmPass {
         s: &RenderSettings,
         shadow: &ShadowKernel,
         occlusion: Occlusion,
-    ) -> wgpu::SubmissionIndex {
+    ) -> Result<wgpu::SubmissionIndex, DrawError> {
         let depth = depth_index::<C>();
         let shared = self.shared.clone();
         let compose = shared.compose(self.composite_at(depth).format());
         let size = (target.width, target.height);
-        let draw = self.prepare_draw((size.0 as i32, size.1 as i32), windows, frame, s, shadow);
+        let draw = self.prepare_draw((size.0 as i32, size.1 as i32), windows, frame, s, shadow)?;
         self.ensure_targets(size, compose.format);
         let targets = self.targets.as_ref().expect("ensure_targets made them");
 
         let mut encoder = shared.device.create_command_encoder(&Default::default());
+        if let Some(frame) = self.frame.as_ref().filter(|_| draw.reads_frame) {
+            frame.copy_staged(&mut encoder);
+        }
         if target.format == compose.format && !s.straight_alpha {
             compose_windows(
                 &mut encoder,
@@ -1122,7 +1151,7 @@ impl SwarmPass {
             );
             write_output(&mut encoder, &output, &target.view, targets, &draw);
         }
-        shared.queue.submit(Some(encoder.finish()))
+        Ok(shared.queue.submit(Some(encoder.finish())))
     }
 
     /// Uploads what a draw of `windows` over a canvas of `(w, h)` reads.
@@ -1133,7 +1162,7 @@ impl SwarmPass {
         frame: Option<&View<C>>,
         s: &RenderSettings,
         shadow: &ShadowKernel,
-    ) -> Draw {
+    ) -> Result<Draw, DrawError> {
         let depth = depth_index::<C>();
         let m = SwarmMetrics::new(h);
         let mut instances: Vec<Instance> = (0..)
@@ -1163,8 +1192,9 @@ impl SwarmPass {
         let frame = frame.filter(|f| !f.is_empty());
         let source_backdrop = s.swarm_background == SwarmBackground::Source && frame.is_some();
         let live = s.live_windows && frame.is_some();
-        if let Some(frame) = frame.filter(|_| source_backdrop || live) {
-            self.upload_frame(frame);
+        let reads_frame = source_backdrop || live;
+        if let Some(frame) = frame.filter(|_| reads_frame) {
+            self.stage_frame(frame)?;
         }
         let radius = f64::from(chrome::CORNER_RADIUS) * m.scale;
         let mut flags = if s.straight_alpha { STRAIGHT } else { 0 };
@@ -1197,16 +1227,17 @@ impl SwarmPass {
         self.shared
             .queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
-        Draw {
+        Ok(Draw {
             bind: self.draw_bind(shadow, m.scale, depth),
             instances: instance_buffer,
             count,
             source_backdrop,
+            reads_frame,
             clear: match s.swarm_background {
                 SwarmBackground::Black => wgpu::Color::BLACK,
                 _ => wgpu::Color::TRANSPARENT,
             },
-        }
+        })
     }
 
     /// A vertex buffer of at least `bytes`.
@@ -1227,50 +1258,48 @@ impl SwarmPass {
         }
     }
 
-    fn upload_frame<C: Channel>(&mut self, frame: &View<C>) {
+    /// Writes `frame`'s rows into the queue's staging memory, for the copy
+    /// [`FrameTexture::copy_staged`] records.
+    fn stage_frame<C: Channel>(&mut self, frame: &View<C>) -> Result<(), DrawError> {
         use wgpu::TextureFormat as F;
         let depth = depth_index::<C>();
         let size = (frame.width as u32, frame.height as u32);
-        let extent = wgpu::Extent3d {
-            width: size.0,
-            height: size.1,
-            depth_or_array_layers: 1,
-        };
+        let row = frame.width as usize * size_of::<Argb<C>>();
         if !matches!(&self.frame, Some(f) if f.size == size && f.depth == depth) {
-            let texture = self.shared.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("segcam swarm pass frame"),
-                size: extent,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: [F::Rgba8Unorm, F::Rgba16Uint, F::Rgba32Float][depth as usize],
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
+            let format = [F::Rgba8Unorm, F::Rgba16Uint, F::Rgba32Float][depth as usize];
+            let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+            let texture = self.canvas_texture("segcam swarm pass frame", size, format, usage);
+            let padded_row = (row as u32).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+            let staging = self.shared.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("segcam swarm pass frame rows"),
+                size: u64::from(padded_row) * u64::from(size.1),
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
             self.frame = Some(FrameTexture {
                 size,
                 depth,
                 view: texture.create_view(&Default::default()),
                 texture,
+                staging,
+                padded_row,
             });
         }
-        let texture = &self.frame.as_ref().expect("made above").texture;
-        let row = frame.width as usize * size_of::<Argb<C>>();
-        self.frame_texels.clear();
+        let texture = self.frame.as_ref().expect("made above");
+        let bytes =
+            wgpu::BufferSize::new(texture.staging.size()).ok_or(DrawError::NoStagingMemory)?;
+        let mut staged = self
+            .shared
+            .queue
+            .write_buffer_with(&texture.staging, 0, bytes)
+            .ok_or(DrawError::NoStagingMemory)?;
         for y in 0..frame.height {
-            self.frame_texels
-                .extend_from_slice(bytemuck::cast_slice(frame.row(y)));
+            let at = y as usize * texture.padded_row as usize;
+            staged
+                .slice(at..at + row)
+                .copy_from_slice(bytemuck::cast_slice(frame.row(y)));
         }
-        self.shared.queue.write_texture(
-            texture.as_image_copy(),
-            &self.frame_texels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row as u32),
-                rows_per_image: None,
-            },
-            extent,
-        );
+        Ok(())
     }
 
     /// The bind group of a draw at `depth` with `shadow`, made for `scale`.
@@ -2138,7 +2167,8 @@ mod tests {
                     &s,
                     &shadow,
                     Occlusion::Depth,
-                );
+                )
+                .expect("the draw is accepted");
                 let in_frame = read_frame(&device, &queue, &target);
                 assert!(read_back == in_frame, "{name}, composite {composite:?}");
             }
@@ -2230,7 +2260,8 @@ mod tests {
                     &s,
                     &shadow,
                     Occlusion::Depth,
-                );
+                )
+                .expect("the draw is accepted");
                 wait();
                 times.push(started.elapsed());
             }

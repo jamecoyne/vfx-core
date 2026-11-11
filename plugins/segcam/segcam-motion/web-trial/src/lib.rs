@@ -51,7 +51,8 @@ async fn draw<C: Channel>(
         s,
         &shadow,
         occlusion,
-    );
+    )
+    .expect("the draw is accepted");
     let mapped = Arc::new(AtomicBool::new(false));
     let done = mapped.clone();
     pass.readback()
