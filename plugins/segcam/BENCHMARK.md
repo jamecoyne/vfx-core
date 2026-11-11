@@ -84,10 +84,14 @@ Linux the GPUs `lspci` lists.
 | same | CLI | overlay | float | CPU, kept, 600 of 600 frames | 20.1 ms | 20.9 ms | 22.5 ms | 47.8 fps | the `--cpu` rows, 300 of 300 |
 | same | CLI | overlay faces | 8 bit | CPU, kept, 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 18.3 ms | 20.3 ms | 27.9 ms | 49.3 fps | no reference |
 | same | CLI | overlay faces | float | CPU, kept, 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 25.5 ms | 27.0 ms | 33.9 ms | 37.0 fps | no reference |
-| same | CLI | show | 8 bit | GPU (NVIDIA GeForce RTX 4070), 582 of 600 frames, CPU 18 frames | 15.1 ms | 16.0 ms | 25.2 ms | 62.7 fps | no reference |
-| same | CLI | show | float | GPU (NVIDIA GeForce RTX 4070), 548 of 600 frames, CPU 52 frames | 21.7 ms | 23.7 ms | 33.6 ms | 42.1 fps | no reference |
-| same | CLI | show faces | 8 bit | GPU (NVIDIA GeForce RTX 4070), 596 of 600 frames, CPU 4 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 21.6 ms | 22.1 ms | 37.7 ms | 45.3 fps | no reference |
-| same | CLI | show faces | float | GPU (NVIDIA GeForce RTX 4070), 564 of 600 frames, CPU 36 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 30.9 ms | 34.5 ms | 60.2 ms | 28.9 fps | no reference |
+| same | CLI | show | 8 bit | GPU (NVIDIA GeForce RTX 4070), 598 of 600 frames, CPU 2 frames | 15.5 ms | 15.6 ms | 18.3 ms | 64.0 fps | no reference |
+| same | CLI | show | float | GPU (NVIDIA GeForce RTX 4070), 598 of 600 frames, CPU 2 frames | 22.1 ms | 23.6 ms | 31.6 ms | 42.4 fps | no reference |
+| same | CLI | show faces | 8 bit | GPU (NVIDIA GeForce RTX 4070), 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 20.9 ms | 21.8 ms | 36.9 ms | 45.9 fps | no reference |
+| same | CLI | show faces | float | GPU (NVIDIA GeForce RTX 4070), 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 30.1 ms | 34.4 ms | 58.3 ms | 29.1 fps | no reference |
+| same | CLI | show | 8 bit | GPU (Intel UHD Graphics 770), 598 of 600 frames, CPU 2 frames | 17.6 ms | 19.1 ms | 21.4 ms | 52.3 fps | no reference |
+| same | CLI | show | float | GPU (Intel UHD Graphics 770), 598 of 600 frames, CPU 2 frames | 24.9 ms | 27.9 ms | 35.5 ms | 35.9 fps | no reference |
+| same | CLI | show faces | 8 bit | GPU (Intel UHD Graphics 770), 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 23.9 ms | 24.7 ms | 42.9 ms | 40.5 fps | no reference |
+| same | CLI | show faces | float | GPU (Intel UHD Graphics 770), 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 36.0 ms | 38.2 ms | 69.2 ms | 26.2 fps | no reference |
 | Apple M4, 10 CPU cores, 10 GPU cores, 24 GB, macOS 27.2.1 | CLI | show | 8 bit | GPU (Apple M4), 600 of 600 frames | 8.2 ms | 8.6 ms | 11.9 ms | 116.2 fps | no reference |
 | same | CLI | show | float | GPU (Apple M4), 600 of 600 frames | 11.6 ms | 11.5 ms | 17.1 ms | 87.1 fps | no reference |
 | same | CLI | show faces | 8 bit | GPU (Apple M4), 600 of 600 frames, faces on Vision | 16.1 ms | 13.3 ms | 24.1 ms | 75.5 fps | no reference |
@@ -100,7 +104,8 @@ Linux the GPUs `lspci` lists.
 | same | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output kept on the GPU | not split out | 28.9 ms | 41.4 ms | 30.0 fps | the swarm read back, byte for byte (`tests/target.rs`) |
 
 CLI rows: the benchmark clip (H.264, 1080p, 59.94 fps), frames 0 to 299, two runs pooled, printed by
-`cargo vfx bench`. The first two rows are `--cpu`. Faces run on DirectML on the RTX 4070.
+`cargo vfx bench`. The first two rows are `--cpu`. Faces run on DirectML on the RTX 4070. A GPU row's
+CPU frames are each run's frame 0, which has no windows yet.
 
 Resolume rows: the #26 clip, an 8 s 720p pan over the Apollo 11 crew photo looping in a 1080p
 composition, one run of 3 minutes each, the same build, the first row with `VFX_FFGL_PATH=ram`.
