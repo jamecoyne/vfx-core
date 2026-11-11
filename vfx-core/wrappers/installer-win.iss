@@ -4,7 +4,8 @@
 ; package-win.sh builds the plugins, writes Effects (an .iss that includes
 ; installer-effect-win.iss once per effect) and runs this with the lead effect's names:
 ;   ISCC -DVersion=1.2.3 -DSource=<built plugins> -DEffects=<effects.iss> -DAppName=...
-;        -DLeadFile=... -DPublisher=... -DCategory=... -DAppGuid=... installer-win.iss
+;        -DLeadFile=... -DPublisher=... -DCategory=... -DAppGuid=... -DDxcTag=<tag>
+;        installer-win.iss
 ; -DTestRoot=<folder> installs everything under that folder instead, without administrator
 ; rights, for testing the installer.
 
@@ -20,14 +21,17 @@
   #define MediaCore TestRoot + "\MediaCore"
   #define Documents TestRoot + "\Documents"
   #define AppDir TestRoot + "\App"
+  #define CommonFiles TestRoot + "\Common"
 #else
   #define OfxPlugins "{commoncf64}\OFX\Plugins"
   #define MediaCore "{commonpf64}\Adobe\Common\Plug-ins\7.0\MediaCore"
   #define Documents "{userdocs}"
   #define AppDir AddBackslash("{commonpf64}") + AppName
+  #define CommonFiles "{commoncf64}"
 #endif
 #define Arena Documents + "\Resolume Arena\Extra Effects"
 #define Avenue Documents + "\Resolume Avenue\Extra Effects"
+#define Dxc CommonFiles + "\vfx-core\dxc-" + DxcTag
 
 [Setup]
 AppId={{{#AppGuid}}
@@ -79,19 +83,17 @@ Type: filesandordirs; Name: "{#MediaCore}\SegcamMotionRust"; Components: adobe
 Type: files; Name: "{#Arena}\SegcamMotionRust.dll"; Components: arena
 Type: files; Name: "{#Avenue}\SegcamMotionRust.dll"; Components: avenue
 
-; windows-dlls holds the DirectX Shader Compiler with its licenses, which the FFGL DLLs and
-; the .aex files load from their own folder; each OFX bundle carries its own copy.
-; Extra Effects is shared with plugins from elsewhere, so these are counted and removed,
-; without asking, with the last installer that put them there. The counts live in HKLM,
-; which a TestRoot install can't write.
+; windows-dlls holds the DirectX Shader Compiler with its licenses. Every plugin loads it from
+; this one folder per DXC release when it is there, and else from its own folder (the zips).
+; Installers of other effects share the folder: it is counted, and removed without asking
+; with the last of them. The counts live in HKLM, which a TestRoot install can't write.
 #ifdef TestRoot
   #define Shared ""
 #else
   #define Shared " sharedfile uninsnosharedfileprompt"
 #endif
 [Files]
-Source: "{#Source}\windows-dlls\*"; DestDir: "{#Arena}"; Components: arena; Flags: ignoreversion{#Shared}
-Source: "{#Source}\windows-dlls\*"; DestDir: "{#Avenue}"; Components: avenue; Flags: ignoreversion{#Shared}
+Source: "{#Source}\windows-dlls\*"; DestDir: "{#Dxc}"; Components: ofx or arena or avenue or adobe; Flags: ignoreversion{#Shared}
 
 [Components]
 Name: "examples"; Description: "Example effects from vfx-core"
@@ -318,11 +320,12 @@ begin
   if not AdobeAppFound then MarkNotFound('After Effects and Premiere Pro');
 end;
 
-// The ready page lists the folders each chosen app gets.
+// The ready page lists the shader compiler's folder and the folders each chosen app gets.
 function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo,
   MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
 begin
-  Result := MemoComponentsInfo + NewLine + NewLine + 'Folders:';
+  Result := MemoComponentsInfo + NewLine + NewLine + 'Folders:' + NewLine + Space
+    + ExpandConstant('{#Dxc}');
   if WizardIsComponentSelected('ofx') then
     Result := Result + NewLine + Space + ExpandConstant('{#OfxPlugins}');
   if WizardIsComponentSelected('arena') then

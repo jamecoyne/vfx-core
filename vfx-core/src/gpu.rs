@@ -167,8 +167,8 @@ impl Gpu {
     }
 
     /// Backend options for every wgpu instance a host or effect makes. On Windows
-    /// they select the DXC beside this module, or the slower FXC without it;
-    /// `WGPU_DX12_COMPILER` overrides.
+    /// they select the DXC the Setup shares, else the one beside this module (the
+    /// zips), else the slower FXC; `WGPU_DX12_COMPILER` overrides.
     pub fn backend_options() -> wgpu::BackendOptions {
         wgpu::BackendOptions {
             dx12: wgpu::Dx12BackendOptions {
@@ -273,33 +273,95 @@ fn dx12_shader_compiler() -> wgpu::Dx12Compiler {
         .clone()
 }
 
-/// The DXC that packaging puts beside every Windows module.
+/// The DXC that the Windows Setup shares in Common Files, or that the zips
+/// put beside each module.
 #[cfg(windows)]
 mod dxc {
     use std::error::Error;
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
-    use std::path::PathBuf;
-    use std::{io, mem, ptr};
+    use std::path::{Path, PathBuf};
+    use std::{io, mem, ptr, slice};
 
     use libloading::Library;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::System::LibraryLoader::{
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         GetModuleFileNameW, GetModuleHandleExW,
     };
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_ProgramFilesCommon, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+    };
 
-    /// Loads the `dxcompiler.dll` beside this module and returns its path.
+    /// The DXC release that packaging ships, from `wrappers/dxc-tag`.
+    const TAG: &str = include_str!("../wrappers/dxc-tag");
+
+    /// Loads the `dxcompiler.dll` in [`shared_dir`], or else the one beside
+    /// this module, and returns its path.
     ///
-    /// wgpu needs the full path: a host doesn't search a plugin's folder.
+    /// The shared folder is this build's DXC release; a DLL beside a plugin in
+    /// a shared folder can be older or another vendor's. wgpu needs the full
+    /// path: a host doesn't search a plugin's folder.
     pub fn bundled() -> io::Result<String> {
-        let path = module_dir()?.join("dxcompiler.dll");
+        load(&locate(shared_dir().as_deref(), &module_dir()?)?)
+    }
+
+    /// The `dxcompiler.dll` in `shared`, or else in `beside`.
+    fn locate(shared: Option<&Path>, beside: &Path) -> io::Result<PathBuf> {
+        for dir in shared.into_iter().chain([beside]) {
+            let path = dir.join("dxcompiler.dll");
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+        let beside = beside.display();
+        let message = match shared {
+            Some(shared) => format!("no dxcompiler.dll in {} or {beside}", shared.display()),
+            None => format!("no dxcompiler.dll in {beside}"),
+        };
+        Err(io::Error::new(io::ErrorKind::NotFound, message))
+    }
+
+    /// Where the Windows Setup puts one DXC for all its plugins, a folder per
+    /// release: `Common Files/vfx-core/dxc-<tag>`. `None` if Windows can't
+    /// name its Common Files folder.
+    fn shared_dir() -> Option<PathBuf> {
+        let mut path = ptr::null_mut();
+        // SAFETY: the folder id and the out pointer are valid; on success
+        // `path` is a NUL terminated string that Windows allocated.
+        let status = unsafe {
+            SHGetKnownFolderPath(
+                &FOLDERID_ProgramFilesCommon,
+                KF_FLAG_DEFAULT as u32,
+                ptr::null_mut(),
+                &mut path,
+            )
+        };
+        let common = (status >= 0).then(|| {
+            // SAFETY: `path` is NUL terminated, so every index before the NUL
+            // is inside the string.
+            let len = (0..).take_while(|&i| unsafe { *path.add(i) } != 0).count();
+            // SAFETY: the first `len` units are the string, read above.
+            OsString::from_wide(unsafe { slice::from_raw_parts(path, len) })
+        });
+        // SAFETY: Windows asks for the string to be freed whether the call
+        // succeeded or not; freeing null does nothing.
+        unsafe { CoTaskMemFree(path as *const _) };
+        Some(
+            PathBuf::from(common?)
+                .join("vfx-core")
+                .join(format!("dxc-{}", TAG.trim())),
+        )
+    }
+
+    fn load(path: &Path) -> io::Result<String> {
         let shown = path.display();
         let Some(utf8) = path.to_str() else {
             return Err(io::Error::other(format!("{shown} is not Unicode")));
         };
         // SAFETY: loading runs the `DllMain` of the file at that path, which is
         // trusted to be the DXC that packaging put there.
-        let library = unsafe { Library::new(&path) }.map_err(|err| {
+        let library = unsafe { Library::new(path) }.map_err(|err| {
             match err.source().and_then(|os| os.downcast_ref::<io::Error>()) {
                 Some(os) => io::Error::new(os.kind(), format!("{shown}: {os}")),
                 None => io::Error::other(format!("{shown}: {err}")),
@@ -344,10 +406,60 @@ mod dxc {
         }
 
         #[test]
-        fn bundled_names_missing_dll() {
-            // Cargo puts test binaries in `deps`, where nothing puts a DXC.
-            let err = bundled().unwrap_err();
+        fn locate_prefers_shared() {
+            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            std::fs::write(shared.path().join("dxcompiler.dll"), b"").unwrap();
+            std::fs::write(beside.path().join("dxcompiler.dll"), b"").unwrap();
+            assert_eq!(
+                locate(Some(shared.path()), beside.path()).unwrap(),
+                shared.path().join("dxcompiler.dll")
+            );
+        }
+
+        #[test]
+        fn locate_falls_back_to_beside() {
+            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            std::fs::write(beside.path().join("dxcompiler.dll"), b"").unwrap();
+            assert_eq!(
+                locate(Some(shared.path()), beside.path()).unwrap(),
+                beside.path().join("dxcompiler.dll")
+            );
+        }
+
+        #[test]
+        fn locate_without_shared_dir_uses_beside() {
+            let beside = tempfile::tempdir().unwrap();
+            std::fs::write(beside.path().join("dxcompiler.dll"), b"").unwrap();
+            assert_eq!(
+                locate(None, beside.path()).unwrap(),
+                beside.path().join("dxcompiler.dll")
+            );
+        }
+
+        #[test]
+        fn locate_names_both_folders() {
+            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let err = locate(Some(shared.path()), beside.path()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+            let shown = err.to_string();
+            assert!(shown.contains(&*shared.path().to_string_lossy()), "{shown}");
+            assert!(shown.contains(&*beside.path().to_string_lossy()), "{shown}");
+        }
+
+        #[test]
+        fn load_names_missing_dll() {
+            let dir = tempfile::tempdir().unwrap();
+            let err = load(&dir.path().join("dxcompiler.dll")).unwrap_err();
             assert!(err.to_string().contains("dxcompiler.dll"), "{err}");
+        }
+
+        #[test]
+        fn shared_dir_is_in_an_existing_common_files() {
+            let dir = shared_dir().unwrap();
+            let common = dir.parent().and_then(Path::parent).unwrap();
+            assert!(common.is_dir(), "{}", common.display());
+            let name = dir.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("dxc-"), "{name}");
         }
     }
 }

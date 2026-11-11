@@ -3462,6 +3462,7 @@ dependencies = [
  "bytemuck",
  "libloading",
  "pollster 1.0.1",
+ "tempfile",
  "wgpu",
  "windows-sys 0.61.2",
 ]

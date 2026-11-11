@@ -5,8 +5,9 @@
 #   target/vfx-plugin/segcam-<version>-Windows-OpenFX.zip         segcam's plugins, one zip
 #   target/vfx-plugin/segcam-<version>-Windows-Resolume.zip       per host to copy by hand,
 #   target/vfx-plugin/segcam-<version>-Windows-AfterEffects.zip   each with a README.txt
-# Next to the FFGL DLL and the .aex goes the DirectX Shader Compiler (fetch-dxc.sh) with its
-# licenses; the OFX bundle carries its own copy.
+# Next to the FFGL DLL and the .aex in each zip goes the DirectX Shader Compiler
+# (fetch-dxc.sh) with its licenses, and the OFX bundle carries its own copy. The installer
+# puts one copy in Common Files instead, which every plugin looks for first.
 # The names come from each effect crate's [package.metadata.vfx] (`cargo vfx env`).
 # Usage: ./package-win.sh   (run from Git Bash)
 #   VERSION   the release version, default "dev"
@@ -72,7 +73,7 @@ for crate in "${crates[@]}"; do
     [ -f "$bundle_dir/$(basename "$f")" ] || { echo "$bundle_dir has no $(basename "$f")" >&2; exit 1; }
   done
 done
-# The installer copies this folder next to the FFGL DLLs and the .aex files.
+# The installer copies this folder to Common Files\vfx-core\dxc-<tag>.
 rm -rf "$out/windows-dlls"
 mkdir -p "$out/windows-dlls"
 cp "${dxc_files[@]}" "$out/windows-dlls/"
@@ -147,6 +148,7 @@ name="$PLUGIN_FILE-$version-Windows-Setup"
 "$iscc" -Q "-DVersion=$version" "-DSource=$(cygpath -w "$out")" "-DEffects=$(cygpath -w "$effects")" \
   "-DAppName=$PLUGIN_NAME" "-DLeadFile=$PLUGIN_FILE" "-DPublisher=$PLUGIN_CATEGORY" \
   "-DCategory=$PLUGIN_CATEGORY" "-DAppGuid=$WINDOWS_INSTALLER_ID" \
+  "-DDxcTag=$(tr -d '[:space:]' <"$here/dxc-tag")" \
   ${TEST_ROOT:+"-DTestRoot=$TEST_ROOT"} "-O$(cygpath -w "$out")" "-F$name" \
   "$(cygpath -w "$here/installer-win.iss")"
 echo "$out/$name.exe"

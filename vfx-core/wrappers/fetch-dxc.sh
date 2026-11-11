@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Fetches the DirectX Shader Compiler that ships next to every Windows binary linking
-# vfx-core, and prints the folder that holds it: dxcompiler.dll (x64) and DXC's
-# licenses. Without it wgpu compiles D3D12 shaders with FXC, which takes seconds before an
+# Fetches the DirectX Shader Compiler that ships with every Windows binary linking vfx-core
+# (beside it in the zips, in Common Files with the Setup), and prints the folder that holds
+# it: dxcompiler.dll (x64) and DXC's licenses. Without it wgpu compiles D3D12 shaders with FXC, which takes seconds before an
 # effect draws on the GPU. The release is pinned and checked by sha256, so every build ships
 # the same compiler whatever the machine has installed.
 # Usage: ./fetch-dxc.sh [TARGET]   (Git Bash; downloads once into TARGET/dxc, default
 #   <repo>/target). Exits 3 when the zip doesn't match the pin.
 set -euo pipefail
 
-tag=v1.9.2609
+# dxc-tag holds the tag, which vfx-core also reads to name the folder Setup shares the
+# compiler in. Change it with zip and sha256.
+here="$(cd "$(dirname "$0")" && pwd)"
+tag="$(tr -d '[:space:]' <"$here/dxc-tag")"
 zip=dxc_2026_09_29.zip
 sha256=ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1
 
-here="$(cd "$(dirname "$0")" && pwd)"
 cache="${1:-$here/../../target}/dxc"
 dir="$cache/files"
 files=(bin/x64/dxcompiler.dll LICENCE-MIT.txt LICENSE-LLVM.txt LICENSE-MS.txt)
