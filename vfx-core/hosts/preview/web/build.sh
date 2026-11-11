@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the preview for the browser (WebGPU) into target/web/:
+# Builds the preview for the browser (WebGPU, or WebGL2 without it) into target/web/:
 #   index.html, vfx-preview.js, vfx-preview_bg.wasm
 # Usage: vfx-core/hosts/preview/web/build.sh [--serve]
 # Needs the wasm32-unknown-unknown target and wasm-bindgen-cli at the version of the
