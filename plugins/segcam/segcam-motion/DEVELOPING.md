@@ -47,8 +47,7 @@ a dropped frame costs far more to fetch than a decoded one, so playback output c
 export. A step of more than 16 frames out of a run is a stop, and that render does the full check,
 since its frame stays on screen while paused. No host property separates playback from a render
 Resolve will save, and Resolve's render cache can carry playback pictures into an export. The user
-facing limit is in the [segcam README](../README.md#known-limits), the reasoning in
-[ADR 3](../decisions/0003-editing-promise.md).
+facing limit is in the [segcam README](../README.md#known-limits).
 
 ### Analysis rate
 

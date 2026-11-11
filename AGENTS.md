@@ -10,13 +10,13 @@ Recent changes for agents (newest first; prune entries once they are old):
 - Run `cargo vfx check --quick` while iterating (format, the core clippy and the tests of the
   packages you changed) and `cargo vfx check --full` before a pull request (CI's steps and the harnesses).
 - Working on segcam: read [`plugins/segcam/SPEC.md`](plugins/segcam/SPEC.md) first, the 1.0
-  requirements with their status. Decisions are in `plugins/segcam/decisions/`, the work order in
-  `ROADMAP.md`, and speed numbers follow `BENCHMARK.md`, all in the same folder.
+  requirements with their status. The work order is in `ROADMAP.md` and speed numbers
+  follow `BENCHMARK.md`, both in the same folder.
 - Pull requests: small, one topic each. Request review from jamecoyne, and from whoever wrote the
   code you change (`git log` on its files). A PR that touches speed adds the benchmark rows for the
   hosts it changes; one that finishes a segcam requirement changes its status in SPEC.md.
 - A PR that adds to the core API (a trait method, a `Context` field, a `Gpu` function) adds a
-  row to the table in [docs/DEVELOPING.md](docs/DEVELOPING.md#what-a-host-implements) (ADR 7).
+  row to the table in [docs/DEVELOPING.md](docs/DEVELOPING.md#what-a-host-implements).
 - Effect logic belongs in a plugin crate (`plugins/`) or the core
   (`vfx-core/src/effects`). A target crate (`vfx-core/wrappers/`) only translates parameters
   and moves pixels, for any effect; what two targets share belongs in
