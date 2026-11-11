@@ -68,10 +68,13 @@ with **Invert**) or Faces only. **Face**, **Eyes**, **Mouth** and **Body** enabl
 those. **Mirror** flips the picture for a selfie camera. Every control is listed under
 [Parameters](segcam-motion/README.md#parameters).
 
-In After Effects, and in Resolve when paused or exporting at normal speed, a frame renders the same
-however you get to it. During playback, Resolve skips any dropped frames to keep up, so playback
-can differ from an export. A change to an earlier frame of the clip shows on the next render after
-you pause or jump, and when an export starts.
+In After Effects a frame renders the same however you get to it, and in Resolve an export from the
+start of a clip does too. Resolve reads earlier frames a few at a time, which keeps its GPU memory
+in bounds. After a jump, or a change to earlier frames, the trail fills in over the next frames as
+you step or play, and a paused frame shows the trail read up to then. An export that starts in the
+middle of a clip can show a shorter trail in its first frames: start it a second earlier and trim.
+During playback, Resolve skips any dropped frames to keep up, and playback can differ from an
+export.
 
 In Resolume, settings you change while it plays reach new windows only. Windows already on screen
 keep the settings they were made with.

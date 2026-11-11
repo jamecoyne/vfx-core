@@ -124,7 +124,10 @@ pub trait CpuEffect: Send {
     /// Whether the effect keeps computed state between renders. Hosts that can keep one
     /// effect per instance then do (OpenFX, FFGL, the preview); After Effects never does. What
     /// it keeps must not change any frame, even when earlier frames change upstream or a host
-    /// can't hand one over: `vfx_host::contract::check` tests an effect for that.
+    /// can't hand one over, except under a
+    /// [fetch budget](crate::cpu::FrameSource::fetch_budget), where a render may
+    /// draw what it kept until it has read the rest: `vfx_host::contract::check`
+    /// tests an effect for that.
     fn keeps_state(&self) -> bool {
         false
     }

@@ -12,7 +12,7 @@
 //! again: their tiles are never recut, so new settings reach new windows only (as segcam 1.1),
 //! and tiles the pile no longer draws release their pixels.
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::RangeInclusive;
+use std::ops::{RangeBounds, RangeInclusive};
 
 use vfx_core::cpu::{FrameSource, Image};
 use vfx_core::{Reading, Report};
@@ -89,12 +89,28 @@ struct KeptFrame {
     read: Option<PixelsRead>,
     analysis: Option<KeptAnalysis>,
     tiles: Option<KeptTiles>,
+    /// Under a fetch budget, an earlier frame its analysis used has changed
+    /// or wasn't read. The analysis and tiles are drawn until redone.
+    stale: bool,
+    /// The budgeted render that last verified it or found it missing, 0 for
+    /// none. Checks take the oldest first.
+    last_checked: u64,
 }
 
 #[derive(Default)]
 pub struct IncrementalRenderer {
     history_format: Option<HistoryFormat>,
     kept: BTreeMap<i64, KeptFrame>,
+    /// Renders under a fetch budget so far, which date
+    /// [`KeptFrame::last_checked`].
+    budgeted_render_count: u64,
+    /// The last budgeted render from an unfixed source, which may follow an
+    /// edit. A stream checks the frames checked before it.
+    last_unfixed_render: u64,
+    /// The budgeted render where the current run of changes was found.
+    /// Frames checked before it are read oldest first with those to rebuild,
+    /// so no frame is redone from an unchecked background frame.
+    changes_found_at: u64,
     /// Created on the first GPU render after the device opens, not per instance, because hosts
     /// create instances often. A frame's tiles enter the atlas on first GPU draw.
     drawer: Option<Box<Drawer>>,
@@ -152,6 +168,8 @@ struct RenderPlan<'a> {
     trail_len: i64,
     fixed: bool,
     live: bool,
+    /// The earlier frames this render may read ([`FrameSource::fetch_budget`]).
+    fetch_budget: Option<usize>,
     /// A live source numbers each frame once, so a number says which frame it is.
     numbers_identify_frames: bool,
     /// The current frame is analysed again to take what detection found: a picture that holds
@@ -180,6 +198,7 @@ impl<'a> RenderPlan<'a> {
             trail_len: trail_frame_count(s),
             fixed: source.fixed(),
             live: source.live(),
+            fetch_budget: source.fetch_budget(),
             numbers_identify_frames: source.fixed() && source.live(),
             takes_faces_on_held_picture: false,
         }
@@ -201,6 +220,16 @@ impl<'a> RenderPlan<'a> {
             })
             .collect()
     }
+}
+
+/// What a render under a fetch budget reads.
+struct BudgetedReads {
+    /// Every frame it reads, the current one included.
+    read: BTreeSet<i64>,
+    /// Those read to show them unchanged.
+    checks: BTreeSet<i64>,
+    /// Frames to rebuild left for later renders.
+    deferred: Vec<i64>,
 }
 
 /// Below these coverages, CPU drawing beats the GPU's readback cost. Coverage is window pixels
@@ -386,24 +415,89 @@ impl IncrementalRenderer {
         if swarm {
             self.pin_unreadable_frames(s, plan.first, number, oldest_held_frame);
         }
-        let frames_to_read = if plan.fixed {
-            self.frames_to_read(s, plan.first, number, oldest_held_frame)
-        } else {
-            plan.frames_feeding_analysis()
+        let (mut checks, mut deferred) = (BTreeSet::new(), Vec::new());
+        let (mut all_verified, mut changed) = (false, false);
+        let frames_to_read = match plan.fetch_budget {
+            None if plan.fixed => self.frames_to_read(s, plan.first, number, oldest_held_frame),
+            None => plan.frames_feeding_analysis(),
+            Some(budget) => {
+                self.budgeted_render_count += 1;
+                if !plan.fixed {
+                    self.last_unfixed_render = self.budgeted_render_count;
+                }
+                let mut rebuild = self.frames_to_read(s, plan.first, number, oldest_held_frame);
+                let checked = |f: &i64| self.kept.get(f).map_or(0, |kept| kept.last_checked);
+                // A frame found missing is checked for its return with the
+                // verified ones, or a missing frame that is never analysed would
+                // take the budget every render.
+                let known_missing: Vec<i64> = rebuild
+                    .iter()
+                    .copied()
+                    .filter(|&f| f != number && self.is_known_missing(f))
+                    .collect();
+                for f in &known_missing {
+                    rebuild.remove(f);
+                }
+                let verified_from = match plan.fixed {
+                    true => self.last_unfixed_render.max(self.changes_found_at),
+                    false => self.changes_found_at,
+                };
+                let (unverified, mut verified): (Vec<i64>, Vec<i64>) = plan
+                    .frames_feeding_analysis()
+                    .into_iter()
+                    .filter(|f| *f >= oldest_held_frame && !rebuild.contains(f))
+                    .partition(|f| checked(f) < verified_from);
+                // A stream checks only what may have changed before it began.
+                if plan.fixed {
+                    verified.clear();
+                }
+                verified.extend(
+                    known_missing
+                        .into_iter()
+                        .filter(|f| !unverified.contains(f)),
+                );
+                verified.sort_by_key(|f| (checked(f), *f));
+                verified.dedup();
+                // Frames still to rebuild belong to the run that made them stale.
+                all_verified = unverified.is_empty()
+                    && rebuild
+                        .iter()
+                        .all(|f| *f == number || checked(f) >= verified_from);
+                // A stream reads the frames it went over, which have nothing
+                // kept, before the rest, or a frame the host skipped would wait
+                // behind the checks a render that wasn't a stream left.
+                let ahead: BTreeSet<i64> = match plan.fixed {
+                    true => rebuild
+                        .iter()
+                        .copied()
+                        .filter(|f| *f != number && !self.kept.contains_key(f))
+                        .collect(),
+                    false => BTreeSet::new(),
+                };
+                let unverified = BTreeSet::from_iter(unverified);
+                let reads =
+                    Self::budgeted_reads(rebuild, &unverified, &verified, &ahead, number, budget);
+                (checks, deferred) = (reads.checks, reads.deferred);
+                reads.read
+            }
         };
         if !plan.live || !s.faces.any() {
             self.live_faces.forget();
         }
 
-        // Frames the host didn't hand over count as empty, as in a cold render, but nothing
-        // computed from one is cached, so it is read again next time.
+        // Frames the host didn't hand over count as empty, as in a cold render. Without
+        // a fetch budget nothing computed from one is cached, so it is read again next
+        // time; under one it is checked again with the frames verified longest ago.
         let mut missing = BTreeSet::new();
         for frame in frames_to_read {
             let index = (frame - plan.first) as usize;
             let before = self.read_before(frame);
-            let read_known = if plan.fixed && before.is_some() {
+            // Whether this read has to show the frame unchanged, rather than take it as it
+            // was.
+            let verify = !plan.fixed || checks.contains(&frame);
+            let read_known = if !verify && before.is_some() {
                 before
-            } else if plan.numbers_identify_frames {
+            } else if plan.numbers_identify_frames && !verify {
                 Some(PixelsRead::NotHashed)
             } else if frame == number {
                 current_hash.map(PixelsRead::Hash)
@@ -411,11 +505,11 @@ impl IncrementalRenderer {
                 None
             };
             let read = std::cell::Cell::new(read_known);
-            // A frame found unchanged with nothing left to work out needs no pixels, and converting
-            // them is most of what a check costs a host that converts. A fixed source lists only
-            // frames it needs. Decided here, after earlier frames' changes have dropped what they
-            // invalidate.
-            let unchanged_is_enough = !plan.fixed
+            // A frame found unchanged with nothing left to work out needs no pixels, and
+            // converting them is most of what a check costs a host that converts. A fixed
+            // source lists only frames it needs, besides checks. Decided here, after
+            // earlier frames' changes have dropped what they invalidate.
+            let unchanged_is_enough = verify
                 && frame != number
                 && (!plan.to_analyse.contains(&frame)
                     || self.is_cached(frame, &analysis_key(s, frame, plan.first), s));
@@ -429,16 +523,44 @@ impl IncrementalRenderer {
             };
             let mut use_frame = |image: Option<Image<'_>>| {
                 let view = image.and_then(C::view);
-                self.note_pixels(&plan, frame, view.as_ref(), read.get(), &mut missing);
+                let read = read.get();
+                self.note_pixels(&plan, frame, view.as_ref(), read, verify, &mut missing);
                 self.analyse_frame(&plan, frame, view.as_ref(), &missing);
                 if frame == number {
                     self.draw(s, count, number, view, out);
                 }
             };
             source.with_frame_if_wanted(index, &mut wanted, &mut use_frame);
+            changed |= verify && before.is_some() && read.get().is_some_and(|r| Some(r) != before);
+            // A frame the host didn't hand over goes to the back too, or it would take the
+            // budget every render.
+            if plan.fetch_budget.is_some()
+                && (verify || before.is_none())
+                && let Some(kept) = self.kept.get_mut(&frame)
+            {
+                kept.last_checked = self.budgeted_render_count;
+            }
         }
-        for &frame in &missing {
-            self.invalidate_frame(frame, plan.invalidation_reach);
+        if changed && all_verified {
+            self.changes_found_at = self.budgeted_render_count;
+        }
+        // Under a budget note_pixels has already made a missing frame's
+        // dependents stale before they were read. Doing it again here would
+        // have the budget redo the oldest of them every render.
+        if plan.fetch_budget.is_none() {
+            for &frame in &missing {
+                self.invalidate_frame(&plan, frame);
+            }
+        }
+        // Frames that use a deferred frame without a grid go stale, and so does
+        // the current frame if its face source is deferred. Reads go oldest
+        // first, so of this render's work that is only the current frame's.
+        if deferred.contains(&face_source_frame(s, number, plan.first)) {
+            self.mark_stale(number..=number);
+        }
+        deferred.retain(|&f| self.grid(f).is_none());
+        for frame in deferred {
+            self.mark_stale(frame..=frame + plan.invalidation_reach);
         }
         let retention_radius = plan.background + plan.trail_len + 2 * AnalysisStep::MAX_EVERY;
         // Later frames are read when they come up. Keeping them from a seek would only compare
@@ -525,26 +647,38 @@ impl IncrementalRenderer {
         }
     }
 
-    /// Records that `frame` was read as `read`, with its grid, and drops what a change to it
-    /// invalidates. A frame with no pixels or no `read` counts as missing.
+    /// Records that `frame` was read as `read`, with its grid, and drops what a
+    /// change to it invalidates if the read was to `verify` it. A frame with no
+    /// pixels or no `read` counts as missing.
     fn note_pixels<C: Depth>(
         &mut self,
         plan: &RenderPlan<'_>,
         frame: i64,
         view: Option<&View<C>>,
         read: Option<PixelsRead>,
+        verify: bool,
         missing: &mut BTreeSet<i64>,
     ) {
         let (Some(v), Some(read)) = (view, read) else {
-            self.invalidate_frame(frame, plan.invalidation_reach);
+            // A frame already known missing changed nothing since it was found so.
+            if !self.is_known_missing(frame) {
+                self.invalidate_frame(plan, frame);
+            }
             missing.insert(frame);
+            // Under a fetch budget it counts as empty, as in a fresh render, so later
+            // renders don't spend the budget asking for it again. Without a hash a check
+            // still does.
+            if plan.fetch_budget.is_some() {
+                self.kept.entry(frame).or_default().grid = Some(LumaGrid::default());
+            }
             return;
         };
         if self.read_before(frame) != Some(read) {
-            // A fixed source's frame read for the first time can't have changed what later frames
-            // computed from it; in other sources an uncached frame may have.
-            if !plan.fixed {
-                self.invalidate_frame(frame, plan.invalidation_reach);
+            // A fixed source's frame read without a check can't have changed what later
+            // frames computed from it; in other sources, and in a check, an uncached frame
+            // may have.
+            if verify {
+                self.invalidate_frame(plan, frame);
             }
             let kept = self.kept.entry(frame).or_default();
             kept.grid = Some(downsample(v, plan.s.grid_width));
@@ -572,12 +706,14 @@ impl IncrementalRenderer {
         if !wanted || self.is_cached(frame, &key, s) {
             return;
         }
-        let motion = match self.cached_motion(frame, &key) {
+        let motion = match self.fresh_motion(frame, &key) {
             Some(motion) => motion.clone(),
             None => {
                 let segments = self.find_segments(plan, frame, &key, view, missing);
                 let motion = segments.clone();
-                self.kept.entry(frame).or_default().analysis = Some(KeptAnalysis { key, segments });
+                let kept = self.kept.entry(frame).or_default();
+                kept.analysis = Some(KeptAnalysis { key, segments });
+                kept.stale = false;
                 motion
             }
         };
@@ -615,14 +751,17 @@ impl IncrementalRenderer {
         };
         let cells = grid.count();
         // The face source is analysed first, unless it is missing or a live source left it out,
-        // which leaves it no grid and no faces.
+        // which leaves it no grid, or under a fetch budget an empty one, and no faces.
         let source_frame = face_source_frame(s, frame, plan.first);
         let source_key = analysis_key(s, source_frame, plan.first);
         let source_motion = key
             .face_source
             .filter(|_| !plan.takes_faces_on_held_picture)
-            .filter(|_| !missing.contains(&source_frame) && self.grid(source_frame).is_some())
-            .and_then(|_| self.cached_motion(source_frame, &source_key));
+            .filter(|_| {
+                !missing.contains(&source_frame)
+                    && self.grid(source_frame).is_some_and(|g| g.count() > 0)
+            })
+            .and_then(|_| self.fresh_motion(source_frame, &source_key));
         if let Some(before) = source_motion {
             motion.blobs.extend(reused_faces(before, source_frame));
         } else if let Some(view) = view.filter(|_| s.faces.any()) {
@@ -1002,37 +1141,99 @@ impl IncrementalRenderer {
         }
     }
 
-    /// Whether `frame` has cached motion and, for the swarm, tiles.
+    /// Whether `frame` has cached motion and, for the swarm, tiles, none of it
+    /// stale.
     fn is_cached(&self, frame: i64, key: &AnalysisKey, s: &RenderSettings) -> bool {
-        self.cached_motion(frame, key).is_some()
+        self.fresh_motion(frame, key).is_some()
             && (s.mode != OutputMode::Swarm
                 || cached_tiles(&self.kept, frame, key, s.mirror).is_some())
     }
 
+    /// The motion `frame` draws for `key`, stale or not.
     fn cached_motion(&self, frame: i64, key: &AnalysisKey) -> Option<&Segmentation> {
         cached_analysis(&self.kept, frame, key)
+    }
+
+    /// [`Self::cached_motion`] that isn't stale, which later work may build on.
+    fn fresh_motion(&self, frame: i64, key: &AnalysisKey) -> Option<&Segmentation> {
+        self.kept.get(&frame).filter(|kept| !kept.stale)?;
+        self.cached_motion(frame, key)
     }
 
     fn grid(&self, frame: i64) -> Option<&LumaGrid> {
         self.kept.get(&frame)?.grid.as_ref()
     }
 
+    /// Whether a render under a fetch budget found `frame` missing and it hasn't
+    /// been handed over since: it has the empty grid such a render gives it.
+    fn is_known_missing(&self, frame: i64) -> bool {
+        self.grid(frame).is_some_and(|g| g.count() == 0)
+    }
+
     fn read_before(&self, frame: i64) -> Option<PixelsRead> {
         self.kept.get(&frame)?.read
     }
 
-    /// Drops `frame`'s cached data, and the motion and tiles of the `dependents` frames after it.
-    fn invalidate_frame(&mut self, frame: i64, dependents: i64) {
+    /// Drops `frame`'s grid and hash, and the motion and tiles of the frames that
+    /// used it. Under a fetch budget those are stale instead, and drawn until they
+    /// are worked out again.
+    fn invalidate_frame(&mut self, plan: &RenderPlan<'_>, frame: i64) {
         if let Some(kept) = self.kept.get_mut(&frame) {
             kept.grid = None;
             kept.read = None;
         }
-        for later in frame..=frame + dependents {
+        // The frame's own work is redone while its pixels are at hand, or, for a
+        // missing frame outside the swarm, not done at all, as in a fresh render.
+        let dependents = match plan.fetch_budget {
+            Some(_) => {
+                // Empty where nothing reads the frame's background.
+                self.mark_stale(frame + 1..frame + plan.invalidation_reach + 1);
+                frame..=frame
+            }
+            None => frame..=frame + plan.invalidation_reach,
+        };
+        for later in dependents {
             if let Some(kept) = self.kept.get_mut(&later) {
                 kept.analysis = None;
                 kept.tiles = None;
             }
             self.atlas.frames.remove(&later);
+        }
+    }
+
+    fn mark_stale(&mut self, frames: impl RangeBounds<i64>) {
+        for (_, kept) in self.kept.range_mut(frames) {
+            kept.stale |= kept.analysis.is_some() || kept.tiles.is_some();
+        }
+    }
+
+    /// The frames a render of `number` reads under a budget of `budget`
+    /// earlier frames: `ahead`, then the oldest of `rebuild` and `unverified`
+    /// together, then the first of `verified`.
+    fn budgeted_reads(
+        rebuild: BTreeSet<i64>,
+        unverified: &BTreeSet<i64>,
+        verified: &[i64],
+        ahead: &BTreeSet<i64>,
+        number: i64,
+        budget: usize,
+    ) -> BudgetedReads {
+        let rest = rebuild.union(unverified).filter(|f| !ahead.contains(f));
+        let mut oldest = ahead.iter().chain(rest).copied().filter(|&f| f != number);
+        let mut read: BTreeSet<i64> = oldest.by_ref().take(budget).collect();
+        let deferred = oldest.filter(|f| rebuild.contains(f)).collect();
+        let room = budget - read.len();
+        read.extend(verified.iter().take(room));
+        let checks = read
+            .iter()
+            .copied()
+            .filter(|f| !rebuild.contains(f))
+            .collect();
+        read.insert(number);
+        BudgetedReads {
+            read,
+            checks,
+            deferred,
         }
     }
 
@@ -1475,6 +1676,33 @@ mod tests {
             let calls = face_detection_calls_in(&mut state, &mut source, clip.len(), n as i64);
             assert!(calls > 0, "frame {n} didn't look for faces");
         }
+    }
+
+    /// Consecutive frames of a stream that holds only the current one look for
+    /// faces on every second analysis, the others taking their face source's
+    /// (SPEC F7).
+    #[test]
+    fn stream_holding_one_frame_reuses_faces() {
+        wait_for_models();
+        let frames = crossing();
+        let s = with_faces(ALL_PARTS);
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let mut state = IncrementalRenderer::default();
+        let consecutive = 4..frames.len();
+        let mut calls = 0;
+        for n in consecutive.clone() {
+            let clip = &frames[n - needed.min(n)..=n];
+            let mut source = OnlyNewestFrame {
+                frames: clip,
+                reads: 0,
+            };
+            calls += face_detection_calls_in(&mut state, &mut source, clip.len(), n as i64);
+        }
+        let renders = consecutive.len() as u32;
+        assert!(
+            calls <= renders.div_ceil(2) + 1,
+            "{calls} detections in {renders} renders"
+        );
     }
 
     /// Going back leaves nothing kept ahead of the frame rendered to be compared later.
@@ -2364,6 +2592,464 @@ mod tests {
 
         let (back, _) = render_converting(&mut state, &frames, n);
         assert_eq!(back, first);
+    }
+
+    /// [`ConvertingFrames`] under a fetch budget, recording the earlier
+    /// frames it hands out.
+    struct Budgeted<'a> {
+        frames: ConvertingFrames<'a>,
+        budget: usize,
+        earlier: BTreeSet<usize>,
+    }
+
+    impl Budgeted<'_> {
+        fn record_earlier(&mut self, index: usize) {
+            if index + 1 != self.frames.frames.len() {
+                self.earlier.insert(index);
+            }
+        }
+    }
+
+    impl FrameSource for Budgeted<'_> {
+        fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+            self.record_earlier(index);
+            self.frames.with_frame(index, f);
+        }
+
+        fn with_frame_if_wanted(
+            &mut self,
+            index: usize,
+            wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+            f: &mut dyn FnMut(Option<Image<'_>>),
+        ) {
+            self.record_earlier(index);
+            self.frames.with_frame_if_wanted(index, wanted, f);
+        }
+
+        fn fetch_budget(&self) -> Option<usize> {
+            Some(self.budget)
+        }
+    }
+
+    struct BudgetedRender {
+        pixels: Vec<Argb<u8>>,
+        /// Indices of the earlier frames handed out.
+        earlier: BTreeSet<usize>,
+        /// Indices of the frames converted, the current one included.
+        converted: Vec<usize>,
+    }
+
+    /// A render of frame `n` under `s` and a fetch budget of `budget`.
+    fn render_budgeted(
+        state: &mut IncrementalRenderer,
+        s: &RenderSettings,
+        frames: &[Vec<Argb<u8>>],
+        n: usize,
+        budget: usize,
+    ) -> BudgetedRender {
+        let start = n.saturating_sub(crate::previous_frames_needed(s) as usize);
+        let clip = &frames[start..=n];
+        let mut pixels = vec![Argb::default(); (W * H) as usize];
+        let mut source = Budgeted {
+            frames: ConvertingFrames {
+                frames: clip,
+                converted: Vec::new(),
+            },
+            budget,
+            earlier: BTreeSet::new(),
+        };
+        let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
+        state.render_frame(s, &mut source, clip.len(), n as i64, out);
+        BudgetedRender {
+            pixels,
+            earlier: source.earlier,
+            converted: source.frames.converted,
+        }
+    }
+
+    /// The most renders it may take to read every earlier frame under `s` and
+    /// a budget of `budget`.
+    fn catch_up_renders(s: &RenderSettings, budget: usize) -> usize {
+        (crate::previous_frames_needed(s) as usize).div_ceil(budget) + 1
+    }
+
+    fn invert_red(frames: &mut [Vec<Argb<u8>>]) {
+        for pixels in frames {
+            for p in pixels.iter_mut() {
+                p.red = 255 - p.red;
+            }
+        }
+    }
+
+    #[test]
+    fn budget_catches_up_from_cold() {
+        let s = swarm_settings();
+        let frames = crossing();
+        let n = frames.len() - 1;
+        let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
+        let mut state = IncrementalRenderer::default();
+        let renders = (1..=catch_up_renders(&s, 2)).find(|_| {
+            let render = render_budgeted(&mut state, &s, &frames, n, 2);
+            assert!(
+                render.earlier.len() <= 2,
+                "read {} earlier frames",
+                render.earlier.len()
+            );
+            render.pixels == cold
+        });
+        assert!(
+            renders.is_some_and(|r| r > 1),
+            "caught up after {renders:?} renders"
+        );
+        let again = render_budgeted(&mut state, &s, &frames, n, 2);
+        assert!(again.pixels == cold, "stays caught up");
+    }
+
+    /// With a background several times the budget, an edit to every frame is
+    /// caught up reading each earlier frame once.
+    #[test]
+    fn budget_reads_each_frame_once_after_edit() {
+        let s = RenderSettings {
+            background_frames: 16,
+            trail_frames: 12,
+            ..swarm_settings()
+        };
+        let mut frames: Vec<_> = (0..40).map(|f| crossing()[f % 14].clone()).collect();
+        let n = frames.len() - 1;
+        let earlier = (crate::previous_frames_needed(&s) as usize).min(n);
+        let mut state = IncrementalRenderer::default();
+        let settled = (0..8).any(|_| {
+            render_budgeted(&mut state, &s, &frames, n, usize::MAX).converted == [earlier]
+        });
+        assert!(settled, "renders before the edit never settled");
+        invert_red(&mut frames[..n]);
+        let cold = render_budgeted(
+            &mut IncrementalRenderer::default(),
+            &s,
+            &frames,
+            n,
+            usize::MAX,
+        );
+        let renders = catch_up_renders(&s, 2);
+        let mut converted = vec![0; earlier];
+        let caught_up = (1..=renders).any(|_| {
+            let render = render_budgeted(&mut state, &s, &frames, n, 2);
+            for index in render.converted.into_iter().filter(|&i| i < earlier) {
+                converted[index] += 1;
+            }
+            render.pixels == cold.pixels
+        });
+        assert!(caught_up, "not caught up in {renders} renders");
+        assert!(
+            converted.iter().all(|&c| c <= 1),
+            "converted more than once: {converted:?}"
+        );
+    }
+
+    /// An edit to earlier frames found by a budgeted check leaves the motion
+    /// that used them drawn until it is redone, so the trail doesn't empty.
+    #[test]
+    fn budget_draws_stale_motion_after_edit() {
+        let s = swarm_settings();
+        let mut frames = crossing();
+        let n = frames.len() - 1;
+        let mut state = IncrementalRenderer::default();
+        let (before, _) = render_converting(&mut state, &frames, n);
+        invert_red(&mut frames[..n]);
+        let first = render_budgeted(&mut state, &s, &frames, n, 2);
+        assert_eq!(first.earlier.len(), 2);
+        assert!(
+            first.pixels == before,
+            "the first check after the edit drew what was kept"
+        );
+        let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
+        assert!(cold != before, "the edit changes the picture");
+        let renders = catch_up_renders(&s, 2);
+        let caught_up = (1..=renders).any(|_| {
+            let render = render_budgeted(&mut state, &s, &frames, n, 2);
+            assert!(
+                render.earlier.len() <= 2,
+                "read {} earlier frames",
+                render.earlier.len()
+            );
+            render.pixels == cold
+        });
+        assert!(caught_up, "not caught up in {renders} renders");
+    }
+
+    /// An edit to the frame a settled held frame's checks just read waits for the
+    /// rotation to come back, and the frames checked before then are read again:
+    /// 25 renders here, where a jump takes at most 15.
+    #[test]
+    fn budget_catches_up_after_one_frame_edit() {
+        let s = RenderSettings {
+            background_frames: 16,
+            trail_frames: 12,
+            ..swarm_settings()
+        };
+        let mut frames: Vec<_> = (0..40).map(|f| crossing()[f % 14].clone()).collect();
+        let n = frames.len() - 1;
+        let start = n - (crate::previous_frames_needed(&s) as usize).min(n);
+        let mut state = IncrementalRenderer::default();
+        for _ in 0..2 * catch_up_renders(&s, 2) {
+            render_budgeted(&mut state, &s, &frames, n, 2);
+        }
+        let checked = render_budgeted(&mut state, &s, &frames, n, 2).earlier;
+        let just_checked = start + checked.last().expect("a settled render checks");
+        invert_red(&mut frames[just_checked..=just_checked]);
+        let cold = render_budgeted(
+            &mut IncrementalRenderer::default(),
+            &s,
+            &frames,
+            n,
+            usize::MAX,
+        );
+        let renders =
+            (1..=40).find(|_| render_budgeted(&mut state, &s, &frames, n, 2).pixels == cold.pixels);
+        assert_eq!(renders, Some(25), "frame {just_checked} edited");
+        let again = render_budgeted(&mut state, &s, &frames, n, 2);
+        assert!(again.pixels == cold.pixels, "stays caught up");
+    }
+
+    /// Threshold reads no background, so a frame's change reaches no later frame.
+    /// Held renders under a budget still catch up.
+    #[test]
+    fn budget_threshold_catches_up() {
+        let s = RenderSettings {
+            detection_mode: crate::DetectionMode::Threshold,
+            ..swarm_settings()
+        };
+        let frames = crossing();
+        let n = frames.len() - 1;
+        let cold = render_budgeted(
+            &mut IncrementalRenderer::default(),
+            &s,
+            &frames,
+            n,
+            usize::MAX,
+        );
+        let mut state = IncrementalRenderer::default();
+        let renders = catch_up_renders(&s, 2);
+        let caught_up = (0..renders)
+            .any(|_| render_budgeted(&mut state, &s, &frames, n, 2).pixels == cold.pixels);
+        assert!(caught_up, "not caught up in {renders} renders");
+    }
+
+    /// Frames that never change, fixed or not as the host says.
+    struct Steps<'a> {
+        frames: &'a [Vec<Argb<u8>>],
+        fixed: bool,
+        budget: Option<usize>,
+    }
+
+    impl FrameSource for Steps<'_> {
+        fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+            f(Some(Image::U8(View::from_pixels(
+                &self.frames[index],
+                W,
+                H,
+            ))))
+        }
+
+        fn fixed(&self) -> bool {
+            self.fixed
+        }
+
+        fn fetch_budget(&self) -> Option<usize> {
+            self.budget
+        }
+    }
+
+    /// Of single steps through a clip, one of them not taken as a stream, then
+    /// a step over a frame, the renders that differ from a fresh render.
+    fn steps_over_a_frame(budget: Option<usize>) -> Vec<usize> {
+        let s = RenderSettings {
+            background_frames: 16,
+            trail_frames: 12,
+            ..swarm_settings()
+        };
+        let frames: Vec<_> = (0..60).map(|f| crossing()[f % 14].clone()).collect();
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let render = |state: &mut IncrementalRenderer, n: usize, fixed: bool, budget| {
+            let clip = &frames[n.saturating_sub(needed)..=n];
+            let mut source = Steps {
+                frames: clip,
+                fixed,
+                budget,
+            };
+            let mut pixels = vec![Argb::<u8>::default(); (W * H) as usize];
+            let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
+            state.render_frame(&s, &mut source, clip.len(), n as i64, out);
+            pixels
+        };
+        let mut state = IncrementalRenderer::default();
+        // Settled single steps, one of which the host doesn't take as a stream.
+        render(&mut state, 0, false, budget);
+        for n in 1..=40 {
+            render(&mut state, n, n != 40, budget);
+        }
+        let mut differing = Vec::new();
+        for n in [42, 43, 44, 45] {
+            let got = render(&mut state, n, true, budget);
+            if got != render(&mut IncrementalRenderer::default(), n, false, None) {
+                differing.push(n);
+            }
+        }
+        differing
+    }
+
+    /// A frame a stream of single steps went over is read before the frames the
+    /// stream checks again after a step it didn't take as a stream, so the next
+    /// renders match a fresh render as they do without a budget.
+    #[test]
+    fn budget_reads_a_stepped_over_frame_first() {
+        let without = steps_over_a_frame(None);
+        assert_eq!(without, Vec::<usize>::new(), "without a budget");
+        assert_eq!(steps_over_a_frame(Some(4)), without);
+    }
+
+    /// Renders of a stream, after a settled pause, an edit to earlier frames
+    /// and the stream's first render, until its frames match fresh renders and
+    /// keep matching.
+    fn stream_renders_after_edit(edit_every_frame: bool) -> usize {
+        let s = RenderSettings {
+            background_frames: 16,
+            trail_frames: 12,
+            ..swarm_settings()
+        };
+        let mut frames: Vec<_> = (0..80).map(|f| crossing()[f % 14].clone()).collect();
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let render = |state: &mut IncrementalRenderer,
+                      frames: &[Vec<Argb<u8>>],
+                      n: usize,
+                      fixed: bool,
+                      budget: Option<usize>| {
+            let clip = &frames[n.saturating_sub(needed)..=n];
+            let mut source = Steps {
+                frames: clip,
+                fixed,
+                budget,
+            };
+            let mut pixels = vec![Argb::<u8>::default(); (W * H) as usize];
+            let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
+            state.render_frame(&s, &mut source, clip.len(), n as i64, out);
+            pixels
+        };
+        let mut state = IncrementalRenderer::default();
+        for _ in 0..3 * catch_up_renders(&s, 4) {
+            render(&mut state, &frames, 30, false, Some(4));
+        }
+        match edit_every_frame {
+            true => invert_red(&mut frames[..30]),
+            false => invert_red(&mut frames[22..=22]),
+        }
+        // Play starts with a render that isn't a stream, then streams.
+        render(&mut state, &frames, 30, false, Some(4));
+        let mut matched_from = None;
+        for n in 31..70 {
+            let got = render(&mut state, &frames, n, true, Some(4));
+            let fresh = render(&mut IncrementalRenderer::default(), &frames, n, false, None);
+            match (got == fresh, matched_from) {
+                (true, None) => matched_from = Some(n - 30),
+                (false, Some(_)) => matched_from = None,
+                _ => {}
+            }
+        }
+        matched_from.expect("the stream matches fresh renders by its end")
+    }
+
+    /// A stream after an edit reads its stale and unchecked frames oldest first
+    /// as a held frame does, so frames aren't rebuilt from background frames not
+    /// checked yet: 6 renders after an edit to every earlier frame, 8 after an
+    /// edit to one, with a budget of 4 for 28 earlier frames.
+    #[test]
+    fn budget_stream_after_edit_catches_up() {
+        assert_eq!(
+            stream_renders_after_edit(true),
+            6,
+            "every earlier frame edited"
+        );
+        assert_eq!(
+            stream_renders_after_edit(false),
+            8,
+            "one earlier frame edited"
+        );
+    }
+
+    /// Playback that dropped frames keeps no hashes of earlier frames. A held
+    /// render after it still catches up within the bound.
+    #[test]
+    fn budget_catches_up_after_dropped_frames() {
+        let frames = crossing();
+        let s = swarm_settings();
+        let needed = crate::previous_frames_needed(&s) as usize;
+        let n = frames.len() - 1;
+        let mut state = IncrementalRenderer::default();
+        render_budgeted(&mut state, &s, &frames, n - 4, usize::MAX);
+        for t in n - 3..=n {
+            let clip = &frames[t - needed.min(t)..=t];
+            let mut source = OnlyNewestFrame {
+                frames: clip,
+                reads: 0,
+            };
+            let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+            let view = &mut ViewMut::from_pixels(&mut out, W, H);
+            state.render_frame(&s, &mut source, clip.len(), t as i64, view);
+        }
+        let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
+        let renders = catch_up_renders(&s, 2);
+        let caught_up = (1..=renders).find(|_| {
+            let render = render_budgeted(&mut state, &s, &frames, n, 2);
+            assert!(
+                render.earlier.len() <= 2,
+                "read {} earlier frames",
+                render.earlier.len()
+            );
+            render.pixels == cold
+        });
+        assert!(caught_up.is_some(), "not caught up in {renders} renders");
+    }
+
+    /// After a detection change on a frame that reuses its face source's faces, a
+    /// render that leaves the source for later leaves the frame stale, so it is
+    /// redone with the source's faces once the source is.
+    #[test]
+    fn budget_redoes_frame_whose_face_source_waits() {
+        wait_for_models();
+        let frames = crossing();
+        let n = frames.len() - 1;
+        let s = with_faces(ALL_PARTS);
+        assert_ne!(
+            face_source_frame(&s, n as i64, 0),
+            n as i64,
+            "frame {n} reuses faces"
+        );
+        let mut state = IncrementalRenderer::default();
+        render_budgeted(&mut state, &s, &frames, n, usize::MAX);
+        let changed = RenderSettings {
+            motion: motion::MotionSettings {
+                sensitivity: s.motion.sensitivity / 2.0,
+                ..s.motion
+            },
+            ..s
+        };
+        render_budgeted(&mut state, &changed, &frames, n, 2);
+        assert!(state.kept[&(n as i64)].stale, "frame {n} kept as done");
+        let cold = render_budgeted(
+            &mut IncrementalRenderer::default(),
+            &changed,
+            &frames,
+            n,
+            usize::MAX,
+        );
+        let renders = catch_up_renders(&changed, 2);
+        let caught_up = (0..renders)
+            .any(|_| render_budgeted(&mut state, &changed, &frames, n, 2).pixels == cold.pixels);
+        assert!(caught_up, "not caught up in {renders} renders");
+        assert!(
+            !state.kept[&(n as i64)].stale,
+            "frame {n} still stale once caught up"
+        );
     }
 
     /// A check that skips converting earlier frames can't hide what a lost device took with it:

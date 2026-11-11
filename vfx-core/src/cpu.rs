@@ -365,8 +365,10 @@ pub trait FrameSource {
 
     /// Whether frames arrive from a live stream, so an effect should draw what it has rather than
     /// hold up the output: true for [`History`], false where a render may be exported and has to
-    /// be exact whatever it costs. A live source that is also [fixed](Self::fixed) numbers each
-    /// frame once, and starts over only from a lower number.
+    /// be exact whatever it costs, unless the source sets a
+    /// [fetch budget](Self::fetch_budget). A live source that is also
+    /// [fixed](Self::fixed) numbers each frame once, and starts over only from a
+    /// lower number.
     fn live(&self) -> bool {
         false
     }
@@ -386,6 +388,16 @@ pub trait FrameSource {
     /// that keeps work works those frames out again if the source later stops being fixed.
     fn held(&self) -> usize {
         usize::MAX
+    }
+
+    /// How many distinct earlier frames one render may ask for, the current frame
+    /// not counted, or `None` for as many as it needs. A hard cap, for a host that
+    /// holds every frame it hands out until the render returns; set it to at least
+    /// 2. Only an effect that [keeps state](crate::CpuEffect::keeps_state) can keep
+    /// to it: it reads the rest over the following renders and draws what it kept
+    /// meanwhile, so a render may differ from a fresh one until it has read them.
+    fn fetch_budget(&self) -> Option<usize> {
+        None
     }
 }
 

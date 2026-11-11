@@ -1,8 +1,12 @@
-//! The contract for a stateful CPU effect: every render equals a fresh effect's render of the
-//! same frames. Hosts rely on it (see [`crate::kept`]); an effect crate checks itself with
-//! [`check`] in its tests, on a clip that moves. A render left
-//! [unfinished](CpuEffect::unfinished) counts only once the same frame renders again and
-//! finishes, as a host must show it.
+//! The contract for a stateful CPU effect: every render equals a fresh effect's
+//! render of the same frames, or under a
+//! [fetch budget](FrameSource::fetch_budget) catches up to it. Hosts rely on it
+//! (see [`crate::kept`]); an effect crate checks itself with [`check`] in its
+//! tests, on a clip that moves. A render left
+//! [unfinished](CpuEffect::unfinished) counts only once the same frame renders
+//! again and finishes, as a host must show it.
+
+use std::collections::BTreeSet;
 
 use vfx_core::cpu::{Argb, FrameSource, Image, ImageMut, View, ViewMut};
 use vfx_core::{Context, CpuEffect, Frame, Gpu, ParamValues, Processor, Target};
@@ -22,6 +26,15 @@ impl Clip {
         self.frames.len() as i64
     }
 
+    /// The clip with only `frame` changed, colours inverted.
+    fn edited_at(&self, frame: i64) -> Clip {
+        let mut edited = self.clone();
+        for p in edited.frames[frame as usize].iter_mut() {
+            (p.red, p.green, p.blue) = (255 - p.red, 255 - p.green, 255 - p.blue);
+        }
+        edited
+    }
+
     /// The clip with every frame before `frame` changed, as a grade or paint fix upstream
     /// would: colours inverted.
     fn edited_before(&self, frame: i64) -> Clip {
@@ -33,6 +46,14 @@ impl Clip {
         }
         edited
     }
+
+    /// The clip's frames over and over, `len` of them.
+    fn cycled(&self, len: usize) -> Clip {
+        Clip {
+            frames: self.frames.iter().cycle().take(len).cloned().collect(),
+            ..self.clone()
+        }
+    }
 }
 
 /// Hands out the frames a render at `number` reads, with those in `missing` unavailable.
@@ -40,10 +61,19 @@ struct Source<'a> {
     clip: &'a Clip,
     first: i64,
     missing: &'a [i64],
+    fetch_budget: Option<usize>,
+    /// Whether the frames it hands out never change ([`FrameSource::fixed`]).
+    fixed: bool,
+    /// The indices of the earlier frames handed out.
+    earlier: BTreeSet<usize>,
+    current: usize,
 }
 
 impl FrameSource for Source<'_> {
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+        if index != self.current {
+            self.earlier.insert(index);
+        }
         let frame = self.first + index as i64;
         if self.missing.contains(&frame) || !(0..self.clip.len()).contains(&frame) {
             return f(None);
@@ -55,6 +85,34 @@ impl FrameSource for Source<'_> {
             self.clip.height,
         ))))
     }
+
+    fn fixed(&self) -> bool {
+        self.fixed
+    }
+
+    fn fetch_budget(&self) -> Option<usize> {
+        self.fetch_budget
+    }
+}
+
+/// The earlier frames a render under a fetch budget may read in [`check`]: few
+/// enough that catching up takes several renders, and more than 2, so a
+/// stream's `budget - 1` new frames a render differs from 1.
+const FETCH_BUDGET: usize = 3;
+
+/// The renders a frame held still under a fetch budget of `budget` takes to
+/// match a fresh render after a jump, a change to every earlier frame or to the
+/// parameters, when one render reads `frames`, the current one included.
+pub fn held_catch_up_renders(frames: usize, budget: usize) -> usize {
+    frames.div_ceil(budget.max(1)) + 1
+}
+
+/// The render from which a stream of fixed frames matches fresh renders after
+/// a jump, under a fetch budget of `budget`, at least 2, when one render reads
+/// `frames`, the current one included. Each render gains `budget - 1` frames:
+/// the frame before it joins those still to read.
+pub fn stream_catch_up_renders(frames: usize, budget: usize) -> usize {
+    frames.saturating_sub(budget).div_ceil(budget.max(2) - 1) + 1
 }
 
 /// How often a frame is rendered again while the effect says it is unfinished.
@@ -66,6 +124,8 @@ fn render(
     number: i64,
     missing: &[i64],
     values: &ParamValues,
+    fetch_budget: Option<usize>,
+    fixed: bool,
 ) -> Result<Vec<Argb<u8>>, String> {
     let count = (effect.frames_before(values, clip.frame_rate) as i64 + 1).min(number + 1);
     let ctx = Context {
@@ -78,6 +138,10 @@ fn render(
             clip,
             first: number - count + 1,
             missing,
+            fetch_budget,
+            fixed,
+            earlier: BTreeSet::new(),
+            current: count as usize - 1,
         };
         // A new buffer each time, so a finished render can't lean on an unfinished one.
         let mut out = vec![Argb::default(); clip.frames[0].len()];
@@ -89,6 +153,14 @@ fn render(
             values,
             &ctx,
         );
+        if let Some(budget) = fetch_budget
+            && source.earlier.len() > budget
+        {
+            return Err(format!(
+                "frame {number}: a render under a fetch budget of {budget} read {} earlier frames",
+                source.earlier.len()
+            ));
+        }
         if !effect.unfinished() {
             return Ok(out);
         }
@@ -105,9 +177,23 @@ fn cpu(make: fn() -> Processor) -> Box<dyn CpuEffect> {
     }
 }
 
-/// Renders `clip` through one kept effect in several orders, with the parameter sets in
-/// `values` taking turns, after edits upstream and with frames missing, and compares every
-/// frame with a fresh effect's render. Returns what differed first.
+/// Compares a kept effect's renders of `clip` with a fresh effect's and
+/// returns what differed first.
+///
+/// Without a budget every frame must match: in several orders, with the
+/// parameter sets in `values` taking turns, after edits upstream, with frames
+/// missing and after clearing the history.
+///
+/// Under a [fetch budget](FrameSource::fetch_budget) each render reads at most
+/// the budget, and:
+/// - renders in order match, for every parameter set;
+/// - a held frame matches within [`held_catch_up_renders`] after a jump, an
+///   edit to every earlier frame, missing frames or another parameter set;
+/// - after an edit to one earlier frame, or missing frames coming back, it
+///   matches within one render more than the frames a render reads;
+/// - a stream of fixed frames after a jump, over the clip repeated past what a
+///   render reads, matches from render [`stream_catch_up_renders`] on;
+/// - a held frame that matches still matches on its next render.
 pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Result<(), String> {
     assert!(!clip.frames.is_empty() && !values.is_empty());
     let n = clip.len();
@@ -118,8 +204,8 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
                    values: &ParamValues,
                    what: &str|
      -> Result<(), String> {
-        let got = render(kept, clip, number, missing, values)?;
-        let want = render(&mut *cpu(make), clip, number, missing, values)?;
+        let got = render(kept, clip, number, missing, values, None, false)?;
+        let want = render(&mut *cpu(make), clip, number, missing, values, None, false)?;
         if got == want {
             Ok(())
         } else {
@@ -160,7 +246,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
     }
 
     let last = n - 1;
-    let values = &values[0];
+    let (values, values_after) = (&values[0], &values[1..]);
     let edited = clip.edited_before(last);
     let mut kept = cpu(make);
     compare(&mut *kept, clip, last, &[], values, "before an edit")?;
@@ -212,6 +298,112 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
             )?;
         }
     }
+
+    let budget = Some(FETCH_BUDGET);
+    let all_values = std::iter::once(values).chain(values_after);
+    let frames_read = |values: &ParamValues| cpu(make).frames_before(values, clip.frame_rate) + 1;
+    for values in all_values.clone() {
+        let mut kept = cpu(make);
+        for number in 0..n {
+            let got = render(&mut *kept, clip, number, &[], values, budget, false)?;
+            if got != render(&mut *cpu(make), clip, number, &[], values, None, false)? {
+                return Err(format!(
+                    "in order under a fetch budget: frame {number} differs from a fresh render"
+                ));
+            }
+        }
+    }
+    let catches_up = |kept: &mut dyn CpuEffect,
+                      clip: &Clip,
+                      missing: &[i64],
+                      values: &ParamValues,
+                      renders: usize,
+                      what: &str| {
+        let want = render(&mut *cpu(make), clip, last, missing, values, None, false)?;
+        let mut caught_up = false;
+        for _ in 0..renders {
+            let matches = render(kept, clip, last, missing, values, budget, false)? == want;
+            if caught_up && !matches {
+                return Err(format!(
+                    "{what}: frame {last} matched a fresh render under a fetch budget, then differed"
+                ));
+            }
+            caught_up |= matches;
+        }
+        if !caught_up {
+            return Err(format!(
+                "{what}: frame {last} differs from a fresh render after {renders} renders \
+                 under a fetch budget of {FETCH_BUDGET}"
+            ));
+        }
+        match render(kept, clip, last, missing, values, budget, false)? == want {
+            true => Ok(()),
+            false => Err(format!(
+                "{what}: frame {last} matched a fresh render under a fetch budget, then differed"
+            )),
+        }
+    };
+    let frames = frames_read(values).min(n as usize);
+    // One render more than the frames a render reads: a cap, not a promise.
+    let (held, changed) = (held_catch_up_renders(frames, FETCH_BUDGET), frames + 1);
+    let mut kept = cpu(make);
+    catches_up(&mut *kept, clip, &[], values, held, "after a jump")?;
+    catches_up(
+        &mut *kept,
+        &edited,
+        &[],
+        values,
+        held,
+        "earlier frames edited",
+    )?;
+    catches_up(&mut *kept, clip, &missing, values, held, "frames missing")?;
+    catches_up(
+        &mut *kept,
+        clip,
+        &[],
+        values,
+        changed,
+        "missing frames back",
+    )?;
+    for values in values_after
+        .iter()
+        .chain(values_after.first().map(|_| values))
+    {
+        let held = held_catch_up_renders(frames_read(values).min(n as usize), FETCH_BUDGET);
+        catches_up(&mut *kept, clip, &[], values, held, "parameters changed")?;
+    }
+    let middle = last - frames_read(values).min(n as usize) as i64 / 2;
+    if middle < last {
+        let one_edited = clip.edited_at(middle);
+        catches_up(
+            &mut *kept,
+            &one_edited,
+            &[],
+            values,
+            changed,
+            "one earlier frame edited",
+        )?;
+    }
+
+    for values in all_values {
+        let frames = frames_read(values);
+        let renders = stream_catch_up_renders(frames, FETCH_BUDGET);
+        // From a frame with a whole render's frames before it, to a few past the bound.
+        let jump = frames as i64;
+        let long = clip.cycled(frames + renders + 2);
+        let mut kept = cpu(make);
+        for (render_index, number) in (jump..long.len()).enumerate() {
+            let got = render(&mut *kept, &long, number, &[], values, budget, true)?;
+            let want = render(&mut *cpu(make), &long, number, &[], values, None, false)?;
+            if render_index + 1 >= renders && got != want {
+                return Err(format!(
+                    "streaming after a jump under a fetch budget of {FETCH_BUDGET}: frame \
+                     {number}, render {}, differs from a fresh render",
+                    render_index + 1
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -234,6 +426,10 @@ fn render_offering(
         clip,
         first: number - count + 1,
         missing: &[],
+        fetch_budget: None,
+        fixed: false,
+        earlier: BTreeSet::new(),
+        current: count as usize - 1,
     };
     let mut out = vec![Argb::<u8>::default(); clip.frames[0].len()];
     let view = ViewMut::from_pixels(&mut out, clip.width, clip.height);

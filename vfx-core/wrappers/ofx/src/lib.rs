@@ -557,6 +557,7 @@ struct ClipFrames<'a, C> {
     frames_dropped: bool,
     /// The index of the frame being rendered, which [`timing`] times apart from earlier ones.
     current_index: usize,
+    fetch_budget: Option<usize>,
     /// `Some` only when timing is enabled.
     times: Option<timing::RenderTimes>,
 }
@@ -677,6 +678,41 @@ impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
     fn held(&self) -> usize {
         if self.frames_dropped { 1 } else { usize::MAX }
     }
+
+    fn fetch_budget(&self) -> Option<usize> {
+        self.fetch_budget
+    }
+}
+
+/// The bytes of earlier frames one render in Resolve may fetch, counted as
+/// unpadded RGBA at the output depth. Resolve holds every image a render
+/// fetches until the render returns.
+const FETCH_BUDGET_BYTES: usize = 1 << 30;
+
+/// [`FETCH_BUDGET_BYTES`], or `VFX_OFX_FETCH_BUDGET_MB` MiB where that is a
+/// whole number, read for each render so the mini host can change it between
+/// renders. Any other value is logged and ignored.
+fn fetch_budget_bytes() -> usize {
+    let Ok(mb) = std::env::var("VFX_OFX_FETCH_BUDGET_MB") else {
+        return FETCH_BUDGET_BYTES;
+    };
+    match mb.trim().parse::<usize>() {
+        Ok(mb) => mb.saturating_mul(1 << 20),
+        Err(e) => {
+            LOG.note(&format!(
+                "warning: VFX_OFX_FETCH_BUDGET_MB {mb:?} ignored ({e}), budget {FETCH_BUDGET_BYTES} bytes"
+            ));
+            FETCH_BUDGET_BYTES
+        }
+    }
+}
+
+/// The frames of `canvas` at `depth` that fit in `bytes`, at least 2: a stream
+/// under a budget reads `budget - 1` new frames a render, so 1 would never
+/// catch up. Above 8K in float 2 frames are more than 1 GiB.
+fn frames_within(bytes: usize, canvas: Rect, depth: Depth) -> usize {
+    let frame = canvas.width() * canvas.height() * 4 * depth.bytes_per_channel();
+    (bytes / frame.max(1)).max(2)
 }
 
 /// Whether to declare temporal clip access. Resolve hands over earlier frames without it and
@@ -1004,6 +1040,10 @@ impl CpuRender<'_> {
                 earlier_frames_unchanged: self.stream.continues,
                 frames_dropped: self.stream.frames_dropped,
                 current_index: self.frame_count - 1,
+                // A fresh effect has nothing kept to draw while it catches up.
+                // Holding fetched images is measured in Resolve only.
+                fetch_budget: (self.effect.is_kept() && host::is_resolve())
+                    .then(|| frames_within(fetch_budget_bytes(), canvas, self.output.depth)),
                 times: timing::enabled().then(timing::RenderTimes::default),
             };
             let started = timing::start(&frames.times);
@@ -1042,6 +1082,22 @@ impl CpuRender<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frames_within_budget_per_canvas() {
+        let rect = |x2, y2| Rect {
+            x1: 0,
+            y1: 0,
+            x2,
+            y2,
+        };
+        let gib = FETCH_BUDGET_BYTES;
+        assert_eq!(frames_within(gib, rect(1920, 1080), Depth::Float), 32);
+        assert_eq!(frames_within(gib, rect(3840, 2160), Depth::Float), 8);
+        assert_eq!(frames_within(gib, rect(1920, 1080), Depth::Byte), 129);
+        let huge = rect(16384, 16384);
+        assert_eq!(frames_within(gib, huge, Depth::Float), 2, "at least 2");
+    }
 
     /// Where renders of `frames`, in this order, stand, each taking `render_time`.
     fn positions(frames: &[i64], render_time: std::time::Duration) -> Vec<StreamPosition> {

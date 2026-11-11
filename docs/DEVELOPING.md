@@ -124,6 +124,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `FrameSource`: `with_frame`; `History` | vfx-core |
 | `FrameSource::held`; `History::next(before, held)` | vfx-core |
 | `FrameSource::live` (true for `History`) | vfx-core |
+| `FrameSource::fetch_budget` (a hard cap on the distinct earlier frames one render may ask for, at least 2, for a host that holds every frame it hands out until the render returns; default `None`, as many as it needs) | vfx-core |
 | `DeviceFaults::same_device` (whether two records are one device, across wgpu instances), `ReopenBackoff` (when to try for a new device after a loss) | vfx-core |
 | `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core |
@@ -132,7 +133,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `Gpu::backend_options` (wgpu backend options for every instance: on Windows, D3D12 compiles with the `dxcompiler.dll` shipped beside the binary, else FXC) | vfx-core |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core |
-| `contract::check` and `Clip` (a kept render equals a fresh one) | vfx-host |
+| `contract::check` and `Clip` (a kept render equals a fresh one; under a fetch budget, in order, and after a jump within `held_catch_up_renders` for a held frame and `stream_catch_up_renders` for a stream) | vfx-host |
 | `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host |
 | `CpuInstance::frames_held` | vfx-host |
 | `CpuInstance::values_known` | vfx-host |
