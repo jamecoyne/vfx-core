@@ -68,27 +68,37 @@ enum PixelsRead {
     NotHashed,
 }
 
-/// A frame's analysis, with the key it was computed for.
-struct KeptAnalysis {
+/// A frame's segments, with the key they were found for.
+struct Analysis {
     key: AnalysisKey,
     segments: Segmentation,
 }
 
 /// A frame's tiles, with the key and mirroring they were cut for.
-struct KeptTiles {
+struct CutTiles {
     key: AnalysisKey,
     mirror: bool,
     tiles: Vec<Tile>,
 }
 
-/// What is kept of one frame. Each part comes and goes on its own: a change to a frame drops the
-/// analysis of the frames that used it as background, and keeps their grids.
+/// What is kept of one frame for later frames' analyses and for draws. Each
+/// part comes and goes on its own: a change to a frame drops the analysis of
+/// the frames that used it as background, and keeps their grids.
+#[derive(Default)]
+struct FrameRecord {
+    /// The frame's luma, which later frames' backgrounds read. Never drawn.
+    grid: Option<LumaGrid>,
+    analysis: Option<Analysis>,
+    /// Pixels cut from the frame, freed apart from the rest once no draw shows
+    /// them.
+    tiles: Option<CutTiles>,
+}
+
+/// A frame's record and what the renderer knows of it.
 #[derive(Default)]
 struct KeptFrame {
-    grid: Option<LumaGrid>,
+    record: FrameRecord,
     read: Option<PixelsRead>,
-    analysis: Option<KeptAnalysis>,
-    tiles: Option<KeptTiles>,
     /// Under a fetch budget, an earlier frame its analysis used has changed
     /// or wasn't read. The analysis and tiles are drawn until redone.
     stale: bool,
@@ -611,8 +621,8 @@ impl IncrementalRenderer {
             return false;
         }
         match self.kept.get_mut(&plan.number) {
-            Some(kept) if kept.analysis.is_some() => {
-                kept.analysis = None;
+            Some(kept) if kept.record.analysis.is_some() => {
+                kept.record.analysis = None;
                 true
             }
             _ => false,
@@ -641,7 +651,7 @@ impl IncrementalRenderer {
             // renders don't spend the budget asking for it again. Without a hash a check
             // still does.
             if plan.fetch_budget.is_some() {
-                self.kept.entry(frame).or_default().grid = Some(LumaGrid::default());
+                self.kept.entry(frame).or_default().record.grid = Some(LumaGrid::default());
             }
             return;
         };
@@ -653,7 +663,7 @@ impl IncrementalRenderer {
                 self.invalidate_frame(plan, frame);
             }
             let kept = self.kept.entry(frame).or_default();
-            kept.grid = Some(downsample(v, plan.s.grid_width));
+            kept.record.grid = Some(downsample(v, plan.s.grid_width));
             kept.read = Some(read);
         }
     }
@@ -684,7 +694,7 @@ impl IncrementalRenderer {
                 let segments = self.find_segments(plan, frame, &key, view, missing);
                 let motion = segments.clone();
                 let kept = self.kept.entry(frame).or_default();
-                kept.analysis = Some(KeptAnalysis { key, segments });
+                kept.record.analysis = Some(Analysis { key, segments });
                 kept.stale = false;
                 motion
             }
@@ -786,7 +796,7 @@ impl IncrementalRenderer {
             s.mirror,
             include_reused_faces,
         );
-        self.kept.entry(frame).or_default().tiles = Some(KeptTiles {
+        self.kept.entry(frame).or_default().record.tiles = Some(CutTiles {
             key,
             mirror: s.mirror,
             tiles,
@@ -812,13 +822,14 @@ impl IncrementalRenderer {
         {
             let key = analysis_key(s, frame, first);
             let kept = self.kept.entry(frame).or_default();
-            kept.analysis
-                .get_or_insert_with(|| KeptAnalysis {
+            kept.record
+                .analysis
+                .get_or_insert_with(|| Analysis {
                     key,
                     segments: Segmentation::default(),
                 })
                 .key = key;
-            let tiles = kept.tiles.get_or_insert_with(|| KeptTiles {
+            let tiles = kept.record.tiles.get_or_insert_with(|| CutTiles {
                 key,
                 mirror: s.mirror,
                 tiles: Vec::new(),
@@ -839,7 +850,7 @@ impl IncrementalRenderer {
         oldest_held_frame: i64,
     ) {
         let mut older = self.kept.range(..oldest_held_frame);
-        if !older.any(|(_, kept)| kept.tiles.is_some()) {
+        if !older.any(|(_, kept)| kept.record.tiles.is_some()) {
             return;
         }
         let visible: BTreeSet<(i64, usize)> =
@@ -848,7 +859,11 @@ impl IncrementalRenderer {
                 .map(|p| (p.frame, p.index))
                 .collect();
         for (&frame, kept) in self.kept.range_mut(..oldest_held_frame) {
-            let tiles = kept.tiles.iter_mut().flat_map(|cut| cut.tiles.iter_mut());
+            let tiles = kept
+                .record
+                .tiles
+                .iter_mut()
+                .flat_map(|cut| cut.tiles.iter_mut());
             for (index, tile) in tiles.enumerate() {
                 if !visible.contains(&(frame, index)) {
                     tile.hidden = true;
@@ -862,7 +877,7 @@ impl IncrementalRenderer {
             .kept
             .range_mut(..oldest_held_frame.min(oldest_displayed_analysis))
         {
-            if let Some(analysis) = &mut kept.analysis {
+            if let Some(analysis) = &mut kept.record.analysis {
                 analysis.segments.mask = Vec::new();
             }
         }
@@ -1115,7 +1130,7 @@ impl IncrementalRenderer {
     }
 
     fn grid(&self, frame: i64) -> Option<&LumaGrid> {
-        self.kept.get(&frame)?.grid.as_ref()
+        self.kept.get(&frame)?.record.grid.as_ref()
     }
 
     /// Whether a render under a fetch budget found `frame` missing and it hasn't
@@ -1133,7 +1148,7 @@ impl IncrementalRenderer {
     /// are worked out again.
     fn invalidate_frame(&mut self, plan: &RenderPlan<'_>, frame: i64) {
         if let Some(kept) = self.kept.get_mut(&frame) {
-            kept.grid = None;
+            kept.record.grid = None;
             kept.read = None;
         }
         // The frame's own work is redone while its pixels are at hand, or, for a
@@ -1148,8 +1163,8 @@ impl IncrementalRenderer {
         };
         for later in dependents {
             if let Some(kept) = self.kept.get_mut(&later) {
-                kept.analysis = None;
-                kept.tiles = None;
+                kept.record.analysis = None;
+                kept.record.tiles = None;
             }
             self.atlas.frames.remove(&later);
         }
@@ -1157,7 +1172,7 @@ impl IncrementalRenderer {
 
     fn mark_stale(&mut self, frames: impl RangeBounds<i64>) {
         for (_, kept) in self.kept.range_mut(frames) {
-            kept.stale |= kept.analysis.is_some() || kept.tiles.is_some();
+            kept.stale |= kept.record.analysis.is_some() || kept.record.tiles.is_some();
         }
     }
 
@@ -1241,7 +1256,7 @@ impl AtlasPlacements {
             if self.frames.contains_key(&f) || self.oldest_frame.is_some_and(|oldest| f < oldest) {
                 continue;
             }
-            let Some(cut) = kept.get(&f).and_then(|k| k.tiles.as_ref()) else {
+            let Some(cut) = kept.get(&f).and_then(|k| k.record.tiles.as_ref()) else {
                 continue;
             };
             loop {
@@ -1274,7 +1289,7 @@ fn cached_analysis<'a>(
     frame: i64,
     key: &AnalysisKey,
 ) -> Option<&'a Segmentation> {
-    let analysis = kept.get(&frame)?.analysis.as_ref()?;
+    let analysis = kept.get(&frame)?.record.analysis.as_ref()?;
     (analysis.key == *key).then_some(&analysis.segments)
 }
 
@@ -1285,7 +1300,7 @@ fn cached_tiles<'a>(
     key: &AnalysisKey,
     mirror: bool,
 ) -> Option<&'a [Tile]> {
-    let cut = kept.get(&frame)?.tiles.as_ref()?;
+    let cut = kept.get(&frame)?.record.tiles.as_ref()?;
     (cut.key == *key && cut.mirror == mirror).then_some(cut.tiles.as_slice())
 }
 
@@ -1933,7 +1948,12 @@ mod tests {
                 state.live_faces.hold(ALL_PARTS, vec![face], 0, 0);
                 continue;
             }
-            let motion = &state.kept[&(n as i64)].analysis.as_ref().unwrap().segments;
+            let motion = &state.kept[&(n as i64)]
+                .record
+                .analysis
+                .as_ref()
+                .unwrap()
+                .segments;
             let shown = motion
                 .blobs
                 .iter()
@@ -3241,7 +3261,7 @@ mod tests {
         let tiles: Vec<&Tile> = state
             .kept
             .range(..last)
-            .filter_map(|(_, kept)| kept.tiles.as_ref())
+            .filter_map(|(_, kept)| kept.record.tiles.as_ref())
             .flat_map(|cut| &cut.tiles)
             .collect();
         let with_pixels = tiles.iter().filter(|t| !t.pixels.is_empty()).count();
