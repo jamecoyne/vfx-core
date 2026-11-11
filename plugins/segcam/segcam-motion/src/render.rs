@@ -399,7 +399,7 @@ pub fn copy_scaled<C: Channel>(src: &View<C>, dst: &mut ViewMut<C>, mirrored: bo
 // ---------------------------------------------------------------------------------------
 // The overlay and the mattes
 
-/// The overlay's measures at a canvas height, shared by the CPU and GPU paths.
+/// The overlay's measures at a canvas height.
 pub(crate) struct OverlayLayout {
     pub line: i32,
     pub text_scale: i32,

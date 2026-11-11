@@ -1091,7 +1091,7 @@ impl IncrementalRenderer {
         if !enough_windows
             || !self
                 .atlas
-                .place(&self.kept, &visible, drawer, (w, h), &shadow, live)?
+                .place(&self.kept, &visible, drawer, (w, h), live)?
         {
             let motion = cached_analysis(&self.kept, number, &analysis_key(s, number, first))
                 .unwrap_or(&NO_SEGMENTS);
@@ -1104,7 +1104,7 @@ impl IncrementalRenderer {
             Some((p.tile, allocation.slots[p.index]))
         });
         if into_target && let Some(offer) = self.target.as_mut() {
-            drawer.draw_swarm_into(&offer.frame, windows, frame.as_ref(), number, s, &shadow)?;
+            drawer.draw_swarm_into(&offer.frame, windows, frame.as_ref(), s, &shadow)?;
             offer.drawn_into = true;
             self.drew_on_gpu = Some(true);
             return Ok(());
@@ -1264,7 +1264,6 @@ impl AtlasPlacements {
         visible: &[PileEntry],
         drawer: &mut Drawer,
         canvas: (i32, i32),
-        shadow: &swarm::ShadowKernel,
         live: bool,
     ) -> Result<bool, Fault> {
         let wanted: BTreeSet<i64> = visible.iter().map(|p| p.frame).collect();
@@ -1277,7 +1276,7 @@ impl AtlasPlacements {
                 continue;
             };
             loop {
-                if let Some(allocation) = drawer.upload_tiles(&cut.tiles, canvas, shadow)? {
+                if let Some(allocation) = drawer.upload_tiles(&cut.tiles, canvas)? {
                     self.frames.insert(f, allocation);
                     break;
                 }
@@ -2215,7 +2214,7 @@ mod tests {
 
     /// Whether `b` is as near `a`, the CPU's picture, as SPEC F8 holds an 8-bit swarm drawn on
     /// the GPU to: every channel within 6 levels, and of 10,000 pixels at most 300 off at all and
-    /// 30 off by over a level.
+    /// 30 off by over a level (at least 4 of each, for small canvases).
     fn within_gpu_bound(a: &[Argb<u8>], b: &[Argb<u8>]) -> bool {
         let apart = |(p, q): (&Argb<u8>, &Argb<u8>)| {
             let channels = [

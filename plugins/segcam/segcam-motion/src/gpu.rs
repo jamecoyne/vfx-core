@@ -1,12 +1,7 @@
-//! The device segcam Motion draws its swarm on, and what happens around a draw. The drawing is
-//! [`crate::swarm_pass`]'s render passes; detection, tile layout, cutting tiles and title bars
-//! stay on the CPU, which also stays the reference and the fallback. The device opens in the
-//! background, and renders draw on the CPU until it is ready. A render the GPU fails is drawn on
-//! the CPU and the next one retries the GPU, or after `MAX_RECENT_FAULTS`, retries after
-//! `FAULT_COOLDOWN`. After a device is lost every instance draws on the CPU until [`DeviceSlot`]
-//! has another. In browsers it draws on the device the host shares. A draw into a host's frame
-//! needs no readback anywhere; otherwise a browser reads it back at the next render of the same
-//! frame.
+//! The device segcam Motion draws its swarm on with [`crate::swarm_pass`], and
+//! what a render does when the device isn't there: it opens in the background,
+//! a failed draw falls back to the CPU and is retried or cooled down, a lost
+//! device is replaced, and a browser reads a draw back a render later.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(test)]
@@ -507,7 +502,8 @@ fn open_on(choice: &str, lost_adapter: Option<&str>) -> Result<GpuContext, NoGpu
         None => pick_adapter(choice)?,
     };
     let info = adapter.get_info();
-    // A readback is one buffer the size of the canvas: take the largest the adapter allows.
+    // A readback is one buffer of the canvas's rows: take the largest the
+    // adapter allows.
     let required_limits = wgpu::Limits {
         max_buffer_size: adapter.limits().max_buffer_size,
         ..wgpu::Limits::default()
@@ -597,8 +593,8 @@ fn open_on(_choice: &str, _lost_adapter: Option<&str>) -> Result<GpuContext, NoG
 }
 
 impl GpuContext {
-    /// The swarm's pipelines on `device`, built here, in the background open, so the first
-    /// render doesn't build them.
+    /// The swarm's pipelines on `device`. The 8-bit ones are built here, in
+    /// the background open, so the first 8-bit render doesn't build them.
     fn build(
         device: wgpu::Device,
         queue: wgpu::Queue,
@@ -800,7 +796,6 @@ impl Drawer {
         &mut self,
         tiles: &[Tile],
         canvas: (i32, i32),
-        _shadow: &ShadowKernel,
     ) -> Result<Option<AtlasAllocation>, Fault> {
         // Made before the check, so a fault gives the room back.
         let allocation = self.pass.upload_tiles(tiles, canvas.1);
@@ -839,9 +834,12 @@ impl Drawer {
         }
     }
 
-    /// A fault where a readback of `out` is a larger buffer than the device makes.
+    /// A fault where a readback of `out` is a larger buffer than the device
+    /// makes.
     fn check_readback_fits<C: Channel>(&self, out: &ViewMut<C>) -> Result<(), Fault> {
-        let bytes = out.width as u64 * out.height as u64 * size_of::<Argb<C>>() as u64;
+        let row = out.width as u64 * size_of::<Argb<C>>() as u64;
+        let padded_row = row.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        let bytes = padded_row * out.height as u64;
         if bytes > self.max_buffer_bytes {
             return Err(Fault(format!(
                 "the readback needs {bytes} bytes, more than the GPU's largest buffer"
@@ -900,6 +898,10 @@ impl Drawer {
                 }
                 (true, _) => return Err(Fault("the readback failed to map".into())),
                 (false, PENDING) => self.superseded_draws += 1,
+                (false, MAPPED) => {
+                    in_flight.readback.buffer().unmap();
+                    self.pass.restore_readback(in_flight.readback);
+                }
                 (false, _) => {}
             }
         }
@@ -941,11 +943,9 @@ impl Drawer {
         target: &vfx_core::Frame,
         windows: impl IntoIterator<Item = (&'t Tile, Slot)>,
         frame: Option<&View<C>>,
-        number: i64,
         s: &RenderSettings,
         shadow: &ShadowKernel,
     ) -> Result<(), Fault> {
-        let _ = number;
         if depth::<C>() != 0 {
             return Err(Fault(
                 "only an 8-bit canvas draws into a host's frame".into(),
@@ -991,7 +991,7 @@ mod tests {
             .map(|(_, tile)| tile.clone())
             .collect();
         let shadow = crate::swarm::shadow_kernel(crate::swarm::SwarmMetrics::new(CANVAS.1).scale);
-        let uploaded = drawer.upload_tiles(&shown, CANVAS, &shadow);
+        let uploaded = drawer.upload_tiles(&shown, CANVAS);
         let allocation = uploaded
             .expect("the upload is accepted")
             .expect("the atlas has room");

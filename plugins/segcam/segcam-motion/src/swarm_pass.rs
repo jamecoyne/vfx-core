@@ -2525,7 +2525,7 @@ mod tests {
     }
 
     #[test]
-    fn grow_waits_out_a_refusal() {
+    fn grow_retries_after_refusal() {
         let limits = AtlasLimits {
             side: 64,
             layers: 8,
@@ -2540,7 +2540,7 @@ mod tests {
         assert_eq!(place(&mut atlas), None, "asked again at once");
         assert_eq!(atlas.layers, 2);
         let due = Instant::now().checked_sub(Atlas::GROWTH_RETRY_AFTER);
-        atlas.last_refusal = Some(due.expect("up for a minute"));
+        atlas.last_refusal = Some(due.expect("uptime over GROWTH_RETRY_AFTER"));
         assert!(place(&mut atlas).is_some(), "stayed capped");
         assert_eq!(atlas.layers, 4);
     }

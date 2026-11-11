@@ -58,8 +58,8 @@ the past 40 median, p95 is of the past 40. The CLI's conversion in and out takes
 frame at 8 bit and 11 ms at float at 1080p on an i7-12700K, so offline 8 bit and float rows compare.
 The Path column counts the frames each path drew, over all runs. The frame hashes go to `target/bench/COMMIT` (`-dirty` for
 a changed tree); that folder is the `--reference` of a later run on the same clip
-(`target/bench/COMMIT-cpu` for a `--cpu` run, which matches overlay; the GPU's swarm stays within a
-level of the CPU's, so it differs there). It prints the machine column from the system: paste it,
+(`target/bench/COMMIT-cpu` for a `--cpu` run, which matches overlay; the GPU's swarm stays within
+SPEC F8's bound of the CPU's, so it differs there). It prints the machine column from the system: paste it,
 don't retype it. Windows gives every GPU with its driver and the one driving the display, an Apple
 silicon Mac the chip with its CPU cores, GPU cores and memory, an Intel Mac its GPUs and the display,
 Linux the GPUs `lspci` lists.

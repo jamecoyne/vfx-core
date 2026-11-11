@@ -1,8 +1,9 @@
-//! The swarm's GPU path against the CPU path, which stays the reference: every pixel within
-//! one level (1/255 of white), and few pixels off by more than half of one. An 8-bit swarm has
-//! a wider bound ([`Bound::SWARM_AT_8_BITS`]). Skipped where there is no adapter, failed where
-//! there is one but it can't draw; `SEGCAM_GPU_ADAPTER=fallback` runs it on a software one
-//! (WARP, lavapipe).
+//! The swarm's GPU path against the CPU path, which stays the reference:
+//! every pixel within one level (1/255 of white), and few pixels off by more
+//! than half of one. An 8-bit swarm has a wider bound ([`Bound::AT_8_BITS`]).
+//! Skipped where there is no adapter, failed where there is one but it can't
+//! draw; `SEGCAM_GPU_ADAPTER=fallback` runs it on a software one (WARP,
+//! lavapipe).
 
 use segcam_motion::gpu::NoGpu;
 use segcam_motion::pixel::Depth;
@@ -22,25 +23,25 @@ struct Bound {
 }
 
 impl Bound {
-    const WITHIN_A_LEVEL: Self = Self {
+    const ONE_LEVEL: Self = Self {
         levels: 1.0,
         over_half_in_10_000: 1,
         over_one_in_10_000: 0,
     };
 
-    /// The CPU rounds the canvas to 8 bits after every window and the GPU's blend rounds
-    /// otherwise, so where windows and their shadows stack the two drift apart. Measured over
-    /// these cases on three adapters: 6 levels, 250 and 23 pixels in 10,000.
-    const SWARM_AT_8_BITS: Self = Self {
+    /// SPEC F8's bound for 8-bit canvases: the two paths round to 8 bits at
+    /// different points, so where windows and their shadows stack they drift
+    /// apart.
+    const AT_8_BITS: Self = Self {
         levels: 6.0,
         over_half_in_10_000: 300,
         over_one_in_10_000: 30,
     };
 
-    fn of<C>(s: &RenderSettings) -> Self {
-        match (s.mode, size_of::<C>()) {
-            (OutputMode::Swarm, 1) => Self::SWARM_AT_8_BITS,
-            _ => Self::WITHIN_A_LEVEL,
+    fn of<C>() -> Self {
+        match size_of::<C>() {
+            1 => Self::AT_8_BITS,
+            _ => Self::ONE_LEVEL,
         }
     }
 
@@ -203,7 +204,7 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
             n as i64,
             &mut ViewMut::from_pixels(&mut b, w, h),
         );
-        let bound = Bound::of::<C>(s);
+        let bound = Bound::of::<C>();
         let (mut over_half, mut over_one) = (0, 0);
         for (i, (p, q)) in a.iter().zip(&b).enumerate() {
             let pairs = [
@@ -236,10 +237,7 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
         );
     }
     let windows = a.iter().filter(|p| p.alpha.to_unit() > 0.0).count();
-    assert!(
-        s.mode != OutputMode::Swarm || windows > 0,
-        "{name}: no windows drawn"
-    );
+    assert!(windows > 0, "{name}: no windows drawn");
     if let Err(e) = segcam_motion::gpu::status() {
         panic!("{name}: {e}");
     }
