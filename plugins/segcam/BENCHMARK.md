@@ -160,7 +160,8 @@ Drawn straight into an RGBA8 host frame, with no readback: 0.15 ms at 49 windows
 the CPU below these coverages when the canvas is read back; a draw into a host frame always takes
 the GPU. CPU and GPU cross at about 0.16 (RTX 4070) and 0.75 (UHD 770) at 8 bit, 0.33 and 1.15 at
 16 bit, 1.65 and 3.0 in float. 1.5 sits between the 16 bit and the float crossings, and either
-depth loses at most about 4.5 ms a draw near it. The CPU rows vary by up to 30% between runs.
+depth loses at most about 5 ms a draw near it. The CPU rows can differ by up to a factor of two
+between runs of the same scene, so the crossings are ranges.
 
 `tests/gpu.rs` allows 1 pixel in 10,000, at least 4, off by over half a level. The 1080p clip's
 cases measured at most 8 of 2,073,600 on an RTX 4070.
