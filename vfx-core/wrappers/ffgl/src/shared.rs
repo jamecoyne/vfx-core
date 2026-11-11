@@ -173,8 +173,7 @@ impl SharedDevice {
         if !adapter.features().contains(features) {
             return Err("Vulkan adapter lacks VULKAN_EXTERNAL_MEMORY_WIN32".into());
         }
-        // CPU effects that draw here read a whole canvas back in one buffer, as
-        // large as the adapter allows, as on a device of their own.
+        // CPU effects read a canvas back in one buffer, as large as allowed.
         let supported = adapter.limits();
         let desc = wgpu::DeviceDescriptor {
             label: Some("ffgl shared Vulkan device"),

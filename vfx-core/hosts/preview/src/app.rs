@@ -178,8 +178,8 @@ async fn open_device(
     choice: Option<&str>,
 ) -> Result<(wgpu::Adapter, Gpu), String> {
     let adapter = pick_adapter(instance, surface, choice).await?;
-    // Effects read a whole canvas back in one buffer: as large a buffer as the
-    // adapter allows, or large float canvases stop at wgpu's default.
+    // Effects read a whole canvas back in one buffer, as large as the adapter
+    // allows; a canvas over it faults and draws on the CPU.
     let supported = adapter.limits();
     // WebGL2 can't meet wgpu's default limits.
     let base = if adapter.get_info().backend == wgpu::Backend::Gl {
@@ -1593,7 +1593,7 @@ impl ApplicationHandler<GpuSetup> for App {
             #[cfg(target_arch = "wasm32")]
             GpuSetup::Failed(e) => {
                 show_startup_message(&format!(
-                    "VFX Preview needs WebGPU or WebGL2, and this browser gave neither ({e}). \
+                    "VFX Preview couldn't start on WebGPU or WebGL2 ({e}). \
                      Try a current Chrome, Edge or Safari."
                 ));
                 let _ = event_loop;

@@ -1,9 +1,5 @@
-//! The swarm's GPU path against the CPU path, which stays the reference:
-//! every pixel within one level (1/255 of white), and few pixels off by more
-//! than half of one. An 8-bit swarm has a wider bound ([`Bound::AT_8_BITS`]).
-//! Skipped where there is no adapter, failed where there is one but it can't
-//! draw; `SEGCAM_GPU_ADAPTER=fallback` runs it on a software one (WARP,
-//! lavapipe).
+//! The swarm's GPU path against the CPU path, within [`Bound::of`] its depth.
+//! `SEGCAM_GPU_ADAPTER=fallback` runs it on a software adapter (WARP).
 
 use segcam_motion::gpu::NoGpu;
 use segcam_motion::pixel::Depth;
@@ -17,8 +13,9 @@ use vfx_core::cpu::{FrameSource, Image};
 struct Bound {
     /// The most levels any channel is off by.
     levels: f32,
-    /// The most pixels off by over half a level, and by over one, in 10,000.
+    /// The most pixels in 10,000 off by over half a level.
     over_half_in_10_000: usize,
+    /// The most pixels in 10,000 off by over one level.
     over_one_in_10_000: usize,
 }
 

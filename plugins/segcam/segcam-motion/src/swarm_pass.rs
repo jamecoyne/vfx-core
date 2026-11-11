@@ -1055,9 +1055,8 @@ impl SwarmPass {
             });
         }
         drop(atlases);
-        // Made with the lock released, since dropping it takes the lock:
-        // that is how the earlier tiles' room comes back where one found
-        // none.
+        // Made after the lock is released: dropping an allocation takes the
+        // lock to free its rows.
         let allocation = AtlasAllocation {
             atlases: self.atlases.clone(),
             slots,

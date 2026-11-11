@@ -1045,10 +1045,10 @@ mod tests {
         assert_eq!(drawer.drawn, 2);
     }
 
-    /// A draw that changes every render never finishes, so one render in four gives up and
-    /// the caller draws it on the CPU.
+    /// A deferred draw replaced [`MAX_SUPERSEDED_DRAWS`] times in a row faults,
+    /// and the caller draws that render on the CPU.
     #[test]
-    fn deferred_swarm_draw_gives_up_when_superseded() {
+    fn deferred_swarm_draw_faults_after_max_superseded() {
         let _lock = gpu_test_lock();
         let (mut drawer, shown, allocation, shadow) = drawer_with_scene();
         let s = swarm_settings();
