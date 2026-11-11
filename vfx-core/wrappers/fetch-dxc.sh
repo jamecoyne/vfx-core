@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Fetches the DirectX Shader Compiler that ships with every Windows binary linking vfx-core
 # (beside it in the zips, in Common Files with the Setup), and prints the folder that holds
-# it: dxcompiler.dll (x64) and DXC's licenses. Without it wgpu compiles D3D12 shaders with FXC, which takes seconds before an
-# effect draws on the GPU. The release is pinned and checked by sha256, so every build ships
-# the same compiler whatever the machine has installed.
+# it: dxcompiler.dll (x64) and DXC's licenses. Without it wgpu compiles D3D12 shaders with
+# FXC, which takes seconds before an effect draws on the GPU. The release is pinned and
+# checked by sha256, so every build ships the same compiler whatever the machine has
+# installed.
 # Usage: ./fetch-dxc.sh [TARGET]   (Git Bash; downloads once into TARGET/dxc, default
 #   <repo>/target). Exits 3 when the zip doesn't match the pin.
 set -euo pipefail

@@ -303,23 +303,21 @@ mod dxc {
     /// a shared folder can be older or another vendor's. wgpu needs the full
     /// path: a host doesn't search a plugin's folder.
     pub fn bundled() -> io::Result<String> {
-        load(&locate(shared_dir().as_deref(), &module_dir()?)?)
+        load_first(shared_dir().as_deref(), &module_dir()?)
     }
 
-    /// The `dxcompiler.dll` in `shared`, or else in `beside`.
-    fn locate(shared: Option<&Path>, beside: &Path) -> io::Result<PathBuf> {
+    /// Loads the `dxcompiler.dll` in `shared`, or else the one in `beside`,
+    /// and returns its path. A DLL that is there but won't load counts as
+    /// missing; the error names every place tried.
+    fn load_first(shared: Option<&Path>, beside: &Path) -> io::Result<String> {
+        let mut tried = Vec::new();
         for dir in shared.into_iter().chain([beside]) {
-            let path = dir.join("dxcompiler.dll");
-            if path.is_file() {
-                return Ok(path);
+            match load(&dir.join("dxcompiler.dll")) {
+                Ok(path) => return Ok(path),
+                Err(err) => tried.push(err.to_string()),
             }
         }
-        let beside = beside.display();
-        let message = match shared {
-            Some(shared) => format!("no dxcompiler.dll in {} or {beside}", shared.display()),
-            None => format!("no dxcompiler.dll in {beside}"),
-        };
-        Err(io::Error::new(io::ErrorKind::NotFound, message))
+        Err(io::Error::new(io::ErrorKind::NotFound, tried.join("; ")))
     }
 
     /// Where the Windows Setup puts one DXC for all its plugins, a folder per
@@ -405,41 +403,43 @@ mod dxc {
             assert_eq!(module_dir().unwrap(), exe.parent().unwrap());
         }
 
-        #[test]
-        fn locate_prefers_shared() {
-            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            std::fs::write(shared.path().join("dxcompiler.dll"), b"").unwrap();
-            std::fs::write(beside.path().join("dxcompiler.dll"), b"").unwrap();
-            assert_eq!(
-                locate(Some(shared.path()), beside.path()).unwrap(),
-                shared.path().join("dxcompiler.dll")
-            );
+        /// A DLL that loads, copied into `dir` as `dxcompiler.dll`.
+        fn put_loadable_dll(dir: &Path) {
+            let system = std::env::var_os("SystemRoot").unwrap();
+            let source = Path::new(&system).join("System32").join("version.dll");
+            std::fs::copy(source, dir.join("dxcompiler.dll")).unwrap();
         }
 
         #[test]
-        fn locate_falls_back_to_beside() {
+        fn load_first_prefers_shared() {
             let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            std::fs::write(beside.path().join("dxcompiler.dll"), b"").unwrap();
-            assert_eq!(
-                locate(Some(shared.path()), beside.path()).unwrap(),
-                beside.path().join("dxcompiler.dll")
-            );
+            put_loadable_dll(shared.path());
+            put_loadable_dll(beside.path());
+            let path = load_first(Some(shared.path()), beside.path()).unwrap();
+            assert_eq!(Path::new(&path), shared.path().join("dxcompiler.dll"));
         }
 
         #[test]
-        fn locate_without_shared_dir_uses_beside() {
+        fn load_first_falls_back_past_a_bad_shared_dll() {
+            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            std::fs::write(shared.path().join("dxcompiler.dll"), b"not a DLL").unwrap();
+            put_loadable_dll(beside.path());
+            let path = load_first(Some(shared.path()), beside.path()).unwrap();
+            assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
+        }
+
+        #[test]
+        fn load_first_without_shared_dir_uses_beside() {
             let beside = tempfile::tempdir().unwrap();
-            std::fs::write(beside.path().join("dxcompiler.dll"), b"").unwrap();
-            assert_eq!(
-                locate(None, beside.path()).unwrap(),
-                beside.path().join("dxcompiler.dll")
-            );
+            put_loadable_dll(beside.path());
+            let path = load_first(None, beside.path()).unwrap();
+            assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
         }
 
         #[test]
-        fn locate_names_both_folders() {
+        fn load_first_names_both_folders() {
             let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            let err = locate(Some(shared.path()), beside.path()).unwrap_err();
+            let err = load_first(Some(shared.path()), beside.path()).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::NotFound);
             let shown = err.to_string();
             assert!(shown.contains(&*shared.path().to_string_lossy()), "{shown}");
