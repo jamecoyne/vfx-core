@@ -135,15 +135,11 @@ pub struct IncrementalRenderer {
     /// `None` before the first render.
     drew_on_gpu: Option<bool>,
     faces_wanted: bool,
-    /// Face detection for live renders, which never wait for it.
-    live_faces: crate::faces::LiveFaces,
+    analyser: Analyser,
     readings: Vec<Reading>,
     /// Live renders act as if the face models were still loading.
     #[cfg(test)]
     simulate_models_loading: bool,
-    /// Face detection calls so far.
-    #[cfg(test)]
-    face_detection_calls: u32,
     /// A host's GPU frame the render may draw into instead of its output.
     target: Option<TargetOffer>,
     /// The slot this instance draws from, where it isn't the process's.
@@ -465,7 +461,7 @@ impl IncrementalRenderer {
             }
         };
         if !plan.live || !s.faces.any() {
-            self.live_faces.forget();
+            self.analyser.live_faces.forget();
         }
 
         // Frames the host didn't hand over count as empty, as in a cold render. Without
@@ -541,7 +537,7 @@ impl IncrementalRenderer {
         if deferred.contains(&face_source_frame(s, number, plan.first)) {
             self.mark_stale(number..=number);
         }
-        deferred.retain(|&f| self.grid(f).is_none());
+        deferred.retain(|&f| kept_grid(&self.kept, f).is_none());
         for frame in deferred {
             self.mark_stale(frame..=frame + plan.invalidation_reach);
         }
@@ -616,7 +612,7 @@ impl IncrementalRenderer {
         if !plan.numbers_identify_frames
             || !plan.s.faces.any()
             || !plan.to_analyse.contains(&plan.number)
-            || !self.live_faces.answer_waiting()
+            || !self.analyser.live_faces.answer_waiting()
         {
             return false;
         }
@@ -668,7 +664,8 @@ impl IncrementalRenderer {
         }
     }
 
-    /// Works out `frame`'s analysis and tiles, if this render wants them and they aren't kept.
+    /// Works out `frame`'s analysis and tiles if this render wants them and they
+    /// aren't kept, and keeps them in its record.
     fn analyse_frame<C: Depth>(
         &mut self,
         plan: &RenderPlan<'_>,
@@ -688,122 +685,17 @@ impl IncrementalRenderer {
         if !wanted || self.is_cached(frame, &key, s) {
             return;
         }
-        let motion = match self.fresh_motion(frame, &key) {
-            Some(motion) => motion.clone(),
-            None => {
-                let segments = self.find_segments(plan, frame, &key, view, missing);
-                let motion = segments.clone();
-                let kept = self.kept.entry(frame).or_default();
-                kept.record.analysis = Some(Analysis { key, segments });
-                kept.stale = false;
-                motion
-            }
-        };
-        if swarm {
-            self.cut_tiles(plan, frame, key, &motion, view);
+        let analysed = self
+            .analyser
+            .analyse(plan, &self.kept, frame, key, view, missing);
+        let kept = self.kept.entry(frame).or_default();
+        if let Some(analysis) = analysed.analysis {
+            kept.record.analysis = Some(analysis);
+            kept.stale = false;
         }
-    }
-
-    /// `frame`'s segments under `s`: what moved or passed the threshold, then its faces.
-    fn find_segments<C: Depth>(
-        &mut self,
-        plan: &RenderPlan<'_>,
-        frame: i64,
-        key: &AnalysisKey,
-        view: Option<&View<C>>,
-        missing: &BTreeSet<i64>,
-    ) -> Segmentation {
-        let s = plan.s;
-        let empty = LumaGrid::default();
-        let grid = self.grid(frame).unwrap_or(&empty);
-        let mut motion = match s.detection_mode {
-            DetectionMode::Motion => {
-                let history = (key.background_start..frame)
-                    .filter(|k| k.rem_euclid(s.analysis_step.every) == 0)
-                    .map(|k| self.grid(k).unwrap_or(&empty));
-                motion::detect_motion(history, grid, &s.motion)
-            }
-            DetectionMode::Threshold => motion::detect_threshold(grid, &s.threshold, &s.motion),
-            DetectionMode::FacesOnly => Segmentation {
-                mask: vec![0; grid.count()],
-                width: grid.width,
-                height: grid.height,
-                ..Segmentation::default()
-            },
-        };
-        let cells = grid.count();
-        // The face source is analysed first, unless it is missing or a live source left it out,
-        // which leaves it no grid, or under a fetch budget an empty one, and no faces.
-        let source_frame = face_source_frame(s, frame, plan.first);
-        let source_key = analysis_key(s, source_frame, plan.first);
-        let source_motion = key
-            .face_source
-            .filter(|_| !plan.takes_faces_on_held_picture)
-            .filter(|_| {
-                !missing.contains(&source_frame)
-                    && self.grid(source_frame).is_some_and(|g| g.count() > 0)
-            })
-            .and_then(|_| self.fresh_motion(source_frame, &source_key));
-        if let Some(before) = source_motion {
-            motion.blobs.extend(reused_faces(before, source_frame));
-        } else if let Some(view) = view.filter(|_| s.faces.any()) {
-            #[cfg(test)]
-            {
-                self.face_detection_calls += 1;
-            }
-            if plan.live {
-                // A live render takes the newest faces there are, and those already shown stay
-                // until newer ones arrive.
-                let first_face = motion.blobs.len();
-                self.live_faces
-                    .exchange(view, s.faces, cells, frame, first_face);
-                motion.blobs.extend(self.live_faces.faces_on(frame));
-            } else {
-                // Any other render may be exported, so it has this frame's own faces, however long
-                // they take.
-                motion
-                    .blobs
-                    .extend(crate::faces::find(view, s.faces, cells));
-            }
-        }
-        motion
-    }
-
-    /// Cuts `frame`'s windows out of its pixels, and frees its old place in the atlas.
-    fn cut_tiles<C: Depth>(
-        &mut self,
-        plan: &RenderPlan<'_>,
-        frame: i64,
-        key: AnalysisKey,
-        motion: &Segmentation,
-        view: Option<&View<C>>,
-    ) {
-        let s = plan.s;
-        // Reused faces need tiles here if a trail no longer than the step draws no earlier
-        // analysis, or if the windows of held faces would leave it before the next analysis, as a
-        // slow detection's do on a short trail.
-        let next_analysis = frame + s.analysis_step.every;
-        let held_windows_leaving = self
-            .live_faces
-            .windows_leave_before(next_analysis, plan.trail_len);
-        let include_reused_faces = plan.trail_len <= s.analysis_step.every || held_windows_leaving;
-        let tiles = cut_frame_tiles(
-            motion,
-            view,
-            self.live_faces.found_in::<C>().as_ref(),
-            frame,
-            plan.canvas,
-            s.mirror,
-            include_reused_faces,
-        );
-        self.kept.entry(frame).or_default().record.tiles = Some(CutTiles {
-            key,
-            mirror: s.mirror,
-            tiles,
-        });
-        self.atlas.frames.remove(&frame);
-        if held_windows_leaving {
-            self.live_faces.windows_cut_on(frame);
+        if let Some(tiles) = analysed.tiles {
+            kept.record.tiles = Some(tiles);
+            self.atlas.frames.remove(&frame);
         }
     }
 
@@ -907,7 +799,9 @@ impl IncrementalRenderer {
             (analysis_key(s, frame, first)
                 .background_start
                 .max(oldest_held_frame)..frame)
-                .filter(|&k| k.rem_euclid(s.analysis_step.every) == 0 && self.grid(k).is_none())
+                .filter(|&k| {
+                    k.rem_euclid(s.analysis_step.every) == 0 && kept_grid(&self.kept, k).is_none()
+                })
         };
         for frame in frames_to_analyse(s, number, first)
             .into_iter()
@@ -924,9 +818,9 @@ impl IncrementalRenderer {
         wanted
     }
 
-    /// Draws frame `number`, the last of `count`, from the cache. `frame` is its pixels, which
-    /// every output but the swarm draws over. A render the GPU fails is drawn on the CPU from the
-    /// same cached state.
+    /// Draws frame `number`, the last of `count`, from its pixels, `frame`, and
+    /// the records of the frames it shows, never other frames' pixels. Every
+    /// output but the swarm draws over `frame`; a GPU fault draws on the CPU.
     pub fn draw<C: Channel>(
         &mut self,
         s: &RenderSettings,
@@ -1026,7 +920,7 @@ impl IncrementalRenderer {
     /// when that analysis is missing.
     fn displayed_analysis_frame(&self, s: &RenderSettings, number: i64, first: i64) -> i64 {
         let analysis = s.analysis_step.analysis_frame(number, first);
-        match self.cached_motion(analysis, &analysis_key(s, analysis, first)) {
+        match cached_analysis(&self.kept, analysis, &analysis_key(s, analysis, first)) {
             Some(_) => analysis,
             None => number,
         }
@@ -1040,8 +934,7 @@ impl IncrementalRenderer {
         first: i64,
     ) -> (i64, &Segmentation) {
         let frame = self.displayed_analysis_frame(s, number, first);
-        let motion = self
-            .cached_motion(frame, &analysis_key(s, frame, first))
+        let motion = cached_analysis(&self.kept, frame, &analysis_key(s, frame, first))
             .unwrap_or(&NO_SEGMENTS);
         (frame, motion)
     }
@@ -1103,7 +996,7 @@ impl IncrementalRenderer {
     pub fn clear_history(&mut self) {
         self.kept.clear();
         self.atlas = AtlasPlacements::default();
-        self.live_faces.forget();
+        self.analyser.live_faces.forget();
         self.unfinished = false;
         if let Some(drawer) = &mut self.drawer {
             drawer.drop_unfinished_draw();
@@ -1113,30 +1006,15 @@ impl IncrementalRenderer {
     /// Whether `frame` has cached motion and, for the swarm, tiles, none of it
     /// stale.
     fn is_cached(&self, frame: i64, key: &AnalysisKey, s: &RenderSettings) -> bool {
-        self.fresh_motion(frame, key).is_some()
+        fresh_analysis(&self.kept, frame, key).is_some()
             && (s.mode != OutputMode::Swarm
                 || cached_tiles(&self.kept, frame, key, s.mirror).is_some())
-    }
-
-    /// The motion `frame` draws for `key`, stale or not.
-    fn cached_motion(&self, frame: i64, key: &AnalysisKey) -> Option<&Segmentation> {
-        cached_analysis(&self.kept, frame, key)
-    }
-
-    /// [`Self::cached_motion`] that isn't stale, which later work may build on.
-    fn fresh_motion(&self, frame: i64, key: &AnalysisKey) -> Option<&Segmentation> {
-        self.kept.get(&frame).filter(|kept| !kept.stale)?;
-        self.cached_motion(frame, key)
-    }
-
-    fn grid(&self, frame: i64) -> Option<&LumaGrid> {
-        self.kept.get(&frame)?.record.grid.as_ref()
     }
 
     /// Whether a render under a fetch budget found `frame` missing and it hasn't
     /// been handed over since: it has the empty grid such a render gives it.
     fn is_known_missing(&self, frame: i64) -> bool {
-        self.grid(frame).is_some_and(|g| g.count() == 0)
+        kept_grid(&self.kept, frame).is_some_and(|g| g.count() == 0)
     }
 
     fn read_before(&self, frame: i64) -> Option<PixelsRead> {
@@ -1212,8 +1090,159 @@ impl IncrementalRenderer {
     }
 }
 
-/// Where kept frames' tiles sit in the atlas. It stays apart from [`KeptFrame`] because a draw
-/// changes it while the windows it draws borrow their tiles.
+/// What analysing frames keeps that is no frame's record: live face detection,
+/// whose answers arrive after the frame they were asked about.
+#[derive(Default)]
+struct Analyser {
+    live_faces: crate::faces::LiveFaces,
+    #[cfg(test)]
+    face_detection_calls: u32,
+}
+
+/// The parts of a frame's record that [`Analyser::analyse`] made.
+struct RecordParts {
+    analysis: Option<Analysis>,
+    tiles: Option<CutTiles>,
+}
+
+impl Analyser {
+    /// Analyses `frame` under `key` from its pixels and these records in
+    /// `kept`: the grids of `frame` and of `key`'s background frames, and of
+    /// the face source `key` names its grid and, if that entry isn't `stale`,
+    /// its analysis. `missing` frames have no grid. Gives an analysis unless a
+    /// fresh one is kept, and the swarm's tiles.
+    fn analyse<C: Depth>(
+        &mut self,
+        plan: &RenderPlan<'_>,
+        kept: &BTreeMap<i64, KeptFrame>,
+        frame: i64,
+        key: AnalysisKey,
+        view: Option<&View<C>>,
+        missing: &BTreeSet<i64>,
+    ) -> RecordParts {
+        let analysis = fresh_analysis(kept, frame, &key)
+            .is_none()
+            .then(|| Analysis {
+                key,
+                segments: self.find_segments(plan, kept, frame, &key, view, missing),
+            });
+        let segments = match &analysis {
+            Some(found) => Some(&found.segments),
+            None => fresh_analysis(kept, frame, &key),
+        };
+        let tiles = segments
+            .filter(|_| plan.s.mode == OutputMode::Swarm)
+            .map(|segments| self.cut_tiles(plan, frame, key, segments, view));
+        RecordParts { analysis, tiles }
+    }
+
+    /// `frame`'s segments: what moved or passed the threshold, then its faces.
+    fn find_segments<C: Depth>(
+        &mut self,
+        plan: &RenderPlan<'_>,
+        kept: &BTreeMap<i64, KeptFrame>,
+        frame: i64,
+        key: &AnalysisKey,
+        view: Option<&View<C>>,
+        missing: &BTreeSet<i64>,
+    ) -> Segmentation {
+        let s = plan.s;
+        let empty = LumaGrid::default();
+        let grid = kept_grid(kept, frame).unwrap_or(&empty);
+        let mut motion = match s.detection_mode {
+            DetectionMode::Motion => {
+                let history = (key.background_start..frame)
+                    .filter(|k| k.rem_euclid(s.analysis_step.every) == 0)
+                    .map(|k| kept_grid(kept, k).unwrap_or(&empty));
+                motion::detect_motion(history, grid, &s.motion)
+            }
+            DetectionMode::Threshold => motion::detect_threshold(grid, &s.threshold, &s.motion),
+            DetectionMode::FacesOnly => Segmentation {
+                mask: vec![0; grid.count()],
+                width: grid.width,
+                height: grid.height,
+                ..Segmentation::default()
+            },
+        };
+        let cells = grid.count();
+        // The face source is analysed first, unless it is missing or a live
+        // source left it out, which leaves it no grid, or under a fetch budget
+        // an empty one, and no faces.
+        let source_frame = face_source_frame(s, frame, plan.first);
+        let source_key = analysis_key(s, source_frame, plan.first);
+        let source_motion = key
+            .face_source
+            .filter(|_| !plan.takes_faces_on_held_picture)
+            .filter(|_| {
+                !missing.contains(&source_frame)
+                    && kept_grid(kept, source_frame).is_some_and(|g| g.count() > 0)
+            })
+            .and_then(|_| fresh_analysis(kept, source_frame, &source_key));
+        if let Some(before) = source_motion {
+            motion.blobs.extend(reused_faces(before, source_frame));
+        } else if let Some(view) = view.filter(|_| s.faces.any()) {
+            #[cfg(test)]
+            {
+                self.face_detection_calls += 1;
+            }
+            if plan.live {
+                // A live render takes the newest faces there are, and those
+                // already shown stay until newer ones arrive.
+                let first_face = motion.blobs.len();
+                self.live_faces
+                    .exchange(view, s.faces, cells, frame, first_face);
+                motion.blobs.extend(self.live_faces.faces_on(frame));
+            } else {
+                // Any other render may be exported, so it has this frame's own
+                // faces, however long they take.
+                motion
+                    .blobs
+                    .extend(crate::faces::find(view, s.faces, cells));
+            }
+        }
+        motion
+    }
+
+    /// Cuts `frame`'s windows out of its pixels.
+    fn cut_tiles<C: Depth>(
+        &mut self,
+        plan: &RenderPlan<'_>,
+        frame: i64,
+        key: AnalysisKey,
+        motion: &Segmentation,
+        view: Option<&View<C>>,
+    ) -> CutTiles {
+        let s = plan.s;
+        // Reused faces need tiles here if a trail no longer than the step draws
+        // no earlier analysis, or if the windows of held faces would leave it
+        // before the next analysis, as a slow detection's do on a short trail.
+        let next_analysis = frame + s.analysis_step.every;
+        let held_windows_leaving = self
+            .live_faces
+            .windows_leave_before(next_analysis, plan.trail_len);
+        let include_reused_faces = plan.trail_len <= s.analysis_step.every || held_windows_leaving;
+        let tiles = cut_frame_tiles(
+            motion,
+            view,
+            self.live_faces.found_in::<C>().as_ref(),
+            frame,
+            plan.canvas,
+            s.mirror,
+            include_reused_faces,
+        );
+        if held_windows_leaving {
+            self.live_faces.windows_cut_on(frame);
+        }
+        CutTiles {
+            key,
+            mirror: s.mirror,
+            tiles,
+        }
+    }
+}
+
+/// Where kept frames' tiles sit in the atlas. A record holds no GPU handles,
+/// and a draw changes this while the windows it draws borrow their tiles.
 #[derive(Default)]
 struct AtlasPlacements {
     frames: BTreeMap<i64, AtlasAllocation>,
@@ -1291,6 +1320,20 @@ fn cached_analysis<'a>(
 ) -> Option<&'a Segmentation> {
     let analysis = kept.get(&frame)?.record.analysis.as_ref()?;
     (analysis.key == *key).then_some(&analysis.segments)
+}
+
+/// [`cached_analysis`] if `frame` isn't stale, which later work may build on.
+fn fresh_analysis<'a>(
+    kept: &'a BTreeMap<i64, KeptFrame>,
+    frame: i64,
+    key: &AnalysisKey,
+) -> Option<&'a Segmentation> {
+    kept.get(&frame).filter(|kept| !kept.stale)?;
+    cached_analysis(kept, frame, key)
+}
+
+fn kept_grid(kept: &BTreeMap<i64, KeptFrame>, frame: i64) -> Option<&LumaGrid> {
+    kept.get(&frame)?.record.grid.as_ref()
 }
 
 /// The tiles of `frame`, if cut for `key` and `mirror`.
@@ -1698,9 +1741,9 @@ mod tests {
         let s = with_faces(ALL_PARTS);
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         let view = &mut ViewMut::from_pixels(&mut out, W, H);
-        let before = state.face_detection_calls;
+        let before = state.analyser.face_detection_calls;
         state.render_frame(&s, source, count, n, view);
-        state.face_detection_calls - before
+        state.analyser.face_detection_calls - before
     }
 
     /// While the models load a live render doesn't look for faces, and looks once they are up.
@@ -1798,16 +1841,17 @@ mod tests {
             };
             let first = show(&mut state, &frames[at]);
             assert!(!first.contains(&found_in));
-            assert!(state.live_faces.request_out());
-            let requests = state.live_faces.requests_sent;
+            assert!(state.analyser.live_faces.request_out());
+            let requests = state.analyser.live_faces.requests_sent;
             state
+                .analyser
                 .live_faces
                 .answer_with(ALL_PARTS, vec![face], found_in, (W, H));
             let with_faces = show(&mut state, &frames[at]);
             assert!(with_faces.contains(&found_in), "no window at frame {at}");
-            assert!(!state.live_faces.answer_waiting());
+            assert!(!state.analyser.live_faces.answer_waiting());
             assert!(show(&mut state, &frames[at]) == with_faces);
-            assert_eq!(state.live_faces.requests_sent, requests);
+            assert_eq!(state.analyser.live_faces.requests_sent, requests);
         }
         drop(models);
     }
@@ -1832,7 +1876,7 @@ mod tests {
             state.render_frame(&s, &mut history, count, number, view);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(state.live_faces.requests_sent, 1);
+        assert_eq!(state.analyser.live_faces.requests_sent, 1);
     }
 
     /// A live source whose numbering restarts drops what detection found in the frames before.
@@ -1846,7 +1890,7 @@ mod tests {
         history.resize(W, H);
         let started = std::time::Instant::now();
         let mut n = 0;
-        while !state.live_faces.holds_faces() {
+        while !state.analyser.live_faces.holds_faces() {
             assert!(started.elapsed() < Duration::from_secs(120), "no detection");
             history
                 .next(before, before)
@@ -1871,7 +1915,7 @@ mod tests {
         restarted.next(before, before).copy_from_slice(&frames[0]);
         let count = restarted.len();
         face_detection_calls_in(&mut state, &mut restarted, count, 0);
-        assert!(!state.live_faces.holds_faces());
+        assert!(!state.analyser.live_faces.holds_faces());
     }
 
     /// Faces stay on screen however long the next detection takes, past the trail and what the
@@ -1913,9 +1957,9 @@ mod tests {
             state.render_frame(&settings, &mut history, count, n, view);
             // The first render takes in the frame format, which clears everything.
             if n == 0 {
-                state.live_faces.hold(ALL_PARTS, vec![face], 0, 0);
+                state.analyser.live_faces.hold(ALL_PARTS, vec![face], 0, 0);
                 let pixels = vec![found_in; (W * H) as usize];
-                state.live_faces.hold_pixels(pixels, W, H);
+                state.analyser.live_faces.hold_pixels(pixels, W, H);
             } else if n >= i64::from(settings.trail_frames) {
                 assert!(out.contains(&found_in), "no window at {n}");
             }
@@ -1945,7 +1989,7 @@ mod tests {
             face_detection_calls_in(&mut state, &mut source, clip.len(), n as i64);
             // The first render takes in the frame format, which clears everything.
             if n == 2 {
-                state.live_faces.hold(ALL_PARTS, vec![face], 0, 0);
+                state.analyser.live_faces.hold(ALL_PARTS, vec![face], 0, 0);
                 continue;
             }
             let motion = &state.kept[&(n as i64)]
@@ -1978,6 +2022,7 @@ mod tests {
             // Past the first render, which takes in the frame format and clears everything.
             if n == 1 {
                 state
+                    .analyser
                     .live_faces
                     .hold(ALL_PARTS, vec![motion::Blob::default()], 0, 0);
             }
@@ -1985,7 +2030,7 @@ mod tests {
             let count = history.len();
             state.render_frame(&settings, &mut history, count, n as i64, view);
         }
-        assert!(!state.live_faces.holds_faces());
+        assert!(!state.analyser.live_faces.holds_faces());
     }
 
     /// Live renders that leave frames out, then an export from there: nothing of the live stretch
@@ -2016,7 +2061,7 @@ mod tests {
                     },
                     ..motion::Blob::default()
                 };
-                state.live_faces.hold(ALL_PARTS, vec![face], 6, 0);
+                state.analyser.live_faces.hold(ALL_PARTS, vec![face], 6, 0);
             }
         }
         for n in [11, 13] {
@@ -2028,7 +2073,7 @@ mod tests {
                 out
             };
             let exported = render(&mut state);
-            assert!(!state.live_faces.holds_faces());
+            assert!(!state.analyser.live_faces.holds_faces());
             assert!(
                 exported == render(&mut IncrementalRenderer::default()),
                 "frame {n}"
