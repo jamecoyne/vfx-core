@@ -10,20 +10,28 @@
 Segcam finds what moves in a shot, and faces and bodies. It draws them as labelled boxes, as mattes
 that cut out the moving parts, or as Swarm. Swarm is a collage of frozen tiles, drawn as macOS
 style windows that trail the subject. segcam started as a macOS app. Downloads for
-[v0.1.0](https://github.com/jamecoyne/vfx-core/releases/tag/v0.1.0):
+[v0.1.1](https://github.com/jamecoyne/vfx-core/releases/tag/v0.1.1):
 
 | Host | Plugin | macOS (signed and notarized) | Windows |
 |---|---|---|---|
-| After Effects | After Effects | [installer](https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-macOS-AfterEffects.pkg) | [installer][win-setup] or [zip][win-zip] |
-| DaVinci Resolve | OpenFX | [installer](https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-macOS-OpenFX.pkg) | [installer][win-setup] or [zip][win-zip] |
-| Resolume Avenue and Arena | FFGL | [zip](https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-macOS-Resolume.zip) | [installer][win-setup] or [zip][win-zip] |
+| After Effects | After Effects | [installer][mac-pkg] or [zip][mac-ae] | [installer][win-setup] or [zip][win-ae] |
+| DaVinci Resolve | OpenFX | [installer][mac-pkg] or [zip][mac-ofx] | [installer][win-setup] or [zip][win-ofx] |
+| Resolume Avenue and Arena | FFGL | [zip][mac-ffgl] | [installer][win-setup] or [zip][win-ffgl] |
 
-[win-setup]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-Windows-Setup.exe
-[win-zip]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.0/SegcamMotionRust-0.1.0-Windows.zip
+[mac-pkg]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-macOS.pkg
+[mac-ae]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-macOS-AfterEffects.zip
+[mac-ofx]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-macOS-OpenFX.zip
+[mac-ffgl]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-macOS-Resolume.zip
+[win-setup]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-Setup.exe
+[win-ae]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-AfterEffects.zip
+[win-ofx]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-OpenFX.zip
+[win-ffgl]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-Resolume.zip
 
-On Windows, one installer covers all three hosts (After Effects is optional in it); the zip holds
-the same files, to copy into the folders its `INSTALL.txt` names. The Windows files are unsigned, so
-SmartScreen asks before running the installer. Restart the host after installing.
+One installer per platform holds segcam, with the other effects as options. On macOS it covers After
+Effects and Resolve, and Resolume takes the zip. On Windows it covers all three hosts, with After
+Effects optional. Each zip holds one host's files and a `README.txt` naming the folder to copy them
+into. The Windows files are unsigned, so SmartScreen asks before running the installer. Restart the
+host after installing.
 
 It runs on integrated graphics from 2020 or later (Intel UHD 770 or Iris Xe, AMD Radeon 680M, any
 Apple M1 or newer) with a 6 core CPU. Swarm draws on the GPU when there is one.
