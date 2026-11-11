@@ -876,12 +876,9 @@ fn copy_all(from: &Path, to: &Path) -> Result<(), String> {
 fn preview(chosen: &[&Effect], root: &Path, target: &Path, o: &Options) -> Result<(), String> {
     if cfg!(target_os = "windows") {
         // vfx-preview.exe loads the shader compiler from its own folder, like the plugins.
-        // Once both DLLs are there, a second preview needn't fetch.
+        // Once it is there, a second preview needn't fetch.
         let dir = target.join("release");
-        if !["dxcompiler.dll", "dxil.dll"]
-            .iter()
-            .all(|f| dir.join(f).is_file())
-        {
+        if !dir.join("dxcompiler.dll").is_file() {
             fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
             fetch_dxc(root, target)?;
             copy_beside(&dxc_unpacked(target), &dir)?;

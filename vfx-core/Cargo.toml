@@ -14,6 +14,10 @@ wgpu = "=30.0.1"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { version = "=30.0.1", features = ["fragile-send-sync-non-atomic-wasm"] }
 
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8.9"
+windows-sys = { version = "0.61.2", features = ["Win32_System_LibraryLoader"] }
+
 [features]
 # wgpu's WebGL2 backend, for browsers: off by default, so native builds and the WebGPU web
 # build are unchanged.
