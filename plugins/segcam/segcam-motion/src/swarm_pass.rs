@@ -2168,7 +2168,16 @@ mod tests {
              pixel |"
         );
         // From under the switch points in `incremental.rs` to the 591 stacked windows.
-        let scenes = [(8, 1), (20, 1), (60, 3), (100, 3), (1000, 9)];
+        let scenes = [
+            (8, 1),
+            (20, 1),
+            (40, 1),
+            (60, 1),
+            (100, 1),
+            (60, 3),
+            (100, 3),
+            (1000, 9),
+        ];
         for (max_tiles, per_frame) in scenes {
             time_draws::<u8>(&device, &queue, max_tiles, per_frame, false, 300);
         }
