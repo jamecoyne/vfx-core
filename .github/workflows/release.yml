@@ -78,8 +78,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # 6.6 or later for the wizard's dark mode; pinned so a new major doesn't change the build.
       - name: Install Inno Setup
-        run: choco install innosetup --no-progress -y
+        run: choco install innosetup --version 6.7.1 --no-progress -y
 
       # One installer with every effect for every host, and segcam's zips.
       - name: Build the installer and zips
