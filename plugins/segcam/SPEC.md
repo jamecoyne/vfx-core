@@ -102,7 +102,7 @@ keep F3; its PR says so and updates the reference outputs.
 |---|---|---|
 | R1 | One tag, `v1.0.0`, names the segcam plugins; vfx-core keeps its own version | todo |
 | R2 | macOS installers signed and notarized by `release.yml` | todo, never run |
-| R3 | Windows plugins as zips, each with a readme naming its folder ([ADR 5](decisions/0005-windows-release.md)) | todo |
+| R3 | Windows plugins as an installer and segcam's zips, each zip with a readme naming its folder ([ADR 5](decisions/0005-windows-release.md)) | done |
 | R4 | User docs: install per host, every control, the editing promise, the floor, known limits | todo |
 | R5 | Before the tag: full checks, the benchmark table, a smoke test in each host on each platform and in the web preview | todo |
 

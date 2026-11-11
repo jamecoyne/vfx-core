@@ -15,7 +15,7 @@ pub const USAGE: &str = "\
 vfx-preview [FLAGS] [FILE]
 
   FILE                 a video or image to start with (same as --input FILE)
-  --effect SLUG        the effect to show, as --list names it (segcam-motion)
+  --effect SLUG        the effect to show, as --list names it (segcam)
   --mode NAME          the effect's mode: an option of its menu (Swarm, \"Motion matte\")
   --param NAME=VALUE   a parameter by its name; repeatable. Numbers, true/false, an
                        option's name or index, r,g,b,a for colours, x,y for points
@@ -450,8 +450,8 @@ mod tests {
 
     #[test]
     fn effect_and_file_args_are_not_scripted() {
-        let o = args(&["--effect", "segcam-motion", "clip.mp4"]).unwrap();
-        assert_eq!(o.effect.as_deref(), Some("segcam-motion"));
+        let o = args(&["--effect", "segcam", "clip.mp4"]).unwrap();
+        assert_eq!(o.effect.as_deref(), Some("segcam"));
         assert_eq!(o.input, Some(Source::File("clip.mp4".into())));
         assert!(!o.scripted());
         assert_eq!(args(&[]).unwrap(), Options::default());
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn segcam_modes_resolve_by_name() {
-        let segcam = catalog::find_slug("segcam-motion").unwrap();
+        let segcam = catalog::find_slug("segcam").unwrap();
         let specs = (catalog::entries()[segcam].make)().params().to_vec();
         for m in ["Overlay", "Motion matte", "Box matte", "Swarm"] {
             assert_eq!(
@@ -584,8 +584,8 @@ mod tests {
     fn stats_line_keys_and_render_times() {
         let s = Snapshot {
             shown: ShownEffect {
-                effect: "segcam Motion",
-                slug: "segcam-motion",
+                effect: "segcam",
+                slug: "segcam",
                 on_cpu: true,
                 source: SourceKind::Video,
                 size: (1920, 1080),
@@ -602,7 +602,7 @@ mod tests {
         };
         assert_eq!(
             stats_line(1.0, 1.0, Duration::from_millis(20), &s, delta),
-            "stats t=1.0 effect=segcam-motion on=cpu source=59.0 rendered=60.0 rendered_ms=10.0 \
+            "stats t=1.0 effect=segcam on=cpu source=59.0 rendered=60.0 rendered_ms=10.0 \
              worst_ms=20.0 drawn=0.0 screen=30.0 size=1920x1080 cpu=0.0 app_cpu=0.0 mem_mb=0 gpu=n/a"
         );
         let s = Snapshot {

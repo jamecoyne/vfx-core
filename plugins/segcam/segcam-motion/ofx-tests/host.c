@@ -171,7 +171,7 @@ int main(int argc, char **argv) {
     if (!lib) { open_failed(); return 2; }
     OfxPlugin *(*getp)(int) = plugin_symbol(lib,"OfxGetPlugin");
     plugin = getp(0);
-    CHECK(!strcmp(plugin->pluginIdentifier,"com.lofiscifi.SegcamMotionRust"),"wrong identity");
+    CHECK(!strcmp(plugin->pluginIdentifier,"com.lofiscifi.segcam"),"wrong identity");
     host.host=props_new(); host.fetchSuite=fetchSuite; plugin->setHost(&host);
     CHECK(action(kOfxActionLoad,NULL,NULL,NULL)==kOfxStatOK,"load failed");
     if (argc == 3) return export_after_edit();

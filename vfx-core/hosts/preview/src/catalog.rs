@@ -97,8 +97,8 @@ pub fn find(name: &str) -> Option<usize> {
 }
 
 /// How effects are named in links and on the command line: runs of letters and digits,
-/// lower case, joined by hyphens. "segcam Motion" is `segcam-motion`. `cargo vfx` names
-/// them the same way.
+/// lower case, joined by hyphens. "Gaussian blur" is `gaussian-blur`.
+/// `cargo vfx` names them the same way.
 pub fn slug(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars() {
@@ -127,7 +127,7 @@ mod tests {
     fn slugs_name_effects() {
         assert_eq!(slug("segcam Motion"), "segcam-motion");
         assert_eq!(slug("segcam"), "segcam");
-        assert!(find_slug("segcam-motion").is_some());
+        assert!(find_slug("segcam").is_some());
         assert!(find_slug("vfx-preview").is_none());
         assert!(find_slug("gaussian-blur").is_some());
     }

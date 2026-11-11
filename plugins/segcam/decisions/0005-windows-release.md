@@ -1,24 +1,26 @@
-# ADR 5: Windows plugins ship as zips
+# ADR 5: Windows plugins ship as an installer and zips
 
-Status: proposed. Date: 2026-10-30. Proposed by: Strongtut. Decides: jamecoyne.
+Status: proposed. Date: 2026-11-10 (first proposed 2026-10-30). Proposed by: Strongtut. Decides: jamecoyne.
 
 ## Context
 
-`release.yml` builds an unsigned Windows installer and a zip of the same files. An unsigned
-installer makes Windows SmartScreen warn "unknown publisher" before it runs. The hosts load
-unsigned plugin files without a warning.
+`release.yml` builds an unsigned Windows installer. An unsigned installer makes Windows
+SmartScreen warn "unknown publisher" before it runs. The hosts load unsigned plugin files
+without a warning. v0.1.0 shipped the unsigned installer.
 
 ## Decision
 
-For 1.0, the Windows download is the zip, one per plugin, each with a readme naming its folder:
+The Windows download is one installer with segcam and the example effects as options, plus
+segcam's zips, one per host, each with a readme naming its folder:
 
 | Plugin | Folder |
 |---|---|
 | OpenFX | `C:\Program Files\Common Files\OFX\Plugins` |
-| After Effects | `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore` |
+| After Effects | `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\segcam` |
 | Resolume | `Documents\Resolume Arena\Extra Effects` (or Avenue's) |
 
-`DirectML.dll` sits next to the plugin. The installer comes back once there is code signing.
+The DXC files sit next to the plugin; the OpenFX bundle carries them and `DirectML.dll`
+inside. The README says how to get past the SmartScreen warning until there is code signing.
 
 ## Options considered
 
@@ -30,5 +32,5 @@ For 1.0, the Windows download is the zip, one per plugin, each with a readme nam
 
 ## Consequences
 
-- The install docs explain the copy for each host.
+- The install docs explain the installer's warning and the copy for each host.
 - Code signing becomes a later decision for jamecoyne.

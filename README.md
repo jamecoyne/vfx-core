@@ -3,7 +3,7 @@
 <!-- Hero: a short GIF of segcam's window swarm goes here. -->
 
 [Download](https://github.com/jamecoyne/vfx-core/releases) ·
-[Try segcam in your browser](https://jamecoyne.github.io/vfx-core/?effect=segcam-motion) ·
+[Try segcam in your browser](https://jamecoyne.github.io/vfx-core/?effect=segcam) ·
 [Developer guide](docs/DEVELOPING.md) ·
 [Report a bug](https://github.com/jamecoyne/vfx-core/issues)
 

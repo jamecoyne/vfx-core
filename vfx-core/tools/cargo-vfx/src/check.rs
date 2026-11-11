@@ -38,7 +38,10 @@ pub fn check(all: &[Effect], root: &Path) -> Vec<String> {
 /// name its match name: After Effects would load only one of them.
 pub fn installed_clashes(dir: &Path, e: &Effect) -> Vec<String> {
     let own = format!("{}.plugin", e.meta.file);
-    let needle = e.meta.ae_match_name.as_bytes();
+    let match_name = e.meta.ae_match_name.as_bytes();
+    // A PiPL writes the match name after its length byte, so a longer name that
+    // starts the same doesn't match. `Metadata::check` keeps it under 32 bytes.
+    let needle = [&[match_name.len() as u8], match_name].concat();
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -54,7 +57,7 @@ pub fn installed_clashes(dir: &Path, e: &Effect) -> Vec<String> {
         };
         let names_it = files.flatten().any(|f| {
             f.path().extension().is_some_and(|x| x == "rsrc")
-                && fs::read(f.path()).is_ok_and(|bytes| contains(&bytes, needle))
+                && fs::read(f.path()).is_ok_and(|bytes| contains(&bytes, &needle))
         });
         if names_it {
             found.push(format!(
@@ -107,13 +110,24 @@ mod tests {
             fs::create_dir_all(&res).unwrap();
             fs::write(res.join("x.rsrc"), rsrc).unwrap();
         };
-        bundle("VfxPreview.plugin", b"..VFXPreview..");
-        bundle("VfxAdobe.plugin", b"..VFXPreview..");
-        bundle("Other.plugin", b"..SomethingElse..");
+        bundle("VfxPreview.plugin", b"..\x0aVFXPreview..");
+        bundle("VfxAdobe.plugin", b"..\x0aVFXPreview..");
+        bundle("Other.plugin", b"..\x0dSomethingElse..");
         let found = installed_clashes(&dir, &effect());
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("VfxAdobe.plugin"));
+    }
+
+    #[test]
+    fn installed_clashes_skips_longer_match_name() {
+        let dir = std::env::temp_dir().join(format!("cargo-vfx-longer-{}", std::process::id()));
+        let res = dir.join("Longer.plugin").join("Contents/Resources");
+        fs::create_dir_all(&res).unwrap();
+        fs::write(res.join("x.rsrc"), b"..\x0fVFXPreview Plus..").unwrap();
+        let found = installed_clashes(&dir, &effect());
+        let _ = fs::remove_dir_all(&dir);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

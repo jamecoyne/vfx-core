@@ -106,21 +106,21 @@ frame ([GPU thresholds](../BENCHMARK.md#gpu-thresholds)), and on the CPU otherwi
 ## Building
 
 ```bash
-cargo vfx build -p segcam-motion      # SegcamMotionRust.plugin, .ofx.bundle and .bundle
+cargo vfx build -p segcam-motion      # segcam.plugin, .ofx.bundle and .bundle
 cargo vfx package -p segcam-motion    # macOS installers for After Effects and OpenFX
 cargo vfx install -p segcam-motion    # Resolume; prints the sudo commands for the others
 ```
 
-In every host it shows as **segcam**: **Effect ▸ LO.FI.SCI.FI ▸ segcam** in After Effects and
-**LO.FI.SCI.FI / segcam** in OpenFX hosts. Resolume shows its short name, **segcam Motion**, since
-FFGL hosts cut names at 16 bytes.
+In every host it shows as **segcam**: **Effect ▸ LO.FI.SCI.FI ▸ segcam** in After Effects,
+**LO.FI.SCI.FI / segcam** in OpenFX hosts and **segcam** in Resolume.
 
-Saved projects find the plugin by its identifiers, which never change once shipped: the After
-Effects match name `LOFISCIFI segcam Motion Rust`, the OpenFX identifier
-`com.lofiscifi.SegcamMotionRust` and the FFGL code `SGCM`. They differ from jamecoyne's C++
-effect's, so both install side by side and a project keeps whichever of the two it was saved with.
-The files are named `SegcamMotionRust`, and its logs are `~/Library/Logs/SegcamMotionRust-<host>.log`
-(on Windows, in `%TEMP%`).
+Saved projects find the plugin by its identifiers: the After Effects match name
+`LOFISCIFI segcam`, the OpenFX identifier `com.lofiscifi.segcam` and the FFGL code `SGCM`.
+v0.1.0 used `LOFISCIFI segcam Motion Rust` and `com.lofiscifi.SegcamMotionRust`, so its After
+Effects and OpenFX projects need segcam added again; from v0.1.1 on they stay. They differ from
+jamecoyne's C++ effect's, so both install side by side and a project keeps whichever of the two
+it was saved with. The files are named `segcam`, and its logs are
+`~/Library/Logs/segcam-<host>.log` (on Windows, in `%TEMP%`).
 
 ## In the preview app
 
@@ -129,7 +129,7 @@ cargo vfx preview -p segcam-motion -- clip.mp4
 ```
 
 opens the preview on segcam, with test patterns, images, video files or a webcam. On the web build,
-add `?effect=segcam-motion` to the page's address.
+add `?effect=segcam` to the page's address.
 
 The preview hands segcam one frame per render. A new time adds the input to its history. The same
 time renders that frame again with the current parameters. An earlier time, such as a seek back,
@@ -191,9 +191,10 @@ Multi Frame Rendering on and off give identical frames, and that the movers were
 uses real footage instead of the generated squares.
 
 It runs on macOS and Windows. On Windows the plugin is a folder in MediaCore,
-`C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\SegcamMotionRust\`, holding
-`SegcamMotionRust.aex` and the `DirectML.dll` the face models load beside it. The harness runs its
-project script with `AfterFX.exe -r`. Without the C++ effect installed, the comparison is skipped.
+`C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\segcam\`, holding
+`segcam.aex` and the DXC files beside it; the face models use the `DirectML.dll` After Effects
+ships in its own folder. The harness runs its project script with `AfterFX.exe -r`. Without the
+C++ effect installed, the comparison is skipped.
 
 ### OpenFX
 

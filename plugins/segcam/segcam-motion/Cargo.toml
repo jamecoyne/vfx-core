@@ -11,11 +11,10 @@ description = "Motion segmentation from segcam: overlay, mattes and the swarm co
 # match name differs from segcam's C++ effect's, so both can be installed side by side.
 [package.metadata.vfx]
 name = "segcam"
-short-name = "segcam Motion"          # FFGL hosts show 16 bytes of a name
 category = "LO.FI.SCI.FI"
-file = "SegcamMotionRust"
-id = "com.lofiscifi.SegcamMotionRust"
-ae-match-name = "LOFISCIFI segcam Motion Rust"
+file = "segcam"
+id = "com.lofiscifi.segcam"
+ae-match-name = "LOFISCIFI segcam"
 ffgl-code = "SGCM"
 processor = "cpu"                     # a CpuEffect: frames in RAM, earlier frames fetched
 windows-dlls = ["DirectML.dll"]       # segcam-face loads this copy, not the host's
