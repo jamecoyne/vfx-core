@@ -948,6 +948,21 @@ impl SwarmPass {
         self.readback_timeout = timeout;
     }
 
+    /// Replaces the tile atlas with one of `side` texels square that grows to
+    /// `layers` layers and no further. Before anything is uploaded.
+    #[cfg(test)]
+    pub(crate) fn limit_tile_atlas(&mut self, side: u32, layers: u32) {
+        let limits = AtlasLimits {
+            side,
+            layers,
+            bytes: u64::MAX,
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let device = &self.shared.device;
+        lock(&self.atlases).tiles =
+            Atlas::new(device, "segcam tile atlas", format, (side, side), limits);
+    }
+
     /// Blends in `composite`, or with `None` in what the canvas depth takes
     /// by itself on this device.
     pub fn set_composite(&mut self, composite: Option<Composite>) {
@@ -1756,7 +1771,7 @@ pub mod scene {
         d
     }
 
-    /// The swarm cases `tests/gpu.rs` holds the compute path to.
+    /// The swarm settings `tests/gpu.rs` runs through the effect.
     pub fn cases() -> Vec<(&'static str, RenderSettings)> {
         let swarm = RenderSettings {
             mode: OutputMode::Swarm,
@@ -1803,11 +1818,9 @@ pub mod scene {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::scene::{cases, difference, frame_pixels, trail_tiles, visible};
     use super::*;
-    use crate::gpu::{self, Drawer};
+    use crate::gpu;
     use crate::motion::Segmentation;
     use crate::render::{OutputMode, PixelRect, draw_output, intersect};
     use crate::swarm::shadow_kernel;
@@ -2027,8 +2040,8 @@ mod tests {
         [whole as f64 / pixels, with_depth as f64 / pixels]
     }
 
-    /// Times `draws` draws of one 1080p scene at depth `C` on the compute
-    /// path and with render passes, both on `device`, and prints a row each.
+    /// Times `draws` draws of one 1080p scene at depth `C` on `device` and
+    /// prints a row for each way of drawing it.
     fn time_draws<C: Channel>(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -2060,36 +2073,6 @@ mod tests {
         let [whole, with_depth] = overdraw(&windows, (w, h), &shadow);
         let mut out = vec![Argb::<C>::default(); (w * h) as usize];
         let warm_up = 20;
-
-        let context = gpu::open("").expect("the compute path opens on the shared device");
-        let mut drawer = Drawer::new(Arc::new(context)).expect("the device is there");
-        let allocation = drawer
-            .upload_tiles(&shown, (w, h), &shadow)
-            .expect("the upload is accepted")
-            .expect("the atlas has room");
-        let mut times = Vec::new();
-        for n in 0..warm_up + draws {
-            let started = Instant::now();
-            drawer.begin_render();
-            drawer
-                .draw_swarm(
-                    &mut ViewMut::from_pixels(&mut out, w, h),
-                    shown.iter().zip(allocation.slots.iter().copied()),
-                    frame.as_ref(),
-                    n as i64,
-                    &s,
-                    &shadow,
-                )
-                .expect("the compute draw comes back");
-            times.push(started.elapsed());
-        }
-        let (median, worst) = median_and_worst(&mut times[warm_up..]);
-        println!(
-            "| {bits} bit | {count} | compute{reads} | {median:.2} ms | {worst:.2} ms | | | | \
-             {whole:.1} |"
-        );
-        drop(allocation);
-        drop(drawer);
 
         let shared = SwarmPipelines::new(device, queue);
         shared.prepare::<C>();
@@ -2143,13 +2126,7 @@ mod tests {
     #[ignore = "a timed run on the PC's slot; SWARM_PASS_ADAPTER picks the GPU"]
     fn bench_draw() {
         let _lock = gpu::gpu_test_lock();
-        let (_, device, queue) = open(wgpu::Limits {
-            max_storage_buffer_binding_size: 1 << 30,
-            max_buffer_size: 1 << 30,
-            ..wgpu::Limits::default()
-        });
-        // The compute path draws on a device a host shared.
-        vfx_core::Gpu::from_parts(device.clone(), queue.clone()).share();
+        let (_, device, queue) = open(wgpu::Limits::default());
         println!(
             "| depth | windows | path | median | worst | submit | wait | copy | fragments per \
              pixel |"
@@ -2357,33 +2334,6 @@ mod tests {
             println!("| {count} | {path} | {median:.2} ms | {worst:.2} ms |");
         };
 
-        let context = gpu::open("").expect("the compute path opens on the shared device");
-        let mut drawer = Drawer::new(Arc::new(context)).expect("the device is there");
-        let allocation = drawer
-            .upload_tiles(&shown, (w, h), &shadow)
-            .expect("the upload is accepted")
-            .expect("the atlas has room");
-        let mut times = Vec::new();
-        for n in 0..warm_up + draws {
-            let started = Instant::now();
-            drawer.begin_render();
-            drawer
-                .draw_swarm_into::<u8>(
-                    &target,
-                    shown.iter().zip(allocation.slots.iter().copied()),
-                    None,
-                    n as i64,
-                    &settings(false),
-                    &shadow,
-                )
-                .expect("the compute draw is accepted");
-            wait();
-            times.push(started.elapsed());
-        }
-        row("compute, then its pass into the frame", &mut times);
-        drop(allocation);
-        drop(drawer);
-
         let shared = SwarmPipelines::new(&gpu.device, &gpu.queue);
         let mut pass = SwarmPass::new(shared);
         let placed = pass
@@ -2427,82 +2377,12 @@ mod tests {
     #[ignore = "a timed run on the PC's slot; SWARM_PASS_ADAPTER picks the GPU"]
     fn bench_draw_into_frame() {
         let _lock = gpu::gpu_test_lock();
-        let (_, device, queue) = open(wgpu::Limits {
-            max_storage_buffer_binding_size: 1 << 30,
-            max_buffer_size: 1 << 30,
-            ..wgpu::Limits::default()
-        });
+        let (_, device, queue) = open(wgpu::Limits::default());
         let gpu = vfx_core::Gpu::from_parts(device, queue);
-        // The compute path draws on a device a host shared.
-        gpu.share();
         println!("| windows | path | median | worst |");
         for (max_tiles, per_frame) in [(60, 3), (1000, 9)] {
             time_draws_into_frame(&gpu, max_tiles, per_frame, 300);
         }
-    }
-
-    /// Which D3D12 shader compilers this process has loaded.
-    fn loaded_compilers() -> String {
-        let pid = std::process::id().to_string();
-        ["dxcompiler.dll", "d3dcompiler_47.dll"]
-            .into_iter()
-            .filter(|dll| {
-                std::process::Command::new("tasklist")
-                    .args(["/fi", &format!("PID eq {pid}"), "/m", dll, "/nh"])
-                    .output()
-                    .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid))
-            })
-            .collect::<Vec<_>>()
-            .join(" and ")
-    }
-
-    #[test]
-    #[ignore = "a timed run on the PC's slot; WGPU_DX12_COMPILER picks the compiler"]
-    fn bench_pipeline_build() {
-        let _lock = gpu::gpu_test_lock();
-        let (_, device, queue) = open(wgpu::Limits::default());
-        println!("| pipelines | build |");
-        let started = Instant::now();
-        let shared = SwarmPipelines::new(&device, &queue);
-        shared.prepare::<u8>();
-        let _pass = SwarmPass::new(shared.clone());
-        println!(
-            "| render pass, 8 bit (4 pipelines) | {:.0} ms |",
-            milliseconds(started.elapsed())
-        );
-        let started = Instant::now();
-        shared.prepare::<u16>();
-        shared.prepare::<f32>();
-        println!(
-            "| render pass, 16 bit and float (8 more) | {:.0} ms |",
-            milliseconds(started.elapsed())
-        );
-
-        let started = Instant::now();
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(include_str!("gpu.wgsl").into()),
-        });
-        println!(
-            "| compute, shader module | {:.0} ms |",
-            milliseconds(started.elapsed())
-        );
-        for entry in ["swarm", "overlay"] {
-            let started = Instant::now();
-            let _pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: None,
-                layout: None,
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-            println!(
-                "| compute, {entry} | {:.0} ms |",
-                milliseconds(started.elapsed())
-            );
-        }
-        println!("compilers loaded: {}", loaded_compilers());
     }
 
     #[test]
@@ -2642,6 +2522,27 @@ mod tests {
         assert_eq!(placed, 6, "the byte limit allows six of eight layers");
         let past_side = atlas.place(&device, &queue, 1025, 16);
         assert_eq!(past_side, None);
+    }
+
+    #[test]
+    fn grow_waits_out_a_refusal() {
+        let limits = AtlasLimits {
+            side: 64,
+            layers: 8,
+            bytes: u64::MAX,
+        };
+        let (device, queue, mut atlas) = test_atlas((64, 64), limits);
+        let place = |atlas: &mut Atlas| atlas.place(&device, &queue, 64, 64);
+        assert!(place(&mut atlas).is_some() && place(&mut atlas).is_some());
+        // As the GPU's refusal of a larger texture leaves it.
+        atlas.ceiling = atlas.bytes(atlas.size, atlas.layers);
+        atlas.last_refusal = Some(Instant::now());
+        assert_eq!(place(&mut atlas), None, "asked again at once");
+        assert_eq!(atlas.layers, 2);
+        let due = Instant::now().checked_sub(Atlas::GROWTH_RETRY_AFTER);
+        atlas.last_refusal = Some(due.expect("up for a minute"));
+        assert!(place(&mut atlas).is_some(), "stayed capped");
+        assert_eq!(atlas.layers, 4);
     }
 
     #[test]
