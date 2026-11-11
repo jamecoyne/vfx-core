@@ -89,6 +89,59 @@ static void replay_order(int mode, const char *name, const int *order, int n, in
     }
     edit_frames(from,to);
 }
+/* 1 MB is four of these 320x180 8 bit frames. NULL takes the budget away again. */
+#define BUDGET_FRAMES 4
+static void set_budget(const char *mb) {
+#ifdef _WIN32
+    _putenv_s("VFX_OFX_FETCH_BUDGET_MB", mb ? mb : "");
+#else
+    if (mb) setenv("VFX_OFX_FETCH_BUDGET_MB", mb, 1); else unsetenv("VFX_OFX_FETCH_BUDGET_MB");
+#endif
+}
+/* Under a fetch budget a stream stays exact. After a stop and an edit each render reads at most
+   the budget, and the held frame matches a fresh render within frames / budget + 1 renders. The
+   fresh renders go without a budget, which a cold render would spread over several renders. */
+static void within_budget(int mode) {
+    static unsigned char streamed[24][320*180*4];
+    OfxImageEffectHandle e=instance(mode,0);
+    set_budget("1");
+    for(int t=0;t<24;t++) {
+        render_frame(e,t);
+        CHECK(reads<=BUDGET_FRAMES+1,"mode %d: a stream under a budget read %d frames at %d",mode,reads,t);
+        memcpy(streamed[t],output.data,sizeof streamed[t]);
+    }
+    set_budget(NULL);
+    for(int t=0;t<24;t++) CHECK(same_as_fresh(mode,t,streamed[t]),"mode %d: frame %d of a stream under a budget differs from a fresh render",mode,t);
+
+    edit_frames(0,21);
+    int renders=(23+BUDGET_FRAMES-1)/BUDGET_FRAMES+1, caught_up=0;
+    for(int i=0;i<renders && !caught_up;i++) {
+        set_budget("1");
+        render_frame(e,23);
+        CHECK(reads<=BUDGET_FRAMES+1,"mode %d: a check under a budget read %d frames",mode,reads);
+        memcpy(streamed[0],output.data,sizeof streamed[0]);
+        set_budget(NULL);
+        caught_up=same_as_fresh(mode,23,streamed[0]);
+    }
+    CHECK(caught_up,"mode %d: frame 23 differs from a fresh render after %d renders under a budget",mode,renders);
+    /* Changing the frames back is another edit. A jump to 12 and a stream from there, as an
+       export from an In point: the stream checks what the jump left unread. */
+    edit_frames(0,21);
+    set_budget("1");
+    for(int t=12;t<24;t++) {
+        render_frame(e,t);
+        /* A stream fetches the current frame twice around its checks: to see the source didn't
+           start over, and to draw it. */
+        CHECK(reads<=BUDGET_FRAMES+2,"mode %d: a stream after a jump read %d frames at %d",mode,reads,t);
+        memcpy(streamed[t],output.data,sizeof streamed[t]);
+    }
+    set_budget(NULL);
+    /* After an edit the stream reads what the edit left unchecked as well as the frames it has
+       nothing kept for, and the frame before each render joins those. Here it matches within the
+       held bound. The defaults read back to frame 0, so the history doesn't slide here;
+       vfx_host::contract::check streams cold over more frames than a render reads. */
+    for(int t=12+renders-1;t<24;t++) CHECK(same_as_fresh(mode,t,streamed[t]),"mode %d: frame %d, render %d of a stream after a jump, differs from a fresh render",mode,t,t-11);
+}
 static int export_after_edit(void) {
     as_resolve=1;
     setString(host.host,kOfxPropName,0,"DaVinci Resolve");
@@ -158,6 +211,7 @@ static int export_after_edit(void) {
         REPLAY(forward_start,15,15);
         REPLAY(late_step_back,0,13);
         REPLAY(late_step_back,15,15);
+        within_budget(mode);
     }
     printf("export after edit: %d failures\n",failures);
     return failures?1:0;

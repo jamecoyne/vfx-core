@@ -123,8 +123,12 @@ Sensitivity 62, Background 64, Trail frames 120, Swarm max tiles 60 and no face 
 | same | Resolve 21.1, long trail, whole clip H.265 export, no render cache, fresh start | 38 fps |
 | same | Resolve 21.1, long trail, playback | 24 to 36 renders/s |
 | same | Resolve 21.1, long trail, export straight after playback in the same session | 30 fps, the same pixels |
-| same | Resolve 21.1, long trail, picture after a pause, reading 183 frames | 3.3 to 4.2 s |
-| same | Resolve 21.1, long trail, picture after a seek | about 3 to 4 s |
+| same | Resolve 21.1, long trail, picture after a pause, reading 183 frames (before the fetch budget) | 3.3 to 4.2 s |
+| same | Resolve 21.1, long trail, picture after a seek (before the fetch budget) | about 3 to 4 s |
+| same | Resolve 21, long trail, fetch budget of 1 GiB, 2026-11-10: picture after a stop, a step back | 0.64 s, 0.57 to 0.65 s; whole within 7 renders after an edit to every frame |
+| same | Resolve 21, long trail, fetch budget of 1 GiB, 2026-11-10: picture after a seek | 0.52 s, trail whole after 6 renders |
+| same | Resolve 21, long trail, fetch budget of 1 GiB, 2026-11-10: play from a paused frame | 12 renders over 6.1 s, worst 0.74 s, then playback speed |
+| same | Resolve 21, long trail, fetch budget of 1 GiB, 2026-11-10: VRAM peak over play, stops, steps, seeks, an edit and exports | 5.6 GB, against 10.2 GB before |
 
 No host has been timed yet on an Apple M1 or M2, an Intel Iris Xe, an Intel UHD 770 or a Radeon 680M.
 

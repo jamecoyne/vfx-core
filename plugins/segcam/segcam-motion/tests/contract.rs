@@ -73,6 +73,8 @@ fn overlay_and_mattes_keep_the_contract() {
             ("output", ParamValue::Int(2)),
             ("background", ParamValue::Int(6)),
         ]),
+        // Threshold reads no background.
+        with(&[("detect", ParamValue::Int(1))]),
     ];
     for frame_rate in [None, Some(60.0), Some(120.0)] {
         let clip = Clip {
