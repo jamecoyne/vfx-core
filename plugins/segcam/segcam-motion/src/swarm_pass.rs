@@ -225,6 +225,25 @@ fn atlas_texture(
     })
 }
 
+/// The layers an atlas of `size` gets for `wanted` and at most `most`: never
+/// one, and for a square atlas never a multiple of six.
+///
+/// wgpu-hal 30's GL backend picks a texture's target from its shape
+/// (`is_cube_compatible`): one layer makes a plain 2D texture, a square
+/// multiple of six a cube map, and a 2D array binding draws neither. From the
+/// first wgpu release with `texture_binding_view_dimension` (gfx-rs/wgpu#8014)
+/// the texture states its view and this rule goes.
+fn atlas_layers(size: (u32, u32), wanted: u32, most: u32) -> u32 {
+    let layers = wanted.max(2);
+    if size.0 != size.1 || layers % 6 != 0 {
+        layers
+    } else if layers < most {
+        layers + 1
+    } else {
+        layers - 1
+    }
+}
+
 fn array_view(texture: &wgpu::Texture) -> wgpu::TextureView {
     texture.create_view(&wgpu::TextureViewDescriptor {
         dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -236,9 +255,6 @@ impl Atlas {
     /// Shelf heights are multiples of this, so tiles of about one height
     /// share shelves.
     const SHELF_STEP: u32 = 16;
-    /// The GL backend makes a one layer texture a plain 2D one, which a 2D
-    /// array binding refuses.
-    const MIN_LAYERS: u32 = 2;
     /// A full atlas doubles its layers up to this many more, so a large one
     /// doesn't hold twice what its tiles need.
     const MOST_LAYERS_ADDED: u32 = 8;
@@ -252,17 +268,16 @@ impl Atlas {
         limits: AtlasLimits,
     ) -> Self {
         let size = (size.0.min(limits.side), size.1.min(limits.side));
-        let texture = atlas_texture(device, label, format, size, Self::MIN_LAYERS);
+        let layers = atlas_layers(size, 2, limits.layers);
+        let texture = atlas_texture(device, label, format, size, layers);
         Self {
             label,
             format,
             view: array_view(&texture),
             texture,
             size,
-            layers: Self::MIN_LAYERS,
-            rows: (0..Self::MIN_LAYERS)
-                .map(|_| FreeRuns::new(size.1))
-                .collect(),
+            layers,
+            rows: (0..layers).map(|_| FreeRuns::new(size.1)).collect(),
             shelves: Vec::new(),
             pending_growth: None,
             limits,
@@ -363,8 +378,12 @@ impl Atlas {
                 } else {
                     self.layers
                 };
-                let layers = u64::from(wanted.min(self.limits.layers)).min(most_layers) as u32;
-                if layers < self.layers || (layers == self.layers && size == self.size) {
+                let most = u64::from(self.limits.layers).min(most_layers) as u32;
+                let layers = atlas_layers(size, wanted.min(most), most);
+                if layers > most
+                    || layers < self.layers
+                    || (layers == self.layers && size == self.size)
+                {
                     return false;
                 }
                 let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -2484,6 +2503,71 @@ mod tests {
         assert!(from_grown == from_large, "a tile changed as the atlas grew");
     }
 
+    #[test]
+    #[ignore = "SWARM_PASS_ADAPTER picks the GPU; set SWARM_PASS_BACKEND=gl"]
+    fn square_atlas_draws_at_cube_layer_counts() {
+        let _lock = gpu::gpu_test_lock();
+        let (_, device, queue) = open(wgpu::Limits::default());
+        let shared = SwarmPipelines::new(&device, &queue);
+        let (w, h) = (640, 360);
+        let shadow = shadow_kernel(SwarmMetrics::new(h).scale);
+        let s = RenderSettings {
+            mode: OutputMode::Swarm,
+            max_tiles: 1000,
+            ..RenderSettings::default()
+        };
+        let tiles = trail_tiles::<u8>((w, h), 120, 3, false);
+        let pixels = frame_pixels::<u8>(w, h, 120);
+        let frame = View::from_pixels(&pixels, w, h);
+        for most_layers in [6, 12, 24] {
+            let mut pass = SwarmPass::new(shared.clone());
+            pass.limit_tile_atlas(256, most_layers);
+            let mut held = Vec::new();
+            for frame in tiles.chunks(3) {
+                let Some(placed) = pass.upload_tiles(frame, h) else {
+                    break;
+                };
+                held.push(placed);
+            }
+            let slots: Vec<Slot> = held.iter().flat_map(|p| p.slots.clone()).collect();
+            let layers = lock(&pass.atlases).tiles.layers;
+            let placed = &tiles[..slots.len()];
+            let windows = visible(placed, (w, h), s.max_tiles);
+            let mut expected = vec![Argb::<u8>::default(); (w * h) as usize];
+            draw_output(
+                &mut ViewMut::from_pixels(&mut expected, w, h),
+                &s,
+                Some(View::from_pixels(&pixels, w, h)),
+                &Segmentation::default(),
+                120,
+                windows.iter().map(|(_, tile)| *tile),
+            );
+            let mut drawn = vec![Argb::<u8>::default(); (w * h) as usize];
+            pass.draw(
+                &mut ViewMut::from_pixels(&mut drawn, w, h),
+                windows.iter().map(|&(i, tile)| (tile, slots[i])),
+                Some(&frame),
+                &s,
+                &shadow,
+                Occlusion::Depth,
+            )
+            .expect("the draw comes back");
+            let d = difference(&expected, &drawn);
+            println!(
+                "at most {most_layers} layers: {layers} layers, {} windows, {d:?}",
+                windows.len()
+            );
+            assert!(
+                d.over_one * 100 <= d.pixels,
+                "{layers} layers of a square atlas draw a wrong picture: {d:?}"
+            );
+            assert!(
+                layers % 6 != 0,
+                "a square atlas of {layers} layers is a cube map array on GL"
+            );
+        }
+    }
+
     fn test_atlas(size: (u32, u32), limits: AtlasLimits) -> (wgpu::Device, wgpu::Queue, Atlas) {
         let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
         let atlas = Atlas::new(
@@ -2560,17 +2644,27 @@ mod tests {
         let limits = AtlasLimits {
             side: 1024,
             layers: 8,
-            bytes: 1024 * 1024 * 4 * 6,
+            bytes: 1024 * 1024 * 4 * 7,
         };
         let (device, queue, mut atlas) = test_atlas((256, 256), limits);
         let mut placed = 0;
         while atlas.place(&device, &queue, 1024, 1024).is_some() {
             placed += 1;
         }
-        assert_eq!((atlas.size, atlas.layers), ((1024, 1024), 6));
-        assert_eq!(placed, 6, "the byte limit allows six of eight layers");
+        assert_eq!((atlas.size, atlas.layers), ((1024, 1024), 7));
+        assert_eq!(placed, 7, "the byte limit allows seven of eight layers");
         let past_side = atlas.place(&device, &queue, 1025, 16);
         assert_eq!(past_side, None);
+    }
+
+    #[test]
+    fn atlas_layers_avoid_gl_shapes() {
+        assert_eq!(atlas_layers((256, 256), 1, 8), 2);
+        for (wanted, layers) in [(6, 7), (12, 13), (24, 25), (8, 8)] {
+            assert_eq!(atlas_layers((256, 256), wanted, 256), layers);
+        }
+        assert_eq!(atlas_layers((256, 256), 6, 6), 5);
+        assert_eq!(atlas_layers((1024, 256), 6, 256), 6);
     }
 
     #[test]
