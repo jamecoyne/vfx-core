@@ -178,8 +178,8 @@ async fn open_device(
     choice: Option<&str>,
 ) -> Result<(wgpu::Adapter, Gpu), String> {
     let adapter = pick_adapter(instance, surface, choice).await?;
-    // Effects draw on this device, and segcam's atlas grows with the trail: as much of a binding
-    // as the adapter allows, or the atlas stops at wgpu's default.
+    // Effects read a whole canvas back in one buffer: as large a buffer as the
+    // adapter allows, or large float canvases stop at wgpu's default.
     let supported = adapter.limits();
     // WebGL2 can't meet wgpu's default limits.
     let base = if adapter.get_info().backend == wgpu::Backend::Gl {
@@ -188,7 +188,6 @@ async fn open_device(
         wgpu::Limits::default()
     };
     let required_limits = wgpu::Limits {
-        max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
         max_buffer_size: supported.max_buffer_size,
         ..base
     };
@@ -1594,7 +1593,7 @@ impl ApplicationHandler<GpuSetup> for App {
             #[cfg(target_arch = "wasm32")]
             GpuSetup::Failed(e) => {
                 show_startup_message(&format!(
-                    "VFX Preview needs WebGPU, which this browser didn't provide ({e}). \
+                    "VFX Preview needs WebGPU or WebGL2, and this browser gave neither ({e}). \
                      Try a current Chrome, Edge or Safari."
                 ));
                 let _ = event_loop;

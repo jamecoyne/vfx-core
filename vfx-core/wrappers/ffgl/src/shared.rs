@@ -173,14 +173,13 @@ impl SharedDevice {
         if !adapter.features().contains(features) {
             return Err("Vulkan adapter lacks VULKAN_EXTERNAL_MEMORY_WIN32".into());
         }
-        // CPU effects that draw here bind as much as the adapter allows, as on a device of
-        // their own (segcam's swarm atlas grows with the trail).
+        // CPU effects that draw here read a whole canvas back in one buffer, as
+        // large as the adapter allows, as on a device of their own.
         let supported = adapter.limits();
         let desc = wgpu::DeviceDescriptor {
             label: Some("ffgl shared Vulkan device"),
             required_features: features,
             required_limits: wgpu::Limits {
-                max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
                 max_buffer_size: supported.max_buffer_size,
                 ..wgpu::Limits::default()
             },
