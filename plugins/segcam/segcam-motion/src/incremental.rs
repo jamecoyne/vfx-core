@@ -1054,9 +1054,13 @@ impl IncrementalRenderer {
         self.atlas
             .leave_out_dropped(&mut visible, self.source_is_live);
         let live = self.source_is_live;
-        if !self
-            .atlas
-            .place(&self.kept, &visible, drawer, (w, h), live)?
+        // With no windows both paths draw the same picture, and the CPU's
+        // costs nothing next to a readback.
+        let no_windows = visible.is_empty() && !into_target;
+        if no_windows
+            || !self
+                .atlas
+                .place(&self.kept, &visible, drawer, (w, h), live)?
         {
             let motion = cached_analysis(&self.kept, number, &analysis_key(s, number, first))
                 .unwrap_or(&NO_SEGMENTS);
@@ -3045,7 +3049,8 @@ mod tests {
         assert_eq!(dev.errors().0, 1, "the error went unreported");
         assert!(dev.lost().is_none(), "an error lost the device");
         let mut on_gpu = on_device(&dev);
-        render(&mut on_gpu, &frames, 0);
+        // Frame 0 has no windows yet, so it draws on the CPU.
+        render(&mut on_gpu, &frames, 1);
         assert_eq!(drawn(&on_gpu), 1, "the render didn't draw on the GPU");
         assert_eq!(
             faults(&on_gpu),
@@ -3111,9 +3116,10 @@ mod tests {
                 assert_eq!(a, b, "the faulted frame isn't the CPU's");
                 assert_eq!(drawn(&on_gpu), before, "the faulted frame counts as drawn");
             } else {
+                // Frame 0 has no windows yet, so it draws on the CPU.
                 assert_eq!(
                     drawn(&on_gpu),
-                    before + 1,
+                    before + u64::from(n > 0),
                     "frame {n} wasn't drawn on the GPU"
                 );
             }
@@ -3151,9 +3157,10 @@ mod tests {
             );
             assert!(within_gpu_bound(&a, &b), "frame {n} is off the CPU's");
             if n != 7 {
+                // Frame 0 has no windows yet, so it draws on the CPU.
                 assert_eq!(
                     drawn(&on_gpu),
-                    before + 1,
+                    before + u64::from(n > 0),
                     "frame {n} wasn't drawn on the GPU"
                 );
             }
@@ -3173,11 +3180,12 @@ mod tests {
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
         let mut on_gpu = on_device(&dev);
-        // Frames 0, 2 and 4 fault; the cooldown runs from 5 until the test ends it at 8.
-        let cooldown_frames = 5..8;
+        // Frame 0 has no windows and draws on the CPU. Frames 1, 3 and 5 fault; the
+        // cooldown runs from 6 until the test ends it at 9.
+        let cooldown_frames = 6..9;
         for n in 0..frames.len() {
             let drawer = on_gpu.drawer.as_mut().expect("on the GPU");
-            let failing = n < 8 && n % 2 == 0 || cooldown_frames.contains(&n);
+            let failing = n < 9 && n % 2 == 1 || cooldown_frames.contains(&n);
             drawer.set_max_buffer_bytes(if failing { 1024 } else { u64::MAX });
             if n == cooldown_frames.end {
                 assert!(
@@ -3198,7 +3206,7 @@ mod tests {
                 assert_eq!(a, b, "cooldown frame {n} isn't the CPU's");
                 assert_eq!(drawn(&on_gpu), before, "cooldown frame {n} drew on the GPU");
                 assert_eq!(faults(&on_gpu), faulted, "cooldown frame {n} tried the GPU");
-            } else if !failing {
+            } else if !failing && n > 0 {
                 assert_eq!(drawn(&on_gpu), before + 1, "frame {n} wasn't on the GPU");
             }
         }
@@ -3274,7 +3282,8 @@ mod tests {
             );
             assert!(within_gpu_bound(&a, &b), "frame {n} is off the CPU's");
         }
-        assert_eq!(drawn(&on_gpu), drawn_before + frames.len() as u64);
+        // Frame 0 has no windows, so it draws on the CPU.
+        assert_eq!(drawn(&on_gpu), drawn_before + frames.len() as u64 - 1);
         assert_eq!(
             on_gpu.drawer().expect("a drawer").atlas_texels().0,
             grown_texels
@@ -3311,7 +3320,9 @@ mod tests {
             state.render_frame(&s, &mut history, count, n as i64, view);
         }
         assert!(state.atlas.oldest_frame.is_some(), "the atlas never filled");
-        assert_eq!(drawn(&state), frames.len() as u64, "a render left the GPU");
+        // Frame 0 has no windows, so it draws on the CPU.
+        let with_windows = frames.len() as u64 - 1;
+        assert_eq!(drawn(&state), with_windows, "a render left the GPU");
         assert_eq!(faults(&state), 0);
         assert!(state.report().out_of_gpu_memory);
         assert!(

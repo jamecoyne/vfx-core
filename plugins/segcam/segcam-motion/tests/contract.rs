@@ -49,10 +49,6 @@ fn make_gpu() -> Processor {
     Processor::Cpu(Box::new(SegcamMotion::with_gpu(true)))
 }
 
-fn make_gpu_or_cpu() -> Processor {
-    Processor::Cpu(Box::new(SegcamMotion::with_gpu(true)))
-}
-
 fn with(changes: &[(&str, ParamValue)]) -> ParamValues {
     let mut values = motion_only::motion_only(SegcamMotion::default().params());
     for (name, value) in changes {
@@ -104,8 +100,7 @@ fn swarm_keeps_the_contract() {
     }
 }
 
-/// The swarm on the GPU keeps it too, and so does choosing the path by its windows; skipped
-/// where there is no adapter.
+/// The swarm on the GPU keeps it too; skipped where there is no adapter.
 #[test]
 fn swarm_on_the_gpu_keeps_the_contract() {
     match segcam_motion::gpu::status() {
@@ -125,7 +120,6 @@ fn swarm_on_the_gpu_keeps_the_contract() {
         ])
     };
     check(make_gpu, &crossing(), &[swarm(false), swarm(true)]).unwrap();
-    check(make_gpu_or_cpu, &crossing(), &[swarm(false), swarm(true)]).unwrap();
     if let Err(e) = segcam_motion::gpu::status() {
         panic!("{e}");
     }

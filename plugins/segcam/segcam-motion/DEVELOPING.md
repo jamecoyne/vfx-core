@@ -98,8 +98,9 @@ Windows the new shared device opens off the render thread.
 ### Detection and drawing
 
 Detection runs on the CPU: a connected component labeller over a grid, 192 columns by default, fed
-one frame at a time. Swarm draws on the GPU when there is one and its windows cover enough of the
-frame ([GPU thresholds](../BENCHMARK.md#gpu-thresholds)), and on the CPU otherwise.
+one frame at a time. Swarm draws on the GPU when there is one, every render
+([Swarm draw](../BENCHMARK.md#swarm-draw)), and on the CPU without one, after a fault or while the
+device is lost.
 
 ## Building
 

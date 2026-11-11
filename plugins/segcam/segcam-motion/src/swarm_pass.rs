@@ -2185,8 +2185,10 @@ mod tests {
             "| depth | windows | path | median | worst | submit | wait | copy | fragments per \
              pixel |"
         );
-        // From coverage 0.16 to the 591 stacked windows.
+        // From no windows to the 591 stacked ones.
         let scenes = [
+            (1, 0),
+            (1, 1),
             (8, 1),
             (20, 1),
             (40, 1),

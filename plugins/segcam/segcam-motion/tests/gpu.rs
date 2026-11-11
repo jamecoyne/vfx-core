@@ -178,6 +178,7 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     gpu.use_gpu(true);
     let mut a = vec![Argb::<C>::default(); (w * h) as usize];
     let mut b = a.clone();
+    let mut on_gpu = Vec::with_capacity(frames.len());
     for n in 0..frames.len() {
         let first = n.saturating_sub(needed);
         let count = n - first + 1;
@@ -193,6 +194,8 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
             n as i64,
             &mut ViewMut::from_pixels(&mut a, w, h),
         );
+        let drawn = |gpu: &IncrementalRenderer| gpu.drawer().map_or(0, |d| d.drawn);
+        let before = drawn(&gpu);
         gpu.render_frame(
             s,
             &mut source(),
@@ -200,6 +203,7 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
             n as i64,
             &mut ViewMut::from_pixels(&mut b, w, h),
         );
+        on_gpu.push(drawn(&gpu) > before);
         let bound = Bound::of::<C>();
         let (mut over_half, mut over_one) = (0, 0);
         for (i, (p, q)) in a.iter().zip(&b).enumerate() {
@@ -237,12 +241,14 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     if let Err(e) = segcam_motion::gpu::status() {
         panic!("{name}: {e}");
     }
-    let (drawn, faults) = gpu.drawer().map_or((0, 0), |d| (d.drawn, d.faults));
+    let faults = gpu.drawer().map_or(0, |d| d.faults);
     assert_eq!(faults, 0, "{name}: renders fell back to the CPU");
-    assert_eq!(
-        drawn,
-        frames.len() as u64,
-        "{name}: renders drawn on the GPU"
+    // Frames with no windows draw on the CPU: only those before the first windows.
+    let first = on_gpu.iter().position(|&g| g);
+    let first = first.unwrap_or_else(|| panic!("{name}: no render drawn on the GPU"));
+    assert!(
+        on_gpu[first..].iter().all(|&g| g),
+        "{name}: a render after frame {first} left the GPU: {on_gpu:?}"
     );
     true
 }

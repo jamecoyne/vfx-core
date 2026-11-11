@@ -137,23 +137,29 @@ No host has been timed yet on an Apple M1 or M2, an Intel Iris Xe, an Intel UHD 
 The Swarm draw alone at 1080p, median of 300 draws: `swarm_pass::tests::bench_draw` and
 `bench_draw_into_frame` (ignored, `SWARM_PASS_ADAPTER` picks the GPU), D3D12, i7-12700K. The GPU
 columns are a render pass with the depth buffer and the canvas read back; the 8 bit blend for 8 bit
-canvases, 32-bit float for the deeper ones. Coverage is window pixels with shadow over canvas pixels,
-what `incremental.rs` switches on. The times leave out tile uploads: the tiles are already in the
+canvases, 32-bit float for the deeper ones. Coverage is window pixels with shadow over canvas pixels.
+The times leave out tile uploads: the tiles are already in the
 atlas.
 
 | Depth | Windows | Coverage | CPU | RTX 4070 | UHD 770 |
 |---|---|---|---|---|---|
+| 8 bit | 0 | 0.00 | 0.05 ms | 0.88 ms | 3.36 ms |
+| 8 bit | 1 | 0.02 | 0.18 ms | 0.89 ms | 3.89 ms |
 | 8 bit | 8 | 0.16 | 1.15 ms | 1.14 ms | 3.79 ms |
 | 8 bit | 20 | 0.39 | 2.29 ms | 1.03 ms | 3.55 ms |
 | 8 bit | 40 | 0.78 | 3.66 ms | 1.05 ms | 3.44 ms |
 | 8 bit | 100 | 1.95 | 8.89 ms | 1.07 ms | 3.54 ms |
 | 8 bit | 591 | 47.79 | 177.83 ms | 1.31 ms | 7.59 ms |
+| 16 bit | 0 | 0.00 | 0.08 ms | 1.73 ms | 4.59 ms |
+| 16 bit | 1 | 0.02 | 0.20 ms | 1.76 ms | 4.68 ms |
 | 16 bit | 8 | 0.16 | 1.06 ms | 2.04 ms | 5.37 ms |
 | 16 bit | 20 | 0.39 | 2.38 ms | 2.00 ms | 5.49 ms |
 | 16 bit | 40 | 0.78 | 3.55 ms | 2.07 ms | 5.35 ms |
 | 16 bit | 60 | 1.17 | 5.50 ms | 2.17 ms | 5.55 ms |
 | 16 bit | 100 | 1.95 | 8.75 ms | 2.34 ms | 5.48 ms |
 | 16 bit | 591 | 47.79 | 204.90 ms | 3.27 ms | 9.20 ms |
+| float | 0 | 0.00 | 0.34 ms | 3.25 ms | 8.10 ms |
+| float | 1 | 0.02 | 0.37 ms | 3.25 ms | 8.17 ms |
 | float | 20 | 0.39 | 1.74 ms | 4.25 ms | 8.57 ms |
 | float | 60 | 1.17 | 3.46 ms | 4.38 ms | 9.33 ms |
 | float | 100 | 1.95 | 5.24 ms | 4.49 ms | 9.54 ms |
@@ -164,9 +170,11 @@ atlas.
 Drawn straight into an RGBA8 host frame, with no readback: 0.15 ms at 49 windows and 0.36 ms at
 591 on the RTX 4070, 1.63 ms and 5.41 ms on the UHD 770.
 
-With a GPU every Swarm render draws on it; at low coverage that costs at most about 7 ms more than
-the CPU would (UHD 770, float, 20 windows: 8.57 against 1.74 ms). The CPU rows can differ by up to a
-factor of two between runs of the same scene.
+With a GPU every Swarm render with windows draws on it; one with none draws on the CPU, which gives
+the same picture without a readback (it was 8.10 against 0.45 ms on the UHD 770 in float). In the
+measured scenes a few windows cost at most about 7.8 ms more than the CPU would (UHD 770, float, 1
+window: 8.17 against 0.37 ms). The CPU rows can differ by up to a factor of two between runs of the
+same scene.
 
 `tests/gpu.rs` allows 1 pixel in 10,000, at least 4, off by over half a level. The 1080p clip's
 cases measured at most 8 of 2,073,600 on an RTX 4070.
