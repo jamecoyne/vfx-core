@@ -12,7 +12,7 @@ reader = app.createReader(root + "/in####.png")
 warmup = app.createWriter(root + "/warmup.png")
 warmup.connectInput(0, reader)
 app.render(warmup, 0, 0)
-effect = app.createNode("com.lofiscifi.SegcamMotionRust")
+effect = app.createNode("com.lofiscifi.segcam")
 assert effect is not None, "segcam OpenFX plugin missing"
 effect.getParam("detect").set(0)
 effect.getParam("eyes").set(False)

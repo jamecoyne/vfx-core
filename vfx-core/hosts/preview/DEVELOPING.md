@@ -4,7 +4,7 @@ The flags in the [README](README.md#starting-it-set-up) set the preview up. Thes
 so a measurement is one command with no clicks:
 
 ```sh
-cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm \
+cargo run --release -p vfx-preview -- --effect segcam --mode Swarm \
     --input clip.mp4 --stats --seconds 10 --quiet
 ```
 

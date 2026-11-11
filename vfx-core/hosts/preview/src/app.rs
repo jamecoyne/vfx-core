@@ -1484,9 +1484,9 @@ fn new_wgpu_instance(display: winit::event_loop::OwnedDisplayHandle) -> wgpu::In
     wgpu::Instance::new(descriptor)
 }
 
-/// What to start with: `vfx-preview [--effect segcam-motion] [clip.mp4]` and the other
-/// flags of [`script::USAGE`] on the desktop, `?effect=segcam-motion` in the page's address
-/// on the web.
+/// What to start with: `vfx-preview [--effect segcam] [clip.mp4]` and the
+/// other flags of [`script::USAGE`] on the desktop, `?effect=segcam` in the
+/// page's address on the web.
 #[cfg(not(target_arch = "wasm32"))]
 type StartOptions = script::Options;
 

@@ -29,7 +29,7 @@ id = "com.vfx-core.VfxPreview"      # OpenFX identifier; macOS bundle IDs start 
 ae-match-name = "VFXPreview"
 ffgl-code = "VFXP"                  # exactly 4 characters
 processor = "gpu"                   # "gpu" (Effect) or "cpu" (CpuEffect)
-windows-installer-id = "…a GUID…"
+windows-installer-id = "…a GUID…"  # the Windows installer's AppId, when this effect leads it
 
 # optional: the crate's own features `cargo vfx` turns on per OS (all, macos, windows, linux)
 features = { windows = ["onnx"], linux = ["onnx"] }
@@ -173,7 +173,8 @@ vfx-core/
     ffgl/               vfx-ffgl: FFGL 2.1, OpenGL + IOSurface / Vulkan interop
       minihost/         a small FFGL host in C with a headless OpenGL context
     ffgl-common/        FFGL bindings, GL transfers and pixel repacking
-    package-win.sh      an effect's Windows installer (Inno Setup)
+    package-win.sh      the Windows release: one installer (Inno Setup) and segcam's zips
+    package-mac.sh      the macOS release: one installer (productbuild) and segcam's zips
   tools/cargo-vfx/      cargo vfx: builds, packages and installs effect crates
   hosts/preview/        the preview: a library host (`vfx_preview::run`) and the repository's app
     src/catalog.rs      the effects it offers (effect crates listed by build.rs)
@@ -214,11 +215,12 @@ acts on every effect crate; output goes to `target/vfx-plugin/`.
 | segcam's benchmark | `cargo vfx bench clip.mp4 [--preset overlay] [--depth 8] [--runs 2] [--cpu] [--reference DIR]` | the offline rows of `plugins/segcam/BENCHMARK.md`, timed on the release CLI; needs ffmpeg |
 | Checks | `cargo vfx check` | effects missing from the preview, and installed After Effects plugins that share a match name; `--quick` and `--full` run the test tiers ([Testing](#testing)) |
 | Plugins | `cargo vfx build [-p segcam-motion] [--hosts ae,ofx,ffgl] [--native]` | `<file>.plugin`, `.ofx.bundle` and `.bundle` on macOS (one universal binary; `--native` builds this Mac's architecture only); `.aex`, `.ofx.bundle` and `.dll` on Windows |
-| macOS installers | `cargo vfx package` | `<file>-adobe.pkg` (Adobe's MediaCore folder) and `<file>-ofx.pkg` (`/Library/OFX/Plugins`) |
+| macOS installers | `cargo vfx package` | `<file>-adobe.pkg` (Adobe's MediaCore folder) and `<file>-ofx.pkg` (`/Library/OFX/Plugins`) for each effect |
+| macOS release | `vfx-core/wrappers/package-mac.sh` | `segcam-<version>-macOS.pkg` with every effect, and segcam's zips |
 | Install | `cargo vfx install [--hosts ffgl]` | copies FFGL bundles into Resolume's Extra Effects; for After Effects and OpenFX, prints the `sudo installer` commands |
-| Windows installer | `EFFECT=segcam-motion vfx-core/wrappers/package-win.sh` | `<file>-<version>-Windows-Setup.exe` and a `.zip` (needs [Inno Setup](https://jrsoftware.org/isinfo.php)) |
+| Windows release | `vfx-core/wrappers/package-win.sh` | `segcam-<version>-Windows-Setup.exe` with every effect, and segcam's zips (needs [Inno Setup](https://jrsoftware.org/isinfo.php)) |
 | Preview (desktop) | `cargo vfx preview [-p segcam-motion] [-- clip.mp4]` | the preview, opened on the effect; drop an image or video on it |
-| Preview (web) | `vfx-core/hosts/preview/web/build.sh --serve` | http://localhost:8123, or `?effect=segcam-motion` to open on an effect (needs `wasm-bindgen-cli` at the lockfile's version) |
+| Preview (web) | `vfx-core/hosts/preview/web/build.sh --serve` | http://localhost:8123, or `?effect=segcam` to open on an effect (needs `wasm-bindgen-cli` at the lockfile's version) |
 | Tests | `cargo test -p vfx-core -p vfx-host -p vfx-chain -p colour-adjust -p gaussian-blur -p vignette -p blend -p segcam-motion` | headless GPU and CPU tests |
 
 `cargo vfx package` signs and notarizes only when `SIGN_IDENTITY`, `NOTARY_PROFILE` and
@@ -272,15 +274,19 @@ git tag v0.2.0 && git push origin v0.2.0
 ```
 
 Running the workflow by hand (Actions → release → Run workflow) builds the same files
-as the run's artifacts, without a release. For each effect:
+as the run's artifacts, without a release. The files are named after segcam:
 
 | File | What |
 |---|---|
-| `<file>-<version>-macOS-AfterEffects.pkg` | After Effects and Premiere Pro installer |
-| `<file>-<version>-macOS-OpenFX.pkg` | OpenFX installer (Resolve, Nuke, Natron) |
-| `<file>-<version>-macOS-Resolume.zip` | the FFGL bundle, for Extra Effects |
-| `<file>-<version>-Windows-Setup.exe` | Windows installer: OpenFX and Resolume, After Effects optional |
-| `<file>-<version>-Windows.zip` | the same Windows files, to copy by hand |
+| `segcam-<version>-macOS.pkg` | macOS installer for After Effects and OpenFX: segcam, the other effects as options |
+| `segcam-<version>-Windows-Setup.exe` | Windows installer for OpenFX, Resolume and After Effects: segcam, the other effects as options |
+| `segcam-<version>-<macOS or Windows>-OpenFX.zip` | segcam's OpenFX bundle, to copy by hand |
+| `segcam-<version>-<macOS or Windows>-Resolume.zip` | segcam's FFGL plugin, for Extra Effects |
+| `segcam-<version>-<macOS or Windows>-AfterEffects.zip` | segcam's After Effects plugin |
+
+Both installers remove v0.1.0's `SegcamMotionRust` files, except the macOS Resolume bundle,
+which no installer replaces. The Windows installer keeps segcam's v0.1.0 AppId
+(`windows-installer-id`), so it replaces that install in Apps.
 
 Every Windows plugin ships `dxcompiler.dll` and `dxil.dll` next to its binary, with DXC's
 licenses: without them wgpu compiles the D3D12 shaders with FXC, which takes seconds before

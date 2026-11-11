@@ -50,7 +50,7 @@ Record doesn't work in the browser on the WebGL2 fallback yet. It needs WebGPU.
 Flags open the preview already set up, for example on segcam's Swarm with a clip:
 
 ```sh
-cargo run --release -p vfx-preview -- --effect segcam-motion --mode Swarm clip.mp4
+cargo run --release -p vfx-preview -- --effect segcam --mode Swarm clip.mp4
 ```
 
 | Flag | What |

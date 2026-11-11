@@ -41,16 +41,16 @@ if WINDOWS:
     AERENDER = AE_SUPPORT / "aerender.exe"
     MEDIACORE = Path(r"C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore")
     # A Windows plugin is a folder holding the .aex and the DLLs it loads beside it.
-    BUNDLES = ("SegcamMotionRust/SegcamMotionRust.aex", "SegcamMotion/SegcamMotion.aex")
+    BUNDLES = ("segcam/segcam.aex", "SegcamMotion/SegcamMotion.aex")
 else:
     AERENDER = Path(f"/Applications/{AE_APP}/aerender")
     MEDIACORE = Path("/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore")
-    BUNDLES = ("SegcamMotionRust.plugin", "SegcamMotion.plugin")
+    BUNDLES = ("segcam.plugin", "SegcamMotion.plugin")
 FPS = 30
 DEPTHS = [8, 16, 32]
 MODES = ["overlay", "matte", "boxmatte", "swarm"]  # Output popup values 1..4
 EFFECTS = {
-    "rust": ("LOFISCIFI segcam Motion Rust", BUNDLES[0]),
+    "rust": ("LOFISCIFI segcam", BUNDLES[0]),
     "cpp": ("LOFISCIFI segcam Motion", BUNDLES[1]),
 }
 # 8-bit levels the Rust and C++ effects may differ by.
