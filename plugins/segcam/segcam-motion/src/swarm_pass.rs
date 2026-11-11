@@ -2144,20 +2144,9 @@ mod tests {
                 part(|t| t.copy),
             );
         }
-        // The CPU draw of the same scene, at the coverage `incremental.rs` reads.
-        let canvas = PixelRect::new(0, 0, w, h);
-        let m = SwarmMetrics::new(h);
-        let window_pixels: i64 = shown
-            .iter()
-            .map(|t| {
-                let r = intersect(
-                    shadow.shadow_rect(window_rect(t.content_rect, m.title_height)),
-                    canvas,
-                );
-                i64::from(r.w) * i64::from(r.h)
-            })
-            .sum();
-        let coverage = window_pixels as f64 / f64::from(w * h);
+        // The CPU draw of the same scene. Every window whole is the coverage
+        // `incremental.rs` switches on.
+        let coverage = whole;
         let mut times = Vec::new();
         for _ in 0..warm_up + draws {
             let start = Instant::now();

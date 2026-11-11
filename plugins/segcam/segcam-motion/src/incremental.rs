@@ -231,17 +231,22 @@ struct BudgetedReads {
     deferred: Vec<i64>,
 }
 
-/// Below these coverages, CPU drawing beats the GPU's readback cost. Coverage is window pixels
-/// over canvas pixels, counted per window with shadow, overlaps included. See BENCHMARK.md.
+/// Below these coverages a read back canvas draws on the CPU; BENCHMARK.md
+/// gives the crossings. Coverage is window pixels with shadow over canvas
+/// pixels, overlaps included.
 #[cfg(not(target_arch = "wasm32"))]
 const GPU_MIN_COVERAGE_8_BIT: f64 = 0.5;
 #[cfg(not(target_arch = "wasm32"))]
-const GPU_MIN_COVERAGE_DEEPER: f64 = 1.5;
+const GPU_MIN_COVERAGE_16_BIT: f64 = 1.15;
+#[cfg(not(target_arch = "wasm32"))]
+const GPU_MIN_COVERAGE_FLOAT: f64 = 1.5;
 // The browser CPU path runs on one thread, so the GPU draws every swarm there.
 #[cfg(target_arch = "wasm32")]
 const GPU_MIN_COVERAGE_8_BIT: f64 = 0.0;
 #[cfg(target_arch = "wasm32")]
-const GPU_MIN_COVERAGE_DEEPER: f64 = 0.0;
+const GPU_MIN_COVERAGE_16_BIT: f64 = 0.0;
+#[cfg(target_arch = "wasm32")]
+const GPU_MIN_COVERAGE_FLOAT: f64 = 0.0;
 
 /// What a frame without a cached analysis draws from.
 static NO_SEGMENTS: Segmentation = Segmentation {
@@ -1069,10 +1074,10 @@ impl IncrementalRenderer {
         // reflect readback cost, so drawing directly into a host frame always uses the GPU.
         let (w, h) = (out.width, out.height);
         let canvas_pixels = i64::from(w) * i64::from(h);
-        let default = if size_of::<C>() == 1 {
-            GPU_MIN_COVERAGE_8_BIT
-        } else {
-            GPU_MIN_COVERAGE_DEEPER
+        let default = match size_of::<C>() {
+            1 => GPU_MIN_COVERAGE_8_BIT,
+            2 => GPU_MIN_COVERAGE_16_BIT,
+            _ => GPU_MIN_COVERAGE_FLOAT,
         };
         let into_target = self.can_draw_into_target::<C>(drawer, (w, h));
         let min_coverage_permille = match into_target {
