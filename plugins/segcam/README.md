@@ -50,7 +50,9 @@ from the Resolume zip in its place. If you copied v0.1.0 by hand, delete
 while it is there, because both have the same plugin ID.
 
 Resolve and After Effects projects saved with v0.1.0 will need segcam added to the clip again,
-with its controls set again.
+with its controls set again. Resolve won't export a clip that still has v0.1.0's segcam on it, even
+switched off, and says GPU processing failed: delete that segcam from the clip (Resolve's notice
+about a missing plugin calls it `com.lofiscifi.SegcamMotionRust`) and add segcam again.
 
 ### Uninstall
 
