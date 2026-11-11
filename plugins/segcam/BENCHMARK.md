@@ -84,10 +84,10 @@ Linux the GPUs `lspci` lists.
 | same | CLI | overlay | float | CPU, kept, 600 of 600 frames | 20.1 ms | 20.9 ms | 22.5 ms | 47.8 fps | the `--cpu` rows, 300 of 300 |
 | same | CLI | overlay faces | 8 bit | CPU, kept, 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 18.3 ms | 20.3 ms | 27.9 ms | 49.3 fps | no reference |
 | same | CLI | overlay faces | float | CPU, kept, 600 of 600 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 25.5 ms | 27.0 ms | 33.9 ms | 37.0 fps | no reference |
-| same | CLI | show | 8 bit | GPU (NVIDIA GeForce RTX 4070), 582 of 600 frames, CPU 18 frames | 17.0 ms | 17.9 ms | 20.5 ms | 55.9 fps | no reference |
-| same | CLI | show | float | GPU (NVIDIA GeForce RTX 4070), 548 of 600 frames, CPU 52 frames | 23.6 ms | 26.2 ms | 35.3 ms | 38.2 fps | no reference |
-| same | CLI | show faces | 8 bit | GPU (NVIDIA GeForce RTX 4070), 594 of 600 frames, CPU 6 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 24.0 ms | 25.4 ms | 35.5 ms | 39.4 fps | no reference |
-| same | CLI | show faces | float | GPU (NVIDIA GeForce RTX 4070), 570 of 600 frames, CPU 30 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 30.4 ms | 34.0 ms | 63.6 ms | 29.4 fps | no reference |
+| same | CLI | show | 8 bit | GPU (NVIDIA GeForce RTX 4070), 582 of 600 frames, CPU 18 frames | 15.1 ms | 16.0 ms | 25.2 ms | 62.7 fps | no reference |
+| same | CLI | show | float | GPU (NVIDIA GeForce RTX 4070), 548 of 600 frames, CPU 52 frames | 21.7 ms | 23.7 ms | 33.6 ms | 42.1 fps | no reference |
+| same | CLI | show faces | 8 bit | GPU (NVIDIA GeForce RTX 4070), 596 of 600 frames, CPU 4 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 21.6 ms | 22.1 ms | 37.7 ms | 45.3 fps | no reference |
+| same | CLI | show faces | float | GPU (NVIDIA GeForce RTX 4070), 564 of 600 frames, CPU 36 frames, faces on DirectML 0 (NVIDIA GeForce RTX 4070) | 30.9 ms | 34.5 ms | 60.2 ms | 28.9 fps | no reference |
 | Ryzen 5 3600, RX 5700 XT 50th Anniversary (display), AMD 26.10.1, Windows 10 22H2 | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output through RAM | not split out | 32.7 ms | 45.6 ms | 26.7 fps | |
 | same | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output kept on the GPU | not split out | 28.9 ms | 41.4 ms | 30.0 fps | the swarm read back, byte for byte (`tests/target.rs`) |
 
