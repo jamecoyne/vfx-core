@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Builds every effect's macOS plugins and packages them for a release, named after segcam:
 #   target/vfx-plugin/segcam-<version>-macOS.pkg                one installer for After
-#                                                               Effects and OpenFX: segcam,
-#                                                               the other effects as options
+#                                                               Effects and OpenFX: segcam
+#                                                               for the apps found, the other
+#                                                               effects as options
 #   target/vfx-plugin/segcam-<version>-macOS-OpenFX.zip         segcam's bundles, one zip
 #   target/vfx-plugin/segcam-<version>-macOS-AfterEffects.zip   per host to copy by hand,
 #   target/vfx-plugin/segcam-<version>-macOS-Resolume.zip       each with a README.txt
@@ -39,6 +40,10 @@ done
 identity "$lead"
 # An earlier or failed run's files go first, so the folder holds only this run's release.
 rm -rf "$out/.product" "$out"/.stage-* "$out/$PLUGIN_FILE"-*-macOS.pkg "$out/$PLUGIN_FILE"-*-macOS-*.zip
+# Bundles and packages carry the release's version, not each crate's.
+if [ "$version" != dev ]; then
+  export VFX_VERSION="$version"
+fi
 cargo vfx package
 
 work="$out/.product"
@@ -46,9 +51,8 @@ mkdir -p "$work"
 sign=()
 [ -n "${INSTALLER_IDENTITY:-}" ] && sign=(--sign "$INSTALLER_IDENTITY")
 
-# v0.1.0 installed segcam as SegcamMotionRust. For each host chosen, a package with no
-# payload removes that host's old bundle, so it doesn't list segcam twice. The Resolume
-# bundle stays: this installer has no new one to put in its place.
+# v0.1.0 installed segcam as SegcamMotionRust. For each app chosen, a package with no
+# payload removes that app's old bundle, so the app doesn't keep v0.1.0.
 # cleanup HOST PATH: the cleanup package for HOST, removing PATH.
 cleanup() {
   mkdir -p "$work/scripts-$1"
@@ -60,76 +64,107 @@ exit 0
 SH
   chmod 755 "$work/scripts-$1/preinstall"
   pkgbuild --nopayload --scripts "$work/scripts-$1" --identifier "$PLUGIN_ID.cleanup.$1" \
-    --version "$PLUGIN_VERSION" ${sign[@]+"${sign[@]}"} "$work/cleanup-$1.pkg"
+    --version "$version" ${sign[@]+"${sign[@]}"} "$work/cleanup-$1.pkg"
 }
 cleanup ofx "/Library/OFX/Plugins/SegcamMotionRust.ofx.bundle"
 cleanup adobe "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/SegcamMotionRust.plugin"
+# Resolume's v0.1.0 bundle has the same FFGL ID as segcam.bundle from the zip, and Resolume
+# keeps the one it loads first. So where the signed in user already put segcam.bundle, the
+# old one goes; where segcam.bundle isn't there yet, v0.1.0 stays as Resolume's only segcam.
+mkdir -p "$work/scripts-resolume"
+cat >"$work/scripts-resolume/preinstall" <<'SH'
+#!/bin/sh
+user="$(stat -f %Su /dev/console)"
+home="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null |
+  sed -e 's/^NFSHomeDirectory://' -e 's/^ *//' | tr -d '\n')"
+[ -n "$home" ] || exit 0
+for app in "Resolume Arena" "Resolume Avenue"; do
+  dir="$home/Documents/$app/Extra Effects"
+  if [ -d "$dir/segcam.bundle" ]; then
+    rm -rf "$dir/SegcamMotionRust.bundle"
+  fi
+done
+exit 0
+SH
+chmod 755 "$work/scripts-resolume/preinstall"
+pkgbuild --nopayload --scripts "$work/scripts-resolume" --identifier "$PLUGIN_ID.cleanup.resolume" \
+  --version "$version" ${sign[@]+"${sign[@]}"} "$work/cleanup-resolume.pkg"
 
-# The product: a choice per effect, holding one per host; the examples start unselected.
-# effect_choices CHOICE SELECTED INDENT: the effect's choice, holding its OpenFX and After
-# Effects choices, at INDENT in the outline. segcam's host choices also hold the cleanup.
-effect_choices() {
-  local choice="$1" selected="$2" indent="$3" host title refs
-  outline+="$indent<line choice=\"$choice\">
-"
-  choices+="  <choice id=\"$choice\" title=\"$PLUGIN_NAME\"/>
-"
-  for host in ofx adobe; do
-    case "$host" in
-      ofx) title="DaVinci Resolve, Nuke and Natron (OpenFX)" ;;
-      adobe) title="After Effects and Premiere Pro" ;;
-    esac
-    cp "$out/$PLUGIN_FILE-$host.pkg" "$work/"
-    refs="    <pkg-ref id=\"$PLUGIN_ID.$host\"/>
-"
-    if [ "$crate" = "$lead" ]; then
-      refs="    <pkg-ref id=\"$PLUGIN_ID.cleanup.$host\"/>
-$refs"
-      choices+="  <pkg-ref id=\"$PLUGIN_ID.cleanup.$host\" version=\"$PLUGIN_VERSION\">cleanup-$host.pkg</pkg-ref>
-"
-    fi
-    choices+="  <choice id=\"$choice-$host\" title=\"$title\" start_selected=\"$selected\">
-$refs  </choice>
-  <pkg-ref id=\"$PLUGIN_ID.$host\" version=\"$PLUGIN_VERSION\">$PLUGIN_FILE-$host.pkg</pkg-ref>
-"
-    outline+="$indent  <line choice=\"$choice-$host\"/>
-"
-  done
-  outline+="$indent</line>
-"
-}
+# The product, as the Windows Setup: a choice per app, selected when the app is installed,
+# which installs segcam there; then the examples, each installed for the apps chosen through
+# a hidden choice per app.
+ofx_found="system.files.fileExistsAtPath('/Library/OFX/Plugins') || system.files.fileExistsAtPath('/Applications/DaVinci Resolve/DaVinci Resolve.app')"
+adobe_found="system.files.fileExistsAtPath('/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore')"
 choices=""
 outline=""
+examples=""
+hidden=""
 for crate in "${crates[@]}"; do
   identity "$crate"
   choice="$(printf %s "$PLUGIN_FILE" | tr "[:upper:]" "[:lower:]")"
+  for host in ofx adobe; do
+    cp "$out/$PLUGIN_FILE-$host.pkg" "$work/"
+    choices+="  <pkg-ref id=\"$PLUGIN_ID.$host\" version=\"$version\">$PLUGIN_FILE-$host.pkg</pkg-ref>
+"
+  done
   if [ "$crate" = "$lead" ]; then
-    effect_choices "$choice" true "    "
-    outline+="    <line choice=\"examples\">
+    choices+="  <pkg-ref id=\"$PLUGIN_ID.cleanup.ofx\" version=\"$version\">cleanup-ofx.pkg</pkg-ref>
+  <pkg-ref id=\"$PLUGIN_ID.cleanup.adobe\" version=\"$version\">cleanup-adobe.pkg</pkg-ref>
+  <pkg-ref id=\"$PLUGIN_ID.cleanup.resolume\" version=\"$version\">cleanup-resolume.pkg</pkg-ref>
+  <choice id=\"ofx\" title=\"DaVinci Resolve, Nuke and Natron (OpenFX)\" description=\"Adds $PLUGIN_NAME to DaVinci Resolve, Nuke and Natron.\" start_selected=\"$ofx_found\">
+    <pkg-ref id=\"$PLUGIN_ID.cleanup.ofx\"/>
+    <pkg-ref id=\"$PLUGIN_ID.cleanup.resolume\"/>
+    <pkg-ref id=\"$PLUGIN_ID.ofx\"/>
+  </choice>
+  <choice id=\"adobe\" title=\"After Effects and Premiere Pro\" description=\"Adds $PLUGIN_NAME to After Effects and Premiere Pro.\" start_selected=\"$adobe_found\">
+    <pkg-ref id=\"$PLUGIN_ID.cleanup.adobe\"/>
+    <pkg-ref id=\"$PLUGIN_ID.cleanup.resolume\"/>
+    <pkg-ref id=\"$PLUGIN_ID.adobe\"/>
+  </choice>
+"
+    outline+="    <line choice=\"ofx\"/>
+    <line choice=\"adobe\"/>
 "
   else
-    effect_choices "$choice" false "      "
+    size_mb=$(( $(du -sk "$out/$PLUGIN_FILE.ofx.bundle" | cut -f1) / 1024 ))
+    choices+="  <choice id=\"$choice\" title=\"$PLUGIN_NAME\" description=\"An example effect from vfx-core, for the apps checked above. About $size_mb MB for each app.\" start_selected=\"false\"/>
+"
+    examples+="      <line choice=\"$choice\"/>
+"
+    for host in ofx adobe; do
+      choices+="  <choice id=\"$choice-$host\" visible=\"false\" selected=\"choices['$choice'].selected &amp;&amp; choices['$host'].selected\">
+    <pkg-ref id=\"$PLUGIN_ID.$host\"/>
+  </choice>
+"
+      hidden+="    <line choice=\"$choice-$host\"/>
+"
+    done
   fi
 done
-outline+="    </line>
-"
 identity "$lead"
+mkdir -p "$work/resources"
+printf '%s\n' "$PLUGIN_NAME for DaVinci Resolve and After Effects. Installed apps are already selected." "" \
+  "For Resolume, use $PLUGIN_FILE-$version-macOS-Resolume.zip from the same release." \
+  >"$work/resources/welcome.txt"
 cat >"$work/distribution.xml" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
   <title>$PLUGIN_NAME</title>
+  <welcome file="welcome.txt" mime-type="text/plain"/>
   <options customize="always" require-scripts="false" hostArchitectures="arm64,x86_64"/>
   <domains enable_localSystem="true"/>
   <choices-outline>
-$outline  </choices-outline>
-  <choice id="examples" title="Example effects"/>
+$outline    <line choice="examples">
+$examples    </line>
+$hidden  </choices-outline>
+  <choice id="examples" title="Example effects from vfx-core" description="Small effects that come with vfx-core, added to the apps checked above." start_selected="false"/>
 $choices</installer-gui-script>
 XML
 
 product="$out/$PLUGIN_FILE-$version-macOS.pkg"
 rm -f "$product"
 productbuild --distribution "$work/distribution.xml" --package-path "$work" \
-  ${sign[@]+"${sign[@]}"} "$product"
+  --resources "$work/resources" ${sign[@]+"${sign[@]}"} "$product"
 if [ -n "${NOTARY_PROFILE:-}" ]; then
   xcrun notarytool submit "$product" --keychain-profile "$NOTARY_PROFILE" --wait
   xcrun stapler staple "$product"
@@ -168,11 +203,10 @@ Then restart After Effects. The effect is in the Effect menu under $PLUGIN_CATEG
 
 zip_host Resolume "$PLUGIN_NAME for Resolume Arena and Avenue (FFGL), macOS, version $version
 
-The macOS installer doesn't install Resolume plugins, so this zip is how segcam
-gets there. Copy $PLUGIN_FILE.bundle into Documents/Resolume Arena/Extra Effects
-(Documents/Resolume Avenue/Extra Effects for Avenue). Delete
-SegcamMotionRust.bundle from that folder if it is there: it is v0.1.0, and the
-installer leaves it.
 Resolume makes its Documents folder the first time it starts.
+Copy $PLUGIN_FILE.bundle into Documents/Resolume Arena/Extra Effects
+(Documents/Resolume Avenue/Extra Effects for Avenue). Remove
+SegcamMotionRust.bundle from that folder if it's there: it is v0.1.0, and
+Resolume keeps loading it instead of this one.
 Then restart Resolume. The effect is in the Effects browser as $PLUGIN_SHORT_NAME." \
   "$out/$PLUGIN_FILE.bundle"
