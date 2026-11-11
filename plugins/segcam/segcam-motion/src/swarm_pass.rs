@@ -1855,14 +1855,23 @@ mod tests {
     use crate::swarm::{draw_swarm, shadow_kernel};
 
     /// A device on the adapter whose name contains `SWARM_PASS_ADAPTER`, on
-    /// the backend `SWARM_PASS_BACKEND` names (D3D12 unless set), with 32-bit
-    /// float blending where the adapter has it.
+    /// the backend `SWARM_PASS_BACKEND` names (unless set, the platform's: Metal
+    /// on macOS, D3D12 on Windows, Vulkan elsewhere), with 32-bit float
+    /// blending where the adapter has it.
     fn open(limits: wgpu::Limits) -> (wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+        let platform = if cfg!(target_os = "macos") {
+            wgpu::Backends::METAL
+        } else if cfg!(windows) {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::VULKAN
+        };
         let backends = match std::env::var("SWARM_PASS_BACKEND").as_deref() {
             Ok("gl") => wgpu::Backends::GL,
             Ok("vulkan") => wgpu::Backends::VULKAN,
             Ok("metal") => wgpu::Backends::METAL,
-            _ => wgpu::Backends::DX12,
+            Ok("dx12") => wgpu::Backends::DX12,
+            _ => platform,
         };
         let wanted = std::env::var("SWARM_PASS_ADAPTER")
             .unwrap_or_default()
