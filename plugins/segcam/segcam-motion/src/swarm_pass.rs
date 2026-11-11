@@ -1823,7 +1823,7 @@ mod tests {
     use crate::gpu;
     use crate::motion::Segmentation;
     use crate::render::{OutputMode, PixelRect, draw_output, intersect};
-    use crate::swarm::shadow_kernel;
+    use crate::swarm::{draw_swarm, shadow_kernel};
 
     /// A device on the adapter whose name contains `SWARM_PASS_ADAPTER`, on
     /// the backend `SWARM_PASS_BACKEND` names (D3D12 unless set), with 32-bit
@@ -2115,6 +2115,42 @@ mod tests {
                 part(|t| t.copy),
             );
         }
+        // The CPU draw of the same scene, at the coverage `incremental.rs` reads.
+        let canvas = PixelRect::new(0, 0, w, h);
+        let m = SwarmMetrics::new(h);
+        let window_pixels: i64 = shown
+            .iter()
+            .map(|t| {
+                let r = intersect(
+                    shadow.shadow_rect(window_rect(t.content_rect, m.title_height)),
+                    canvas,
+                );
+                i64::from(r.w) * i64::from(r.h)
+            })
+            .sum();
+        let coverage = window_pixels as f64 / f64::from(w * h);
+        let mut times = Vec::new();
+        for _ in 0..warm_up + draws {
+            let start = Instant::now();
+            if reads_frame {
+                out.copy_from_slice(&frame_pixels);
+            }
+            let mut view = ViewMut::from_pixels(&mut out, w, h);
+            draw_swarm(
+                &mut view,
+                &shown,
+                s.straight_alpha,
+                !reads_frame,
+                frame.as_ref(),
+                s.mirror,
+            );
+            times.push(start.elapsed());
+        }
+        let (median, worst) = median_and_worst(&mut times[warm_up..]);
+        println!(
+            "| {bits} bit | {count} | CPU{reads}, coverage {coverage:.2} | {median:.2} ms \
+             | {worst:.2} ms | | | | |"
+        );
         let [(tile_texels, tile_room), (bar_texels, bar_room)] = pass.atlas_usage();
         println!(
             "atlas for {count} windows: tiles {tile_texels} of {tile_room} texels, title bars \
@@ -2131,12 +2167,16 @@ mod tests {
             "| depth | windows | path | median | worst | submit | wait | copy | fragments per \
              pixel |"
         );
-        for (max_tiles, per_frame) in [(60, 3), (100, 3), (1000, 9)] {
+        // From under the switch points in `incremental.rs` to the 591 stacked windows.
+        let scenes = [(8, 1), (20, 1), (60, 3), (100, 3), (1000, 9)];
+        for (max_tiles, per_frame) in scenes {
             time_draws::<u8>(&device, &queue, max_tiles, per_frame, false, 300);
         }
         time_draws::<u8>(&device, &queue, 60, 3, true, 300);
-        time_draws::<u16>(&device, &queue, 60, 3, false, 300);
-        time_draws::<f32>(&device, &queue, 60, 3, false, 300);
+        for (max_tiles, per_frame) in scenes {
+            time_draws::<u16>(&device, &queue, max_tiles, per_frame, false, 300);
+            time_draws::<f32>(&device, &queue, max_tiles, per_frame, false, 300);
+        }
     }
 
     /// The texels of `frame`, RGBA8 or RGBA32F, as red, green, blue and alpha
