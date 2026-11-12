@@ -153,8 +153,9 @@ fn render(
             values,
             &ctx,
         );
+        // Up to as many again for the current frame's own analysis.
         if let Some(budget) = fetch_budget
-            && source.earlier.len() > budget
+            && source.earlier.len() > budget.saturating_mul(2)
         {
             return Err(format!(
                 "frame {number}: a render under a fetch budget of {budget} read {} earlier frames",
@@ -185,7 +186,7 @@ fn cpu(make: fn() -> Processor) -> Box<dyn CpuEffect> {
 /// missing and after clearing the history.
 ///
 /// Under a [fetch budget](FrameSource::fetch_budget) each render reads at most
-/// the budget, and:
+/// twice the budget, and:
 /// - renders in order match, for every parameter set;
 /// - a held frame matches within [`held_catch_up_renders`] after a jump, an
 ///   edit to every earlier frame, missing frames or another parameter set;

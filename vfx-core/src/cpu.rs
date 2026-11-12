@@ -391,9 +391,11 @@ pub trait FrameSource {
     }
 
     /// How many distinct earlier frames one render may ask for, the current frame
-    /// not counted, or `None` for as many as it needs. A hard cap, for a host that
-    /// holds every frame it hands out until the render returns; set it to at least
-    /// 2. Only an effect that [keeps state](crate::CpuEffect::keeps_state) can keep
+    /// not counted, or `None` for as many as it needs. For a host that holds every
+    /// frame it hands out until the render returns; set it to at least 2. A render
+    /// reads at most this many, plus up to as many again of the frames the current
+    /// frame's own analysis needs and nothing was kept from, which it reads first.
+    /// Only an effect that [keeps state](crate::CpuEffect::keeps_state) can keep
     /// to it: it reads the rest over the following renders and draws what it kept
     /// meanwhile, so a render may differ from a fresh one until it has read them.
     fn fetch_budget(&self) -> Option<usize> {
