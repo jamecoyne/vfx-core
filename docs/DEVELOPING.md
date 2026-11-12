@@ -129,6 +129,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core |
 | `Gpu::share`, `Gpu::shared` | vfx-core |
+| `Gpu::unshare` (a host whose device was lost stops sharing it before dropping it, which D3D12 needs to offer the adapter again) | vfx-core |
 | `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core |
 | `Gpu::backend_options` (wgpu backend options for every instance: on Windows, D3D12 compiles with the `dxcompiler.dll` beside the binary or in `Common Files/vfx-core/dxc-<tag>`, else FXC) | vfx-core |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core |
