@@ -50,7 +50,7 @@ pub enum InteropError {
     /// Metal couldn't wrap the surface as a texture.
     MetalTexture,
     /// The input framebuffer or a blit program failed to build.
-    Gl(String),
+    Gl(gl::Error),
 }
 
 impl fmt::Display for InteropError {
@@ -60,7 +60,7 @@ impl fmt::Display for InteropError {
             Self::CglTexture(code) => write!(f, "CGLTexImageIOSurface2D failed ({code})"),
             Self::NotMetal => f.write_str("the plugin's GPU device isn't Metal"),
             Self::MetalTexture => f.write_str("newTextureWithDescriptor:iosurface: failed"),
-            Self::Gl(message) => f.write_str(message),
+            Self::Gl(error) => write!(f, "{error}"),
         }
     }
 }

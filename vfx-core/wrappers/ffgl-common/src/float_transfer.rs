@@ -1,8 +1,10 @@
 //! The host's texture to straight, top-down RGBA floats in RAM and back: GL converts the host's pixels before readback and after upload.
 
+use std::ffi::CStr;
+
 use crate::gl;
 
-pub const FROM_CANVAS: &str = "#version 410 core
+pub const FROM_CANVAS: &CStr = c"#version 410 core
 uniform sampler2D image;
 uniform vec2 max_uv;
 in vec2 uv;
@@ -24,7 +26,7 @@ pub struct FloatTransfer {
 impl FloatTransfer {
     /// # Safety
     /// The host's GL context must be current.
-    pub unsafe fn new(size: (u32, u32)) -> Result<Self, String> {
+    pub unsafe fn new(size: (u32, u32)) -> Result<Self, gl::Error> {
         // SAFETY: the caller has the context current; partial setup is deleted on error.
         unsafe {
             let to_canvas = gl::Blit::new(gl::TO_CANVAS)?;

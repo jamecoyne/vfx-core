@@ -7,7 +7,48 @@
 
 #![allow(clippy::upper_case_acronyms)]
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, c_char, c_void};
+use std::fmt;
+
+/// Why a GL call or setup step failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// No OpenGL context is current on this thread.
+    NoContext,
+    /// The context doesn't provide this function.
+    MissingFunction(&'static str),
+    /// The context doesn't offer this extension.
+    MissingExtension(&'static str),
+    /// `operation` left this error code on the context.
+    Call {
+        operation: &'static str,
+        code: GLenum,
+    },
+    /// A blit shader didn't compile.
+    Compile,
+    /// The blit program didn't link.
+    Link,
+    /// A framebuffer over a texture isn't complete, with the status GL gave.
+    IncompleteFramebuffer(GLenum),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoContext => f.write_str("no current OpenGL context"),
+            Self::MissingFunction(name) => write!(f, "missing OpenGL function {name}"),
+            Self::MissingExtension(name) => write!(f, "missing {name}"),
+            Self::Call { operation, code } => write!(f, "{operation}: GL error 0x{code:04x}"),
+            Self::Compile => f.write_str("blit shader failed to compile"),
+            Self::Link => f.write_str("blit program failed to link"),
+            Self::IncompleteFramebuffer(status) => {
+                write!(f, "texture framebuffer incomplete (0x{status:x})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 pub type GLenum = u32;
 pub type GLuint = u32;
@@ -52,13 +93,13 @@ macro_rules! interop_functions {
             $($name: unsafe extern "system" fn($($ty),*) $(-> $ret)?,)*
         }
         impl InteropFunctions {
-            unsafe fn load_with(resolve: &mut impl FnMut(&CStr) -> *const c_void) -> Result<Self, String> {
+            unsafe fn load_with(resolve: &mut impl FnMut(&CStr) -> *const c_void) -> Result<Self, Error> {
                 Ok(Self {
                     $($name: {
                         let name = CStr::from_bytes_with_nul(concat!(stringify!($name), "\0").as_bytes()).unwrap();
                         let address = resolve(name);
                         if !valid_address(address) {
-                            return Err(format!("missing OpenGL function {}", name.to_string_lossy()));
+                            return Err(Error::MissingFunction(stringify!($name)));
                         }
                         // SAFETY: the resolver supplies the named function's GL ABI.
                         unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn($($ty),*) $(-> $ret)?>(address) }
@@ -89,25 +130,15 @@ macro_rules! gl_functions {
         #[allow(non_snake_case, clippy::too_many_arguments)]
         mod windows {
             use super::*;
-            use std::ffi::CStr;
             use std::sync::OnceLock;
-
-            #[link(name = "opengl32")]
-            unsafe extern "system" {
-                fn wglGetProcAddress(name: *const c_char) -> *const c_void;
-                fn wglGetCurrentContext() -> *mut c_void;
-            }
-            #[link(name = "kernel32")]
-            unsafe extern "system" {
-                fn GetModuleHandleA(name: *const c_char) -> *mut c_void;
-                fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *const c_void;
-            }
+            use windows_sys::Win32::Graphics::OpenGL::{wglGetCurrentContext, wglGetProcAddress};
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 
             struct Functions {
                 $( $(#[$attr])* $name: unsafe extern "system" fn($($ty),*) $(-> $ret)?, )*
-                interop: Result<InteropFunctions, String>,
+                interop: Result<InteropFunctions, Error>,
             }
-            static FUNCTIONS: OnceLock<Result<Functions, String>> = OnceLock::new();
+            static FUNCTIONS: OnceLock<Result<Functions, Error>> = OnceLock::new();
 
             fn valid_address(address: *const c_void) -> bool {
                 !matches!(address as usize, 0 | 1 | 2 | 3 | usize::MAX)
@@ -116,14 +147,14 @@ macro_rules! gl_functions {
             impl Functions {
                 // SAFETY: the resolver must return each named GL function's address
                 // in the current context, or a null/sentinel address when unavailable.
-                unsafe fn load_with(mut resolve: impl FnMut(&CStr) -> *const c_void) -> Result<Self, String> {
+                unsafe fn load_with(mut resolve: impl FnMut(&CStr) -> *const c_void) -> Result<Self, Error> {
                     Ok(Self {
                         $( $(#[$attr])* $name: {
                             let name = concat!(stringify!($name), "\0");
                             let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
                             let address = resolve(name);
                             if !valid_address(address) {
-                                return Err(format!("missing OpenGL function {}", name.to_string_lossy()));
+                                return Err(Error::MissingFunction(stringify!($name)));
                             }
                             // SAFETY: the resolver supplies this symbol's declared GL ABI.
                             unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn($($ty),*) $(-> $ret)?>(address) }
@@ -148,25 +179,28 @@ macro_rules! gl_functions {
                 fn glSignalSemaphoreEXT(semaphore: GLuint, buffers: GLuint, buffer_names: *const GLuint, textures: GLuint, texture_names: *const GLuint, layouts: *const GLenum);
             }
 
-            pub(super) fn interop_loaded() -> Result<(), String> {
+            pub(super) fn interop_loaded() -> Result<(), Error> {
                 FUNCTIONS.get().unwrap().as_ref().unwrap().interop.as_ref().map(|_| ()).map_err(Clone::clone)
             }
 
             /// Loads the table once, with the host's GL context current.
-            pub fn load() -> Result<(), String> {
+            pub fn load() -> Result<(), Error> {
                 // SAFETY: these queries don't need a context or dereference host data.
                 unsafe {
                     if wglGetCurrentContext().is_null() {
-                        return Err("no current OpenGL context".into());
+                        return Err(Error::NoContext);
                     }
                     FUNCTIONS.get_or_init(|| {
-                        let module = GetModuleHandleA(c"opengl32.dll".as_ptr());
+                        let module = GetModuleHandleA(c"opengl32.dll".as_ptr().cast());
+                        let address = |function: Option<unsafe extern "system" fn() -> isize>| {
+                            function.map_or(std::ptr::null(), |f| f as *const c_void)
+                        };
                         Functions::load_with(|name| {
-                            let address = wglGetProcAddress(name.as_ptr());
-                            if valid_address(address) {
-                                address
+                            let from_context = address(wglGetProcAddress(name.as_ptr().cast()));
+                            if valid_address(from_context) {
+                                from_context
                             } else if !module.is_null() {
-                                GetProcAddress(module, name.as_ptr())
+                                address(GetProcAddress(module, name.as_ptr().cast()))
                             } else {
                                 std::ptr::null()
                             }
@@ -201,13 +235,13 @@ macro_rules! gl_functions {
                     for address in [0, 1, 2, 3, usize::MAX] {
                         // SAFETY: a failure address is rejected before any function is stored.
                         let result = unsafe { Functions::load_with(|_| address as *const c_void) };
-                        assert_eq!(result.err().as_deref(), Some("missing OpenGL function glGenTextures"));
+                        assert_eq!(result.err(), Some(Error::MissingFunction("glGenTextures")));
                     }
                 }
 
                 #[test]
                 fn loading_without_a_context_fails_before_caching() {
-                    assert_eq!(load(), Err("no current OpenGL context".into()));
+                    assert_eq!(load(), Err(Error::NoContext));
                     assert!(FUNCTIONS.get().is_none());
                 }
 
@@ -218,8 +252,8 @@ macro_rules! gl_functions {
                         if name.to_bytes().ends_with(b"EXT") { std::ptr::null() }
                         else { 4usize as *const c_void }
                     }) }.unwrap();
-                    assert_eq!(functions.interop.err().as_deref(),
-                        Some("missing OpenGL function glCreateMemoryObjectsEXT"));
+                    assert_eq!(functions.interop.err(),
+                        Some(Error::MissingFunction("glCreateMemoryObjectsEXT")));
                 }
             }
         }
@@ -322,23 +356,23 @@ pub use windows::{
 #[cfg(target_os = "windows")]
 /// # Safety
 /// The host GL context must be current and any texture must belong to it.
-pub unsafe fn shared_memory_luid() -> Result<[u8; 8], String> {
-    use std::ffi::CStr;
+pub unsafe fn shared_memory_luid() -> Result<[u8; 8], Error> {
     let mut count = 0;
     // SAFETY: the caller has the host's GL 4.1 context current.
     unsafe {
         clear_errors();
         glGetIntegerv(0x821D, &mut count); // GL_NUM_EXTENSIONS
         for required in [
-            c"GL_EXT_memory_object",
-            c"GL_EXT_memory_object_win32",
-            c"GL_EXT_semaphore",
-            c"GL_EXT_semaphore_win32",
+            "GL_EXT_memory_object",
+            "GL_EXT_memory_object_win32",
+            "GL_EXT_semaphore",
+            "GL_EXT_semaphore_win32",
         ] {
-            if !(0..count)
-                .any(|i| CStr::from_ptr(glGetStringi(0x1F03, i as u32).cast()) == required)
-            {
-                return Err(format!("missing {}", required.to_string_lossy()));
+            if !(0..count).any(|i| {
+                CStr::from_ptr(glGetStringi(0x1F03, i as u32).cast()).to_bytes()
+                    == required.as_bytes()
+            }) {
+                return Err(Error::MissingExtension(required));
             }
         }
         windows::interop_loaded()?;
@@ -366,13 +400,13 @@ pub unsafe fn clear_errors() {
 #[cfg(target_os = "windows")]
 /// # Safety
 /// The host GL context must be current and any texture must belong to it.
-pub unsafe fn check_error(operation: &str) -> Result<(), String> {
+pub unsafe fn check_error(operation: &'static str) -> Result<(), Error> {
     // SAFETY: the caller has a current context.
-    let error = unsafe { glGetError() };
-    if error == 0 {
+    let code = unsafe { glGetError() };
+    if code == 0 {
         Ok(())
     } else {
-        Err(format!("{operation}: GL error 0x{error:04x}"))
+        Err(Error::Call { operation, code })
     }
 }
 
@@ -406,7 +440,7 @@ pub unsafe fn nearest_2d(texture: GLuint) {
     }
 }
 
-const VERTEX: &str = "#version 410 core
+const VERTEX: &CStr = c"#version 410 core
 uniform vec2 max_uv;
 out vec2 uv;
 void main() {
@@ -418,7 +452,7 @@ void main() {
 ";
 
 /// Draws a texture as it is.
-pub const PASS: &str = "#version 410 core
+pub const PASS: &CStr = c"#version 410 core
 uniform sampler2D image;
 in vec2 uv;
 out vec4 color;
@@ -429,7 +463,7 @@ void main() {
 
 /// An FFGL texture (premultiplied, bottom-up) to a pipeline canvas (straight, top-down).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub const TO_CANVAS: &str = "#version 410 core
+pub const TO_CANVAS: &CStr = c"#version 410 core
 uniform sampler2D image;
 uniform vec2 max_uv;
 in vec2 uv;
@@ -442,7 +476,7 @@ void main() {
 
 /// A pipeline canvas in a rectangle texture back to a premultiplied, bottom-up image.
 #[cfg(target_os = "macos")]
-pub const FROM_CANVAS: &str = "#version 410 core
+pub const FROM_CANVAS: &CStr = c"#version 410 core
 uniform sampler2DRect image;
 uniform vec2 max_uv;
 in vec2 uv;
@@ -463,7 +497,7 @@ pub struct Blit {
 impl Blit {
     /// # Safety
     /// The host's GL context must be current.
-    pub unsafe fn new(fragment: &str) -> Result<Self, String> {
+    pub unsafe fn new(fragment: &CStr) -> Result<Self, Error> {
         // SAFETY: the caller has the context current.
         unsafe {
             let vs = compile(VERTEX_SHADER, VERTEX)?;
@@ -484,7 +518,7 @@ impl Blit {
             glGetProgramiv(program, LINK_STATUS, &mut ok);
             if ok == 0 {
                 glDeleteProgram(program);
-                return Err("blit program failed to link".into());
+                return Err(Error::Link);
             }
             let mut vao = 0;
             glGenVertexArrays(1, &mut vao);
@@ -532,8 +566,7 @@ impl Blit {
     }
 }
 
-unsafe fn compile(kind: GLenum, source: &str) -> Result<GLuint, String> {
-    let source = CString::new(source).map_err(|e| e.to_string())?;
+unsafe fn compile(kind: GLenum, source: &CStr) -> Result<GLuint, Error> {
     // SAFETY: the caller has the context current; the source outlives the call.
     unsafe {
         let shader = glCreateShader(kind);
@@ -543,7 +576,7 @@ unsafe fn compile(kind: GLenum, source: &str) -> Result<GLuint, String> {
         glGetShaderiv(shader, COMPILE_STATUS, &mut ok);
         if ok == 0 {
             glDeleteShader(shader);
-            return Err("blit shader failed to compile".into());
+            return Err(Error::Compile);
         }
         Ok(shader)
     }
@@ -716,7 +749,7 @@ pub struct TextureFramebuffer {
 impl TextureFramebuffer {
     /// # Safety
     /// The context must be current and `texture` a `target` texture of `size`.
-    pub unsafe fn new(texture: GLuint, target: GLenum, size: (u32, u32)) -> Result<Self, String> {
+    pub unsafe fn new(texture: GLuint, target: GLenum, size: (u32, u32)) -> Result<Self, Error> {
         // SAFETY: the caller has the context current. Only the draw framebuffer is
         // changed; a separate host read framebuffer stays bound throughout.
         unsafe {
@@ -730,7 +763,7 @@ impl TextureFramebuffer {
             glBindFramebuffer(DRAW_FRAMEBUFFER, previous as GLuint);
             if status != FRAMEBUFFER_COMPLETE {
                 glDeleteFramebuffers(1, &fbo);
-                return Err(format!("texture framebuffer incomplete (0x{status:x})"));
+                return Err(Error::IncompleteFramebuffer(status));
             }
             Ok(Self { fbo, size })
         }

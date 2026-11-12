@@ -1,10 +1,12 @@
 //! For CPU effects: the host texture to ARGB bytes in RAM and back. GL does the row order,
 //! alpha and channel order; RAM holds ARGB bytes throughout.
 
+use std::ffi::CStr;
+
 use vfx_core::cpu::Argb;
 use vfx_ffgl_common::gl;
 
-const TO_ARGB: &str = "#version 410 core
+const TO_ARGB: &CStr = c"#version 410 core
 uniform sampler2D image;
 uniform vec2 max_uv;
 in vec2 uv;
@@ -14,7 +16,7 @@ void main() {
     color = c.a > 0.0 ? vec4(c.a, c.rgb / c.a) : vec4(0.0);
 }
 ";
-const FROM_ARGB: &str = "#version 410 core
+const FROM_ARGB: &CStr = c"#version 410 core
 uniform sampler2D image;
 uniform vec2 max_uv;
 in vec2 uv;
@@ -36,7 +38,7 @@ pub struct ArgbTransfer {
 impl ArgbTransfer {
     /// # Safety
     /// The host's GL context must be current.
-    pub unsafe fn new(size: (u32, u32)) -> Result<Self, String> {
+    pub unsafe fn new(size: (u32, u32)) -> Result<Self, gl::Error> {
         // SAFETY: the caller has the context current; release partial setup on failure.
         unsafe {
             let to_argb = gl::Blit::new(TO_ARGB)?;
