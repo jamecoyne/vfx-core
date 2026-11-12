@@ -23,6 +23,12 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Dependencies built on main, restored by every run; only main saves, so pull requests
+      # don't fill the repository's 10 GB with caches nobody else reads.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Install software Vulkan (lavapipe) for headless rendering
         if: runner.os == 'Linux'
         run: |
@@ -66,6 +72,12 @@ jobs:
         with:
           targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
           components: clippy
+
+      # Shared with the release workflow's builds, which reuse it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plugins
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Host target tests and clippy (every host feature on)
         run: |
