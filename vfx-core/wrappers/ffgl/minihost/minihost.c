@@ -608,18 +608,29 @@ static void case_timing(void) {
 }
 
 #ifdef _WIN32
+#define LOG_PATH_MAX MAX_PATH
+static unsigned long process_id(void) { return GetCurrentProcessId(); }
 static int log_path(char *name, size_t size) {
     DWORD n = GetTempPathA((DWORD)size, name);
     if (!n || n + strlen(PLUGIN_LOG) >= size) return 0;
     strcat(name, PLUGIN_LOG);
     return 1;
 }
+#else
+#include <unistd.h>
+#define LOG_PATH_MAX 1024
+static unsigned long process_id(void) { return (unsigned long)getpid(); }
+static int log_path(char *name, size_t size) {
+    const char *home = getenv("HOME");
+    return home && snprintf(name, size, "%s/Library/Logs/%s", home, PLUGIN_LOG) < (int)size;
+}
+#endif
 
 /* The log's length before the plugin loads: this process's entries all come after it. */
 static long log_start = 0;
 
 static void mark_log_start(void) {
-    char name[MAX_PATH];
+    char name[LOG_PATH_MAX];
     FILE *log = log_path(name, sizeof name) ? fopen(name, "rb") : NULL;
     if (!log) return;
     if (!fseek(log, 0, SEEK_END)) log_start = ftell(log);
@@ -629,12 +640,12 @@ static void mark_log_start(void) {
 /* Check only this process's log entries, never a successful path from an earlier run. With
  * `number`, it takes the number right after `message` in the latest entry that has one. */
 static int logged_entry(const char *message, double *number) {
-    char name[MAX_PATH], prefix[64], line[2048];
+    char name[LOG_PATH_MAX], prefix[64], line[2048];
     if (!log_path(name, sizeof name)) return 0;
     FILE *log = fopen(name, "rb");
     if (!log) return 0;
     if (log_start > 0) fseek(log, log_start, SEEK_SET);
-    snprintf(prefix, sizeof prefix, "[pid %lu] ", GetCurrentProcessId());
+    snprintf(prefix, sizeof prefix, "[pid %lu] ", process_id());
     int found = 0;
     while (fgets(line, sizeof line, log)) {
         const char *at = strstr(line, message);
@@ -650,6 +661,8 @@ static int logged_entry(const char *message, double *number) {
 
 static int logged_message(const char *message) { return logged_entry(message, NULL); }
 
+#ifdef _WIN32
+
 /* The rest of the line after `message` in this process's latest entry that has it, in `rest`;
  * empty if none does. */
 static void logged_rest(const char *message, char *rest, size_t size) {
@@ -659,7 +672,7 @@ static void logged_rest(const char *message, char *rest, size_t size) {
     FILE *log = fopen(name, "rb");
     if (!log) return;
     if (log_start > 0) fseek(log, log_start, SEEK_SET);
-    snprintf(prefix, sizeof prefix, "[pid %lu] ", GetCurrentProcessId());
+    snprintf(prefix, sizeof prefix, "[pid %lu] ", process_id());
     while (fgets(line, sizeof line, log)) {
         const char *at = strstr(line, message);
         if (strncmp(line, prefix, strlen(prefix)) || !at) continue;
@@ -1160,9 +1173,7 @@ int main(int argc, char **argv) {
 #endif
     printf("GL %s on %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
 
-#ifdef _WIN32
     mark_log_start();
-#endif
     void *lib = open_plugin(argv[1]);
     if (!lib) { open_failed(); return 2; }
     plug = (PlugMain)plugin_symbol(lib, "plugMain");
@@ -1212,6 +1223,13 @@ int main(int argc, char **argv) {
         CHECK(!logged_message("warning: zero-copy path unavailable"), "shared setup fell back during this run");
         CHECK(!logged_message("warning: shared GPU render failed, using RAM: GL")
                   && !logged_message("the render panicked"), "shared rendering fell back during this run");
+    }
+#elif defined(__APPLE__)
+    if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
+        CHECK(logged_message("render path: GPU-native (IOSurface"), "IOSurface shared path absent from this process's log");
+        CHECK(!logged_message("warning: zero-copy path unavailable")
+                  && !logged_message("warning: zero-copy path not set up"), "IOSurface setup fell back during this run");
+        CHECK(!logged_message("warning: GPU render failed"), "IOSurface rendering fell back during this run");
     }
 #endif
     if (!ran) { fprintf(stderr, "unknown case %s\n", only); return 2; }
