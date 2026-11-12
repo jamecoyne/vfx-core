@@ -2208,12 +2208,13 @@ impl Preview {
     /// offers a removed device's adapter again only once nothing holds the device,
     /// the shared copy and a CPU effect's objects on it included.
     fn release_device(&mut self) -> (effects::Released, Option<std::thread::JoinHandle<()>>) {
+        // While the lost device is still shared, so an effect can tell which it was.
+        self.effects.device_lost();
         Gpu::unshare();
         #[cfg(windows)]
         if let Some(receiver) = &mut self.spout {
             receiver.release_device();
         }
-        self.effects.device_lost();
         let (released, effects_on_device) = self.effects.take().release();
         // On the window's thread, as before, since macOS wants the surface's layer
         // there.
