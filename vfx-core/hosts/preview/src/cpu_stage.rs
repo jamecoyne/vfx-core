@@ -49,6 +49,27 @@ pub struct CpuStage {
     reader: Option<GpuFrameReader>,
 }
 
+/// What [`CpuStage::release`] keeps in RAM: the effect, its history and the
+/// last picture.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct Released {
+    effect: CpuInstance,
+    history: History<u8>,
+    size: (u32, u32),
+    last_time: Option<f64>,
+    rendered: Vec<Argb<u8>>,
+    shown: Vec<Argb<u8>>,
+    upload_rgba: Vec<u8>,
+}
+
+/// The output frame and reader [`CpuStage::release`] split off, on the lost
+/// device.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct OnDevice {
+    _output: Frame,
+    _reader: Option<GpuFrameReader>,
+}
+
 impl CpuStage {
     pub fn new(gpu: &Gpu, effect: CpuInstance, size: (u32, u32)) -> Self {
         let pixels = size.0 as usize * size.1 as usize;
@@ -65,6 +86,79 @@ impl CpuStage {
             shown: Vec::new(),
             upload_rgba: vec![0; pixels * 4],
             upload_pending: false,
+            output: Frame::new(gpu, size.0, size.1, wgpu::TextureFormat::Rgba8Unorm),
+            output_drawn_on_gpu: false,
+            reader: None,
+        }
+    }
+
+    /// Tells the effect the shared device was lost
+    /// ([`vfx_core::CpuEffect::device_lost`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn device_lost(&self) {
+        self.effect.device_lost();
+    }
+
+    /// Splits off what's on the device, for a host whose device was lost. The
+    /// effect and the history stay, and the next device's first render draws from
+    /// them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn release(self) -> (Released, OnDevice) {
+        let CpuStage {
+            effect,
+            history,
+            size,
+            last_time,
+            rendered,
+            rendered_with: _,
+            partial_render_time: _,
+            shown,
+            upload_rgba,
+            upload_pending: _,
+            output,
+            output_drawn_on_gpu: _,
+            reader,
+        } = self;
+        let released = Released {
+            effect,
+            history,
+            size,
+            last_time,
+            rendered,
+            shown,
+            upload_rgba,
+        };
+        let on_device = OnDevice {
+            _output: output,
+            _reader: reader,
+        };
+        (released, on_device)
+    }
+
+    /// The stage on `gpu` again after [`CpuStage::release`]. The output starts
+    /// black until the next render, which draws for the new device.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn restore(gpu: &Gpu, released: Released) -> Self {
+        let Released {
+            effect,
+            history,
+            size,
+            last_time,
+            rendered,
+            shown,
+            upload_rgba,
+        } = released;
+        Self {
+            effect,
+            history,
+            size,
+            last_time,
+            rendered,
+            rendered_with: None,
+            partial_render_time: Duration::ZERO,
+            upload_pending: !shown.is_empty(),
+            shown,
+            upload_rgba,
             output: Frame::new(gpu, size.0, size.1, wgpu::TextureFormat::Rgba8Unorm),
             output_drawn_on_gpu: false,
             reader: None,
@@ -522,6 +616,75 @@ fn new_readback_buffer(gpu: &Gpu, pitch: u32, height: u32) -> wgpu::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A kept CPU effect that holds a texture on the shared device until it hears the
+    /// device was lost.
+    struct HoldsTheDevice(Option<wgpu::Texture>);
+
+    impl vfx_core::CpuEffect for HoldsTheDevice {
+        fn params(&self) -> &[vfx_core::ParamSpec] {
+            &[]
+        }
+
+        fn keeps_state(&self) -> bool {
+            true
+        }
+
+        fn render(
+            &mut self,
+            _: &mut dyn vfx_core::cpu::FrameSource,
+            _: usize,
+            _: ImageMut<'_>,
+            _: &ParamValues,
+            _: &Context,
+        ) {
+        }
+
+        fn device_lost(&mut self) {
+            self.0 = None;
+        }
+    }
+
+    fn holds_the_device() -> vfx_core::Processor {
+        let gpu = Gpu::shared().expect("the test shares its device");
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        vfx_core::Processor::Cpu(Box::new(HoldsTheDevice(Some(texture))))
+    }
+
+    /// A CPU effect that holds something on the shared device keeps a removed D3D12
+    /// device's adapter away until it's told the device was lost; the stage's own
+    /// objects go with its release.
+    #[cfg(windows)]
+    #[test]
+    fn device_lost_lets_a_removed_adapter_back() {
+        let (_turn, other) = crate::test_gpu();
+        drop(other);
+        let gpu = crate::warp_gpu();
+        gpu.share();
+        let effect = CpuInstance::new(holds_the_device, true).expect("a kept CPU effect");
+        let stage = CpuStage::new(&gpu, effect, (16, 16));
+
+        crate::app::remove_d3d12_device(&gpu.device).expect("removed");
+        Gpu::unshare();
+        let (released, on_device) = stage.release();
+        drop((on_device, gpu));
+        assert!(!crate::warp_offered(), "the effect doesn't hold the device");
+        released.effect.device_lost();
+        assert!(crate::warp_offered(), "the effect kept the removed device");
+    }
     use crate::catalog::{self, find};
     use segcam_motion::SegcamMotion;
     use vfx_core::cpu::{Channel, FrameSource, Image};

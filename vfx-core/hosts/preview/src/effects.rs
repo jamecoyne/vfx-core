@@ -374,6 +374,8 @@ pub struct Effects {
 pub struct Released {
     /// Index into the catalog.
     effect: usize,
+    /// A CPU effect, which goes on with its history on the next device.
+    cpu_stage: Option<cpu_stage::Released>,
     size: (u32, u32),
     source_name: Option<String>,
     video: Option<VideoFrame>,
@@ -412,7 +414,14 @@ pub struct OnDevice {
     _source: Option<Frame>,
     _readback: Option<Readback>,
     _passes: (FullscreenPass, FullscreenPass),
-    _stage: EffectStage,
+    _stage: StageOnDevice,
+}
+
+/// A CPU stage's output and reader, or a GPU effect's whole chain.
+#[cfg(not(target_arch = "wasm32"))]
+struct StageOnDevice {
+    _cpu: Option<cpu_stage::OnDevice>,
+    _gpu: Option<Box<EffectChain>>,
 }
 
 impl Effects {
@@ -467,9 +476,18 @@ impl Effects {
         }
     }
 
-    /// Splits off everything on the device, for a host whose device was lost. The
-    /// effect instance goes with it, so a CPU effect starts over on the next
-    /// device.
+    /// Tells a CPU effect the shared device was lost, so it lets go of what it holds
+    /// on it. Before [`Effects::release`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn device_lost(&self) {
+        if let EffectRun::Cpu(stage) = &self.stage.run {
+            stage.device_lost();
+        }
+    }
+
+    /// Splits off everything on the device, for a host whose device was lost. A CPU
+    /// effect stays, with its history; a GPU effect's state was on the device and
+    /// goes.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn release(self) -> (Released, OnDevice) {
         let Effects {
@@ -491,8 +509,27 @@ impl Effects {
         } = self;
         let size = frames.size;
         let (source_name, source) = loaded_source.unzip();
+        let EffectStage { effect, run, .. } = stage;
+        let (cpu_stage, stage_on_device) = match run {
+            EffectRun::Cpu(stage) => {
+                let (released, on_device) = stage.release();
+                let on_device = StageOnDevice {
+                    _cpu: Some(on_device),
+                    _gpu: None,
+                };
+                (Some(released), on_device)
+            }
+            EffectRun::Gpu { chain, .. } => {
+                let on_device = StageOnDevice {
+                    _cpu: None,
+                    _gpu: Some(chain),
+                };
+                (None, on_device)
+            }
+        };
         let released = Released {
-            effect: stage.effect,
+            effect,
+            cpu_stage,
             size,
             source_name,
             video,
@@ -508,17 +545,18 @@ impl Effects {
             _source: source,
             _readback: readback,
             _passes: (pattern_pass, display_pass),
-            _stage: stage,
+            _stage: stage_on_device,
         };
         (released, on_device)
     }
 
-    /// Effects on `gpu` again after [`Effects::release`], with the source, sizes
-    /// and layer kept in RAM, and the effect made new.
+    /// Effects on `gpu` again after [`Effects::release`], with the source, sizes,
+    /// layer and a CPU effect kept in RAM. A GPU effect is made new.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn restore(gpu: &Gpu, released: Released) -> Self {
         let Released {
             effect,
+            cpu_stage,
             size,
             source_name,
             video,
@@ -553,7 +591,14 @@ impl Effects {
             readback: None,
             pattern_pass,
             display_pass,
-            stage: EffectStage::new(gpu, effect, size),
+            stage: match cpu_stage {
+                Some(released) => EffectStage {
+                    effect,
+                    layers: 0,
+                    run: EffectRun::Cpu(Box::new(CpuStage::restore(gpu, released))),
+                },
+                None => EffectStage::new(gpu, effect, size),
+            },
             pattern_size,
             keep_output_in_ram,
         }
@@ -1096,10 +1141,9 @@ mod tests {
         assert!(first.iter().all(|v| (v - 0.75).abs() < 0.01));
     }
 
-    /// After a loss the source comes back from RAM and the effect is made new, so
-    /// it draws what a fresh one draws of the same frame.
+    /// A CPU effect goes on after a loss with its source and its history.
     #[test]
-    fn restore_keeps_the_source_and_starts_the_effect_over() {
+    fn new_device_keeps_the_source_and_the_history() {
         let (_turn, lost) = crate::test_gpu();
         let mut effects = Effects::new(&lost);
         effects.keep_output_in_ram(true);
@@ -1107,7 +1151,7 @@ mod tests {
         effects.start_stream(&lost, "still".into(), (64, 64), None);
         effects.write_source(&lost, &vec![0.25; 64 * 64 * 4]);
         let picture = render_to_float(&mut effects, &lost, &controls, &values, 0.0);
-        render_to_float(&mut effects, &lost, &controls, &values, 1.0);
+        effects.device_lost();
         let (released, on_device) = effects.release();
         lost.device.destroy();
         drop(on_device);
@@ -1116,10 +1160,14 @@ mod tests {
         let mut effects = Effects::restore(&gpu, released);
         assert_eq!(effects.source_name(), Some("still"));
         assert_eq!(effects.size(), (64, 64));
-        // The still's pixels were on the lost device too.
-        let fresh = render_to_float(&mut effects, &gpu, &controls, &values, 2.0);
+        // The same time, so no new frame: this draws what the history holds on the new device.
+        let same = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
         assert!(effects.last_outcome().finished, "nothing rendered");
-        assert_eq!(picture, fresh, "not a fresh effect's picture of the still");
+        assert_eq!(picture, same);
+        // A new frame reads the still, whose pixels were only on the lost device.
+        render_to_float(&mut effects, &gpu, &controls, &values, 1.0);
+        let settled = render_to_float(&mut effects, &gpu, &controls, &values, 2.0);
+        assert_eq!(picture, settled, "the still didn't reach the new device");
     }
 
     /// Everything `Effects` made on a removed D3D12 device goes with
@@ -1130,28 +1178,7 @@ mod tests {
     fn released_effects_let_a_removed_adapter_back() {
         let (_turn, other) = crate::test_gpu();
         drop(other);
-        let instance = || {
-            wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::DX12,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            })
-        };
-        let warp_offered = || {
-            pollster::block_on(instance().enumerate_adapters(wgpu::Backends::DX12))
-                .iter()
-                .any(|a| a.get_info().device_type == wgpu::DeviceType::Cpu)
-        };
-        let adapter =
-            pollster::block_on(instance().request_adapter(&wgpu::RequestAdapterOptions {
-                force_fallback_adapter: true,
-                ..Default::default()
-            }))
-            .expect("WARP");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("a device on WARP");
-        drop(adapter);
-        let gpu = Gpu::from_parts(device, queue);
+        let gpu = crate::warp_gpu();
         let mut effects = Effects::new(&gpu);
         let (mut controls, values) = shown("Gaussian Blur");
         controls.pattern = 1;
@@ -1161,11 +1188,11 @@ mod tests {
         let (_released, on_device) = effects.release();
         drop(gpu);
         assert!(
-            !warp_offered(),
+            !crate::warp_offered(),
             "the effects' objects don't hold the removed device"
         );
         drop(on_device);
-        assert!(warp_offered(), "something kept the removed device");
+        assert!(crate::warp_offered(), "something kept the removed device");
     }
 
     /// A GPU effect's state was on the device, so it's rebuilt and draws the same frame again.

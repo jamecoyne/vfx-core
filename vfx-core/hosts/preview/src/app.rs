@@ -2204,15 +2204,16 @@ impl Preview {
         });
     }
 
-    /// Drops everything made on the device on a thread, keeping what's in RAM.
-    /// D3D12 offers a removed device's adapter again only once nothing holds the
-    /// device: not a texture, the shared copy, or a CPU effect's own context.
+    /// Drops everything made on the device on a thread, keeping what's in RAM: D3D12
+    /// offers a removed device's adapter again only once nothing holds the device,
+    /// the shared copy and a CPU effect's objects on it included.
     fn release_device(&mut self) -> (effects::Released, Option<std::thread::JoinHandle<()>>) {
         Gpu::unshare();
         #[cfg(windows)]
         if let Some(receiver) = &mut self.spout {
             receiver.release_device();
         }
+        self.effects.device_lost();
         let (released, effects_on_device) = self.effects.take().release();
         // On the window's thread, as before, since macOS wants the surface's layer
         // there.
@@ -2226,7 +2227,7 @@ impl Preview {
     }
 
     /// Nothing can show frames, but a file stays in step with its sound and a camera doesn't back
-    /// up. No effect runs on them: the effects went with the device.
+    /// up. No effect runs on them: the effects' device objects went with the device.
     fn keep_sources_moving(&mut self) {
         if let Some(media) = &mut self.media {
             if let Err(e) = media.loop_at_end(self.sound_on) {
@@ -2459,8 +2460,8 @@ impl Preview {
 
 /// Drops a lost device's objects off the window's thread, since wgpu's queue
 /// waits when it drops; the handle says when that's done. The effects and the
-/// face tracker go first, outside the D3D12 device lock, which face models take to
-/// release.
+/// face tracker go first, outside the D3D12 device lock, which face models take
+/// to release.
 #[cfg(not(target_arch = "wasm32"))]
 fn retire_device(
     effects: effects::OnDevice,
