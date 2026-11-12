@@ -85,7 +85,7 @@ fn follows_the_hosts_device_through_a_loss() {
     first.share();
     segcam_motion::gpu::status().expect("segcam draws on the shared device");
 
-    let mut effect = SegcamMotion::with_gpu_min_coverage(0.0);
+    let mut effect = SegcamMotion::with_gpu(true);
     let mut params = ParamValues::new(effect.params());
     for (name, value) in [
         ("output", ParamValue::Int(3)),

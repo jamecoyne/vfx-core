@@ -44,6 +44,13 @@ fn render(
     out
 }
 
+/// Whether both effects drew their last render on the same path. During the load both
+/// have the same windows, but one can draw on the CPU while the device opens and the
+/// other on the GPU, which differ within the GPU's bound (`tests/gpu.rs`).
+fn same_path(a: &SegcamMotion, b: &SegcamMotion) -> bool {
+    a.report().draw == b.report().draw
+}
+
 #[test]
 fn renders_match_faces_off_during_the_load_and_show_faces_after() {
     let Some(p) = portrait() else { return };
@@ -76,7 +83,7 @@ fn renders_match_faces_off_during_the_load_and_show_faces_after() {
         next(&mut history, &swarm);
         let got = render(&mut kept, &mut history, &swarm);
         let off = render(&mut plain, &mut history, &without);
-        if !faces::ready() {
+        if !faces::ready() && same_path(&kept, &plain) {
             held += 1;
             assert!(got == off, "render {held} during the load");
         }

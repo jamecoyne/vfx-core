@@ -18,6 +18,7 @@ pub mod motion;
 pub mod pixel;
 pub mod render;
 pub mod swarm;
+pub mod swarm_pass;
 
 pub use effect::SegcamMotion;
 pub use incremental::IncrementalRenderer;

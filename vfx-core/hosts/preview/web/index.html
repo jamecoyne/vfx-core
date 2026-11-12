@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>VFX Preview</title>
-  <meta name="description" content="vfx-core GPU video effects running in the browser with WebGPU.">
+  <meta name="description" content="vfx-core GPU video effects running in the browser with WebGPU or WebGL2.">
   <style>
     html, body { margin: 0; height: 100%; background: #121212; color: #ddd; overflow: hidden;
                  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -23,17 +23,12 @@
   </script>
   <script type="module">
     import init from "./vfx-preview.js";
-    if (!navigator.gpu) {
-      document.getElementById("status").textContent =
-        "VFX Preview needs WebGPU, which this browser doesn't have. Try a current Chrome, Edge or Safari.";
-    } else {
-      init().catch((e) => {
-        // winit's web event loop ends startup by throwing a control-flow exception.
-        if (!String(e).includes("Using exceptions for control flow")) {
-          document.getElementById("status").textContent = "VFX Preview failed to start: " + e;
-        }
-      });
-    }
+    init().catch((e) => {
+      // winit's web event loop ends startup by throwing a control-flow exception.
+      if (!String(e).includes("Using exceptions for control flow")) {
+        document.getElementById("status").textContent = "VFX Preview failed to start: " + e;
+      }
+    });
   </script>
 </body>
 </html>

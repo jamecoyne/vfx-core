@@ -178,8 +178,8 @@ async fn open_device(
     choice: Option<&str>,
 ) -> Result<(wgpu::Adapter, Gpu), String> {
     let adapter = pick_adapter(instance, surface, choice).await?;
-    // Effects draw on this device, and segcam's atlas grows with the trail: as much of a binding
-    // as the adapter allows, or the atlas stops at wgpu's default.
+    // Effects read a whole canvas back in one buffer, as large as the adapter
+    // allows; a canvas over it faults and draws on the CPU.
     let supported = adapter.limits();
     // WebGL2 can't meet wgpu's default limits.
     let base = if adapter.get_info().backend == wgpu::Backend::Gl {
@@ -188,15 +188,17 @@ async fn open_device(
         wgpu::Limits::default()
     };
     let required_limits = wgpu::Limits {
-        max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
         max_buffer_size: supported.max_buffer_size,
         ..base
     };
     // Spout input imports D3D11 textures into a Vulkan device through this extension.
     #[cfg(windows)]
-    let required_features = adapter.features() & wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+    let interop = adapter.features() & wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
     #[cfg(not(windows))]
-    let required_features = wgpu::Features::empty();
+    let interop = wgpu::Features::empty();
+    // Effects blend in 32-bit float targets where the adapter can.
+    let float_blend = adapter.features() & wgpu::Features::FLOAT32_BLENDABLE;
+    let required_features = interop | float_blend;
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             required_features,
@@ -1591,7 +1593,7 @@ impl ApplicationHandler<GpuSetup> for App {
             #[cfg(target_arch = "wasm32")]
             GpuSetup::Failed(e) => {
                 show_startup_message(&format!(
-                    "VFX Preview needs WebGPU, which this browser didn't provide ({e}). \
+                    "VFX Preview couldn't start on WebGPU or WebGL2 ({e}). \
                      Try a current Chrome, Edge or Safari."
                 ));
                 let _ = event_loop;

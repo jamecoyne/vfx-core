@@ -167,14 +167,6 @@ impl SegcamMotion {
         renderer.use_gpu(gpu);
         Self { renderer }
     }
-
-    /// On the GPU from `min_coverage` (see [`IncrementalRenderer::set_gpu_min_coverage`]); 0 draws
-    /// every swarm render there.
-    pub fn with_gpu_min_coverage(min_coverage: f64) -> Self {
-        let mut effect = Self::with_gpu(true);
-        effect.renderer.set_gpu_min_coverage(min_coverage);
-        effect
-    }
 }
 
 impl CpuEffect for SegcamMotion {

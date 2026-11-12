@@ -116,7 +116,7 @@ fn kept_target_render_matches_fresh() {
         frames: clip(16),
         frame_rate: None,
     };
-    let make = || vfx_core::Processor::Cpu(Box::new(SegcamMotion::with_gpu_min_coverage(0.0)));
+    let make = || vfx_core::Processor::Cpu(Box::new(SegcamMotion::with_gpu(true)));
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let drawn = vfx_host::contract::check_target(make, &clip, &params, gpu, format).unwrap();
     assert!(drawn > 0, "no render drew into the target");
@@ -154,8 +154,8 @@ fn swarm_in_host_frame_matches_readback() {
     ];
     let target = Frame::new(gpu, W as u32, H as u32, wgpu::TextureFormat::Rgba32Float);
     for (name, params) in &sets {
-        let mut read_back = SegcamMotion::with_gpu_min_coverage(0.0);
-        let mut drawn_into = SegcamMotion::with_gpu_min_coverage(0.0);
+        let mut read_back = SegcamMotion::with_gpu(true);
+        let mut drawn_into = SegcamMotion::with_gpu(true);
         let needed = read_back.frames_before(params, None);
         let mut want = vec![Argb::default(); (W * H) as usize];
         let mut out = want.clone();

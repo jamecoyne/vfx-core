@@ -156,6 +156,8 @@ impl Gpu {
             .map_err(|e| GpuError(e.to_string()))?;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
+                // Effects blend in 32-bit float targets where the adapter can.
+                required_features: adapter.features() & wgpu::Features::FLOAT32_BLENDABLE,
                 memory_hints: Self::memory_hints(),
                 ..wgpu::DeviceDescriptor::default()
             })
