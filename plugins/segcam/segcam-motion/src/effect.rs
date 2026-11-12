@@ -254,6 +254,11 @@ impl CpuEffect for SegcamMotion {
     fn report(&self) -> Report {
         self.renderer.report()
     }
+
+    fn device_lost(&mut self) {
+        self.renderer.device_lost();
+        crate::gpu::SHARED_SLOT.host_device_lost();
+    }
 }
 
 #[cfg(test)]
