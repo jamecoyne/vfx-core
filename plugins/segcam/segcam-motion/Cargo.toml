@@ -57,7 +57,7 @@ segcam-face = { path = "../segcam-face" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The noop backend answers a test with a real OutOfMemory.
-wgpu = { version = "=30.0.1", features = ["noop"] }
+wgpu = { version = "=30.0.2", features = ["noop"] }
 
 [dev-dependencies]
 vfx-host = { path = "../../../vfx-core/wrappers/common" }

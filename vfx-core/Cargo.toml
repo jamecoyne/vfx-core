@@ -7,13 +7,13 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
-wgpu = "=30.0.1"
+wgpu = "=30.0.2"
 
 # Browsers are single-threaded: lets wgpu's web types satisfy the `Send` bound on effects,
 # so any web build of the core compiles, not just the preview's. Safe without wasm threads
 # (atomics), which no build here uses.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wgpu = { version = "=30.0.1", features = ["fragile-send-sync-non-atomic-wasm"] }
+wgpu = { version = "=30.0.2", features = ["fragile-send-sync-non-atomic-wasm"] }
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.9.0"

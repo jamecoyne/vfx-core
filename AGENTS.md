@@ -33,6 +33,6 @@ Recent changes for agents (newest first; prune entries once they are old):
   depends on shows up in it with no code; `cargo vfx check` reports one it doesn't.
 - `cargo fmt --all -- --check` and clippy with `-D warnings` (see `ci.yml` for the crates
   and features) must pass; CI runs latest stable, whose clippy can be stricter.
-- wgpu is pinned to `=30.0.1`; the Metal interop uses `wgpu-hal` types and must be checked
+- wgpu is pinned to `=30.0.2`; the Metal interop uses `wgpu-hal` types and must be checked
   when it moves. The web build needs wgpu's `fragile-send-sync-non-atomic-wasm` feature
   (set in `vfx-core/hosts/preview/Cargo.toml`) because effects are `Send`.
