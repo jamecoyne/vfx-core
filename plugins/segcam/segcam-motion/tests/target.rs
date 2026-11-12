@@ -153,11 +153,6 @@ fn swarm_in_host_frame_matches_readback() {
         ),
     ];
     let target = Frame::new(gpu, W as u32, H as u32, wgpu::TextureFormat::Rgba32Float);
-    // Each set's instances stay, as a host's layers do: segcam's context on a
-    // host's device lasts as long as an instance holds it, and a set started after
-    // the last one went would wait for a new context and draw its first frame on
-    // the CPU.
-    let mut kept = Vec::new();
     for (name, params) in &sets {
         let mut read_back = SegcamMotion::with_gpu(true);
         let mut drawn_into = SegcamMotion::with_gpu(true);
@@ -186,6 +181,5 @@ fn swarm_in_host_frame_matches_readback() {
             *name != "swarm" || want.iter().any(|p| p.alpha == 255),
             "{name}: no windows drawn"
         );
-        kept.push((read_back, drawn_into));
     }
 }

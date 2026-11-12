@@ -118,6 +118,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `CpuEffect::render_to` and `Target` (a host's GPU frame the effect may draw its output into instead) | vfx-core |
 | `CpuEffect::can_draw_to_target` (whether a render can use a `Target`, so a host allocates one only then; default `false`) | vfx-core |
 | `CpuEffect::report`, `Report`, `Reading` (where the last render's work ran and what it found; default empty) | vfx-core |
+| `CpuEffect::device_lost`, `CpuInstance::device_lost` (the host's shared device was lost: the effect lets go of everything on it, so the host can open a new one; default does nothing) | vfx-core |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core |
 | `Context::frame_rate` | vfx-core |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core |

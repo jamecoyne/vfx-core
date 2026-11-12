@@ -189,6 +189,11 @@ pub trait CpuEffect: Send {
     fn report(&self) -> Report {
         Report::default()
     }
+
+    /// The device the host shared ([`crate::Gpu::share`]) was lost. After this
+    /// returns the effect holds nothing on that device; the next render may come on
+    /// a new one.
+    fn device_lost(&mut self) {}
 }
 
 /// What an effect tells its host about its last render ([`CpuEffect::report`]). `draw` and `faces`
