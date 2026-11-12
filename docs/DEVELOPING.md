@@ -169,7 +169,7 @@ vfx-core/
     build/              vfx-build: the effect crate's build script (identity and its checks, PiPL)
     adobe/              vfx-ae: After Effects SmartFX, Metal interop
       ae-tests/         harness that renders VFX Preview inside After Effects
-    ofx/                vfx-ofx: OpenFX, hand-written bindings to the OpenFX 1.4 C API
+    ofx/                vfx-ofx: OpenFX, bindings generated from the OpenFX 1.5.1 headers
       minihost/         a small OpenFX host in C for testing without an application
     ffgl/               vfx-ffgl: FFGL 2.1, OpenGL + IOSurface / Vulkan interop
       minihost/         a small FFGL host in C with a headless OpenGL context
@@ -379,9 +379,13 @@ conversions. Each host also has a harness that runs the effects:
   render a frame on that device (`CpuEffect::render_to`). An effect that draws there says so. The
   frame is then shown with no trip through RAM. Otherwise its output goes up through RAM as before.
   The input still comes through RAM, for the effect's work on the CPU.
-- The OpenFX and FFGL bindings are written by hand. Both are small C ABIs, transcribed from their
-  BSD licensed headers; FFGL's notice is kept in `vfx-core/wrappers/ffgl-common/src/ffi.rs`. The
-  `ffgl-core` crate is GPL 3.0, so it isn't used.
+- The OpenFX bindings, `vfx-core/wrappers/ofx/src/sys.rs`, are bindgen's output for the
+  OpenFX 1.5.1 headers, committed so a build needs neither bindgen nor libclang.
+  `vfx-core/wrappers/ofx/bindings.sh` regenerates them from the pinned release, and with
+  `--check` fails when the file is out of date.
+- The FFGL bindings are written by hand, transcribed from its BSD licensed header; its notice is
+  kept in `vfx-core/wrappers/ffgl-common/src/ffi.rs`. The `ffgl-core` crate is GPL 3.0, so it
+  isn't used.
 - Testing found these host quirks. Tests or the harnesses now cover each one.
   After Effects needs PiPL spec version 13.25 or later for MFR. It also needs sequence data
   flattening flags for saved projects. It trims an effect's input to the mask bounds. Resolve 21

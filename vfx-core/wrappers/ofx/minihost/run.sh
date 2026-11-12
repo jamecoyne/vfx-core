@@ -2,7 +2,7 @@
 # Builds an effect as an OpenFX plugin and the minimal OpenFX host, then runs the host's
 # checks. The checks are VFX Preview's (plugins/vfx-chain), the default EFFECT.
 # Usage: ./minihost/run.sh [case]     (default: all)
-# Needs the OpenFX 1.4 headers; DaVinci Resolve installs them on macOS. Set OFX_INCLUDE to
+# Needs the OpenFX headers; DaVinci Resolve installs them on macOS. Set OFX_INCLUDE to
 # use others, such as a clone of github.com/AcademySoftwareFoundation/openfx (its include/).
 # Runs on macOS, and on Windows from Git Bash. CC picks the C compiler (default cc).
 set -euo pipefail
