@@ -360,10 +360,11 @@ mod dxc {
         // SAFETY: loading runs the `DllMain` of the file at that path, which is
         // trusted to be the DXC that packaging put there.
         let library = unsafe { Library::new(path) }.map_err(|err| {
-            match err.source().and_then(|os| os.downcast_ref::<io::Error>()) {
-                Some(os) => io::Error::new(os.kind(), format!("{shown}: {os}")),
-                None => io::Error::other(format!("{shown}: {err}")),
-            }
+            // The error names the call; its source is the OS reason.
+            let reason = err
+                .source()
+                .map_or_else(|| err.to_string(), ToString::to_string);
+            io::Error::other(format!("{shown}: {reason}"))
         })?;
         // It stays loaded, so every instance wgpu opens finds it in memory.
         mem::forget(library);
@@ -449,8 +450,14 @@ mod dxc {
         #[test]
         fn load_names_missing_dll() {
             let dir = tempfile::tempdir().unwrap();
-            let err = load(&dir.path().join("dxcompiler.dll")).unwrap_err();
-            assert!(err.to_string().contains("dxcompiler.dll"), "{err}");
+            let err = load(&dir.path().join("dxcompiler.dll"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("dxcompiler.dll"), "{err}");
+            assert!(
+                !err.contains("LoadLibraryExW"),
+                "the OS reason, not the call: {err}"
+            );
         }
 
         #[test]
