@@ -29,15 +29,44 @@ use winit::keyboard::Key;
 use winit::keyboard::NamedKey;
 use winit::window::{Window, WindowId};
 
+/// Something made on the device, which an outage takes away until a new device
+/// is in place ([`Preview::release_device`]). Nothing reads one during an
+/// outage: if something does, it panics rather than keep the lost device alive.
+struct DeviceBound<T>(Option<T>);
+
+impl<T> DeviceBound<T> {
+    fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn take(&mut self) -> T {
+        self.0.take().expect("released once per outage")
+    }
+}
+
+impl<T> std::ops::Deref for DeviceBound<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.as_ref().expect("no device during an outage")
+    }
+}
+
+impl<T> std::ops::DerefMut for DeviceBound<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0.as_mut().expect("no device during an outage")
+    }
+}
+
 struct Preview {
     window: Arc<Window>,
-    gpu: Gpu,
-    surface: wgpu::Surface<'static>,
+    gpu: DeviceBound<Gpu>,
+    surface: DeviceBound<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
     egui: egui::Context,
     egui_state: egui_winit::State,
-    egui_renderer: egui_wgpu::Renderer,
-    effects: Effects,
+    egui_renderer: DeviceBound<egui_wgpu::Renderer>,
+    effects: DeviceBound<Effects>,
     /// The effects output, registered with egui; re-registered when its size changes.
     display_texture: egui::TextureId,
     display_size: (u32, u32),
@@ -377,13 +406,13 @@ impl Preview {
 
         Ok(Self {
             window,
-            gpu,
-            surface,
+            gpu: DeviceBound::new(gpu),
+            surface: DeviceBound::new(surface),
             config,
             egui,
             egui_state,
-            egui_renderer,
-            effects,
+            egui_renderer: DeviceBound::new(egui_renderer),
+            effects: DeviceBound::new(effects),
             display_texture,
             display_size,
             controls: Controls::default(),
@@ -1055,12 +1084,21 @@ impl Preview {
         true
     }
 
+    /// Whether the window has a device that isn't lost.
+    fn device_working(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.reopening.outage.is_some() {
+            return false;
+        }
+        self.gpu.faults().lost().is_none()
+    }
+
     /// A draw that survives what a lost device can panic on after its loss was recorded, such as
     /// a staging buffer in egui, so the next draw can act on it. Other panics go on as panics.
     fn draw_guarded(&mut self) {
         let drawn = catch_unwind(AssertUnwindSafe(|| self.draw()));
         if let Err(panic) = drawn
-            && self.gpu.faults().lost().is_none()
+            && self.device_working()
         {
             resume_unwind(panic);
         }
@@ -2029,7 +2067,19 @@ struct Outage {
     /// The try under way, on its own thread: a driver coming back from a reset can take seconds to
     /// answer, and the window's events go on meanwhile.
     opening: Option<std::sync::mpsc::Receiver<Result<OpenedDevice, String>>>,
+    /// The effects' state in RAM, for the next device.
+    released: Option<effects::Released>,
+    /// Drops everything made on the lost device. The first try waits for it, up to
+    /// [`RETIRE_WAIT`]: D3D12 offers the adapter again only once every object on
+    /// the removed device is gone.
+    retiring: Option<std::thread::JoinHandle<()>>,
 }
+
+/// How long the first try waits for the lost device's objects to drop. A drop
+/// that hangs in the driver doesn't hold the reopen for good; the try then goes
+/// ahead and may find no adapter.
+#[cfg(not(target_arch = "wasm32"))]
+const RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A new device for the window.
 #[cfg(not(target_arch = "wasm32"))]
@@ -2060,7 +2110,7 @@ fn d3d12_device_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
 /// Removes this device, and every other D3D12 user's of the adapter in this process, as a driver
 /// reset would. It touches nothing outside the process.
 #[cfg(windows)]
-fn remove_d3d12_device(device: &wgpu::Device) -> Result<(), String> {
+pub(crate) fn remove_d3d12_device(device: &wgpu::Device) -> Result<(), String> {
     use windows::Win32::Graphics::Direct3D12::ID3D12Device5;
     use windows::core::Interface;
     // SAFETY: the raw device is only used here, to ask for its removal, which every later call on
@@ -2076,7 +2126,7 @@ fn remove_d3d12_device(device: &wgpu::Device) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn remove_d3d12_device(_device: &wgpu::Device) -> Result<(), String> {
+pub(crate) fn remove_d3d12_device(_device: &wgpu::Device) -> Result<(), String> {
     Err("--lose-gpu removed: D3D12 only".into())
 }
 
@@ -2125,14 +2175,17 @@ impl Preview {
         }
     }
 
-    /// Says so where it can be seen. Nothing asks anyone anything: a show has nobody to answer.
+    /// Drops everything made on the lost device and tries for a new one once that's
+    /// done. Says so where it can be seen. Nothing asks anyone anything: a show has
+    /// nobody to answer.
     fn start_outage(&mut self, why: String) {
         self.reopening.losses += 1;
+        let lost_adapter_info = self.gpu.device.adapter_info();
+        let (released, retiring) = self.release_device();
         let reopening = &mut self.reopening;
         reopening.backoff.lost(reopening.device_opened_at.elapsed());
-        reopening.lost_adapter_info = Some(self.gpu.device.adapter_info());
-        let delay = reopening.backoff.next_delay();
-        eprintln!("preview: the GPU was lost ({why}); reopening in {delay:?}");
+        reopening.lost_adapter_info = Some(lost_adapter_info);
+        eprintln!("preview: the GPU was lost ({why}); reopening");
         self.window
             .set_title(&format!("VFX Preview: the GPU was lost ({why}), reopening"));
         let now = Instant::now();
@@ -2140,9 +2193,29 @@ impl Preview {
             why,
             since: now,
             tries: 0,
-            next_try: now + delay,
+            next_try: now,
             opening: None,
+            released: Some(released),
+            retiring,
         });
+    }
+
+    /// Drops everything made on the device on a thread, keeping what's in RAM.
+    /// D3D12 offers a removed device's adapter again only once nothing holds the
+    /// device: not a texture, the shared copy, or a CPU effect's own context.
+    fn release_device(&mut self) -> (effects::Released, Option<std::thread::JoinHandle<()>>) {
+        Gpu::unshare();
+        #[cfg(windows)]
+        if let Some(receiver) = &mut self.spout {
+            receiver.release_device();
+        }
+        let (released, effects_on_device) = self.effects.take().release();
+        let window_on_device = (
+            self.gpu.take(),
+            self.surface.take(),
+            self.egui_renderer.take(),
+        );
+        (released, retire_device(effects_on_device, window_on_device))
     }
 
     /// Nothing can show frames, but a file stays in step with its sound and a camera doesn't back
@@ -2154,7 +2227,14 @@ impl Preview {
                 self.message = Some(e);
             }
             self.counts.arrived += media.video.take_arrived_count();
-            let _ = self.effects.take_video_frame(&media.video);
+            if let Some(released) = self
+                .reopening
+                .outage
+                .as_mut()
+                .and_then(|o| o.released.as_mut())
+            {
+                released.take_video_frame(&media.video);
+            }
             media.restart_sound_after_loop(self.sound_on);
         }
         if let Layer::Video(video) = &mut self.layer {
@@ -2163,7 +2243,14 @@ impl Preview {
             {
                 self.message = Some(e);
             }
-            self.effects.discard_layer_frame(video);
+            if let Some(released) = self
+                .reopening
+                .outage
+                .as_mut()
+                .and_then(|o| o.released.as_mut())
+            {
+                released.discard_layer_frame(video);
+            }
         }
     }
 
@@ -2203,7 +2290,11 @@ impl Preview {
                     ));
                 }
             }
-        } else if Instant::now() >= outage.next_try {
+        } else if Instant::now() >= outage.next_try
+            && (outage.retiring.as_ref()).is_none_or(|retiring| {
+                retiring.is_finished() || outage.since.elapsed() >= RETIRE_WAIT
+            })
+        {
             outage.tries += 1;
             self.start_opening_device();
         }
@@ -2267,32 +2358,35 @@ impl Preview {
             gpu,
         } = opened;
         let info = adapter.get_info();
-        let old_gpu = std::mem::replace(&mut self.gpu, gpu);
+        let mut outage = self.reopening.outage.take();
+        self.gpu = DeviceBound::new(gpu);
         #[cfg(windows)]
         if let Some(receiver) = &mut self.spout {
             receiver.use_device(spout::AdapterId::of(&info));
         }
         // Later readers, as a CPU effect that looks for its next device, find this one.
         self.gpu.share();
-        // The old surface first: it gives up the window's swap chain, which D3D12 allows one of.
-        self.surface = surface;
+        self.surface = DeviceBound::new(surface);
         self.config = surface_config(&self.surface, &adapter, self.window.inner_size());
         self.surface.configure(&self.gpu.device, &self.config);
+        // A wgpu adapter on D3D12 holds a device of its own on the adapter.
+        drop(adapter);
         // egui sends its font atlas once, and the renderer that had it is going. A new context
         // sends it again, and the old one's memory keeps the panel as it was.
         let memory = self.egui.memory(|memory| memory.clone());
         self.egui = egui::Context::default();
         self.egui.memory_mut(|m| *m = memory);
         self.egui_state = new_egui_state(&self.egui, &self.window, &self.gpu);
-        let old_renderer = std::mem::replace(
-            &mut self.egui_renderer,
-            egui_wgpu::Renderer::new(
-                &self.gpu.device,
-                self.config.format,
-                egui_wgpu::RendererOptions::default(),
-            ),
-        );
-        self.effects.move_to_device(&self.gpu);
+        self.egui_renderer = DeviceBound::new(egui_wgpu::Renderer::new(
+            &self.gpu.device,
+            self.config.format,
+            egui_wgpu::RendererOptions::default(),
+        ));
+        let released = outage.as_mut().and_then(|o| o.released.take());
+        self.effects = DeviceBound::new(match released {
+            Some(released) => Effects::restore(&self.gpu, released),
+            None => Effects::new(&self.gpu),
+        });
         self.display_texture = self.egui_renderer.register_native_texture(
             &self.gpu.device,
             self.effects.display_view(),
@@ -2302,12 +2396,10 @@ impl Preview {
         if let Layer::Still { fed, .. } = &mut self.layer {
             *fed = None;
         }
-        drop(old_renderer);
-        retire_device(old_gpu);
         self.window.set_title("VFX Preview");
         self.last_frame = Instant::now();
         self.reopening.device_opened_at = Instant::now();
-        if let Some(outage) = self.reopening.outage.take() {
+        if let Some(outage) = outage {
             let gap = outage.since.elapsed();
             let text = format!(
                 "The GPU was lost and came back after {:.1} s.",
@@ -2353,19 +2445,25 @@ impl Preview {
     }
 }
 
-/// Drops a lost device off the window's thread: wgpu's queue waits when it drops and panics on
-/// anything but a loss from that wait. If it panics, what's left of the device leaks.
+/// Drops a lost device's objects off the window's thread, since wgpu's queue
+/// waits when it drops; the handle says when that's done. The effects go first,
+/// outside the D3D12 device lock, which segcam's face models take to release.
 #[cfg(not(target_arch = "wasm32"))]
-fn retire_device(gpu: Gpu) {
-    let spawned = std::thread::Builder::new()
+fn retire_device(
+    effects: effects::OnDevice,
+    window: impl Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
         .name("preview GPU retire".into())
         .spawn(move || {
+            let effects_dropped = catch_unwind(AssertUnwindSafe(move || drop(effects)));
             let _device_lock = d3d12_device_lock();
-            if catch_unwind(AssertUnwindSafe(move || drop(gpu))).is_err() {
+            let window_dropped = catch_unwind(AssertUnwindSafe(move || drop(window)));
+            if effects_dropped.is_err() || window_dropped.is_err() {
                 eprintln!("preview: dropping a lost device panicked; it stays allocated");
             }
-        });
-    drop(spawned);
+        })
+        .ok()
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

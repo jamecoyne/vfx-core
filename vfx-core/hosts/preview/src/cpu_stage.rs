@@ -103,22 +103,6 @@ impl CpuStage {
         self.reader = None;
     }
 
-    /// Goes on with what's in RAM on a new device, after the last was lost: the effect keeps its
-    /// history and the next render draws for the new device. The output starts black until then.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn move_to_device(&mut self, gpu: &Gpu) {
-        self.output = Frame::new(
-            gpu,
-            self.size.0,
-            self.size.1,
-            wgpu::TextureFormat::Rgba8Unorm,
-        );
-        self.output_drawn_on_gpu = false;
-        self.reader = None;
-        self.rendered_with = None;
-        self.upload_pending = !self.shown.is_empty();
-    }
-
     pub fn output(&self) -> &Frame {
         &self.output
     }
