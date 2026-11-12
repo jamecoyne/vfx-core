@@ -130,7 +130,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core |
 | `Gpu::share`, `Gpu::shared` | vfx-core |
 | `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core |
-| `Gpu::backend_options` (wgpu backend options for every instance: on Windows, D3D12 compiles with the `dxcompiler.dll` shipped beside the binary, else FXC) | vfx-core |
+| `Gpu::backend_options` (wgpu backend options for every instance: on Windows, D3D12 compiles with the `dxcompiler.dll` beside the binary or in `Common Files/vfx-core/dxc-<tag>`, else FXC) | vfx-core |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core |
 | `contract::check` and `Clip` (a kept render equals a fresh one; under a fetch budget, in order, and after a jump within `held_catch_up_renders` for a held frame and `stream_catch_up_renders` for a stream) | vfx-host |
@@ -289,14 +289,16 @@ Both installers remove v0.1.0's `SegcamMotionRust` files, except the macOS Resol
 which no installer replaces. The Windows installer keeps segcam's v0.1.0 AppId
 (`windows-installer-id`), so it replaces that install in Apps.
 
-Every Windows plugin ships `dxcompiler.dll` next to its binary, with DXC's
-licenses: without it wgpu compiles the D3D12 shaders with FXC, which takes seconds before
-an effect draws on the GPU. `vfx-core/wrappers/fetch-dxc.sh` downloads it from a pinned
-[DXC release](https://github.com/microsoft/DirectXShaderCompiler/releases), checked by
-sha256, rather than taking whatever Windows SDK the machine has. `package-win.sh` stops when
-it can't fetch it; `cargo vfx build`, `install` and `preview` put it next to what they
-build too and go on without it, so local builds offline still work. To move to a newer
-DXC, change its tag, zip and sha256 there.
+Every Windows plugin loads `dxcompiler.dll` from `Common Files/vfx-core/dxc-<tag>`, where
+the Setup puts one copy for all its plugins (`<tag>` is `vfx-core/wrappers/dxc-tag`), or
+else from its own folder, where the zips put it with DXC's licenses. Without it wgpu compiles
+the D3D12 shaders with FXC, which takes seconds before an effect draws on the GPU.
+`vfx-core/wrappers/fetch-dxc.sh` downloads it from a pinned [DXC
+release](https://github.com/microsoft/DirectXShaderCompiler/releases), checked by sha256,
+rather than taking whatever Windows SDK the machine has. `package-win.sh` stops when it
+can't fetch it; `cargo vfx build`, `install` and `preview` put it next to what they build
+too and go on without it, so local builds offline still work. To move to a newer DXC, change
+`dxc-tag` and the zip and sha256 in the script.
 
 macOS signing and notarization run when the repository owner sets these secrets (Settings,
 Secrets and variables, Actions). A fork sets its own to sign its own builds. Without them the
