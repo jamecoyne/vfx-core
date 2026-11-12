@@ -16,8 +16,10 @@ use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamValue, ParamValues, Processor};
 use vfx_host::contract::{Clip, check};
 
+/// On the CPU: while the shared GPU device opens, a kept and a fresh effect can draw the
+/// same render on different paths, which differ within the GPU's bound (`tests/gpu.rs`).
 fn make() -> Processor {
-    Processor::Cpu(Box::new(SegcamMotion::default()))
+    Processor::Cpu(Box::new(SegcamMotion::with_gpu(false)))
 }
 
 /// Face, eyes and mouth on, with `changes`.
@@ -152,11 +154,12 @@ fn faces_from_a_kept_history_match_fresh_renders() {
         .iter()
         .flat_map(|p| [(p, None), (p, Some(60.0)), (p, Some(120.0))])
     {
-        let mut kept = SegcamMotion::default();
+        // On the CPU, as in `make`.
+        let mut kept = SegcamMotion::with_gpu(false);
         let mut history = History::<u8>::default();
         history.resize(W, H);
         // The same effect from a history holding what it says it needs.
-        let mut lean = SegcamMotion::default();
+        let mut lean = SegcamMotion::with_gpu(false);
         let mut lean_history = History::<u8>::default();
         lean_history.resize(W, H);
         for (f, pixels) in clip.frames.iter().enumerate() {
@@ -179,7 +182,7 @@ fn faces_from_a_kept_history_match_fresh_renders() {
             };
             let got = render(&mut kept);
             assert!(
-                got == render(&mut SegcamMotion::default()),
+                got == render(&mut SegcamMotion::with_gpu(false)),
                 "frame {f} at {frame_rate:?}"
             );
             let mut out = vec![Argb::<u8>::default(); (W * H) as usize];

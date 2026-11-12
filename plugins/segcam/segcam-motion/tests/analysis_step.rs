@@ -289,14 +289,16 @@ fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]
 #[test]
 fn seek_back_restarts_analysis_cadence() {
     let frames = crossing(30);
-    let mut effect = SegcamMotion::default();
+    // On the CPU, so the device opening between two renders can't put them on different
+    // paths.
+    let mut effect = SegcamMotion::with_gpu(false);
     let mut history = History::default();
     history.resize(W, H);
     let _ = stream(&mut effect, &mut history, &frames[..20]);
     history.clear();
     let after = stream(&mut effect, &mut history, &frames[7..19]);
 
-    let mut fresh = SegcamMotion::default();
+    let mut fresh = SegcamMotion::with_gpu(false);
     let mut new_history = History::default();
     new_history.resize(W, H);
     let want = stream(&mut fresh, &mut new_history, &frames[7..19]);
