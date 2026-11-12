@@ -42,6 +42,9 @@ const USAGE: &str = "usage: cargo vfx <list|build|package|install|preview|env|ch
 
 const MEDIACORE: &str = "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore";
 const MAC_OFX: &str = "/Library/OFX/Plugins";
+/// The oldest macOS the plugins run on: rustc and cc build for it, and the bundles and
+/// packages refuse anything older.
+const MACOS_MINIMUM: &str = "14.0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Host {
@@ -355,6 +358,9 @@ fn cargo_build(e: &Effect, o: &Options, triple: Option<&str>) -> Result<(), Stri
     if let Some(t) = triple {
         cmd.args(["--target", t]);
     }
+    if target_os(triple) == "macos" {
+        cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_MINIMUM);
+    }
     run(&mut cmd)
 }
 
@@ -466,6 +472,7 @@ fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<P
   <key>CFBundlePackageType</key><string>{kind}</string>{signature}
   <key>CFBundleVersion</key><string>{version}</string>
   <key>CFBundleShortVersionString</key><string>{version}</string>
+  <key>LSMinimumSystemVersion</key><string>{MACOS_MINIMUM}</string>
 </dict>
 </plist>
 "#,
@@ -780,6 +787,8 @@ fn pkgbuild(
             id,
             "--version",
             version,
+            "--min-os-version",
+            MACOS_MINIMUM,
         ]);
     if let Ok(identity) = std::env::var("INSTALLER_IDENTITY")
         && !identity.is_empty()

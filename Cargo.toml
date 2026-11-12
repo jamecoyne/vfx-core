@@ -7,6 +7,11 @@ members = ["vfx-core", "plugins/vfx-chain", "plugins/colour-adjust", "plugins/ga
 # Plain `cargo test` builds only the core, so windowing never enters CI on Linux.
 default-members = ["vfx-core"]
 
+# The latest stable Rust, raised at each dependency update. Resolver 3 picks the newest crate
+# versions that build with it.
+[workspace.package]
+rust-version = "1.99"
+
 # The pixel heavy crates' tests run optimised: minutes become seconds, and overflow checks and
 # debug assertions stay on.
 [profile.test.package.segcam-motion]
