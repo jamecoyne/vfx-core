@@ -45,7 +45,7 @@ impl Drop for GpuContext {
     /// hold the same removed D3D12 device, so they go too.
     fn drop(&mut self) {
         if self.lost().is_some() && !*self.faces_released.get_mut() {
-            crate::faces::release_on_lost_adapter(&self.info);
+            crate::faces::release_on_d3d12_adapter(&self.info);
         }
     }
 }
@@ -220,25 +220,26 @@ pub(crate) struct DeviceSlot {
     users: std::sync::atomic::AtomicUsize,
 }
 
-/// One live instance of the slot's users, for [`DeviceSlot`]'s count.
-pub(crate) struct SlotUser(&'static DeviceSlot);
+/// One live instance of the slot's users, for [`DeviceSlot`]'s count, and what the
+/// last one to go releases besides the slot's context on a host's device.
+pub(crate) struct SlotUser {
+    slot: &'static DeviceSlot,
+    on_last: fn(),
+}
 
 impl SlotUser {
-    pub(crate) fn new(slot: &'static DeviceSlot) -> Self {
+    pub(crate) fn new(slot: &'static DeviceSlot, on_last: fn()) -> Self {
         slot.users.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Self(slot)
+        Self { slot, on_last }
     }
 }
 
 impl Drop for SlotUser {
     fn drop(&mut self) {
-        if self
-            .0
-            .users
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-            == 1
-        {
-            self.0.release_host_context(false);
+        let users = &self.slot.users;
+        if users.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            self.slot.release_host_context(false);
+            (self.on_last)();
         }
     }
 }
@@ -342,20 +343,23 @@ impl DeviceSlot {
     }
 
     /// See [`Self::host_device_lost`]; with `lost` false, after the last instance
-    /// went, only an open context on a host's device goes.
+    /// went, only an open context on a host's device goes, and a working one leaves
+    /// the slot unopened, so the next instance opens it afresh.
     fn release_host_context(&self, lost: bool) {
         let mut state = self.state();
-        let why = match &*state {
-            SlotState::Open { device, .. } if device.host_shared => device
-                .lost()
-                .unwrap_or_else(|| "its host or instances let it go".into()),
-            // `publish` drops an answer that finds the slot moved on.
-            SlotState::Opening { .. } if lost => "the host lost its device".into(),
-            _ => return,
-        };
-        *state = SlotState::Lost {
+        let lost_now = |why: String| SlotState::Lost {
             why,
             next_try: Instant::now(),
+        };
+        *state = match &*state {
+            SlotState::Open { device, .. } if device.host_shared => match device.lost() {
+                Some(why) => lost_now(why),
+                None if lost => lost_now("the host lost its device".into()),
+                None => SlotState::Unopened,
+            },
+            // `publish` drops an answer that finds the slot moved on.
+            SlotState::Opening { .. } if lost => lost_now("the host lost its device".into()),
+            _ => return,
         };
         self.answered.notify_all();
     }
@@ -529,7 +533,7 @@ fn retire(device: Arc<GpuContext>) {
     let spawned = std::thread::Builder::new()
         .name("segcam GPU retire".into())
         .spawn(move || {
-            crate::faces::release_on_lost_adapter(&device.info);
+            crate::faces::release_on_d3d12_adapter(&device.info);
             device
                 .faces_released
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1203,8 +1207,8 @@ mod tests {
         let _lock = gpu_test_lock();
         let slot: &'static DeviceSlot =
             Box::leak(Box::new(DeviceSlot::new(move |_| Ok(host_context()))));
-        let first = SlotUser::new(slot);
-        let second = SlotUser::new(slot);
+        let first = SlotUser::new(slot, || {});
+        let second = SlotUser::new(slot, || {});
         let held = loop {
             match slot.now() {
                 DeviceNow::Ready(dev) => break Arc::downgrade(&dev),

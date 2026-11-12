@@ -154,6 +154,15 @@ pub struct SegcamMotion {
     _slot_user: crate::gpu::SlotUser,
 }
 
+/// With the last instance gone, face models with DirectML on the device a host
+/// shares go too, since nothing else would release them before a loss. Hosts that
+/// share no device make an instance per render (After Effects) and keep them.
+fn release_shared_faces() {
+    if let Some(gpu) = vfx_core::Gpu::shared() {
+        crate::faces::release_on_d3d12_adapter(&gpu.device.adapter_info());
+    }
+}
+
 impl Default for SegcamMotion {
     /// Draws Swarm on the GPU where there is one, unless `SEGCAM_GPU=0`.
     fn default() -> Self {
@@ -168,7 +177,7 @@ impl SegcamMotion {
         renderer.use_gpu(gpu);
         Self {
             renderer,
-            _slot_user: crate::gpu::SlotUser::new(&crate::gpu::SHARED_SLOT),
+            _slot_user: crate::gpu::SlotUser::new(&crate::gpu::SHARED_SLOT, release_shared_faces),
         }
     }
 }
@@ -264,7 +273,7 @@ impl CpuEffect for SegcamMotion {
         // Face models on DirectML hold the lost adapter's D3D12 device whatever the
         // slot holds; the host still shares the lost device here.
         if let Some(gpu) = vfx_core::Gpu::shared() {
-            crate::faces::release_on_lost_adapter(&gpu.device.adapter_info());
+            crate::faces::release_on_d3d12_adapter(&gpu.device.adapter_info());
         }
         crate::gpu::SHARED_SLOT.host_device_lost();
     }

@@ -201,13 +201,12 @@ mod models {
         );
     }
 
-    /// Releases the models if they run with DirectML on `adapter`, whose D3D12
-    /// device segcam lost: a process has one D3D12 device per adapter, so they hold
-    /// the removed one. They load again on the reload backoff.
+    /// Releases the models if they run with DirectML on `adapter`'s D3D12 device, the
+    /// one per adapter a removal needs gone. They load again on the reload backoff.
     ///
     /// On a thread of its own, since dropping a DirectML session takes about 0.1 s
     /// and an inference in flight holds the models: the caller can be a render.
-    pub(crate) fn release_on_lost_adapter(adapter: &vfx_core::wgpu::AdapterInfo) {
+    pub(crate) fn release_on_d3d12_adapter(adapter: &vfx_core::wgpu::AdapterInfo) {
         if adapter.backend != vfx_core::wgpu::Backend::Dx12 {
             return;
         }
@@ -753,7 +752,7 @@ pub fn lock_models() -> std::sync::MutexGuard<'static, Option<segcam_face::Segme
 #[cfg(not(target_arch = "wasm32"))]
 pub use live::LiveFaces;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use models::release_on_lost_adapter;
+pub(crate) use models::release_on_d3d12_adapter;
 #[cfg(not(target_arch = "wasm32"))]
 pub use models::{ready, runs_on, start, wait};
 
@@ -914,7 +913,7 @@ pub fn runs_on() -> Option<&'static str> {
 
 /// The web build has no face models.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn release_on_lost_adapter(_adapter: &vfx_core::wgpu::AdapterInfo) {}
+pub(crate) fn release_on_d3d12_adapter(_adapter: &vfx_core::wgpu::AdapterInfo) {}
 
 /// The best face in `blobs`, 0 to 1 of the source frame: the model's box, not the one segcam
 /// draws. No face: `face` at 0 alone. No models: nothing, so a host's own tracker can run.
