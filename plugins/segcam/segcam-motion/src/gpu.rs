@@ -215,6 +215,32 @@ pub(crate) struct DeviceSlot {
     /// The name of the adapter of the last device of segcam's own that was lost.
     lost_adapter: Mutex<Option<String>>,
     answered: Condvar,
+    /// The live instances ([`SlotUser`]). When the last goes, a context on a host's
+    /// device goes too, so nothing holds the host's device without an instance.
+    users: std::sync::atomic::AtomicUsize,
+}
+
+/// One live instance of the slot's users, for [`DeviceSlot`]'s count.
+pub(crate) struct SlotUser(&'static DeviceSlot);
+
+impl SlotUser {
+    pub(crate) fn new(slot: &'static DeviceSlot) -> Self {
+        slot.users.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(slot)
+    }
+}
+
+impl Drop for SlotUser {
+    fn drop(&mut self) {
+        if self
+            .0
+            .users
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.release_host_context(false);
+        }
+    }
 }
 
 type OpenDevice = Box<dyn Fn(Option<&str>) -> Result<GpuContext, NoGpu> + Send + Sync>;
@@ -229,6 +255,7 @@ impl DeviceSlot {
             backoff: Mutex::new(ReopenBackoff::default()),
             lost_adapter: Mutex::new(None),
             answered: Condvar::new(),
+            users: 0.into(),
         }
     }
 
@@ -282,7 +309,11 @@ impl DeviceSlot {
                         self.backoff().next_delay()
                     }
                 };
-                retire(device.clone());
+                // A host's context goes with its instances' drawers; the host waits for
+                // nothing of segcam's own.
+                if !device.host_shared {
+                    retire(device.clone());
+                }
                 *state = SlotState::Lost {
                     why,
                     next_try: Instant::now() + delay,
@@ -303,19 +334,30 @@ impl DeviceSlot {
     }
 
     /// Drops the context on a host's device, which the host says it lost, on the
-    /// caller's thread so the host can open its next one. The next render takes the
-    /// host's next device. A context on segcam's own device stays.
+    /// caller's thread so the host can open its next one, and drops what an open in
+    /// flight answers. The next render takes the host's next device. A context on
+    /// segcam's own device stays.
     pub(crate) fn host_device_lost(&self) {
+        self.release_host_context(true);
+    }
+
+    /// See [`Self::host_device_lost`]; with `lost` false, after the last instance
+    /// went, only an open context on a host's device goes.
+    fn release_host_context(&self, lost: bool) {
         let mut state = self.state();
-        if let SlotState::Open { device, .. } = &*state
-            && device.host_shared
-        {
-            let why = device.lost().unwrap_or_else(|| "the host lost it".into());
-            *state = SlotState::Lost {
-                why,
-                next_try: Instant::now(),
-            };
-        }
+        let why = match &*state {
+            SlotState::Open { device, .. } if device.host_shared => device
+                .lost()
+                .unwrap_or_else(|| "its host or instances let it go".into()),
+            // `publish` drops an answer that finds the slot moved on.
+            SlotState::Opening { .. } if lost => "the host lost its device".into(),
+            _ => return,
+        };
+        *state = SlotState::Lost {
+            why,
+            next_try: Instant::now(),
+        };
+        self.answered.notify_all();
     }
 
     /// Starts the first open if nothing has.
@@ -405,7 +447,7 @@ impl DeviceSlot {
         let (replaces, failures) = match &*state {
             SlotState::Opening { replaces } => (replaces.clone(), 0),
             SlotState::RetryingFirstOpen { failures, .. } => (None, *failures),
-            // Only a try in flight publishes, and nothing else leaves these two states.
+            // The host lost its device while this opened: drop the answer.
             _ => return,
         };
         *state = match (opened, replaces) {
@@ -1152,6 +1194,28 @@ mod tests {
         let again = device();
         assert!(again.lost().is_none());
         assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// When the last instance goes, so does the slot's context on a host's device:
+    /// otherwise switching to another effect left segcam holding it through a loss.
+    #[test]
+    fn the_last_instance_takes_a_host_context_with_it() {
+        let _lock = gpu_test_lock();
+        let slot: &'static DeviceSlot =
+            Box::leak(Box::new(DeviceSlot::new(move |_| Ok(host_context()))));
+        let first = SlotUser::new(slot);
+        let second = SlotUser::new(slot);
+        let held = loop {
+            match slot.now() {
+                DeviceNow::Ready(dev) => break Arc::downgrade(&dev),
+                DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+                DeviceNow::Never => panic!("the slot gave up"),
+            }
+        };
+        drop(first);
+        assert!(held.upgrade().is_some(), "went with an instance still live");
+        drop(second);
+        assert!(held.upgrade().is_none(), "the slot kept the host's device");
     }
 
     /// A try after a loss asks for the adapter that was lost.

@@ -19,6 +19,7 @@ mod models {
     use vfx_core::ReopenBackoff;
 
     pub(super) static MODELS: OnceLock<Mutex<Option<Segmenter>>> = OnceLock::new();
+    static START: Once = Once::new();
     static RUNS_ON: Mutex<Option<&'static str>> = Mutex::new(None);
 
     /// The models, once they have loaded or failed to. A panic while they ran leaves them usable:
@@ -36,7 +37,6 @@ mod models {
     /// Loads the models every instance shares, on first use, in the background: timing each device
     /// and loading on the best takes seconds, which would stall a live render.
     pub fn start() {
-        static START: Once = Once::new();
         START.call_once(|| {
             let spawned = std::thread::Builder::new()
                 .name("segcam faces".into())
@@ -213,6 +213,10 @@ mod models {
         }
         let adapter = adapter.clone();
         let release_models = move || {
+            // A first load in flight may land on the lost device.
+            if START.is_completed() {
+                MODELS.wait();
+            }
             let Some(mut models) = lock() else {
                 return;
             };

@@ -151,6 +151,7 @@ pub fn settings_from_params(p: &ParamValues, premultiplied: bool) -> RenderSetti
 /// recomputes only what changed.
 pub struct SegcamMotion {
     renderer: IncrementalRenderer,
+    _slot_user: crate::gpu::SlotUser,
 }
 
 impl Default for SegcamMotion {
@@ -165,7 +166,10 @@ impl SegcamMotion {
     pub fn with_gpu(gpu: bool) -> Self {
         let mut renderer = IncrementalRenderer::default();
         renderer.use_gpu(gpu);
-        Self { renderer }
+        Self {
+            renderer,
+            _slot_user: crate::gpu::SlotUser::new(&crate::gpu::SHARED_SLOT),
+        }
     }
 }
 
@@ -257,6 +261,11 @@ impl CpuEffect for SegcamMotion {
 
     fn device_lost(&mut self) {
         self.renderer.device_lost();
+        // Face models on DirectML hold the lost adapter's D3D12 device whatever the
+        // slot holds; the host still shares the lost device here.
+        if let Some(gpu) = vfx_core::Gpu::shared() {
+            crate::faces::release_on_lost_adapter(&gpu.device.adapter_info());
+        }
         crate::gpu::SHARED_SLOT.host_device_lost();
     }
 }
