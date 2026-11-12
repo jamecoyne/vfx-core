@@ -1227,7 +1227,9 @@ int main(int argc, char **argv) {
 #elif defined(__APPLE__)
     if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
         CHECK(logged_message("render path: GPU-native (IOSurface"), "IOSurface shared path absent from this process's log");
-        CHECK(!logged_message("warning: zero-copy path unavailable"), "IOSurface setup fell back during this run");
+        CHECK(!logged_message("warning: zero-copy path unavailable")
+                  && !logged_message("warning: zero-copy path not set up"), "IOSurface setup fell back during this run");
+        CHECK(!logged_message("warning: GPU render failed"), "IOSurface rendering fell back during this run");
     }
 #endif
     if (!ran) { fprintf(stderr, "unknown case %s\n", only); return 2; }
