@@ -10,27 +10,26 @@
 Segcam finds what moves in a shot, and faces and bodies. It draws them as labelled boxes, as mattes
 that cut out the moving parts, or as Swarm. Swarm is a collage of frozen tiles, drawn as macOS
 style windows that trail the subject. segcam started as a macOS app. Downloads for
-[v0.1.1](https://github.com/jamecoyne/vfx-core/releases/tag/v0.1.1):
+[v0.1.2](https://github.com/jamecoyne/vfx-core/releases/tag/v0.1.2):
 
 | Host | Plugin | macOS (signed and notarized) | Windows |
 |---|---|---|---|
 | After Effects | After Effects | [installer][mac-pkg] or [zip][mac-ae] | [installer][win-setup] or [zip][win-ae] |
 | DaVinci Resolve | OpenFX | [installer][mac-pkg] or [zip][mac-ofx] | [installer][win-setup] or [zip][win-ofx] |
-| Resolume Avenue and Arena | FFGL | [zip][mac-ffgl] | [installer][win-setup] or [zip][win-ffgl] |
+| Resolume Avenue and Arena | FFGL | [installer][mac-pkg] or [zip][mac-ffgl] | [installer][win-setup] or [zip][win-ffgl] |
 
-[mac-pkg]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-macOS.pkg
-[mac-ae]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-macOS-AfterEffects.zip
-[mac-ofx]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-macOS-OpenFX.zip
-[mac-ffgl]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-macOS-Resolume.zip
-[win-setup]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-Setup.exe
-[win-ae]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-AfterEffects.zip
-[win-ofx]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-OpenFX.zip
-[win-ffgl]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-Resolume.zip
+[mac-pkg]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.2/segcam-0.1.2-macOS.pkg
+[mac-ae]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.2/segcam-0.1.2-macOS-AfterEffects.zip
+[mac-ofx]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.2/segcam-0.1.2-macOS-OpenFX.zip
+[mac-ffgl]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.2/segcam-0.1.2-macOS-Resolume.zip
+[win-setup]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.2/segcam-0.1.2-Windows-Setup.exe
+[win-ae]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.2/segcam-0.1.2-Windows-AfterEffects.zip
+[win-ofx]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.2/segcam-0.1.2-Windows-OpenFX.zip
+[win-ffgl]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.2/segcam-0.1.2-Windows-Resolume.zip
 
-Start with the installer for your platform. On Windows it covers Resolve, Resolume and After
-Effects, and checks the ones it finds. On macOS it covers After Effects and Resolve, and Resolume
-takes the zip. Each zip holds one app's files and a `README.txt` naming the folder to copy them
-into. The Windows files are unsigned, so SmartScreen asks before running the installer. Restart the
+Start with the installer for your platform. It covers Resolve, Resolume and After Effects, and
+checks the ones it finds. Each zip holds one app's files and a `README.txt` naming the folder to
+copy them into. The Windows files are unsigned, so SmartScreen asks before running the installer. Restart the
 app after installing.
 
 It runs on integrated graphics from 2020 or later (Intel UHD 770 or Iris Xe, AMD Radeon 680M, any
