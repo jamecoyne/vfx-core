@@ -209,7 +209,7 @@ fn detect(bgra: &mut [u8], width: usize, height: usize, faces: bool, bodies: boo
     autoreleasepool(|_| {
         // SAFETY: `bgra` outlives the pool, which releases the buffer and its
         // handler, and nothing writes to it until `detect` returns. Vision is
-        // trusted to keep no reference past its handler.
+        // assumed to keep no reference past its handler.
         let Some(buffer) = (unsafe { pixel_buffer(bgra, width, height) }) else {
             return Found::default();
         };
