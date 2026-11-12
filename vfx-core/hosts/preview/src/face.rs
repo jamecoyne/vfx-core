@@ -251,6 +251,7 @@ impl Detector {
 /// found, with `face` at 0.
 pub struct Tracker {
     shared: Arc<(Mutex<TrackerState>, Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 type SizedFrame = (Vec<Argb<u8>>, (u32, u32));
@@ -275,7 +276,7 @@ impl Tracker {
             Condvar::new(),
         ));
         let worker = Arc::clone(&shared);
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let (lock, wake) = &*worker;
             loop {
                 let (pixels, size) = {
@@ -297,7 +298,20 @@ impl Tracker {
                 }
             }
         });
-        Ok(Self { shared })
+        Ok(Self {
+            shared,
+            worker: Some(worker),
+        })
+    }
+
+    /// Stops the tracker and waits for its models to go: on DirectML they hold the
+    /// adapter's D3D12 device, which a removed device's adapter needs gone.
+    pub fn stop(mut self) {
+        let worker = self.worker.take();
+        drop(self);
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
     }
 
     /// Hands over a copy of the newest frame (at `size`), replacing any not yet looked at.

@@ -2069,6 +2069,8 @@ struct Outage {
     opening: Option<std::sync::mpsc::Receiver<Result<OpenedDevice, String>>>,
     /// The effects' state in RAM, for the next device.
     released: Option<effects::Released>,
+    /// Whether the face tracker ran, to start it again on the next device.
+    tracking: bool,
     /// Drops everything made on the lost device. The first try waits for it, up to
     /// [`RETIRE_WAIT`]: D3D12 offers the adapter again only once every object on
     /// the removed device is gone.
@@ -2181,6 +2183,7 @@ impl Preview {
     fn start_outage(&mut self, why: String) {
         self.reopening.losses += 1;
         let lost_adapter_info = self.gpu.device.adapter_info();
+        let tracking = self.tracker.is_some();
         let (released, retiring) = self.release_device();
         let reopening = &mut self.reopening;
         reopening.backoff.lost(reopening.device_opened_at.elapsed());
@@ -2196,6 +2199,7 @@ impl Preview {
             next_try: now,
             opening: None,
             released: Some(released),
+            tracking,
             retiring,
         });
     }
@@ -2210,17 +2214,19 @@ impl Preview {
             receiver.release_device();
         }
         let (released, effects_on_device) = self.effects.take().release();
-        let window_on_device = (
-            self.gpu.take(),
-            self.surface.take(),
-            self.egui_renderer.take(),
-        );
-        (released, retire_device(effects_on_device, window_on_device))
+        // On the window's thread, as before, since macOS wants the surface's layer
+        // there.
+        drop(self.surface.take());
+        let window_on_device = (self.gpu.take(), self.egui_renderer.take());
+        let tracker = self.tracker.take();
+        (
+            released,
+            retire_device(effects_on_device, tracker, window_on_device),
+        )
     }
 
     /// Nothing can show frames, but a file stays in step with its sound and a camera doesn't back
-    /// up. A CPU effect isn't run on them: its input and output are on the device, and rendering on
-    /// a lost device is where the panics are.
+    /// up. No effect runs on them: the effects went with the device.
     fn keep_sources_moving(&mut self) {
         if let Some(media) = &mut self.media {
             if let Err(e) = media.loop_at_end(self.sound_on) {
@@ -2383,6 +2389,12 @@ impl Preview {
             egui_wgpu::RendererOptions::default(),
         ));
         let released = outage.as_mut().and_then(|o| o.released.take());
+        if outage.as_ref().is_some_and(|o| o.tracking) {
+            match face::Tracker::start() {
+                Ok(tracker) => self.tracker = Some(tracker),
+                Err(e) => self.message = Some(e),
+            }
+        }
         self.effects = DeviceBound::new(match released {
             Some(released) => Effects::restore(&self.gpu, released),
             None => Effects::new(&self.gpu),
@@ -2446,17 +2458,22 @@ impl Preview {
 }
 
 /// Drops a lost device's objects off the window's thread, since wgpu's queue
-/// waits when it drops; the handle says when that's done. The effects go first,
-/// outside the D3D12 device lock, which segcam's face models take to release.
+/// waits when it drops; the handle says when that's done. The effects and the
+/// face tracker go first, outside the D3D12 device lock, which face models take to
+/// release.
 #[cfg(not(target_arch = "wasm32"))]
 fn retire_device(
     effects: effects::OnDevice,
+    tracker: Option<face::Tracker>,
     window: impl Send + 'static,
 ) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("preview GPU retire".into())
         .spawn(move || {
             let effects_dropped = catch_unwind(AssertUnwindSafe(move || drop(effects)));
+            if let Some(tracker) = tracker {
+                tracker.stop();
+            }
             let _device_lock = d3d12_device_lock();
             let window_dropped = catch_unwind(AssertUnwindSafe(move || drop(window)));
             if effects_dropped.is_err() || window_dropped.is_err() {

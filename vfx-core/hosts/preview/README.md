@@ -71,7 +71,8 @@ flag shows in the panel.
 ## The GPU
 
 On the desktop, a lost GPU device is reopened in place. The source, the settings and a recording
-carry on, and the title shows it while the device reopens. In the browser, a lost device ends the
+carry on, and the title shows it while the device reopens. The effect starts over on the new
+device, so segcam's windows and its background build up again. In the browser, a lost device ends the
 recording, and the page says to reload.
 
 On Windows the preview draws with D3D12 by default, which avoids the memory growth seen with
