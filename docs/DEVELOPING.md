@@ -124,7 +124,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `FrameSource`: `with_frame`; `History` | vfx-core |
 | `FrameSource::held`; `History::next(before, held)` | vfx-core |
 | `FrameSource::live` (true for `History`) | vfx-core |
-| `FrameSource::fetch_budget` (a hard cap on the distinct earlier frames one render may ask for, at least 2, for a host that holds every frame it hands out until the render returns; default `None`, as many as it needs) | vfx-core |
+| `FrameSource::fetch_budget` (the distinct earlier frames one render may ask for, at least 2, plus up to as many again that one analysis of the current frame needs and nothing was kept from, for a host that holds every frame it hands out until the render returns; default `None`, as many as it needs) | vfx-core |
 | `DeviceFaults::same_device` (whether two records are one device, across wgpu instances), `ReopenBackoff` (when to try for a new device after a loss) | vfx-core |
 | `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core |

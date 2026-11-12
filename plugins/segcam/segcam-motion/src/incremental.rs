@@ -561,8 +561,10 @@ impl IncrementalRenderer {
             }
         }
         // Frames that use a deferred frame without a grid go stale, and so does
-        // the current frame if its face source is deferred. Reads go oldest
-        // first, so of this render's work that is only the current frame's.
+        // the current frame if its face source is deferred. The current frame's
+        // own frames are read before older ones, so a deferred frame can be
+        // older than frames this render analysed; the stale range after it
+        // covers those too.
         if deferred.contains(&face_source_frame(s, number, plan.first)) {
             self.mark_stale(number..=number);
         }
@@ -2720,12 +2722,14 @@ mod tests {
         let n = frames.len() - 1;
         let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
         let mut state = IncrementalRenderer::default();
-        // The first render also reads its own frame's background of 4.
-        let renders = (1..=catch_up_renders(&s, 2)).find(|_| {
+        // Only the first render reads past the budget, for its frame's
+        // background of 4; once that is kept every render keeps to 2.
+        let renders = (1..=catch_up_renders(&s, 2)).find(|&r| {
             let render = render_budgeted(&mut state, &s, &frames, n, 2);
+            let limit = if r == 1 { 4 } else { 2 };
             assert!(
-                render.earlier.len() <= 4,
-                "read {} earlier frames",
+                render.earlier.len() <= limit,
+                "render {r} read {} earlier frames",
                 render.earlier.len()
             );
             render.pixels == cold
@@ -2736,6 +2740,7 @@ mod tests {
         );
         let again = render_budgeted(&mut state, &s, &frames, n, 2);
         assert!(again.pixels == cold, "stays caught up");
+        assert!(again.earlier.len() <= 2, "read {}", again.earlier.len());
     }
 
     /// A seek at 4K in Resolve: a budget of 8 earlier float frames under a

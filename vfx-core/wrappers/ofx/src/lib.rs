@@ -684,9 +684,10 @@ impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
     }
 }
 
-/// The bytes of earlier frames one render in Resolve may fetch, counted as
-/// unpadded RGBA at the output depth. Resolve holds every image a render
-/// fetches until the render returns.
+/// The bytes of earlier frames one render in Resolve fetches, counted as
+/// unpadded RGBA at the output depth, and twice this for a render that reads
+/// the frames one analysis of its own frame needs. Resolve holds every image a
+/// render fetches until the render returns.
 const FETCH_BUDGET_BYTES: usize = 1 << 30;
 
 /// [`FETCH_BUDGET_BYTES`], or `VFX_OFX_FETCH_BUDGET_MB` MiB where that is a
