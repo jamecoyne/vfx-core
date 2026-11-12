@@ -8,4 +8,4 @@ description = "Build-script helper for vfx-core effect crates: identity variable
 
 [dependencies]
 pipl = "0.1.1"
-toml = { version = "0.5", features = ["preserve_order"] }
+toml = { version = "1.2.1", features = ["preserve_order"] }
