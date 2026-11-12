@@ -31,6 +31,13 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      # A run by hand reuses main's built dependencies; a tag builds clean.
+      - uses: Swatinem/rust-cache@v2
+        if: github.ref_type != 'tag'
+        with:
+          shared-key: plugins
+          save-if: false
+
       # `cargo vfx package` signs when SIGN_IDENTITY and INSTALLER_IDENTITY are set and
       # notarizes when NOTARY_PROFILE is; this puts the certificates in a keychain for it.
       - name: Signing keychain
@@ -77,6 +84,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        if: github.ref_type != 'tag'
+        with:
+          shared-key: plugins
+          save-if: false
 
       # 6.6 or later for the wizard's dark mode; pinned so a new major doesn't change the build.
       - name: Install Inno Setup
