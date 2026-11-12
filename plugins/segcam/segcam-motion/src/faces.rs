@@ -204,16 +204,28 @@ mod models {
     /// Releases the models if they run with DirectML on `adapter`, whose D3D12
     /// device segcam lost: a process has one D3D12 device per adapter, so they hold
     /// the removed one. They load again on the reload backoff.
+    ///
+    /// On a thread of its own, since dropping a DirectML session takes about 0.1 s
+    /// and an inference in flight holds the models: the caller can be a render.
     pub(crate) fn release_on_lost_adapter(adapter: &vfx_core::wgpu::AdapterInfo) {
         if adapter.backend != vfx_core::wgpu::Backend::Dx12 {
             return;
         }
-        let Some(mut models) = lock() else {
-            return;
+        let adapter = adapter.clone();
+        let release_models = move || {
+            let Some(mut models) = lock() else {
+                return;
+            };
+            if let Some(old) = models.take_if(|m| on_d3d12_adapter(&m.runs_on(), &adapter)) {
+                eprintln!("segcam Motion: the face models' device was lost; releasing them");
+                reload().dropped(old, Segmenter::optional_models, release);
+            }
         };
-        if let Some(old) = models.take_if(|m| on_d3d12_adapter(&m.runs_on(), adapter)) {
-            eprintln!("segcam Motion: the face models' device was lost; releasing them");
-            reload().dropped(old, Segmenter::optional_models, release);
+        let spawned = std::thread::Builder::new()
+            .name("segcam faces release".into())
+            .spawn(release_models.clone());
+        if spawned.is_err() {
+            release_models();
         }
     }
 

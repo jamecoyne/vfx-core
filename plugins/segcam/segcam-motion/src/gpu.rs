@@ -34,8 +34,8 @@ pub struct GpuContext {
     /// Whether a host shared this device. Only then can a host's frame be on it, and only the host
     /// can replace it.
     host_shared: bool,
-    /// Whether [`retire`] has released the face models on this adapter, which it
-    /// does before it takes the D3D12 device lock.
+    /// Whether [`retire`] has released the face models on this adapter, so the drop
+    /// doesn't again.
     faces_released: std::sync::atomic::AtomicBool,
 }
 
@@ -526,7 +526,6 @@ fn retire(device: Arc<GpuContext>) {
     let spawned = std::thread::Builder::new()
         .name("segcam GPU retire".into())
         .spawn(move || {
-            // The face models' lock comes before the device lock, as in a render.
             crate::faces::release_on_lost_adapter(&device.info);
             device
                 .faces_released
