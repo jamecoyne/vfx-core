@@ -6,7 +6,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(test)]
 use std::sync::MutexGuard;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -34,6 +34,20 @@ pub struct GpuContext {
     /// Whether a host shared this device. Only then can a host's frame be on it, and only the host
     /// can replace it.
     host_shared: bool,
+    /// Whether [`retire`] has released the face models on this adapter, which it
+    /// does before it takes the D3D12 device lock.
+    faces_released: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for GpuContext {
+    /// A lost context can go without [`retire`]: one on a host's device goes with
+    /// its last instance when the host drops its effects. Face models with DirectML
+    /// on its adapter hold the same removed D3D12 device, so they go too.
+    fn drop(&mut self) {
+        if self.lost().is_some() && !*self.faces_released.get_mut() {
+            crate::faces::release_on_lost_adapter(&self.info);
+        }
+    }
 }
 
 impl GpuContext {
@@ -158,6 +172,49 @@ const FIRST_OPEN_RETRIES: u32 = if cfg!(target_arch = "wasm32") { 0 } else { 5 }
 #[cfg(test)]
 pub(crate) const FIRST_OPEN_TEST_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How the slot holds its open context.
+enum Kept {
+    /// On segcam's own device, for as long as it lasts.
+    Own(Arc<GpuContext>),
+    /// On a host's device, only until an instance takes it, then as long as
+    /// instances hold it: a host whose device is lost drops its effects, and D3D12
+    /// offers the adapter again only once nothing holds the removed device.
+    Host {
+        device: Weak<GpuContext>,
+        untaken: Option<Arc<GpuContext>>,
+    },
+}
+
+impl Kept {
+    fn new(device: Arc<GpuContext>) -> Self {
+        match device.host_shared {
+            true => Kept::Host {
+                device: Arc::downgrade(&device),
+                untaken: Some(device),
+            },
+            false => Kept::Own(device),
+        }
+    }
+
+    /// The context for an instance to draw with, unless it's on a host's device and
+    /// every instance has let it go. From then on the instances hold a host's
+    /// context.
+    fn take(&mut self) -> Option<Arc<GpuContext>> {
+        match self {
+            Kept::Own(device) => Some(device.clone()),
+            Kept::Host { device, untaken } => untaken.take().or_else(|| device.upgrade()),
+        }
+    }
+
+    /// The context, without handing it to an instance.
+    fn peek(&self) -> Option<Arc<GpuContext>> {
+        match self {
+            Kept::Own(device) => Some(device.clone()),
+            Kept::Host { device, untaken } => untaken.clone().or_else(|| device.upgrade()),
+        }
+    }
+}
+
 enum SlotState {
     Unopened,
     /// With why the last device was lost, where this replaces one. Without, the first open.
@@ -165,7 +222,7 @@ enum SlotState {
         replaces: Option<String>,
     },
     Open {
-        device: Arc<GpuContext>,
+        device: Kept,
         opened_at: Instant,
     },
     /// No device has opened yet: the last of `failures` tries answered `why`, and the next isn't
@@ -233,7 +290,7 @@ impl DeviceSlot {
     /// What to draw on now; moves the slot on when a device is lost or a try is due.
     pub(crate) fn now(&'static self) -> DeviceNow {
         let mut state = self.state();
-        let replaces = match &*state {
+        let replaces = match &mut *state {
             SlotState::Unopened => None,
             SlotState::Opening { .. } | SlotState::RetryingFirstOpen { .. } => {
                 return DeviceNow::Waiting;
@@ -256,8 +313,18 @@ impl DeviceSlot {
                 return DeviceNow::Waiting;
             }
             SlotState::Open { device, opened_at } => {
+                let opened_at = *opened_at;
+                let Some(device) = device.take() else {
+                    // Its instances dropped it; the host's device may be another one by now.
+                    *state = SlotState::Opening {
+                        replaces: Some("its instances let it go".into()),
+                    };
+                    drop(state);
+                    self.open_in_background();
+                    return DeviceNow::Waiting;
+                };
                 let Some(why) = device.lost() else {
-                    return DeviceNow::Ready(device.clone());
+                    return DeviceNow::Ready(device);
                 };
                 self.backoff().lost(opened_at.elapsed());
                 // A host's replacement is taken as soon as there is one.
@@ -268,7 +335,7 @@ impl DeviceSlot {
                         self.backoff().next_delay()
                     }
                 };
-                retire(device.clone());
+                retire(device);
                 *state = SlotState::Lost {
                     why,
                     next_try: Instant::now() + delay,
@@ -305,9 +372,11 @@ impl DeviceSlot {
             state = self.answered.wait(state).unwrap_or_else(|e| e.into_inner());
         }
         match &*state {
-            SlotState::Open { device, .. } => {
-                device.lost().map_or(Ok(()), |e| Err(NoGpu::Failed(e)))
-            }
+            SlotState::Open { device, .. } => match device.peek() {
+                Some(device) => device.lost().map_or(Ok(()), |e| Err(NoGpu::Failed(e))),
+                // The next render opens it again on the host's device.
+                None => Ok(()),
+            },
             SlotState::Refused(e)
             | SlotState::FirstOpenFailed { why: e, .. }
             | SlotState::RetryingFirstOpen { why: e, .. } => Err(e.clone()),
@@ -388,7 +457,7 @@ impl DeviceSlot {
                     *self.backoff() = ReopenBackoff::default();
                 }
                 SlotState::Open {
-                    device,
+                    device: Kept::new(device),
                     opened_at: Instant::now(),
                 }
             }
@@ -457,6 +526,11 @@ fn retire(device: Arc<GpuContext>) {
     let spawned = std::thread::Builder::new()
         .name("segcam GPU retire".into())
         .spawn(move || {
+            // The face models' lock comes before the device lock, as in a render.
+            crate::faces::release_on_lost_adapter(&device.info);
+            device
+                .faces_released
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             while Arc::strong_count(&device) > 1 {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -615,6 +689,7 @@ impl GpuContext {
             info,
             faults,
             host_shared,
+            faces_released: false.into(),
         }
     }
 }
@@ -1074,6 +1149,47 @@ mod tests {
         let expected = [false, false, false, true, false, false, false, true];
         assert_eq!(faults, expected, "which renders gave up");
         assert_eq!(drawer.drawn, 0, "an unread draw counted as drawn");
+    }
+
+    /// A context on a device as a host shares it.
+    fn host_context() -> GpuContext {
+        let adapter = pick_adapter(&adapter_choice())
+            .or_else(|_| pick_adapter("fallback"))
+            .expect("an adapter: CI has lavapipe, WARP or Metal");
+        let info = adapter.get_info();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("a device");
+        let faults = DeviceFaults::watch(&device);
+        GpuContext::build(device, queue, info, faults, true)
+    }
+
+    /// The slot doesn't keep a host's device alive once its instances let the
+    /// context go, which a host that lost its D3D12 device needs. The next render
+    /// opens a context again.
+    #[test]
+    fn a_host_device_is_held_only_by_its_instances() {
+        let _lock = gpu_test_lock();
+        let opens = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = opens.clone();
+        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(host_context())
+        })));
+        let device = || loop {
+            match slot.now() {
+                DeviceNow::Ready(dev) => return dev,
+                DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+                DeviceNow::Never => panic!("the slot gave up"),
+            }
+        };
+        let taken = device();
+        let held = Arc::downgrade(&taken);
+        drop(taken);
+        assert!(held.upgrade().is_none(), "the slot kept the host's device");
+        let again = device();
+        assert!(again.lost().is_none());
+        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     /// A try after a loss asks for the adapter that was lost.
