@@ -619,8 +619,10 @@ mod tests {
 
     /// A kept CPU effect that holds a texture on the shared device until it hears the
     /// device was lost.
+    #[cfg(windows)]
     struct HoldsTheDevice(Option<wgpu::Texture>);
 
+    #[cfg(windows)]
     impl vfx_core::CpuEffect for HoldsTheDevice {
         fn params(&self) -> &[vfx_core::ParamSpec] {
             &[]
@@ -645,6 +647,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn holds_the_device() -> vfx_core::Processor {
         let gpu = Gpu::shared().expect("the test shares its device");
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
