@@ -380,6 +380,12 @@ fn build(
     }
 }
 
+/// The version on macOS bundles and their packages: `VFX_VERSION` when
+/// set (package-mac.sh sets the release's), else the crate's.
+fn bundle_version(m: &Metadata) -> String {
+    std::env::var("VFX_VERSION").unwrap_or_else(|_| m.version.clone())
+}
+
 fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<PathBuf>, String> {
     let m = &e.meta;
     let archs: Vec<&str> = if o.native {
@@ -464,7 +470,7 @@ fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<P
 </plist>
 "#,
             name = xml(&m.name),
-            version = m.version,
+            version = bundle_version(m),
         );
         fs::write(contents.join("Info.plist"), plist).map_err(|err| err.to_string())?;
         println!("{}", bundle.display());
@@ -651,7 +657,7 @@ fn package(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), Str
             &bundle,
             &pkg,
             &format!("{}.{suffix}", m.id),
-            &m.version,
+            &bundle_version(m),
             location,
         )?;
         notarize_pkg(&pkg)?;

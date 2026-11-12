@@ -27,11 +27,11 @@ style windows that trail the subject. segcam started as a macOS app. Downloads f
 [win-ofx]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-OpenFX.zip
 [win-ffgl]: https://github.com/jamecoyne/vfx-core/releases/download/v0.1.1/segcam-0.1.1-Windows-Resolume.zip
 
-One installer per platform holds segcam, with the other effects as options. On macOS it covers After
-Effects and Resolve, and Resolume takes the zip. On Windows it covers all three hosts, with After
-Effects optional. Each zip holds one host's files and a `README.txt` naming the folder to copy them
+Start with the installer for your platform. On Windows it covers Resolve, Resolume and After
+Effects, and checks the ones it finds. On macOS it covers After Effects and Resolve, and Resolume
+takes the zip. Each zip holds one app's files and a `README.txt` naming the folder to copy them
 into. The Windows files are unsigned, so SmartScreen asks before running the installer. Restart the
-host after installing.
+app after installing.
 
 It runs on integrated graphics from 2020 or later (Intel UHD 770 or Iris Xe, AMD Radeon 680M, any
 Apple M1 or newer) with a 6 core CPU. Swarm draws on the GPU when there is one.

@@ -25,7 +25,7 @@ jobs:
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -65,7 +65,7 @@ jobs:
           mkdir -p dist
           cp target/vfx-plugin/*-macOS.pkg target/vfx-plugin/*-macOS-*.zip dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: release-macOS
           path: dist/*
@@ -74,19 +74,20 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # 6.6 or later for the wizard's dark mode; pinned so a new major doesn't change the build.
       - name: Install Inno Setup
-        run: choco install innosetup --no-progress -y
+        run: choco install innosetup --version 6.7.1 --no-progress -y
 
       # One installer with every effect for every host, and segcam's zips.
       - name: Build the installer and zips
         shell: bash
         run: VERSION="${VERSION#v}" ./vfx-core/wrappers/package-win.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: release-Windows
           path: |
@@ -99,7 +100,7 @@ jobs:
     needs: [macos, windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: release-*
           merge-multiple: true
@@ -110,4 +111,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --draft --title "$GITHUB_REF_NAME" --generate-notes
+            --draft --title "$GITHUB_REF_NAME"
