@@ -82,6 +82,11 @@ Type: files; Name: "{#MediaCore}\SegcamMotionRust\SegcamMotionRust.aex"; Compone
 Type: filesandordirs; Name: "{#MediaCore}\SegcamMotionRust"; Components: adobe
 Type: files; Name: "{#Arena}\SegcamMotionRust.dll"; Components: arena
 Type: files; Name: "{#Avenue}\SegcamMotionRust.dll"; Components: avenue
+; v0.1.1 put the compiler beside the Resolume plugins; the shared one replaces it.
+Type: files; Name: "{#Arena}\dxcompiler.dll"; Components: arena
+Type: files; Name: "{#Arena}\DXC-*.txt"; Components: arena
+Type: files; Name: "{#Avenue}\dxcompiler.dll"; Components: avenue
+Type: files; Name: "{#Avenue}\DXC-*.txt"; Components: avenue
 
 ; windows-dlls holds the DirectX Shader Compiler with its licenses. Every plugin loads it from
 ; this one folder per DXC release when it is there, and else from its own folder (the zips).

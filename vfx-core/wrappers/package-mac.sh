@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Builds every effect's macOS plugins and packages them for a release, named after segcam:
-#   target/vfx-plugin/segcam-<version>-macOS.pkg                one installer for After
-#                                                               Effects and OpenFX: segcam
-#                                                               for the apps found, the other
-#                                                               effects as options
+#   target/vfx-plugin/segcam-<version>-macOS.pkg                one installer: segcam for the
+#                                                               apps found, the other effects
+#                                                               as options for OpenFX and
+#                                                               After Effects
 #   target/vfx-plugin/segcam-<version>-macOS-OpenFX.zip         segcam's bundles, one zip
 #   target/vfx-plugin/segcam-<version>-macOS-AfterEffects.zip   per host to copy by hand,
 #   target/vfx-plugin/segcam-<version>-macOS-Resolume.zip       each with a README.txt
-# Resolume reads plugins from the user's Documents, which the macOS installer doesn't write
-# to, so its plugin comes as a zip only.
+# Resolume reads plugins from the signed in user's Documents. The installer puts segcam's
+# bundle in /Library/Application Support/segcam/Resolume and copies it from there into
+# Documents as that user.
 # `cargo vfx package` makes each effect's component installers, signed and notarized when
 # SIGN_IDENTITY, INSTALLER_IDENTITY and NOTARY_PROFILE are set; this signs and notarizes
 # the product the same way. Apple asks only for the outermost container to be notarized, so
@@ -91,11 +92,44 @@ chmod 755 "$work/scripts-resolume/preinstall"
 pkgbuild --nopayload --scripts "$work/scripts-resolume" --identifier "$PLUGIN_ID.cleanup.resolume" \
   --version "$version" ${sign[@]+"${sign[@]}"} "$work/cleanup-resolume.pkg"
 
+# Resolume: one package puts segcam.bundle in a shared folder, and one per app copies it into
+# the signed in user's Extra Effects as that user, in place of v0.1.0's bundle.
+resolume_store="/Library/Application Support/$PLUGIN_FILE/Resolume"
+mkdir -p "$work/root-resolume"
+ditto "$out/$PLUGIN_FILE.bundle" "$work/root-resolume/$PLUGIN_FILE.bundle"
+pkgbuild --root "$work/root-resolume" --install-location "$resolume_store" \
+  --identifier "$PLUGIN_ID.resolume" --version "$version" ${sign[@]+"${sign[@]}"} \
+  "$work/resolume.pkg"
+# resolume_app ID APP: the package that copies the bundle into APP's Extra Effects.
+resolume_app() {
+  mkdir -p "$work/scripts-$1"
+  cat >"$work/scripts-$1/postinstall" <<SH
+#!/bin/sh
+user="\$(stat -f %Su /dev/console)"
+[ -n "\$user" ] && [ "\$user" != root ] && [ "\$user" != loginwindow ] || exit 0
+home="\$(dscl . -read "/Users/\$user" NFSHomeDirectory 2>/dev/null |
+  sed -e 's/^NFSHomeDirectory://' -e 's/^ *//' | tr -d '\n')"
+[ -n "\$home" ] || exit 0
+dir="\$home/Documents/$2/Extra Effects"
+sudo -u "\$user" mkdir -p "\$dir" || exit 0
+rm -rf "\$dir/SegcamMotionRust.bundle" "\$dir/$PLUGIN_FILE.bundle"
+sudo -u "\$user" ditto "$resolume_store/$PLUGIN_FILE.bundle" "\$dir/$PLUGIN_FILE.bundle"
+exit 0
+SH
+  chmod 755 "$work/scripts-$1/postinstall"
+  pkgbuild --nopayload --scripts "$work/scripts-$1" --identifier "$PLUGIN_ID.$1" \
+    --version "$version" ${sign[@]+"${sign[@]}"} "$work/$1.pkg"
+}
+resolume_app arena "Resolume Arena"
+resolume_app avenue "Resolume Avenue"
+
 # The product, as the Windows Setup: a choice per app, selected when the app is installed,
 # which installs segcam there; then the examples, each installed for the apps chosen through
 # a hidden choice per app.
 ofx_found="system.files.fileExistsAtPath('/Library/OFX/Plugins') || system.files.fileExistsAtPath('/Applications/DaVinci Resolve/DaVinci Resolve.app')"
 adobe_found="system.files.fileExistsAtPath('/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore')"
+arena_found="system.files.fileExistsAtPath('/Applications/Resolume Arena')"
+avenue_found="system.files.fileExistsAtPath('/Applications/Resolume Avenue')"
 choices=""
 outline=""
 examples=""
@@ -122,8 +156,21 @@ for crate in "${crates[@]}"; do
     <pkg-ref id=\"$PLUGIN_ID.cleanup.resolume\"/>
     <pkg-ref id=\"$PLUGIN_ID.adobe\"/>
   </choice>
+  <pkg-ref id=\"$PLUGIN_ID.resolume\" version=\"$version\">resolume.pkg</pkg-ref>
+  <pkg-ref id=\"$PLUGIN_ID.arena\" version=\"$version\">arena.pkg</pkg-ref>
+  <pkg-ref id=\"$PLUGIN_ID.avenue\" version=\"$version\">avenue.pkg</pkg-ref>
+  <choice id=\"arena\" title=\"Resolume Arena\" description=\"Adds $PLUGIN_NAME to Resolume Arena, in your Documents.\" start_selected=\"$arena_found\">
+    <pkg-ref id=\"$PLUGIN_ID.resolume\"/>
+    <pkg-ref id=\"$PLUGIN_ID.arena\"/>
+  </choice>
+  <choice id=\"avenue\" title=\"Resolume Avenue\" description=\"Adds $PLUGIN_NAME to Resolume Avenue, in your Documents.\" start_selected=\"$avenue_found\">
+    <pkg-ref id=\"$PLUGIN_ID.resolume\"/>
+    <pkg-ref id=\"$PLUGIN_ID.avenue\"/>
+  </choice>
 "
     outline+="    <line choice=\"ofx\"/>
+    <line choice=\"arena\"/>
+    <line choice=\"avenue\"/>
     <line choice=\"adobe\"/>
 "
   else
@@ -144,8 +191,7 @@ for crate in "${crates[@]}"; do
 done
 identity "$lead"
 mkdir -p "$work/resources"
-printf '%s\n' "$PLUGIN_NAME for DaVinci Resolve and After Effects. Installed apps are already selected." "" \
-  "For Resolume, use $PLUGIN_FILE-$version-macOS-Resolume.zip from the same release." \
+printf '%s\n' "$PLUGIN_NAME for DaVinci Resolve, Resolume and After Effects. Installed apps are already selected." \
   >"$work/resources/welcome.txt"
 cat >"$work/distribution.xml" <<XML
 <?xml version="1.0" encoding="utf-8"?>

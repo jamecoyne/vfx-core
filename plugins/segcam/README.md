@@ -11,14 +11,13 @@ Close the app before you install, then start it again.
 
 | | Windows | macOS |
 |---|---|---|
-| Installer | `segcam-<version>-Windows-Setup.exe`: Resolve, Nuke and Natron, Resolume, After Effects and Premiere Pro | `segcam-<version>-macOS.pkg`: Resolve, Nuke and Natron, After Effects and Premiere Pro |
+| Installer | `segcam-<version>-Windows-Setup.exe`: Resolve, Nuke and Natron, Resolume, After Effects and Premiere Pro | `segcam-<version>-macOS.pkg`: Resolve, Nuke and Natron, Resolume, After Effects and Premiere Pro |
 | By hand | `segcam-<version>-Windows-OpenFX.zip`, `-Resolume.zip`, `-AfterEffects.zip` | `segcam-<version>-macOS-OpenFX.zip`, `-Resolume.zip`, `-AfterEffects.zip` |
 
-Each installer lets you pick the apps and whether to add vfx-core's example effects. The Windows
-installer checks the apps it finds on the PC. Each zip holds one app's plugin and a `README.txt`
-naming the folder it goes in. On macOS, Resolume comes as a zip only: its plugin goes in
-`~/Documents/Resolume Arena/Extra Effects` (or `Resolume Avenue`), which the macOS installer doesn't
-write to.
+Each installer lets you pick the apps, with the ones it finds already checked, and whether to add
+vfx-core's example effects. Resolume's plugin goes in your Documents, in
+`Resolume Arena/Extra Effects` (or `Resolume Avenue`). Each zip holds one app's plugin and a
+`README.txt` naming the folder it goes in.
 
 The Windows installer isn't signed yet, so Windows warns that it is from an unknown publisher. Click
 **More info**, then **Run anyway**.
@@ -29,8 +28,8 @@ The Windows installer isn't signed yet, so Windows warns that it is from an unkn
 | Resolume Arena and Avenue | Effects, segcam |
 | After Effects | Effect, LO.FI.SCI.FI, segcam |
 
-On macOS, if Arena hangs at start once you add the bundle, clear the download flag on it and start
-Arena again:
+On macOS, if Arena hangs at start after you copy the bundle from the zip, clear the download flag on
+it and start Arena again:
 
 ```bash
 xattr -dr com.apple.quarantine ~/Documents/Resolume\ Arena/Extra\ Effects/segcam.bundle
@@ -43,8 +42,7 @@ clone of this repository, see the [developer guide](../../docs/DEVELOPING.md#bui
 ### From v0.1.0
 
 v0.1.0 named the plugin `SegcamMotionRust`, and the installers remove it for each app you install.
-For Resolume on macOS, remove `SegcamMotionRust.bundle` from Extra Effects and copy `segcam.bundle`
-from the Resolume zip in its place. If you copied v0.1.0 by hand, delete
+If you copied v0.1.0 by hand, delete
 `SegcamMotionRust.ofx.bundle`, `SegcamMotionRust.dll` or `SegcamMotionRust.bundle`, or the
 `SegcamMotionRust` folder or `SegcamMotionRust.plugin` in MediaCore. Resolume keeps loading v0.1.0
 while it is there, because both have the same plugin ID.
@@ -57,10 +55,11 @@ about a missing plugin calls it `com.lofiscifi.SegcamMotionRust`) and add segcam
 ### Uninstall
 
 On Windows, remove **segcam plugins** in Settings, Apps. On macOS, delete what you installed;
-Finder asks for your password for the first two:
+Finder asks for your password for the first three:
 
 - `/Library/OFX/Plugins/segcam.ofx.bundle`
 - `/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/segcam.plugin`
+- `/Library/Application Support/segcam`
 - `~/Documents/Resolume Arena/Extra Effects/segcam.bundle` (or `Resolume Avenue`)
 - any example effects you added, next to segcam's bundles, such as `Blend.ofx.bundle` and
   `Blend.plugin`
