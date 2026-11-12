@@ -33,7 +33,7 @@ copy them into. The Windows files are unsigned, so SmartScreen asks before runni
 app after installing.
 
 It runs on integrated graphics from 2020 or later (Intel UHD 770 or Iris Xe, AMD Radeon 680M, any
-Apple M1 or newer) with a 6 core CPU. Swarm draws on the GPU when there is one.
+Apple M1 or newer) with a 6 core CPU.
 
 [segcam's controls, install steps and limits](plugins/segcam/README.md)
 
