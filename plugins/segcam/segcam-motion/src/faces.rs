@@ -166,6 +166,14 @@ mod models {
             release(old);
             self.next_try = Some(Instant::now() + self.backoff.next_delay());
         }
+
+        /// Releases `old`, which works, and lets the next find load again at once:
+        /// nothing was lost, so the backoff and what a reload must have stay as they
+        /// are.
+        fn set_aside<T>(&mut self, old: T, release: impl Fn(T)) {
+            release(old);
+            self.next_try = Some(Instant::now());
+        }
     }
 
     /// Whether models that run on `runs_on` ("DirectML 0 (NVIDIA GeForce RTX
@@ -207,6 +215,17 @@ mod models {
     /// On a thread of its own, since dropping a DirectML session takes about 0.1 s
     /// and an inference in flight holds the models: the caller can be a render.
     pub(crate) fn release_on_d3d12_adapter(adapter: &vfx_core::wgpu::AdapterInfo) {
+        release_on(adapter, true);
+    }
+
+    /// Like [`release_on_d3d12_adapter`] for models that still work but have no
+    /// instance left: the next find loads them again at once, on the device the first
+    /// load chose.
+    pub(crate) fn set_aside_on_d3d12_adapter(adapter: &vfx_core::wgpu::AdapterInfo) {
+        release_on(adapter, false);
+    }
+
+    fn release_on(adapter: &vfx_core::wgpu::AdapterInfo, lost: bool) {
         if adapter.backend != vfx_core::wgpu::Backend::Dx12 {
             return;
         }
@@ -219,9 +238,15 @@ mod models {
             let Some(mut models) = lock() else {
                 return;
             };
-            if let Some(old) = models.take_if(|m| on_d3d12_adapter(&m.runs_on(), &adapter)) {
+            let Some(old) = models.take_if(|m| on_d3d12_adapter(&m.runs_on(), &adapter)) else {
+                return;
+            };
+            if lost {
                 eprintln!("segcam Motion: the face models' device was lost; releasing them");
                 reload().dropped(old, Segmenter::optional_models, release);
+            } else {
+                eprintln!("segcam Motion: no instance left; releasing the face models");
+                reload().set_aside(old, release);
             }
         };
         let spawned = std::thread::Builder::new()
@@ -373,6 +398,22 @@ mod models {
             assert!(!on(dml, &lost("NVIDIA GeForce RTX 4070", Backend::Vulkan)));
             assert!(!on(dml, &lost("Intel(R) UHD Graphics 770", Backend::Dx12)));
             assert!(!on("CPU", &lost("NVIDIA GeForce RTX 4070", Backend::Dx12)));
+        }
+
+        /// Models set aside with no instance left load again at the next find, however
+        /// often that happens: setting aside isn't a loss and charges no backoff.
+        #[test]
+        fn set_aside_models_load_at_the_next_find() {
+            let optional = |_: &i32| (true, true);
+            let mut reload = Reload::default();
+            let mut models = Some(1);
+            for next in [2, 3] {
+                let old = models.take().expect("models");
+                reload.set_aside(old, drop);
+                reload.keep_working(&mut models, |_| false, optional, drop, || Some(next));
+                assert_eq!(models, Some(next), "waited on a backoff");
+                assert!(reload.next_try.is_none(), "goes on reloading");
+            }
         }
 
         /// Models that lasted start the backoff over, so a reset hours later waits 1 s again.
@@ -752,9 +793,9 @@ pub fn lock_models() -> std::sync::MutexGuard<'static, Option<segcam_face::Segme
 #[cfg(not(target_arch = "wasm32"))]
 pub use live::LiveFaces;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use models::release_on_d3d12_adapter;
-#[cfg(not(target_arch = "wasm32"))]
 pub use models::{ready, runs_on, start, wait};
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use models::{release_on_d3d12_adapter, set_aside_on_d3d12_adapter};
 
 #[cfg(target_arch = "wasm32")]
 pub fn start() {}
@@ -914,6 +955,10 @@ pub fn runs_on() -> Option<&'static str> {
 /// The web build has no face models.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn release_on_d3d12_adapter(_adapter: &vfx_core::wgpu::AdapterInfo) {}
+
+/// The web build has no face models.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn set_aside_on_d3d12_adapter(_adapter: &vfx_core::wgpu::AdapterInfo) {}
 
 /// The best face in `blobs`, 0 to 1 of the source frame: the model's box, not the one segcam
 /// draws. No face: `face` at 0 alone. No models: nothing, so a host's own tracker can run.

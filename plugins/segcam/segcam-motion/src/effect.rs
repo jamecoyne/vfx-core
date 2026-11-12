@@ -155,11 +155,13 @@ pub struct SegcamMotion {
 }
 
 /// With the last instance gone, face models with DirectML on the device a host
-/// shares go too, since nothing else would release them before a loss. Hosts that
-/// share no device make an instance per render (After Effects) and keep them.
+/// shares go too, since nothing else would release them before a loss. The trade:
+/// the models are freed while segcam is unused, and coming back reloads them, about
+/// 0.9 s on the RTX 4070. Hosts that share no device make an instance per render
+/// (After Effects) and keep them.
 fn release_shared_faces() {
     if let Some(gpu) = vfx_core::Gpu::shared() {
-        crate::faces::release_on_d3d12_adapter(&gpu.device.adapter_info());
+        crate::faces::set_aside_on_d3d12_adapter(&gpu.device.adapter_info());
     }
 }
 
