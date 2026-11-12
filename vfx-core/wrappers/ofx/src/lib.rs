@@ -1231,6 +1231,46 @@ mod tests {
         assert!(resumed.continues && resumed.frames_dropped);
     }
 
+    /// A one frame step straight after a hitch resumes playback as a longer step
+    /// does. The run after it stays playback until the stream breaks: earlier
+    /// frames taken as unchanged, frames dropped, no second check. A big step
+    /// out of that run is a possible stop again.
+    #[test]
+    fn hitch_resumes_at_a_one_frame_step() {
+        let jump = RUN_END + MAX_STREAM_STEP + 1;
+        let run: Vec<i64> = (jump + 1..jump + 40).collect();
+        let stop = jump + 40 + MAX_STREAM_STEP;
+        let frames = run_then(&[&[jump], &run[..], &[stop]].concat());
+        let streams = positions(&frames, std::time::Duration::ZERO);
+        let [hitch, resumed @ .., last] = &streams[streams.len() - run.len() - 2..] else {
+            unreachable!()
+        };
+        assert!(hitch.possible_stop && !hitch.continues);
+        assert!(
+            resumed
+                .iter()
+                .all(|p| p.continues && p.frames_dropped && !p.possible_stop)
+        );
+        assert!(last.possible_stop && !last.continues && !last.frames_dropped);
+    }
+
+    /// A one frame step a person could make after a stop, 200 ms later, isn't playback.
+    #[test]
+    fn one_frame_step_after_a_pause_doesnt_resume() {
+        let jump = RUN_END + MAX_STREAM_STEP + 1;
+        let frames = run_then(&[jump, jump + 1]);
+        let last_index = frames.len() - 1;
+        let streams = positions_with_gaps(&frames, std::time::Duration::ZERO, |i| {
+            if i == last_index {
+                std::time::Duration::from_millis(200)
+            } else {
+                std::time::Duration::ZERO
+            }
+        });
+        let after = streams.last().unwrap();
+        assert!(after.follows && !after.continues && !after.frames_dropped);
+    }
+
     /// The render after a possible stop, starting `gap` after it.
     fn after_possible_stop(gap: std::time::Duration) -> StreamPosition {
         let jump = RUN_END + MAX_STREAM_STEP + 1;
@@ -1299,8 +1339,7 @@ mod tests {
     }
 
     /// Resolve 21 playing a clip with Loop on, through the wrap back to frame 0
-    /// and 50 renders or more past it, logged by `VFX_OFX_TIMING`. After the
-    /// wrap the Mac steps 0, 2, 3, 5, Windows 0, 1, 3, 4.
+    /// and 50 renders or more past it, logged by `VFX_OFX_TIMING`.
     const LOOP_WRAP_LOGS: [(&str, &str); 2] = [
         (
             "macOS",
@@ -1317,7 +1356,7 @@ mod tests {
             .filter(|line| !line.starts_with('#'))
             .map(|line| {
                 let fields: Vec<&str> = line.split(' ').collect();
-                let [frame, end_ms, render_ms, continues, dropped] = fields[..] else {
+                let [frame, end_ms, render_ms, continues, frames_dropped] = fields[..] else {
                     panic!("malformed line {line:?}");
                 };
                 let end = std::time::Duration::from_millis(end_ms.parse().unwrap());
@@ -1328,7 +1367,7 @@ mod tests {
                     start: end - render,
                     end,
                     continues: continues == "1",
-                    frames_dropped: dropped == "1",
+                    frames_dropped: frames_dropped == "1",
                 }
             })
             .collect()
@@ -1401,7 +1440,7 @@ mod tests {
         }
     }
 
-    /// A loop that lands past the start of its range, as Resolve's second wrap did.
+    /// Playback that wraps to a frame after the start of its range.
     #[test]
     fn loop_wrap_to_later_frame_keeps_dropping_frames() {
         let run: Vec<i64> = (0..=40).collect();

@@ -1,4 +1,4 @@
-# Resolve 21.1.2 playback with Loop on, Windows, RTX 4070: frame, end ms, render ms, unchanged, dropped.
+# Resolve 21.1.2 playback with Loop on, Windows, RTX 4070: frame, end ms, render ms, continues, frames_dropped.
 188 95751 1272.9 0 0
 188 96216 450.1 0 0
 188 98202 812.2 0 0

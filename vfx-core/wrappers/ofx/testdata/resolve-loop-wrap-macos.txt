@@ -1,4 +1,4 @@
-# Resolve 21 playback with Loop on, macOS M4: frame, end ms, render ms, unchanged, dropped.
+# Resolve 21 playback with Loop on, macOS M4: frame, end ms, render ms, continues, frames_dropped.
 0 189504 6.2 0 0
 1 189562 37.4 0 0
 2 189707 5.4 1 0
