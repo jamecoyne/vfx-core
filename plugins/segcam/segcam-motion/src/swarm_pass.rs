@@ -377,9 +377,11 @@ impl Atlas {
                 if width > side || rows > side {
                     return false;
                 }
+                // Rows grow to what the shelf needs: the tallest windows
+                // fill a layer's height, rather than half of a power of two.
                 let size = (
                     self.size.0.max(width.next_power_of_two().min(side)),
-                    self.size.1.max(rows.next_power_of_two().min(side)),
+                    self.size.1.max(rows),
                 );
                 let most_bytes = self.limits.bytes.min(self.ceiling);
                 let most_layers = most_bytes / self.bytes(size, 1);
@@ -2705,16 +2707,33 @@ mod tests {
 
     #[test]
     fn grow_taller_drops_empty_layers() {
-        // 41 layers of 1024 x 1024 are 164 MB; 41 of 1024 x 2048 would go
+        // 41 layers of 1024 x 1024 are 164 MB; 41 of 1024 x 2000 would go
         // over the 256 MB cap, 32 fit.
         let (device, queue, mut atlas) = browser_atlas_after(41, 21);
         assert_eq!((atlas.layers, atlas.layers_in_use()), (41, 20));
-        let tall = atlas.place(&device, &queue, 1024, 1080);
+        let tall = atlas.place(&device, &queue, 1024, 2000);
         assert_eq!(tall, Some([0, 0, 20]));
-        assert_eq!((atlas.size, atlas.layers), ((1024, 2048), 32));
+        assert_eq!((atlas.size, atlas.layers), ((1024, 2000), 32));
         assert_eq!(atlas.rows.len(), 32);
-        let below = atlas.place(&device, &queue, 1024, 1024);
+        let below = atlas.place(&device, &queue, 1024, 976);
         assert_eq!(below, Some([0, 1024, 0]), "the kept layers gained rows");
+    }
+
+    #[test]
+    fn grow_taller_to_the_rows_needed() {
+        let limits = AtlasLimits {
+            side: 8192,
+            layers: 256,
+            bytes: 256 << 20,
+        };
+        let (device, queue, mut atlas) = test_atlas((1024, 1024), limits);
+        let mut placed = 0;
+        while atlas.place(&device, &queue, 1024, 1056).is_some() {
+            placed += 1;
+        }
+        // A 1024 x 2048 layer would hold one such window, 32 under the cap.
+        assert_eq!((atlas.size, atlas.layers), ((1024, 1056), 62));
+        assert_eq!(placed, 62, "one full height window a layer");
     }
 
     #[test]
@@ -2748,7 +2767,7 @@ mod tests {
     #[test]
     fn grow_taller_keeps_layers_in_use() {
         let (device, queue, mut atlas) = browser_atlas_after(41, 0);
-        assert_eq!(atlas.place(&device, &queue, 1024, 1080), None);
+        assert_eq!(atlas.place(&device, &queue, 1024, 2000), None);
         assert_eq!((atlas.size, atlas.layers), ((1024, 1024), 41));
     }
 
