@@ -791,8 +791,7 @@ fn stream_position(
     let soon = gap < MAX_STREAM_GAP;
     // Renders carrying on straight after what looked like a stop: playback had
     // a hitch or wrapped to the start of its loop. The check that stop made
-    // leaves it where it was, so it goes on without another, and a resume never
-    // leads to a second check.
+    // leaves it where it was, so it goes on without another.
     let resumes = last.stream.possible_stop && gap < MAX_RESUME_GAP && step >= 1;
     let follows = resumes || soon && (1..=MAX_STREAM_STEP).contains(&step);
     let continues = follows && (resumes || last.stream.follows);
@@ -1231,12 +1230,10 @@ mod tests {
         assert!(resumed.continues && resumed.frames_dropped);
     }
 
-    /// A one frame step straight after a hitch resumes playback as a longer step
-    /// does. The run after it stays playback until the stream breaks: earlier
-    /// frames taken as unchanged, frames dropped, no second check. A big step
-    /// out of that run is a possible stop again.
+    /// A one frame step straight after a possible stop resumes playback, and the
+    /// run after it drops frames until the next big step.
     #[test]
-    fn hitch_resumes_at_a_one_frame_step() {
+    fn stream_position_resume_accepts_single_step() {
         let jump = RUN_END + MAX_STREAM_STEP + 1;
         let run: Vec<i64> = (jump + 1..jump + 40).collect();
         let stop = jump + 40 + MAX_STREAM_STEP;
@@ -1254,9 +1251,9 @@ mod tests {
         assert!(last.possible_stop && !last.continues && !last.frames_dropped);
     }
 
-    /// A one frame step a person could make after a stop, 200 ms later, isn't playback.
+    /// A person can step one frame 200 ms after a possible stop; that isn't playback.
     #[test]
-    fn one_frame_step_after_a_pause_doesnt_resume() {
+    fn stream_position_resume_rejects_paused_step() {
         let jump = RUN_END + MAX_STREAM_STEP + 1;
         let frames = run_then(&[jump, jump + 1]);
         let last_index = frames.len() - 1;
@@ -1338,8 +1335,8 @@ mod tests {
         frames_dropped: bool,
     }
 
-    /// Resolve 21 playing a clip with Loop on, through the wrap back to frame 0
-    /// and 50 renders or more past it, logged by `VFX_OFX_TIMING`.
+    /// `VFX_OFX_TIMING` logs of Resolve 21 playing a clip on loop, through the
+    /// wrap back to frame 0.
     const LOOP_WRAP_LOGS: [(&str, &str); 2] = [
         (
             "macOS",
@@ -1351,7 +1348,7 @@ mod tests {
         ),
     ];
 
-    fn logged_renders(log: &str) -> Vec<LoggedRender> {
+    fn parse_log(log: &str) -> Vec<LoggedRender> {
         log.lines()
             .filter(|line| !line.starts_with('#'))
             .map(|line| {
@@ -1399,11 +1396,10 @@ mod tests {
             + 1
     }
 
-    /// The replay agrees with what the wrapper decided while Resolve played, up to the wrap.
     #[test]
-    fn loop_wrap_replay_matches_log_before_wrap() {
+    fn stream_position_matches_logs_before_wrap() {
         for (system, log) in LOOP_WRAP_LOGS {
-            let renders = logged_renders(log);
+            let renders = parse_log(log);
             let wrap = wrap_index(&renders);
             let streams = replay(&renders);
             for (i, (render, stream)) in renders[..wrap].iter().zip(streams).enumerate() {
@@ -1417,13 +1413,12 @@ mod tests {
         }
     }
 
-    /// Playback that loops back to the start of its range carries on dropping
-    /// frames: Resolve is already behind after the wrap and mixes steps of 1
-    /// and 2, which never makes a run of one frame steps again.
+    /// Resolve is behind after a loop wrap and mixes steps of 1 and 2, which
+    /// never make a run of one frame steps again.
     #[test]
-    fn loop_wrap_keeps_dropping_frames() {
+    fn stream_position_loop_wrap_keeps_frames_dropped() {
         for (system, log) in LOOP_WRAP_LOGS {
-            let renders = logged_renders(log);
+            let renders = parse_log(log);
             let wrap = wrap_index(&renders);
             let streams = replay(&renders);
             assert!(
@@ -1440,9 +1435,8 @@ mod tests {
         }
     }
 
-    /// Playback that wraps to a frame after the start of its range.
     #[test]
-    fn loop_wrap_to_later_frame_keeps_dropping_frames() {
+    fn stream_position_wrap_past_start_keeps_frames_dropped() {
         let run: Vec<i64> = (0..=40).collect();
         let frames = [&run[..], &[42, 6, 15, 24]].concat();
         let streams = positions(&frames, std::time::Duration::ZERO);
@@ -1453,10 +1447,8 @@ mod tests {
         assert!(resumed.frames_dropped && next.frames_dropped);
     }
 
-    /// An export started after playback, at once or later, reads every frame
-    /// however it steps.
     #[test]
-    fn export_after_playback_never_drops_frames() {
+    fn stream_position_export_after_playback_reads_every_frame() {
         let run: Vec<i64> = (0..=40).collect();
         let playback = [&run[..], &[42]].concat();
         let export_start = [0, 0, 0, 2, 1, 3, 4, 5, 6];
