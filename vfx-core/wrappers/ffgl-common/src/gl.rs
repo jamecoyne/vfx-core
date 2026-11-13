@@ -231,7 +231,7 @@ macro_rules! gl_functions {
                 }
 
                 #[test]
-                fn missing_function_names_the_symbol() {
+                fn load_names_missing_function() {
                     for address in [0, 1, 2, 3, usize::MAX] {
                         // SAFETY: a failure address is rejected before any function is stored.
                         let result = unsafe { Functions::load_with(|_| address as *const c_void) };
@@ -240,7 +240,7 @@ macro_rules! gl_functions {
                 }
 
                 #[test]
-                fn loading_without_a_context_fails_before_caching() {
+                fn load_without_context_fails_before_caching() {
                     assert_eq!(load(), Err(Error::NoContext));
                     assert!(FUNCTIONS.get().is_none());
                 }

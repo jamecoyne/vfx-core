@@ -323,6 +323,7 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
                     } else {
                         table[i].name.to_string_lossy().into_owned()
                     };
+                    // SAFETY: the host owns `maxToWrite` bytes at the buffer's address.
                     unsafe { write_string(&string_query.stringBuffer, &text) };
                     FFMixed::success()
                 }
@@ -453,6 +454,7 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
             let set_parameter = unsafe { &*input.PointerValue.cast::<SetParameterStruct>() };
             match (instance, param_index(set_parameter.ParameterNumber)) {
                 (Some(instance), Some(i)) => {
+                    // SAFETY: FFGL passes a parameter value as float bits in the integer.
                     let value =
                         f32::from_bits(unsafe { set_parameter.NewParameterValue.UIntValue });
                     instance.values[i] = params::clamp_to_range(&table[i], value);
