@@ -15,8 +15,8 @@ use web_time::Instant;
 
 const INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long `--stats` keeps saying an effect's tile atlas is full. The effect's flag
-/// flips within a frame or two while it drops windows, faster than one line a second.
+/// How long a snapshot keeps `atlas_full` set after the effect last set it.
+/// The effect's flag flips within a frame or two, faster than `--stats` prints.
 const ATLAS_FULL_HOLD: Duration = Duration::from_secs(5);
 
 /// Running totals of what the preview did.
@@ -248,7 +248,7 @@ impl Sampler {
             self.snapshot.report.clone_from(report);
             self.snapshot.report.readings.clear(); // the bar has no use for them
         }
-        // Looked at every call, since the flag can last less than the bar's second.
+        // Looked at every call, since the flag can last less than an `INTERVAL`.
         if report.atlas_full {
             self.atlas_full_at = Some(Instant::now());
         }
@@ -391,7 +391,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn atlas_full_stays_in_the_stats_after_the_flag_clears() {
+    fn sample_holds_atlas_full() {
         let mut sampler = Sampler::new();
         let shown = ShownEffect {
             effect: "",
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn report_text_leaves_out_a_full_atlas() {
+    fn report_text_omits_atlas_full() {
         let mut report = Report::default();
         assert_eq!(report_text(&report), "");
         report.draw = Some("GPU".to_owned());
