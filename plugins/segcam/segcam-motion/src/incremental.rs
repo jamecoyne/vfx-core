@@ -466,7 +466,7 @@ impl IncrementalRenderer {
                         .collect(),
                     false => BTreeSet::new(),
                 };
-                let inputs: BTreeSet<i64> = plan
+                let analysis_inputs: BTreeSet<i64> = plan
                     .newest_analysis_inputs()
                     .into_iter()
                     .filter(|f| {
@@ -478,7 +478,7 @@ impl IncrementalRenderer {
                     rebuild,
                     &unverified,
                     &verified,
-                    &inputs,
+                    &analysis_inputs,
                     &ahead,
                     number,
                     budget,
@@ -1081,29 +1081,29 @@ impl IncrementalRenderer {
     }
 
     /// The frames a render of `number` reads under a budget of `budget` earlier
-    /// frames: the newest of `inputs`, up to twice the budget, then `ahead`, then
-    /// the oldest of `rebuild` and `unverified` together, then the first of `verified`.
+    /// frames: the newest of `analysis_inputs`, up to twice the budget, then `ahead`,
+    /// then the oldest of `rebuild` and `unverified`, then the first of `verified`.
     fn budgeted_reads(
         rebuild: BTreeSet<i64>,
         unverified: &BTreeSet<i64>,
         verified: &[i64],
-        inputs: &BTreeSet<i64>,
+        analysis_inputs: &BTreeSet<i64>,
         ahead: &BTreeSet<i64>,
         number: i64,
         budget: usize,
     ) -> BudgetedReads {
-        let inputs: BTreeSet<i64> = inputs
+        let analysis_inputs: BTreeSet<i64> = analysis_inputs
             .iter()
             .rev()
             .take(budget.saturating_mul(2))
             .copied()
             .collect();
-        let budget = budget.max(inputs.len());
+        let budget = budget.max(analysis_inputs.len());
         let rest = rebuild
             .union(unverified)
-            .filter(|f| !ahead.contains(f) && !inputs.contains(f));
-        let ahead = ahead.iter().filter(|f| !inputs.contains(f));
-        let mut oldest = inputs
+            .filter(|f| !ahead.contains(f) && !analysis_inputs.contains(f));
+        let ahead = ahead.iter().filter(|f| !analysis_inputs.contains(f));
+        let mut oldest = analysis_inputs
             .iter()
             .chain(ahead)
             .chain(rest)
@@ -2769,7 +2769,7 @@ mod tests {
     }
 
     /// A background over twice the budget, as Background 64 at 4K: the seek keeps
-    /// a stale analysis of its newest frames and catches up once it reads the rest.
+    /// a stale analysis from the newest frames and catches up once it reads the rest.
     #[test]
     fn budget_seek_redoes_partial_analysis() {
         let s = RenderSettings {

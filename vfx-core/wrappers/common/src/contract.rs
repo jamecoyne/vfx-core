@@ -118,8 +118,6 @@ pub fn stream_catch_up_renders(frames: usize, budget: usize) -> usize {
 /// How often a frame is rendered again while the effect says it is unfinished.
 const MAX_UNFINISHED_RERENDERS: usize = 8;
 
-/// With a `read_limit`, the render runs under [`FETCH_BUDGET`] and fails when it
-/// reads more earlier frames than the limit.
 fn render(
     effect: &mut dyn CpuEffect,
     clip: &Clip,
