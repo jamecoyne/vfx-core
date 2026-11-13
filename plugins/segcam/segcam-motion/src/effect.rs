@@ -154,11 +154,8 @@ pub struct SegcamMotion {
     _slot_user: crate::gpu::SlotUser,
 }
 
-/// With the last instance gone, face models with DirectML on the device a host
-/// shares go too, since nothing else would release them before a loss. The trade:
-/// the models are freed while segcam is unused, and coming back reloads them, about
-/// 0.9 s on the RTX 4070. Hosts that share no device make an instance per render
-/// (After Effects) and keep them.
+/// Sets aside face models with DirectML on the host's shared device, for the last
+/// instance to go: nothing else would release them before a loss.
 fn release_shared_faces() {
     if let Some(gpu) = vfx_core::Gpu::shared() {
         crate::faces::set_aside_on_d3d12_adapter(&gpu.device.adapter_info());
@@ -272,8 +269,8 @@ impl CpuEffect for SegcamMotion {
 
     fn device_lost(&mut self) {
         self.renderer.device_lost();
-        // Face models on DirectML hold the lost adapter's D3D12 device whatever the
-        // slot holds; the host still shares the lost device here.
+        // Face models on DirectML hold the adapter's D3D12 device apart from the
+        // slot. The host still shares the lost device here.
         if let Some(gpu) = vfx_core::Gpu::shared() {
             crate::faces::release_on_d3d12_adapter(&gpu.device.adapter_info());
         }

@@ -100,8 +100,7 @@ impl CpuStage {
     }
 
     /// Splits off what's on the device, for a host whose device was lost. The
-    /// effect and the history stay, and the next device's first render draws from
-    /// them.
+    /// effect and the history stay in RAM for [`CpuStage::restore`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn release(self) -> (Released, OnDevice) {
         let CpuStage {
@@ -616,14 +615,17 @@ fn new_readback_buffer(gpu: &Gpu, pitch: u32, height: u32) -> wgpu::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{self, find};
+    use segcam_motion::SegcamMotion;
+    use vfx_core::cpu::{Channel, FrameSource, Image};
+    use vfx_core::{CpuEffect as _, ParamValue, Processor};
 
-    /// A kept CPU effect that holds a texture on the shared device until it hears the
-    /// device was lost.
+    /// A kept CPU effect with a texture on the shared device until `device_lost`.
     #[cfg(windows)]
-    struct HoldsTheDevice(Option<wgpu::Texture>);
+    struct TextureHolder(Option<wgpu::Texture>);
 
     #[cfg(windows)]
-    impl vfx_core::CpuEffect for HoldsTheDevice {
+    impl vfx_core::CpuEffect for TextureHolder {
         fn params(&self) -> &[vfx_core::ParamSpec] {
             &[]
         }
@@ -648,7 +650,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn holds_the_device() -> vfx_core::Processor {
+    fn texture_holder() -> vfx_core::Processor {
         let gpu = Gpu::shared().expect("the test shares its device");
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -664,20 +666,17 @@ mod tests {
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        vfx_core::Processor::Cpu(Box::new(HoldsTheDevice(Some(texture))))
+        vfx_core::Processor::Cpu(Box::new(TextureHolder(Some(texture))))
     }
 
-    /// A CPU effect that holds something on the shared device keeps a removed D3D12
-    /// device's adapter away until it's told the device was lost; the stage's own
-    /// objects go with its release.
     #[cfg(windows)]
     #[test]
-    fn device_lost_lets_a_removed_adapter_back() {
+    fn device_lost_frees_removed_adapter() {
         let (_turn, other) = crate::test_gpu();
         drop(other);
         let gpu = crate::warp_gpu();
         gpu.share();
-        let effect = CpuInstance::new(holds_the_device, true).expect("a kept CPU effect");
+        let effect = CpuInstance::new(texture_holder, true).expect("a kept CPU effect");
         let stage = CpuStage::new(&gpu, effect, (16, 16));
 
         crate::app::remove_d3d12_device(&gpu.device).expect("removed");
@@ -688,10 +687,6 @@ mod tests {
         released.effect.device_lost();
         assert!(crate::warp_offered(), "the effect kept the removed device");
     }
-    use crate::catalog::{self, find};
-    use segcam_motion::SegcamMotion;
-    use vfx_core::cpu::{Channel, FrameSource, Image};
-    use vfx_core::{CpuEffect as _, ParamValue, Processor};
 
     /// Every value of every channel, so a rounding on the way would show.
     fn varied_pixels(width: usize, height: usize) -> Vec<Argb<u8>> {

@@ -304,8 +304,8 @@ impl Tracker {
         })
     }
 
-    /// Stops the tracker and waits for its models to go: on DirectML they hold the
-    /// adapter's D3D12 device, which a removed device's adapter needs gone.
+    /// Stops the tracker and waits for its models to drop. On DirectML they hold
+    /// the adapter's D3D12 device, which blocks a removed device's adapter.
     pub fn stop(mut self) {
         let worker = self.worker.take();
         drop(self);

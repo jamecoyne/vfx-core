@@ -124,7 +124,7 @@ mod models {
         ) {
             if let Some(old) = models.take_if(|m| failing(m)) {
                 eprintln!("segcam Motion: the face models stopped working");
-                self.dropped(old, &optional, &release);
+                self.release_lost(old, &optional, &release);
             }
             if self.next_try.is_some_and(|at| Instant::now() >= at) {
                 if let Some(partial) = models.take() {
@@ -148,12 +148,10 @@ mod models {
                 }
             }
         }
-    }
 
-    impl Reload {
         /// Releases `old`, which can't work any more, and plans the next load on the
         /// backoff.
-        fn dropped<T>(
+        fn release_lost<T>(
             &mut self,
             old: T,
             optional: impl Fn(&T) -> (bool, bool),
@@ -167,17 +165,16 @@ mod models {
             self.next_try = Some(Instant::now() + self.backoff.next_delay());
         }
 
-        /// Releases `old`, which works, and lets the next find load again at once:
-        /// nothing was lost, so the backoff and what a reload must have stay as they
-        /// are.
+        /// Releases `old`, which works, so the next find loads again at once, with
+        /// no backoff.
         fn set_aside<T>(&mut self, old: T, release: impl Fn(T)) {
             release(old);
             self.next_try = Some(Instant::now());
         }
     }
 
-    /// Whether models that run on `runs_on` ("DirectML 0 (NVIDIA GeForce RTX
-    /// 4070)") share the D3D12 device of `adapter`'s lost device.
+    /// Whether models that run on `runs_on`, as "DirectML 0 (NVIDIA GeForce RTX
+    /// 4070)", share the D3D12 device of `adapter`.
     pub(super) fn on_d3d12_adapter(runs_on: &str, adapter: &vfx_core::wgpu::AdapterInfo) -> bool {
         adapter.backend == vfx_core::wgpu::Backend::Dx12
             && runs_on.starts_with("DirectML")
@@ -209,18 +206,15 @@ mod models {
         );
     }
 
-    /// Releases the models if they run with DirectML on `adapter`'s D3D12 device, the
-    /// one per adapter a removal needs gone. They load again on the reload backoff.
-    ///
-    /// On a thread of its own, since dropping a DirectML session takes about 0.1 s
-    /// and an inference in flight holds the models: the caller can be a render.
+    /// Releases the models if they run with DirectML on `adapter`'s D3D12 device,
+    /// on a thread of its own, since a render can call it. They load again on the
+    /// reload backoff.
     pub(crate) fn release_on_d3d12_adapter(adapter: &vfx_core::wgpu::AdapterInfo) {
         release_on(adapter, true);
     }
 
-    /// Like [`release_on_d3d12_adapter`] for models that still work but have no
-    /// instance left: the next find loads them again at once, on the device the first
-    /// load chose.
+    /// Like [`release_on_d3d12_adapter`] for models that still work: the next find
+    /// loads them again at once, on the device the first load chose.
     pub(crate) fn set_aside_on_d3d12_adapter(adapter: &vfx_core::wgpu::AdapterInfo) {
         release_on(adapter, false);
     }
@@ -243,7 +237,7 @@ mod models {
             };
             if lost {
                 eprintln!("segcam Motion: the face models' device was lost; releasing them");
-                reload().dropped(old, Segmenter::optional_models, release);
+                reload().release_lost(old, Segmenter::optional_models, release);
             } else {
                 eprintln!("segcam Motion: no instance left; releasing the face models");
                 reload().set_aside(old, release);
@@ -382,28 +376,32 @@ mod models {
             assert!(reload.next_try.is_none(), "goes on reloading");
         }
 
-        /// Only models with DirectML on the lost D3D12 device's adapter hold that
-        /// device: not on another adapter, not on the CPU, and not when the lost device
-        /// was Vulkan.
         #[test]
-        fn models_on_the_lost_d3d12_adapter_are_released() {
+        fn on_d3d12_adapter_matches_directml_on_same_adapter() {
             use vfx_core::wgpu::{AdapterInfo, Backend, DeviceType};
-            let lost = |name: &str, backend| AdapterInfo {
+            let adapter = |name: &str, backend| AdapterInfo {
                 name: name.to_owned(),
                 ..AdapterInfo::new(DeviceType::DiscreteGpu, backend)
             };
             let on = super::on_d3d12_adapter;
             let dml = "DirectML 0 (NVIDIA GeForce RTX 4070)";
-            assert!(on(dml, &lost("NVIDIA GeForce RTX 4070", Backend::Dx12)));
-            assert!(!on(dml, &lost("NVIDIA GeForce RTX 4070", Backend::Vulkan)));
-            assert!(!on(dml, &lost("Intel(R) UHD Graphics 770", Backend::Dx12)));
-            assert!(!on("CPU", &lost("NVIDIA GeForce RTX 4070", Backend::Dx12)));
+            assert!(on(dml, &adapter("NVIDIA GeForce RTX 4070", Backend::Dx12)));
+            assert!(!on(
+                dml,
+                &adapter("NVIDIA GeForce RTX 4070", Backend::Vulkan)
+            ));
+            assert!(!on(
+                dml,
+                &adapter("Intel(R) UHD Graphics 770", Backend::Dx12)
+            ));
+            assert!(!on(
+                "CPU",
+                &adapter("NVIDIA GeForce RTX 4070", Backend::Dx12)
+            ));
         }
 
-        /// Models set aside with no instance left load again at the next find, however
-        /// often that happens: setting aside isn't a loss and charges no backoff.
         #[test]
-        fn set_aside_models_load_at_the_next_find() {
+        fn set_aside_reloads_without_backoff() {
             let optional = |_: &i32| (true, true);
             let mut reload = Reload::default();
             let mut models = Some(1);

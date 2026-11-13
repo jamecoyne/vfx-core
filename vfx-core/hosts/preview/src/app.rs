@@ -29,9 +29,8 @@ use winit::keyboard::Key;
 use winit::keyboard::NamedKey;
 use winit::window::{Window, WindowId};
 
-/// Something made on the device, which an outage takes away until a new device
-/// is in place ([`Preview::release_device`]). Nothing reads one during an
-/// outage: if something does, it panics rather than keep the lost device alive.
+/// A value made on the device, which [`Preview::release_device`] takes away for
+/// an outage. Reading it during an outage panics.
 struct DeviceBound<T>(Option<T>);
 
 impl<T> DeviceBound<T> {
@@ -2077,9 +2076,8 @@ struct Outage {
     retiring: Option<std::thread::JoinHandle<()>>,
 }
 
-/// How long the first try waits for the lost device's objects to drop. A drop
-/// that hangs in the driver doesn't hold the reopen for good; the try then goes
-/// ahead and may find no adapter.
+/// How long the first try waits for the lost device's objects to drop, in case
+/// a drop hangs in the driver.
 #[cfg(not(target_arch = "wasm32"))]
 const RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -2204,9 +2202,9 @@ impl Preview {
         });
     }
 
-    /// Drops everything made on the device on a thread, keeping what's in RAM: D3D12
-    /// offers a removed device's adapter again only once nothing holds the device,
-    /// the shared copy and a CPU effect's objects on it included.
+    /// Splits off what's in RAM and drops everything made on the device on a
+    /// thread. D3D12 offers a removed device's adapter again only once nothing
+    /// holds the device, the shared copy and a CPU effect's objects included.
     fn release_device(&mut self) -> (effects::Released, Option<std::thread::JoinHandle<()>>) {
         // While the lost device is still shared, so an effect can tell which it was.
         self.effects.device_lost();
@@ -2216,8 +2214,7 @@ impl Preview {
             receiver.release_device();
         }
         let (released, effects_on_device) = self.effects.take().release();
-        // On the window's thread, as before, since macOS wants the surface's layer
-        // there.
+        // On the window's thread, since macOS wants the surface's layer there.
         drop(self.surface.take());
         let window_on_device = (self.gpu.take(), self.egui_renderer.take());
         let tracker = self.tracker.take();
@@ -2459,10 +2456,9 @@ impl Preview {
     }
 }
 
-/// Drops a lost device's objects off the window's thread, since wgpu's queue
-/// waits when it drops; the handle says when that's done. The effects and the
-/// face tracker go first, outside the D3D12 device lock, which face models take
-/// to release.
+/// Drops a lost device's objects on a thread of their own, since wgpu's queue
+/// waits when it drops. The effects and the face tracker go first, outside the
+/// D3D12 device lock, which face models take to release.
 #[cfg(not(target_arch = "wasm32"))]
 fn retire_device(
     effects: effects::OnDevice,

@@ -477,7 +477,7 @@ impl Effects {
     }
 
     /// Tells a CPU effect the shared device was lost, so it lets go of what it holds
-    /// on it. Before [`Effects::release`].
+    /// on it. Called before [`Effects::release`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn device_lost(&self) {
         if let EffectRun::Cpu(stage) = &self.stage.run {
@@ -1170,12 +1170,9 @@ mod tests {
         assert_eq!(picture, settled, "the still didn't reach the new device");
     }
 
-    /// Everything `Effects` made on a removed D3D12 device goes with
-    /// [`Effects::release`]'s second half, so the adapter comes back. On WARP,
-    /// which every Windows machine has and which keeps the same rule.
     #[cfg(windows)]
     #[test]
-    fn released_effects_let_a_removed_adapter_back() {
+    fn release_on_device_frees_removed_adapter() {
         let (_turn, other) = crate::test_gpu();
         drop(other);
         let gpu = crate::warp_gpu();

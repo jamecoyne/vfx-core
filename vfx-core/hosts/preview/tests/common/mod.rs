@@ -1,9 +1,6 @@
-//! What the face model removal tests share: segcam's face models on DirectML on DXGI
-//! adapter 0, a device there shared as a host shares it, its removal, and waiting for
-//! the adapter to come back. Each test is a binary of its own, since the models load
-//! once per process on the adapter `SEGCAM_FACE_DEVICE` names. ONNX Runtime's DirectML
-//! provider refuses WARP, so these need a hardware adapter; `RemoveDevice` touches
-//! only this process's device.
+//! Shared setup for the face model removal tests. Each test is a binary of its own,
+//! since the models load once per process on the adapter `SEGCAM_FACE_DEVICE` names.
+//! ONNX Runtime's DirectML provider refuses WARP, so these need a hardware adapter.
 
 use std::time::{Duration, Instant};
 
@@ -26,10 +23,12 @@ fn offered(name: &str) -> bool {
 }
 
 /// The name of DXGI adapter 0, the one `SEGCAM_FACE_DEVICE=0` puts the models on.
-fn first_adapter() -> String {
-    // SAFETY: plain DXGI enumeration; the returned interfaces are owned and released.
+fn adapter_0_name() -> String {
+    // SAFETY: creating a factory has no preconditions; the interface is owned.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.expect("a DXGI factory");
+    // SAFETY: `factory` is a live factory; the adapter interface is owned.
     let adapter = unsafe { factory.EnumAdapters1(0) }.expect("an adapter");
+    // SAFETY: `adapter` is a live adapter.
     let desc = unsafe { adapter.GetDesc1() }.expect("an adapter description");
     String::from_utf16_lossy(&desc.Description)
         .trim_end_matches('\0')
@@ -39,14 +38,14 @@ fn first_adapter() -> String {
 /// A shared device on DXGI adapter 0 and its name, with segcam's face models loaded on
 /// DirectML there and segcam's own device slot off. The caller is the only test in its
 /// binary.
-pub fn shared_device_with_face_models() -> (Gpu, String) {
+pub fn shared_gpu_with_faces() -> (Gpu, String) {
     // SAFETY: called first in the only test of its binary, before any thread that reads
     // the environment.
     unsafe {
         std::env::set_var("SEGCAM_FACE_DEVICE", "0");
         std::env::set_var("SEGCAM_GPU", "0");
     }
-    let name = first_adapter();
+    let name = adapter_0_name();
     let adapter = pollster::block_on(dx12_instance().enumerate_adapters(wgpu::Backends::DX12))
         .into_iter()
         .find(|a| a.get_info().name == name)
@@ -66,7 +65,7 @@ pub fn shared_device_with_face_models() -> (Gpu, String) {
     (gpu, name)
 }
 
-/// Removes `gpu`'s D3D12 device, as a driver reset would.
+/// Removes `gpu`'s D3D12 device, as a driver reset would, in this process only.
 pub fn remove(gpu: &Gpu) {
     // SAFETY: the raw device is only used to ask for its removal.
     unsafe {

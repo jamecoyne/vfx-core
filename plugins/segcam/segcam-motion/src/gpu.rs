@@ -34,15 +34,13 @@ pub struct GpuContext {
     /// Whether a host shared this device. Only then can a host's frame be on it, and only the host
     /// can replace it.
     host_shared: bool,
-    /// Whether [`retire`] has released the face models on this adapter, so the drop
-    /// doesn't again.
+    /// Whether [`retire`] has released the face models on this adapter.
     faces_released: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for GpuContext {
-    /// A lost context can go without [`retire`]: one on a host's device goes when
-    /// the host says it lost the device. Face models with DirectML on its adapter
-    /// hold the same removed D3D12 device, so they go too.
+    /// Releases face models with DirectML on a lost device's adapter, which hold
+    /// the same removed D3D12 device, unless [`retire`] did.
     fn drop(&mut self) {
         if self.lost().is_some() && !*self.faces_released.get_mut() {
             crate::faces::release_on_d3d12_adapter(&self.info);
@@ -215,13 +213,13 @@ pub(crate) struct DeviceSlot {
     /// The name of the adapter of the last device of segcam's own that was lost.
     lost_adapter: Mutex<Option<String>>,
     answered: Condvar,
-    /// The live instances ([`SlotUser`]). When the last goes, a context on a host's
-    /// device goes too, so nothing holds the host's device without an instance.
+    /// The live [`SlotUser`]s.
     users: std::sync::atomic::AtomicUsize,
 }
 
-/// One live instance of the slot's users, for [`DeviceSlot`]'s count, and what the
-/// last one to go releases besides the slot's context on a host's device.
+/// A live instance, counted in its [`DeviceSlot`]. The last to drop releases the
+/// slot's context on a host's device, so nothing holds it without an instance,
+/// and calls `on_last`.
 pub(crate) struct SlotUser {
     slot: &'static DeviceSlot,
     on_last: fn(),
@@ -310,8 +308,7 @@ impl DeviceSlot {
                         self.backoff().next_delay()
                     }
                 };
-                // A host's context goes with its instances' drawers; the host waits for
-                // nothing of segcam's own.
+                // A host's context drops with the drawers that hold it.
                 if !device.host_shared {
                     retire(device.clone());
                 }
@@ -335,16 +332,14 @@ impl DeviceSlot {
     }
 
     /// Drops the context on a host's device, which the host says it lost, on the
-    /// caller's thread so the host can open its next one, and drops what an open in
-    /// flight answers. The next render takes the host's next device. A context on
-    /// segcam's own device stays.
+    /// caller's thread, and the answer of an open in flight. A context on segcam's
+    /// own device stays.
     pub(crate) fn host_device_lost(&self) {
         self.release_host_context(true);
     }
 
-    /// See [`Self::host_device_lost`]; with `lost` false, after the last instance
-    /// went, only an open context on a host's device goes, and a working one leaves
-    /// the slot unopened, so the next instance opens it afresh.
+    /// See [`Self::host_device_lost`]. With `lost` false, only an open context on a
+    /// host's device goes, and a working one leaves the slot unopened.
     fn release_host_context(&self, lost: bool) {
         let mut state = self.state();
         let lost_now = |why: String| SlotState::Lost {
@@ -1157,7 +1152,7 @@ mod tests {
         assert_eq!(drawer.drawn, 0, "an unread draw counted as drawn");
     }
 
-    /// A context on a device as a host shares it.
+    /// A context on a device a host shares.
     fn host_context() -> GpuContext {
         let adapter = pick_adapter(&adapter_choice())
             .or_else(|_| pick_adapter("fallback"))
@@ -1170,10 +1165,8 @@ mod tests {
         GpuContext::build(device, queue, info, faults, true)
     }
 
-    /// After the host says it lost its device, the slot holds no context on it, and
-    /// the next render opens one on the host's next device.
     #[test]
-    fn a_lost_host_device_leaves_the_slot() {
+    fn host_device_lost_drops_context_and_reopens() {
         let _lock = gpu_test_lock();
         let opens = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let counted = opens.clone();
@@ -1200,10 +1193,8 @@ mod tests {
         assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
-    /// When the last instance goes, so does the slot's context on a host's device:
-    /// otherwise switching to another effect left segcam holding it through a loss.
     #[test]
-    fn the_last_instance_takes_a_host_context_with_it() {
+    fn last_slot_user_drops_host_context() {
         let _lock = gpu_test_lock();
         let slot: &'static DeviceSlot =
             Box::leak(Box::new(DeviceSlot::new(move |_| Ok(host_context()))));

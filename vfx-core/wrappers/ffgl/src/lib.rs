@@ -143,7 +143,8 @@ struct CpuEffectState {
     /// logged. A report clones what the effect found, so it isn't asked for every frame.
     last_on_gpu: Option<bool>,
     frames_since_report: u32,
-    /// Whether the effect has heard that the shared device was lost, once per loss.
+    /// Whether the effect was told the shared device was lost, so it hears once per
+    /// loss.
     told_device_lost: bool,
 }
 
@@ -536,7 +537,6 @@ unsafe fn process_cpu(
     let Some(cpu) = instance.cpu_effect.as_mut() else {
         return false;
     };
-    // Once per loss, the effect lets go of what it holds on the lost shared device.
     let device_lost = vfx_core::Gpu::shared_faults().lost().is_some();
     if device_lost && !cpu.told_device_lost {
         cpu.effect.device_lost();
