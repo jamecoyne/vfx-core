@@ -15,9 +15,9 @@ use web_time::Instant;
 
 const INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long the bar keeps saying an effect ran out of GPU memory. The effect's flag flips within
-/// a frame or two while it drops windows, and a word flashing once a second reads as a fault.
-const OUT_OF_MEMORY_HOLD: Duration = Duration::from_secs(5);
+/// How long `--stats` keeps saying an effect's tile atlas is full. The effect's flag
+/// flips within a frame or two while it drops windows, faster than one line a second.
+const ATLAS_FULL_HOLD: Duration = Duration::from_secs(5);
 
 /// Running totals of what the preview did.
 #[derive(Clone, Copy, Default)]
@@ -139,8 +139,8 @@ pub struct Sampler {
     last_counts: Counts,
     /// The longest render since the last sample.
     longest_render: Duration,
-    /// When the effect last said it was out of GPU memory.
-    out_of_memory_at: Option<Instant>,
+    /// When the effect last said its tile atlas was full.
+    atlas_full_at: Option<Instant>,
     snapshot: Snapshot,
     #[cfg(not(target_arch = "wasm32"))]
     load: MachineLoad,
@@ -223,7 +223,7 @@ impl Sampler {
             last: None,
             last_counts: Counts::default(),
             longest_render: Duration::ZERO,
-            out_of_memory_at: None,
+            atlas_full_at: None,
             snapshot: Snapshot::default(),
             #[cfg(not(target_arch = "wasm32"))]
             load: MachineLoad::start(),
@@ -249,12 +249,12 @@ impl Sampler {
             self.snapshot.report.readings.clear(); // the bar has no use for them
         }
         // Looked at every call, since the flag can last less than the bar's second.
-        if report.out_of_gpu_memory {
-            self.out_of_memory_at = Some(Instant::now());
+        if report.atlas_full {
+            self.atlas_full_at = Some(Instant::now());
         }
-        self.snapshot.report.out_of_gpu_memory = self
-            .out_of_memory_at
-            .is_some_and(|at| at.elapsed() < OUT_OF_MEMORY_HOLD);
+        self.snapshot.report.atlas_full = self
+            .atlas_full_at
+            .is_some_and(|at| at.elapsed() < ATLAS_FULL_HOLD);
         if second_passed {
             if let Some(last) = self.last {
                 let seconds = last.elapsed().as_secs_f32();
@@ -330,9 +330,6 @@ pub fn report_text(report: &Report) -> String {
     if let Some(faces) = &report.faces {
         text += &format!(", faces {faces}");
     }
-    if report.out_of_gpu_memory {
-        text += ", out of GPU memory";
-    }
     text
 }
 
@@ -394,7 +391,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn out_of_memory_stays_on_the_bar_after_the_flag_clears() {
+    fn atlas_full_stays_in_the_stats_after_the_flag_clears() {
         let mut sampler = Sampler::new();
         let shown = ShownEffect {
             effect: "",
@@ -406,24 +403,24 @@ mod tests {
         };
         let mut report = Report::default();
         let quiet = sampler.sample(Counts::default(), None, shown, &report);
-        assert!(!quiet.report.out_of_gpu_memory);
-        report.out_of_gpu_memory = true;
+        assert!(!quiet.report.atlas_full);
+        report.atlas_full = true;
         sampler.sample(Counts::default(), None, shown, &report);
-        report.out_of_gpu_memory = false;
+        report.atlas_full = false;
         let held = sampler.sample(Counts::default(), None, shown, &report);
-        assert!(held.report.out_of_gpu_memory);
-        sampler.out_of_memory_at = Instant::now().checked_sub(OUT_OF_MEMORY_HOLD);
+        assert!(held.report.atlas_full);
+        sampler.atlas_full_at = Instant::now().checked_sub(ATLAS_FULL_HOLD);
         let later = sampler.sample(Counts::default(), None, shown, &report);
-        assert!(!later.report.out_of_gpu_memory);
+        assert!(!later.report.atlas_full);
     }
 
     #[test]
-    fn report_text_says_when_out_of_gpu_memory() {
+    fn report_text_leaves_out_a_full_atlas() {
         let mut report = Report::default();
         assert_eq!(report_text(&report), "");
         report.draw = Some("GPU".to_owned());
-        report.out_of_gpu_memory = true;
-        assert_eq!(report_text(&report), ", draw GPU, out of GPU memory");
+        report.atlas_full = true;
+        assert_eq!(report_text(&report), ", draw GPU");
     }
 
     #[test]
