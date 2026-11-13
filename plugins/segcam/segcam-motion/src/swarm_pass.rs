@@ -326,7 +326,12 @@ impl Atlas {
         if width > self.size.0 {
             return None;
         }
-        let (layer, y) = (0..self.layers)
+        // A pending growth may drop layers past its own count.
+        let layers = match &self.pending_growth {
+            Some(grown) => grown.layers.min(self.layers),
+            None => self.layers,
+        };
+        let (layer, y) = (0..layers)
             .find_map(|layer| Some((layer, self.rows[layer as usize].allocate(rows)?)))?;
         let mut columns = FreeRuns::new(self.size.0);
         let x = columns.allocate(width)?;
@@ -352,9 +357,14 @@ impl Atlas {
         }
     }
 
-    /// Makes the layers large enough for `width` x `rows`, or where they
-    /// are, adds layers. `false` when the atlas is at its limit, the GPU
-    /// refused, or its answer is still to come.
+    /// Layers up to the last one a shelf is in.
+    fn layers_in_use(&self) -> u32 {
+        self.shelves.iter().map(|s| s.layer + 1).max().unwrap_or(0)
+    }
+
+    /// Makes the layers large enough for `width` x `rows`, dropping empty
+    /// layers the limits leave no room for, or where they are, adds layers.
+    /// `false` when at the limit, refused, or the GPU's answer is to come.
     fn grow(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, rows: u32) -> bool {
         loop {
             if self.pending_growth.is_none() {
@@ -381,8 +391,8 @@ impl Atlas {
                 let most = u64::from(self.limits.layers).min(most_layers) as u32;
                 let layers = atlas_layers(size, wanted.min(most), most);
                 if layers > most
-                    || layers < self.layers
-                    || (layers == self.layers && size == self.size)
+                    || layers < self.layers_in_use()
+                    || (layers <= self.layers && size == self.size)
                 {
                     return false;
                 }
@@ -414,9 +424,11 @@ impl Atlas {
             if let Some(e) = refusal {
                 grown.texture.destroy();
                 // Half the step next. Under an eighth of the atlas it isn't
-                // worth a copy.
-                let step = (asked - held) / 2;
-                self.ceiling = held + if step < held / 8 { 0 } else { step };
+                // worth a copy. Below what was asked, so a refused request
+                // with fewer layers isn't asked again.
+                let step = asked.saturating_sub(held) / 2;
+                let next = held + if step < held / 8 { 0 } else { step };
+                self.ceiling = next.min(asked - 1);
                 self.last_refusal = Some(Instant::now());
                 if asked < self.smallest_logged_refusal {
                     self.smallest_logged_refusal = asked;
@@ -429,6 +441,7 @@ impl Atlas {
                 }
                 continue;
             }
+            let kept = self.layers.min(grown.layers);
             let mut encoder = device.create_command_encoder(&Default::default());
             encoder.copy_texture_to_texture(
                 self.texture.as_image_copy(),
@@ -436,10 +449,11 @@ impl Atlas {
                 wgpu::Extent3d {
                     width: self.size.0,
                     height: self.size.1,
-                    depth_or_array_layers: self.layers,
+                    depth_or_array_layers: kept,
                 },
             );
             queue.submit(Some(encoder.finish()));
+            self.rows.truncate(kept as usize);
             for rows in &mut self.rows {
                 rows.deallocate(self.size.1, grown.size.1 - self.size.1);
             }
@@ -449,7 +463,7 @@ impl Atlas {
                     .deallocate(self.size.0, grown.size.0 - self.size.0);
             }
             self.rows
-                .extend((self.layers..grown.layers).map(|_| FreeRuns::new(grown.size.1)));
+                .extend((kept..grown.layers).map(|_| FreeRuns::new(grown.size.1)));
             self.view = array_view(&grown.texture);
             // A browser otherwise holds the old texture until its garbage
             // collector runs.
@@ -2665,6 +2679,77 @@ mod tests {
         assert_eq!(placed, 7, "the byte limit allows seven of eight layers");
         let past_side = atlas.place(&device, &queue, 1025, 16);
         assert_eq!(past_side, None);
+    }
+
+    /// A browser's tile atlas with `full` layers of 1024 x 1024 tiles, the
+    /// last `freed` of them given back.
+    fn browser_atlas_after(full: u32, freed: u32) -> (wgpu::Device, wgpu::Queue, Atlas) {
+        let limits = AtlasLimits {
+            side: 8192,
+            layers: 256,
+            bytes: 256 << 20,
+        };
+        let (device, queue, mut atlas) = test_atlas((1024, 1024), limits);
+        let placed: Vec<_> = (0..full)
+            .map(|_| {
+                atlas
+                    .place(&device, &queue, 1024, 1024)
+                    .expect("under the cap")
+            })
+            .collect();
+        for &at in &placed[(full - freed) as usize..] {
+            atlas.free(at, 1024);
+        }
+        (device, queue, atlas)
+    }
+
+    #[test]
+    fn grow_taller_drops_empty_layers() {
+        // 41 layers of 1024 x 1024 are 164 MB; 41 of 1024 x 2048 would go
+        // over the 256 MB cap, 32 fit.
+        let (device, queue, mut atlas) = browser_atlas_after(41, 21);
+        assert_eq!((atlas.layers, atlas.layers_in_use()), (41, 20));
+        let tall = atlas.place(&device, &queue, 1024, 1080);
+        assert_eq!(tall, Some([0, 0, 20]));
+        assert_eq!((atlas.size, atlas.layers), ((1024, 2048), 32));
+        assert_eq!(atlas.rows.len(), 32);
+        let below = atlas.place(&device, &queue, 1024, 1024);
+        assert_eq!(below, Some([0, 1024, 0]), "the kept layers gained rows");
+    }
+
+    #[test]
+    fn place_while_growing_stays_in_kept_layers() {
+        let (device, queue, mut atlas) = browser_atlas_after(41, 21);
+        let (size, layers) = ((1024, 2048), 32);
+        atlas.pending_growth = Some(PendingGrowth {
+            texture: atlas_texture(&device, "test", atlas.format, size, layers),
+            size,
+            layers,
+            refusal: Box::pin(std::future::pending()),
+        });
+        let placed: Vec<_> = (0..15)
+            .map_while(|_| atlas.place(&device, &queue, 1024, 1024))
+            .collect();
+        assert_eq!(placed.len(), 12, "layers 20 to 31 are free and kept");
+        atlas
+            .pending_growth
+            .as_mut()
+            .expect("still pending")
+            .refusal = Box::pin(std::future::ready(None));
+        let below = atlas.place(&device, &queue, 1024, 1024);
+        assert_eq!((atlas.size, atlas.layers), (size, layers));
+        assert_eq!(below, Some([0, 1024, 0]), "the grown layers take it");
+        for &at in &placed {
+            assert!(at[2] < layers, "{at:?} is in a dropped layer");
+            atlas.free(at, 1024);
+        }
+    }
+
+    #[test]
+    fn grow_taller_keeps_layers_in_use() {
+        let (device, queue, mut atlas) = browser_atlas_after(41, 0);
+        assert_eq!(atlas.place(&device, &queue, 1024, 1080), None);
+        assert_eq!((atlas.size, atlas.layers), ((1024, 1024), 41));
     }
 
     #[test]
