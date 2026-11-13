@@ -100,25 +100,6 @@ impl FrameSource for Source<'_> {
 /// stream's `budget - 1` new frames a render differs from 1.
 const FETCH_BUDGET: usize = 3;
 
-/// A render of [`check`] under [`FETCH_BUDGET`], and the most earlier frames it may read.
-#[derive(Clone, Copy)]
-enum Budgeted {
-    /// Its earlier frames are kept, in order or once caught up: the budget.
-    Kept,
-    /// After a jump, an edit or missing frames: up to as many again for the frames
-    /// one analysis of the current frame needs ([`FrameSource::fetch_budget`]).
-    CatchingUp,
-}
-
-impl Budgeted {
-    fn read_limit(self) -> usize {
-        match self {
-            Budgeted::Kept => FETCH_BUDGET,
-            Budgeted::CatchingUp => 2 * FETCH_BUDGET,
-        }
-    }
-}
-
 /// The renders a frame held still under a fetch budget of `budget` takes to
 /// match a fresh render after a jump, a change to every earlier frame or to the
 /// parameters, when one render reads `frames`, the current one included.
@@ -137,13 +118,15 @@ pub fn stream_catch_up_renders(frames: usize, budget: usize) -> usize {
 /// How often a frame is rendered again while the effect says it is unfinished.
 const MAX_UNFINISHED_RERENDERS: usize = 8;
 
+/// With a `read_limit`, the render runs under [`FETCH_BUDGET`] and fails when it
+/// reads more earlier frames than the limit.
 fn render(
     effect: &mut dyn CpuEffect,
     clip: &Clip,
     number: i64,
     missing: &[i64],
     values: &ParamValues,
-    budgeted: Option<Budgeted>,
+    read_limit: Option<usize>,
     fixed: bool,
 ) -> Result<Vec<Argb<u8>>, String> {
     let count = (effect.frames_before(values, clip.frame_rate) as i64 + 1).min(number + 1);
@@ -157,7 +140,7 @@ fn render(
             clip,
             first: number - count + 1,
             missing,
-            fetch_budget: budgeted.map(|_| FETCH_BUDGET),
+            fetch_budget: read_limit.map(|_| FETCH_BUDGET),
             fixed,
             earlier: BTreeSet::new(),
             current: count as usize - 1,
@@ -172,14 +155,13 @@ fn render(
             values,
             &ctx,
         );
-        if let Some(budgeted) = budgeted
-            && source.earlier.len() > budgeted.read_limit()
+        if let Some(limit) = read_limit
+            && source.earlier.len() > limit
         {
             return Err(format!(
                 "frame {number}: a render under a fetch budget of {FETCH_BUDGET} read {} \
-                 earlier frames, more than {}",
-                source.earlier.len(),
-                budgeted.read_limit()
+                 earlier frames, more than {limit}",
+                source.earlier.len()
             ));
         }
         if !effect.unfinished() {
@@ -320,20 +302,14 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
         }
     }
 
+    let budget = Some(FETCH_BUDGET);
+    let catch_up = Some(2 * FETCH_BUDGET);
     let all_values = std::iter::once(values).chain(values_after);
     let frames_read = |values: &ParamValues| cpu(make).frames_before(values, clip.frame_rate) + 1;
     for values in all_values.clone() {
         let mut kept = cpu(make);
         for number in 0..n {
-            let got = render(
-                &mut *kept,
-                clip,
-                number,
-                &[],
-                values,
-                Some(Budgeted::Kept),
-                false,
-            )?;
+            let got = render(&mut *kept, clip, number, &[], values, budget, false)?;
             if got != render(&mut *cpu(make), clip, number, &[], values, None, false)? {
                 return Err(format!(
                     "in order under a fetch budget: frame {number} differs from a fresh render"
@@ -350,15 +326,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
         let want = render(&mut *cpu(make), clip, last, missing, values, None, false)?;
         let mut caught_up = false;
         for _ in 0..renders {
-            let matches = render(
-                kept,
-                clip,
-                last,
-                missing,
-                values,
-                Some(Budgeted::CatchingUp),
-                false,
-            )? == want;
+            let matches = render(kept, clip, last, missing, values, catch_up, false)? == want;
             if caught_up && !matches {
                 return Err(format!(
                     "{what}: frame {last} matched a fresh render under a fetch budget, then differed"
@@ -372,16 +340,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
                  under a fetch budget of {FETCH_BUDGET}"
             ));
         }
-        match render(
-            kept,
-            clip,
-            last,
-            missing,
-            values,
-            Some(Budgeted::Kept),
-            false,
-        )? == want
-        {
+        match render(kept, clip, last, missing, values, budget, false)? == want {
             true => Ok(()),
             false => Err(format!(
                 "{what}: frame {last} matched a fresh render under a fetch budget, then differed"
@@ -438,15 +397,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
         let long = clip.cycled(frames + renders + 2);
         let mut kept = cpu(make);
         for (render_index, number) in (jump..long.len()).enumerate() {
-            let got = render(
-                &mut *kept,
-                &long,
-                number,
-                &[],
-                values,
-                Some(Budgeted::CatchingUp),
-                true,
-            )?;
+            let got = render(&mut *kept, &long, number, &[], values, catch_up, true)?;
             let want = render(&mut *cpu(make), &long, number, &[], values, None, false)?;
             if render_index + 1 >= renders && got != want {
                 return Err(format!(

@@ -207,11 +207,9 @@ impl<'a> RenderPlan<'a> {
         }
     }
 
-    /// The frames the analysis of the newest frame this render analyses reads:
-    /// that frame and its background. A render under a fetch budget reads those
-    /// it has nothing kept for first, newest first and up to twice the budget,
-    /// so a render after a jump shows the motion around its own frame.
-    fn own_analysis_inputs(&self) -> BTreeSet<i64> {
+    /// The newest frame this render analyses and the frames of its background
+    /// that analysis reads.
+    fn newest_analysis_inputs(&self) -> BTreeSet<i64> {
         let Some(&frame) = self.to_analyse.range(..=self.number).next_back() else {
             return BTreeSet::new();
         };
@@ -468,8 +466,8 @@ impl IncrementalRenderer {
                         .collect(),
                     false => BTreeSet::new(),
                 };
-                let own: BTreeSet<i64> = plan
-                    .own_analysis_inputs()
+                let inputs: BTreeSet<i64> = plan
+                    .newest_analysis_inputs()
                     .into_iter()
                     .filter(|f| {
                         *f != number && *f >= oldest_held_frame && !self.kept.contains_key(f)
@@ -480,7 +478,7 @@ impl IncrementalRenderer {
                     rebuild,
                     &unverified,
                     &verified,
-                    &own,
+                    &inputs,
                     &ahead,
                     number,
                     budget,
@@ -561,10 +559,8 @@ impl IncrementalRenderer {
             }
         }
         // Frames that use a deferred frame without a grid go stale, and so does
-        // the current frame if its face source is deferred. The current frame's
-        // own frames are read before older ones, so a deferred frame can be
-        // older than frames this render analysed; the stale range after it
-        // covers those too.
+        // the current frame if its face source is deferred. A deferred frame can
+        // be older than frames this render analysed, which its range covers.
         if deferred.contains(&face_source_frame(s, number, plan.first)) {
             self.mark_stale(number..=number);
         }
@@ -1084,32 +1080,30 @@ impl IncrementalRenderer {
         }
     }
 
-    /// The frames a render of `number` reads under a budget of `budget`
-    /// earlier frames: the newest of `own`, up to twice the budget, then
-    /// `ahead`, then the oldest of `rebuild` and `unverified` together, then
-    /// the first of `verified`. The rest of `own` waits in `rebuild`, so the
-    /// analysis that needs it is redone once it is read.
+    /// The frames a render of `number` reads under a budget of `budget` earlier
+    /// frames: the newest of `inputs`, up to twice the budget, then `ahead`, then
+    /// the oldest of `rebuild` and `unverified` together, then the first of `verified`.
     fn budgeted_reads(
         rebuild: BTreeSet<i64>,
         unverified: &BTreeSet<i64>,
         verified: &[i64],
-        own: &BTreeSet<i64>,
+        inputs: &BTreeSet<i64>,
         ahead: &BTreeSet<i64>,
         number: i64,
         budget: usize,
     ) -> BudgetedReads {
-        let own: BTreeSet<i64> = own
+        let inputs: BTreeSet<i64> = inputs
             .iter()
             .rev()
             .take(budget.saturating_mul(2))
             .copied()
             .collect();
-        let budget = budget.max(own.len());
+        let budget = budget.max(inputs.len());
         let rest = rebuild
             .union(unverified)
-            .filter(|f| !ahead.contains(f) && !own.contains(f));
-        let ahead = ahead.iter().filter(|f| !own.contains(f));
-        let mut oldest = own
+            .filter(|f| !ahead.contains(f) && !inputs.contains(f));
+        let ahead = ahead.iter().filter(|f| !inputs.contains(f));
+        let mut oldest = inputs
             .iter()
             .chain(ahead)
             .chain(rest)
@@ -2743,12 +2737,11 @@ mod tests {
         assert!(again.earlier.len() <= 2, "read {}", again.earlier.len());
     }
 
-    /// A seek at 4K in Resolve: a budget of 8 earlier float frames under a
-    /// background of 16. The first render reads its own frame's background past
-    /// the budget and analyses that frame, since Resolve may not render a still
-    /// frame again.
+    /// A budget of 8 under a background of 16, as a 4K seek in Resolve: the first
+    /// render reads the whole background and analyses its frame, since Resolve
+    /// may not render a still frame again.
     #[test]
-    fn budget_seek_analyses_its_own_frame() {
+    fn budget_seek_analyses_current_frame() {
         let s = RenderSettings {
             background_frames: 16,
             trail_frames: 12,
@@ -2775,12 +2768,10 @@ mod tests {
         );
     }
 
-    /// A background more than twice the budget, as Background 64 at 4K: the
-    /// seek reads the newest 8 of its 16 background frames, keeps the partial
-    /// analysis as stale, and catches up to a fresh render once it has read
-    /// the rest.
+    /// A background over twice the budget, as Background 64 at 4K: the seek keeps
+    /// a stale analysis of its newest frames and catches up once it reads the rest.
     #[test]
-    fn budget_seek_redoes_a_partial_analysis() {
+    fn budget_seek_redoes_partial_analysis() {
         let s = RenderSettings {
             background_frames: 16,
             trail_frames: 12,
