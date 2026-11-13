@@ -426,11 +426,15 @@ impl Atlas {
             if let Some(e) = refusal {
                 grown.texture.destroy();
                 // Half the step next. Under an eighth of the atlas it isn't
-                // worth a copy. Below what was asked, so a refused request
-                // with fewer layers isn't asked again.
+                // worth a copy. A refusal of no more than the atlas holds
+                // stops growth until the retry, rather than a refused
+                // texture per layer fewer.
                 let step = asked.saturating_sub(held) / 2;
-                let next = held + if step < held / 8 { 0 } else { step };
-                self.ceiling = next.min(asked - 1);
+                self.ceiling = if asked <= held {
+                    0
+                } else {
+                    held + if step < held / 8 { 0 } else { step }
+                };
                 self.last_refusal = Some(Instant::now());
                 if asked < self.smallest_logged_refusal {
                     self.smallest_logged_refusal = asked;
@@ -2762,6 +2766,37 @@ mod tests {
             assert!(at[2] < layers, "{at:?} is in a dropped layer");
             atlas.free(at, 1024);
         }
+    }
+
+    #[test]
+    fn grow_refused_below_held_stops_after_one_try() {
+        // Taller than the device's 8192 texels, so wgpu refuses the texture.
+        let limits = AtlasLimits {
+            side: 16384,
+            layers: 256,
+            bytes: 256 << 20,
+        };
+        let (device, queue, mut atlas) = test_atlas((1024, 8192), limits);
+        let placed: Vec<_> = (0..8)
+            .map(|_| {
+                atlas
+                    .place(&device, &queue, 1024, 8192)
+                    .expect("8 layers fit")
+            })
+            .collect();
+        for at in placed {
+            atlas.free(at, 1024);
+        }
+        assert_eq!(atlas.layers, 8);
+        assert_eq!(atlas.place(&device, &queue, 1024, 16000), None);
+        let four_layers = atlas.bytes((1024, 16000), 4);
+        assert_eq!(
+            atlas.smallest_logged_refusal, four_layers,
+            "refused once at 4 layers, not again at 3 or 2"
+        );
+        assert_eq!(atlas.place(&device, &queue, 1024, 16000), None);
+        assert_eq!(atlas.smallest_logged_refusal, four_layers);
+        assert_eq!(atlas.layers, 8);
     }
 
     #[test]
