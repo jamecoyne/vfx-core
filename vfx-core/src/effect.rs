@@ -209,8 +209,8 @@ pub struct Report {
     pub readings: Vec<Reading>,
     /// The last time the GPU failed a render, why; the render was drawn another way.
     pub gpu_fault: Option<String>,
-    /// Whether it ran out of GPU memory for what it keeps, and draws less to keep its rate.
-    pub out_of_gpu_memory: bool,
+    /// Whether its tile atlas is full, so it leaves out its oldest windows.
+    pub atlas_full: bool,
 }
 
 /// A named number an effect found ([`Report::readings`]).
