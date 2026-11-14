@@ -14,5 +14,5 @@ fn last_instance_drop_frees_removed_adapter() {
     common::remove(&gpu);
     Gpu::unshare();
     drop(gpu);
-    common::assert_offered_again(&name);
+    common::assert_adapter_offered(&name);
 }

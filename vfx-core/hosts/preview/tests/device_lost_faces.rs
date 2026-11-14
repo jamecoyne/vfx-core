@@ -15,5 +15,5 @@ fn device_lost_frees_removed_adapter() {
     effect.device_lost();
     Gpu::unshare();
     drop(gpu);
-    common::assert_offered_again(&name);
+    common::assert_adapter_offered(&name);
 }

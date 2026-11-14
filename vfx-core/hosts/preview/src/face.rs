@@ -1,9 +1,7 @@
 //! Face tracking for expressions: the most confident face's box, eyes, nose and mouth,
 //! as positions from 0 to 1 across the frame (origin top left, like the vignette
-//! centre).
-//!
-//! OpenCV's YuNet (MIT licence): a face box and five points, no mesh, so no mouth-open or blink.
-//! macOS runs it here on the CPU through ONNX Runtime; elsewhere it is segcam-face's.
+//! centre), from OpenCV's YuNet: a box and five points, no mesh. macOS runs it
+//! here through ONNX Runtime; elsewhere it is segcam-face's.
 
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
@@ -31,6 +29,17 @@ const MODEL_INPUT_SIDE: usize = 640;
 #[cfg(target_os = "macos")]
 const MIN_SCORE: f32 = 0.6;
 
+/// Why a face tracker did not start.
+#[derive(Debug, thiserror::Error)]
+pub enum TrackerError {
+    #[cfg(any(target_os = "macos", feature = "tracker"))]
+    #[error("couldn't load the face model: {0}")]
+    Model(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[cfg(not(any(target_os = "macos", feature = "tracker")))]
+    #[error("this build has no face tracker")]
+    Unavailable,
+}
+
 /// Without a tracker, faces come only from effects' reports.
 pub const HAS_TRACKER: bool = cfg!(any(target_os = "macos", feature = "tracker"));
 
@@ -47,9 +56,9 @@ pub struct Detector {
 #[cfg(all(not(target_os = "macos"), feature = "tracker"))]
 impl Detector {
     /// On the CPU, so no D3D12 device is made on the caller's thread.
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, TrackerError> {
         let yunet = OrtYuNet::new(YUNET_MODEL, Device::Cpu)
-            .map_err(|e| format!("couldn't load the face model: {e}"))?;
+            .map_err(|err| TrackerError::Model(err.into()))?;
         Ok(Self {
             yunet: Some(yunet),
             device: Device::Cpu,
@@ -124,8 +133,8 @@ pub struct Detector;
 
 #[cfg(not(any(target_os = "macos", feature = "tracker")))]
 impl Detector {
-    pub fn new() -> Result<Self, String> {
-        Err("this build has no face tracker".to_owned())
+    pub fn new() -> Result<Self, TrackerError> {
+        Err(TrackerError::Unavailable)
     }
 
     pub fn detect(&mut self, _pixels: &[Argb<u8>], _size: (u32, u32)) -> Option<FaceValues> {
@@ -145,16 +154,15 @@ pub struct Detector {
 
 #[cfg(target_os = "macos")]
 impl Detector {
-    pub fn new() -> Result<Self, String> {
-        let err = |e: ort::Error| format!("couldn't load the face model: {e}");
+    pub fn new() -> Result<Self, TrackerError> {
         let env = ENVIRONMENT
-            .get_or_init(|| ort::init().build().map_err(err))
+            .get_or_init(|| ort::init().build().map_err(|err| err.to_string()))
             .as_ref()
-            .map_err(Clone::clone)?;
+            .map_err(|err| TrackerError::Model(err.clone().into()))?;
         let session = Session::builder(env)
-            .map_err(err)?
+            .map_err(|err| TrackerError::Model(err.into()))?
             .commit_from_memory(MODEL)
-            .map_err(err)?;
+            .map_err(|err| TrackerError::Model(err.into()))?;
         Ok(Self {
             session,
             input: vec![0.0; 3 * MODEL_INPUT_SIDE * MODEL_INPUT_SIDE],
@@ -264,7 +272,7 @@ struct TrackerState {
 }
 
 impl Tracker {
-    pub fn start() -> Result<Self, String> {
+    pub fn start() -> Result<Self, TrackerError> {
         let mut detector = Detector::new()?;
         let shared = Arc::new((
             Mutex::new(TrackerState {
@@ -354,7 +362,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_face_in_a_flat_frame() {
+    fn detect_flat_frame_finds_none() {
         let grey = Argb {
             alpha: 255,
             red: 128,
@@ -408,8 +416,8 @@ mod tests {
 
     /// Finds the face in a photo given by FACE_TEST_IMAGE (one clear face).
     #[test]
-    #[ignore]
-    fn finds_a_face_in_a_photo() {
+    #[ignore = "needs FACE_TEST_IMAGE, a photo of one clear face"]
+    fn detect_photo_finds_face() {
         let path = std::env::var("FACE_TEST_IMAGE").expect("set FACE_TEST_IMAGE");
         let img = image::open(path).unwrap().to_rgba8();
         let size = img.dimensions();

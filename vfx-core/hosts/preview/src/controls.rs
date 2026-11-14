@@ -557,8 +557,7 @@ fn effect_box(
         });
     });
 
-    // Capped in height, so a long parameter list scrolls instead of pushing the rest of the
-    // panel off screen.
+    // Capped in height, so a long parameter list scrolls and the panel stays on screen.
     egui::ScrollArea::vertical()
         .max_height(360.0)
         .auto_shrink([false, true])
@@ -679,14 +678,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn final_length_is_the_nearest_second() {
+    fn final_recording_length_rounds_to_second() {
         let text = |millis| final_recording_length(Duration::from_millis(millis));
         assert_eq!(text(6200), "0:06");
         assert_eq!(text(6900), "0:07");
     }
 
     #[test]
-    fn recording_length_reads_as_a_clock() {
+    fn recording_length_formats_clock() {
         let text = |seconds| recording_length(Duration::from_secs(seconds));
         assert_eq!(text(0), "0:00");
         assert_eq!(text(9), "0:09");
@@ -697,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_reach_the_shown_effects_parameters() {
+    fn key_actions_change_shown_effect_params() {
         let mut c = Controls {
             effect: catalog::find("segcam").unwrap(),
             ..Controls::default()
@@ -724,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_turns_mirror_on_and_file_turns_it_off() {
+    fn mirror_for_source_follows_camera() {
         let mut c = Controls::default();
         let segcam = &c.params[catalog::find("segcam").unwrap()];
         assert!(!segcam.bool("mirror"));
@@ -736,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn every_effect_has_its_own_values() {
+    fn params_kept_per_effect() {
         let mut c = Controls::default();
         assert_eq!(c.params.len(), catalog::entries().len());
         c.effect = catalog::find("Vignette").unwrap();

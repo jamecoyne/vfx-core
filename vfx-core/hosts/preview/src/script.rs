@@ -108,7 +108,44 @@ impl Options {
     }
 }
 
-pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String> {
+/// A flag or flag value the run cannot use; the text is shown with the usage.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ScriptError {
+    #[error("{0} needs a value")]
+    MissingValue(String),
+    #[error("--param {0}: expected NAME=VALUE")]
+    ParamPair(String),
+    #[error("--frames {0}: not a count")]
+    FrameCount(String),
+    #[error("--seconds {0}: not a number")]
+    SecondsNotNumber(String),
+    #[error("--seconds {0}: must be above 0")]
+    SecondsNotPositive(String),
+    #[error("--lose-gpu {0}: destroy or removed")]
+    LossKind(String),
+    #[error("--lose-gpu {0}: not a number of seconds")]
+    LossSeconds(String),
+    #[error("unknown flag {0}")]
+    UnknownFlag(String),
+    #[error("--size {0}: expected WxH, as 1920x1080")]
+    Size(String),
+    #[error("no pattern called {wanted}; there are {available}")]
+    NoPattern { wanted: String, available: String },
+    #[error("no webcams found")]
+    NoWebcams,
+    #[error("no webcam {wanted}; there are {available}")]
+    NoWebcam { wanted: String, available: String },
+    #[error("--param {name}={text}: {expected}")]
+    ParamValue {
+        name: &'static str,
+        text: String,
+        expected: String,
+    },
+    #[error("--mode {0}: the effect has no mode by that name")]
+    NoMode(String),
+}
+
+pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, ScriptError> {
     let mut options = Options::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -116,7 +153,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String
         let mut value = || {
             args.next()
                 .map(|a| a.to_string_lossy().into_owned())
-                .ok_or_else(|| format!("{flag} needs a value"))
+                .ok_or_else(|| ScriptError::MissingValue(flag.clone()))
         };
         match flag.as_str() {
             "--effect" => options.effect = Some(value()?),
@@ -125,7 +162,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String
                 let pair = value()?;
                 let (name, v) = pair
                     .split_once('=')
-                    .ok_or_else(|| format!("--param {pair}: expected NAME=VALUE"))?;
+                    .ok_or_else(|| ScriptError::ParamPair(pair.clone()))?;
                 options
                     .params
                     .push((name.trim().to_owned(), v.trim().to_owned()));
@@ -137,18 +174,16 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String
             "--stats" => options.stats = true,
             "--frames" => {
                 let v = value()?;
-                let n = v
-                    .parse()
-                    .map_err(|_| format!("--frames {v}: not a count"))?;
+                let n = v.parse().map_err(|_| ScriptError::FrameCount(v.clone()))?;
                 options.stop = Some(StopAfter::Frames(n));
             }
             "--seconds" => {
                 let v = value()?;
                 let s: f64 = v
                     .parse()
-                    .map_err(|_| format!("--seconds {v}: not a number"))?;
+                    .map_err(|_| ScriptError::SecondsNotNumber(v.clone()))?;
                 if !s.is_finite() || s <= 0.0 {
-                    return Err(format!("--seconds {v}: must be above 0"));
+                    return Err(ScriptError::SecondsNotPositive(v));
                 }
                 options.stop = Some(StopAfter::Seconds(s));
             }
@@ -160,18 +195,18 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String
                 let kind = match kind {
                     "destroy" => LossKind::Destroy,
                     "removed" => LossKind::Removed,
-                    _ => return Err(format!("--lose-gpu {v}: destroy or removed")),
+                    _ => return Err(ScriptError::LossKind(v)),
                 };
                 options.forced_losses.push(ForcedLoss {
                     after_seconds: seconds
                         .parse()
-                        .map_err(|_| format!("--lose-gpu {v}: not a number of seconds"))?,
+                        .map_err(|_| ScriptError::LossSeconds(v.clone()))?,
                     kind,
                 });
             }
             "--list" => options.list = true,
             "--help" | "-h" => options.help = true,
-            _ if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
+            _ if flag.starts_with("--") => return Err(ScriptError::UnknownFlag(flag)),
             _ => options.input = Some(Source::File(arg.into())),
         }
     }
@@ -188,13 +223,13 @@ fn parse_source(text: &str) -> Source {
     }
 }
 
-fn parse_size(text: &str) -> Result<(u32, u32), String> {
+fn parse_size(text: &str) -> Result<(u32, u32), ScriptError> {
     let parsed = text
         .split_once(['x', 'X'])
         .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)));
     match parsed {
         Some((w, h)) if w > 0 && h > 0 => Ok((w, h)),
-        _ => Err(format!("--size {text}: expected WxH, as 1920x1080")),
+        _ => Err(ScriptError::Size(text.to_owned())),
     }
 }
 
@@ -207,20 +242,18 @@ pub fn index_by_name(names: &[&str], wanted: &str) -> Option<usize> {
     names.iter().position(|n| catalog::slug(n) == wanted)
 }
 
-pub fn pattern_index(wanted: &str) -> Result<usize, String> {
+pub fn pattern_index(wanted: &str) -> Result<usize, ScriptError> {
     if wanted.is_empty() {
         return Ok(0);
     }
-    index_by_name(PATTERNS, wanted).ok_or_else(|| {
-        format!(
-            "no pattern called {wanted}; there are {}",
-            PATTERNS.join(", ")
-        )
+    index_by_name(PATTERNS, wanted).ok_or_else(|| ScriptError::NoPattern {
+        wanted: wanted.to_owned(),
+        available: PATTERNS.join(", "),
     })
 }
 
 /// The webcam `wanted` names: part of its name, its index, or the first.
-pub fn camera_name(cameras: &[String], wanted: &str) -> Result<String, String> {
+pub fn camera_name(cameras: &[String], wanted: &str) -> Result<String, ScriptError> {
     let found = if wanted.is_empty() {
         cameras.first()
     } else if let Ok(i) = wanted.parse::<usize>() {
@@ -230,14 +263,21 @@ pub fn camera_name(cameras: &[String], wanted: &str) -> Result<String, String> {
         cameras.iter().find(|c| c.to_lowercase().contains(&wanted))
     };
     found.cloned().ok_or_else(|| match cameras.len() {
-        0 => "no webcams found".to_owned(),
-        _ => format!("no webcam {wanted}; there are {}", cameras.join(", ")),
+        0 => ScriptError::NoWebcams,
+        _ => ScriptError::NoWebcam {
+            wanted: wanted.to_owned(),
+            available: cameras.join(", "),
+        },
     })
 }
 
 /// `text` as a value for `spec`.
-pub fn parse_value(spec: &ParamSpec, text: &str) -> Result<ParamValue, String> {
-    let bad = || format!("--param {}={text}: {}", spec.name, expected_value(spec));
+pub fn parse_value(spec: &ParamSpec, text: &str) -> Result<ParamValue, ScriptError> {
+    let bad = || ScriptError::ParamValue {
+        name: spec.name,
+        text: text.to_owned(),
+        expected: expected_value(spec),
+    };
     let numbers =
         || -> Option<Vec<f32>> { text.split(',').map(|n| n.trim().parse().ok()).collect() };
     match spec.kind {
@@ -277,7 +317,10 @@ fn expected_value(spec: &ParamSpec) -> String {
 }
 
 /// The effect's menu parameter that has an option called `mode`, and that option's value.
-pub fn mode_param(specs: &[ParamSpec], mode: &str) -> Result<(&'static str, ParamValue), String> {
+pub fn mode_param(
+    specs: &[ParamSpec],
+    mode: &str,
+) -> Result<(&'static str, ParamValue), ScriptError> {
     specs
         .iter()
         .find_map(|s| match s.kind {
@@ -286,7 +329,7 @@ pub fn mode_param(specs: &[ParamSpec], mode: &str) -> Result<(&'static str, Para
             }
             _ => None,
         })
-        .ok_or_else(|| format!("--mode {mode}: the effect has no mode by that name"))
+        .ok_or_else(|| ScriptError::NoMode(mode.to_owned()))
 }
 
 /// Every effect and its parameters, for `--list`.
@@ -444,12 +487,12 @@ fn stats_line(elapsed: f64, span: f64, worst: Duration, s: &Snapshot, delta: Cou
 mod tests {
     use super::*;
 
-    fn args(text: &[&str]) -> Result<Options, String> {
+    fn args(text: &[&str]) -> Result<Options, ScriptError> {
         parse(text.iter().map(OsString::from))
     }
 
     #[test]
-    fn effect_and_file_args_are_not_scripted() {
+    fn parse_file_and_effect_unscripted() {
         let o = args(&["--effect", "segcam", "clip.mp4"]).unwrap();
         assert_eq!(o.effect.as_deref(), Some("segcam"));
         assert_eq!(o.input, Some(Source::File("clip.mp4".into())));
@@ -458,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn all_flags_parse_into_options() {
+    fn parse_all_flags() {
         let o = args(&[
             "--mode",
             "Swarm",
@@ -525,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn param_values_parse_by_their_kind() {
+    fn parse_value_per_kind() {
         let menu = ParamSpec::choice("output", &["Overlay", "Motion matte", "Swarm"], 0);
         assert_eq!(parse_value(&menu, "motion-matte"), Ok(ParamValue::Int(1)));
         assert_eq!(parse_value(&menu, "Motion matte"), Ok(ParamValue::Int(1)));
@@ -543,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_resolves_to_the_menu_holding_it() {
+    fn mode_param_finds_owning_menu() {
         let specs = [
             ParamSpec::float("sensitivity", 0.0, 1.0, 0.5),
             ParamSpec::choice("output", &["Overlay", "Motion matte", "Swarm"], 0),
@@ -581,7 +624,7 @@ mod tests {
 
     /// The keys name what they count; the render times are there for a CPU effect only.
     #[test]
-    fn stats_line_keys_and_render_times() {
+    fn stats_line_lists_keys_and_render_times() {
         let s = Snapshot {
             shown: ShownEffect {
                 effect: "segcam",
@@ -631,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn patterns_and_cameras_resolve_by_name_or_index() {
+    fn pattern_and_camera_by_name_or_index() {
         assert_eq!(pattern_index(""), Ok(0));
         assert_eq!(pattern_index("colour-bars"), Ok(1));
         assert!(pattern_index("stripes").is_err());

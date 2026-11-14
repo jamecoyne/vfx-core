@@ -31,6 +31,7 @@ egui = { version = "0.37.0", features = ["default_fonts"] }
 egui-wgpu = { version = "0.37.0", default-features = false }
 egui-winit = { version = "0.37.0", default-features = false }
 bytemuck = "1.25.2"
+thiserror = "2.0.21"
 # std::time::Instant panics in browsers; web-time is the same type on native.
 web-time = "1.1.0"
 

@@ -163,13 +163,33 @@ struct Preview {
 #[cfg(windows)]
 const SENDER_LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Why a GPU device could not be opened.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DeviceError {
+    #[error("couldn't create a surface: {0}")]
+    Surface(#[source] wgpu::CreateSurfaceError),
+    #[error("--gpu {name}: none found; there are {available}")]
+    NoNamedAdapter { name: String, available: String },
+    #[error("no GPU adapter: {0}")]
+    NoAdapter(#[source] wgpu::RequestAdapterError),
+    #[error("couldn't open the GPU: {0}")]
+    Request(#[source] wgpu::RequestDeviceError),
+    /// After a reset the only adapter left can be a software one, which would stay on.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[error("{0} draws in software")]
+    Software(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    #[error("opening the device panicked")]
+    Panicked,
+}
+
 /// The adapter `--gpu` names: `high` or nothing for the high performance one, `low` for the low
 /// power one, anything else the first that can show the window and has that in its name.
 async fn pick_adapter(
     instance: &wgpu::Instance,
     surface: &wgpu::Surface<'_>,
     choice: Option<&str>,
-) -> Result<wgpu::Adapter, String> {
+) -> Result<wgpu::Adapter, DeviceError> {
     let power_preference = match choice {
         None | Some("high") => wgpu::PowerPreference::HighPerformance,
         Some("low") => wgpu::PowerPreference::LowPower,
@@ -183,8 +203,9 @@ async fn pick_adapter(
                     a.get_info().name.to_lowercase().contains(&wanted)
                         && a.is_surface_supported(surface)
                 })
-                .ok_or_else(|| {
-                    format!("--gpu {name}: none found; there are {}", names.join(", "))
+                .ok_or_else(|| DeviceError::NoNamedAdapter {
+                    name: name.to_owned(),
+                    available: names.join(", "),
                 });
         }
     };
@@ -196,7 +217,7 @@ async fn pick_adapter(
             apply_limit_buckets: false,
         })
         .await
-        .map_err(|e| format!("no GPU adapter: {e}"))
+        .map_err(DeviceError::NoAdapter)
 }
 
 /// The adapter `choice` names and a device on it, with what effects need of it.
@@ -204,7 +225,7 @@ async fn open_device(
     instance: &wgpu::Instance,
     surface: &wgpu::Surface<'_>,
     choice: Option<&str>,
-) -> Result<(wgpu::Adapter, Gpu), String> {
+) -> Result<(wgpu::Adapter, Gpu), DeviceError> {
     let adapter = pick_adapter(instance, surface, choice).await?;
     // Effects read a whole canvas back in one buffer, as large as the adapter
     // allows; a canvas over it faults and draws on the CPU.
@@ -235,7 +256,7 @@ async fn open_device(
             ..wgpu::DeviceDescriptor::default()
         })
         .await
-        .map_err(|e| format!("couldn't open the GPU: {e}"))?;
+        .map_err(DeviceError::Request)?;
     Ok((adapter, Gpu::from_parts(device, queue)))
 }
 
@@ -320,7 +341,7 @@ struct Scrub {
 #[cfg(not(target_arch = "wasm32"))]
 impl Media {
     /// Seeks, playing on or paused there, with the sound following along.
-    fn seek(&mut self, position: f64, play: bool, sound_on: bool) -> Result<(), String> {
+    fn seek(&mut self, position: f64, play: bool, sound_on: bool) -> Result<(), video::VideoError> {
         self.sound = None;
         self.video.seek(position, play)?;
         if play && sound_on {
@@ -330,7 +351,7 @@ impl Media {
     }
 
     /// Plays again from the start at the end.
-    fn loop_at_end(&mut self, sound_on: bool) -> Result<(), String> {
+    fn loop_at_end(&mut self, sound_on: bool) -> Result<(), video::VideoError> {
         if self.video.ended() {
             self.seek(0.0, true, sound_on)?;
         }
@@ -357,7 +378,7 @@ impl Preview {
         #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))] mut instance: wgpu::Instance,
         gpu_choice: Option<String>,
         #[cfg(not(target_arch = "wasm32"))] display: winit::event_loop::OwnedDisplayHandle,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DeviceError> {
         // Before the first wait on the GPU, so a drop while it opens is kept for the first frame.
         #[cfg(target_arch = "wasm32")]
         let web_pending = web_media::Pending::default();
@@ -373,7 +394,7 @@ impl Preview {
         }
         let surface = instance
             .create_surface(window.clone())
-            .map_err(|e| format!("couldn't create a surface: {e}"))?;
+            .map_err(DeviceError::Surface)?;
         let (adapter, gpu) = open_device(&instance, &surface, gpu_choice.as_deref()).await?;
         #[cfg(not(target_arch = "wasm32"))]
         eprintln!(
@@ -513,7 +534,7 @@ impl Preview {
         }
         let loaded = match size {
             None => self.effects.load_image(&self.gpu, path),
-            Some(size) => image::open(path).map_err(|e| e.to_string()).map(|img| {
+            Some(size) => image::open(path).map(|img| {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 self.effects
                     .start_stream(&self.gpu, name.into_owned(), size, None);
@@ -764,7 +785,7 @@ impl Preview {
         };
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(media) = &mut self.media {
-            // Dragging the slider: show the frame under it, at most every 60 ms.
+            // Dragging the slider shows the frame under it, with seeks rate limited.
             if let Some(scrub) = &mut media.scrub
                 && let Some(position) = scrub.pending
                 && scrub.last_seek.elapsed().as_millis() >= 60
@@ -773,11 +794,11 @@ impl Preview {
                 scrub.last_seek = Instant::now();
                 media.sound = None;
                 if let Err(e) = media.video.seek(position, false) {
-                    self.message = Some(e);
+                    self.message = Some(e.to_string());
                 }
             }
             if let Err(e) = media.loop_at_end(self.sound_on) {
-                self.message = Some(e);
+                self.message = Some(e.to_string());
             }
 
             self.counts.arrived += media.video.take_arrived_count();
@@ -855,7 +876,7 @@ impl Preview {
             return;
         };
         let result = if self.effects.size() != recording.size {
-            Err("the frame size changed".to_string())
+            Err(video::VideoError::FrameSizeChanged)
         } else {
             match self.effects.output(&self.gpu) {
                 Output::Cpu([]) => Ok(()), // no picture yet
@@ -864,7 +885,7 @@ impl Preview {
             }
         };
         if let Err(e) = result {
-            self.stop_recording_early(&e);
+            self.stop_recording_early(&e.to_string());
         }
     }
 
@@ -993,7 +1014,7 @@ impl Preview {
             if on {
                 match face::Tracker::start() {
                     Ok(tracker) => self.tracker = Some(tracker),
-                    Err(e) => self.message = Some(e),
+                    Err(e) => self.message = Some(e.to_string()),
                 }
             }
         }
@@ -1028,7 +1049,7 @@ impl Preview {
                 .take()
                 .map_or_else(|| media.video.playing(), |s| s.resume);
             if let Err(e) = media.seek(position, resume, self.sound_on) {
-                self.message = Some(e);
+                self.message = Some(e.to_string());
             }
         }
     }
@@ -1059,7 +1080,7 @@ impl Preview {
         {
             let (position, play) = (media.video.position(), !media.video.playing());
             if let Err(e) = media.seek(position, play, self.sound_on) {
-                self.message = Some(e);
+                self.message = Some(e.to_string());
             }
         }
     }
@@ -1454,7 +1475,7 @@ fn show_output(
 /// Sent when the (async, on the web) GPU setup finishes.
 enum GpuSetup {
     Preview(Box<Preview>),
-    Failed(String),
+    Failed(DeviceError),
 }
 
 struct App {
@@ -1584,7 +1605,7 @@ impl ApplicationHandler<GpuSetup> for App {
             event_loop.owned_display_handle(),
         );
         let proxy = self.proxy.clone();
-        let finish = move |result: Result<Preview, String>| {
+        let finish = move |result: Result<Preview, DeviceError>| {
             let _ = proxy.send_event(match result {
                 Ok(preview) => GpuSetup::Preview(Box::new(preview)),
                 Err(e) => GpuSetup::Failed(e),
@@ -1610,7 +1631,7 @@ impl ApplicationHandler<GpuSetup> for App {
                 // The other flags; `vfx-preview clip.mp4` (or "Open with") starts with that file.
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Err(e) = preview.apply_start_options(&start) {
-                    self.failed = Some(e);
+                    self.failed = Some(e.to_string());
                     event_loop.exit();
                     return;
                 }
@@ -1624,7 +1645,7 @@ impl ApplicationHandler<GpuSetup> for App {
             }
             #[cfg(not(target_arch = "wasm32"))]
             GpuSetup::Failed(e) => {
-                self.failed = Some(e);
+                self.failed = Some(e.to_string());
                 event_loop.exit();
             }
             #[cfg(target_arch = "wasm32")]
@@ -1830,22 +1851,57 @@ fn fit_still(image: &image::RgbaImage, size: (u32, u32)) -> Vec<f32> {
     canvas.as_raw().iter().map(|&b| b as f32 / 255.0).collect()
 }
 
+/// A command line flag the run cannot apply; the text is the one error printed.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, thiserror::Error)]
+enum StartError {
+    /// The panel's message when the input failed to open.
+    #[error("{0}")]
+    Status(String),
+    #[error("--size {}x{}: this GPU's limit is {limit}", size.0, size.1)]
+    SizeLimit { size: (u32, u32), limit: u32 },
+    #[error("--param {0}: no such parameter; --list shows them")]
+    NoParam(String),
+    #[error("{name}: {source}")]
+    Param {
+        name: String,
+        source: vfx_core::ParamError,
+    },
+    #[cfg(not(windows))]
+    #[error("Spout input is Windows only")]
+    SpoutUnsupported,
+    #[error(transparent)]
+    Script(#[from] script::ScriptError),
+    #[error(transparent)]
+    Tracker(#[from] face::TrackerError),
+    #[cfg(windows)]
+    #[error(transparent)]
+    Spout(#[from] spout::SenderNotFound),
+}
+
+/// Why a layer source did not open.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, thiserror::Error)]
+enum LayerError {
+    #[error(transparent)]
+    Image(#[from] image::ImageError),
+    #[error(transparent)]
+    Video(#[from] video::VideoError),
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl Preview {
     /// Applies the command line's flags beyond `--effect`. Mistakes in a scripted run are
     /// errors; otherwise they show in the panel.
-    fn apply_start_options(&mut self, start: &script::Options) -> Result<(), String> {
+    fn apply_start_options(&mut self, start: &script::Options) -> Result<(), StartError> {
         let scripted = start.scripted();
         if scripted && let Some(message) = self.message.take() {
-            return Err(message);
+            return Err(StartError::Status(message));
         }
         if let Some(size) = start.size {
             let limit = self.gpu.device.limits().max_texture_dimension_2d;
             if size.0 > limit || size.1 > limit {
-                return Err(format!(
-                    "--size {}x{}: this GPU's limit is {limit}",
-                    size.0, size.1
-                ));
+                return Err(StartError::SizeLimit { size, limit });
             }
             self.effects.set_pattern_size(&self.gpu, size);
             self.refresh_display_texture();
@@ -1879,10 +1935,10 @@ impl Preview {
                 self.open_spout(sender);
             }
             #[cfg(not(windows))]
-            Some(script::Source::Spout(_)) => return Err("Spout input is Windows only".into()),
+            Some(script::Source::Spout(_)) => return Err(StartError::SpoutUnsupported),
         }
         if scripted && let Some(message) = self.message.take() {
-            return Err(message);
+            return Err(StartError::Status(message));
         }
         if let Some(mode) = &start.mode {
             let (name, value) = script::mode_param(self.controls.specs(), mode)?;
@@ -1895,7 +1951,7 @@ impl Preview {
                 .iter()
                 .find(|s| s.name == name)
                 .copied()
-                .ok_or_else(|| format!("--param {name}: no such parameter; --list shows them"))?;
+                .ok_or_else(|| StartError::NoParam(name.clone()))?;
             self.set_param(name, script::parse_value(&spec, text)?)?;
         }
         if start.detect_faces {
@@ -1907,7 +1963,7 @@ impl Preview {
         if let Some(path) = &start.record {
             self.start_recording(path.clone(), true);
             if let Some(message) = self.message.take() {
-                return Err(message);
+                return Err(StartError::Status(message));
             }
         }
         self.quiet = start.quiet;
@@ -1918,11 +1974,14 @@ impl Preview {
         Ok(())
     }
 
-    fn set_param(&mut self, name: &str, value: vfx_core::ParamValue) -> Result<(), String> {
+    fn set_param(&mut self, name: &str, value: vfx_core::ParamValue) -> Result<(), StartError> {
         let effect = self.controls.effect;
         self.controls.params[effect]
             .set(name, value)
-            .map_err(|e| format!("{name}: {e}"))
+            .map_err(|source| StartError::Param {
+                name: name.to_owned(),
+                source,
+            })
     }
 
     fn count_frame(&mut self, stats: &stats::Snapshot) {
@@ -1950,10 +2009,11 @@ impl Preview {
                     image: img.to_rgba8(),
                     fed: None,
                 })
-                .map_err(|e| e.to_string())
+                .map_err(LayerError::from)
         } else {
             video::Video::open_fitted(video::Input::File(path.to_path_buf()), self.effects.size())
                 .map(Layer::Video)
+                .map_err(LayerError::from)
         };
         self.set_layer(layer, name);
     }
@@ -1961,11 +2021,13 @@ impl Preview {
     /// Feeds the layer from a webcam.
     fn open_layer_camera(&mut self, camera: String) {
         let input = video::Input::Camera(camera.clone(), None);
-        let layer = video::Video::open_fitted(input, self.effects.size()).map(Layer::Video);
+        let layer = video::Video::open_fitted(input, self.effects.size())
+            .map(Layer::Video)
+            .map_err(LayerError::from);
         self.set_layer(layer, format!("Webcam: {camera}"));
     }
 
-    fn set_layer(&mut self, layer: Result<Layer, String>, name: String) {
+    fn set_layer(&mut self, layer: Result<Layer, LayerError>, name: String) {
         match layer {
             Ok(layer) => {
                 self.layer = layer;
@@ -1992,7 +2054,7 @@ impl Preview {
             match video::Video::open_fitted(input, size) {
                 Ok(video) => self.layer = Layer::Video(video),
                 Err(e) => {
-                    self.message = Some(e);
+                    self.message = Some(e.to_string());
                     self.clear_layer();
                 }
             }
@@ -2003,7 +2065,7 @@ impl Preview {
                 if video.ended()
                     && let Err(e) = video.seek(0.0, true)
                 {
-                    self.message = Some(e);
+                    self.message = Some(e.to_string());
                 }
                 self.effects.take_layer_frame(&self.gpu, video);
             }
@@ -2065,7 +2127,7 @@ struct Outage {
     next_try: Instant,
     /// The try under way, on its own thread: a driver coming back from a reset can take seconds to
     /// answer, and the window's events go on meanwhile.
-    opening: Option<std::sync::mpsc::Receiver<Result<OpenedDevice, String>>>,
+    opening: Option<std::sync::mpsc::Receiver<Result<OpenedDevice, DeviceError>>>,
     /// The effects' state in RAM, for the next device.
     released: Option<effects::Released>,
     /// Whether the face tracker ran, to start it again on the next device.
@@ -2099,18 +2161,33 @@ fn d3d12_device_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
     Some(segcam_face::d3d12_device_lock())
 }
 
-#[cfg(not(all(
-    not(any(target_os = "macos", target_arch = "wasm32")),
-    feature = "tracker"
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(not(target_os = "macos"), feature = "tracker")
 )))]
 fn d3d12_device_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
     None
 }
 
+/// Why `--lose-gpu removed` could not remove the device.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RemoveDeviceError {
+    #[cfg(windows)]
+    #[error("--lose-gpu removed: not on D3D12; WGPU_BACKEND=dx12 asks for it")]
+    NotD3d12,
+    #[cfg(windows)]
+    #[error(transparent)]
+    Cast(windows::core::Error),
+    #[cfg(not(windows))]
+    #[error("--lose-gpu removed: D3D12 only")]
+    Unsupported,
+}
+
 /// Removes this device, and every other D3D12 user's of the adapter in this process, as a driver
 /// reset would. It touches nothing outside the process.
 #[cfg(windows)]
-pub(crate) fn remove_d3d12_device(device: &wgpu::Device) -> Result<(), String> {
+pub(crate) fn remove_d3d12_device(device: &wgpu::Device) -> Result<(), RemoveDeviceError> {
     use windows::Win32::Graphics::Direct3D12::ID3D12Device5;
     use windows::core::Interface;
     // SAFETY: the raw device is only used here, to ask for its removal, which every later call on
@@ -2118,16 +2195,16 @@ pub(crate) fn remove_d3d12_device(device: &wgpu::Device) -> Result<(), String> {
     unsafe {
         let hal = device
             .as_hal::<wgpu::hal::api::Dx12>()
-            .ok_or("--lose-gpu removed: not on D3D12; WGPU_BACKEND=dx12 asks for it")?;
+            .ok_or(RemoveDeviceError::NotD3d12)?;
         let device = hal.raw_device().cast::<ID3D12Device5>();
-        device.map_err(|e| e.to_string())?.RemoveDevice();
+        device.map_err(RemoveDeviceError::Cast)?.RemoveDevice();
     }
     Ok(())
 }
 
-#[cfg(not(windows))]
-pub(crate) fn remove_d3d12_device(_device: &wgpu::Device) -> Result<(), String> {
-    Err("--lose-gpu removed: D3D12 only".into())
+#[cfg(not(any(windows, target_arch = "wasm32")))]
+pub(crate) fn remove_d3d12_device(_device: &wgpu::Device) -> Result<(), RemoveDeviceError> {
+    Err(RemoveDeviceError::Unsupported)
 }
 
 /// Reopening the device in place. Native only: a browser's device takes async calls and its canvas
@@ -2229,7 +2306,7 @@ impl Preview {
     fn keep_sources_moving(&mut self) {
         if let Some(media) = &mut self.media {
             if let Err(e) = media.loop_at_end(self.sound_on) {
-                self.message = Some(e);
+                self.message = Some(e.to_string());
             }
             self.counts.arrived += media.video.take_arrived_count();
             if let Some(released) = self
@@ -2246,7 +2323,7 @@ impl Preview {
             if video.ended()
                 && let Err(e) = video.seek(0.0, true)
             {
-                self.message = Some(e);
+                self.message = Some(e.to_string());
             }
             if let Some(released) = self
                 .reopening
@@ -2260,7 +2337,7 @@ impl Preview {
     }
 
     fn try_to_reopen(&mut self) {
-        // First: a driver that never answers leaves a try in flight for good.
+        // A driver that never answers leaves a try in flight for good.
         if (self.meter.is_some() || self.quiet)
             && let Some(outage) = &self.reopening.outage
             && outage.since.elapsed() >= SCRIPTED_OUTAGE_LIMIT
@@ -2280,7 +2357,7 @@ impl Preview {
             let answer = match opening.try_recv() {
                 Ok(answer) => answer,
                 Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => Err("opening the device panicked".into()),
+                Err(TryRecvError::Disconnected) => Err(DeviceError::Panicked),
             };
             outage.opening = None;
             match answer {
@@ -2338,7 +2415,7 @@ impl Preview {
                             // would stay for the night.
                             let info = adapter.get_info();
                             match lost_on_hardware && info.device_type == wgpu::DeviceType::Cpu {
-                                true => Err(format!("{} draws in software", info.name)),
+                                true => Err(DeviceError::Software(info.name)),
                                 false => Ok(OpenedDevice {
                                     surface,
                                     adapter,
@@ -2391,7 +2468,7 @@ impl Preview {
         if outage.as_ref().is_some_and(|o| o.tracking) {
             match face::Tracker::start() {
                 Ok(tracker) => self.tracker = Some(tracker),
-                Err(e) => self.message = Some(e),
+                Err(e) => self.message = Some(e.to_string()),
             }
         }
         self.effects = DeviceBound::new(match released {
