@@ -785,7 +785,7 @@ impl Preview {
         };
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(media) = &mut self.media {
-            // Dragging the slider shows the frame under it, at most every 60 ms.
+            // Dragging the slider shows the frame under it, with seeks rate limited.
             if let Some(scrub) = &mut media.scrub
                 && let Some(position) = scrub.pending
                 && scrub.last_seek.elapsed().as_millis() >= 60
