@@ -207,6 +207,19 @@ impl<'a> RenderPlan<'a> {
         }
     }
 
+    /// The newest frame this render analyses and the frames of its background
+    /// that analysis reads.
+    fn newest_analysis_inputs(&self) -> BTreeSet<i64> {
+        let Some(&frame) = self.to_analyse.range(..=self.number).next_back() else {
+            return BTreeSet::new();
+        };
+        let every = self.s.analysis_step.every;
+        (analysis_key(self.s, frame, self.first).background_start..frame)
+            .filter(|f| f.rem_euclid(every) == 0)
+            .chain([frame])
+            .collect()
+    }
+
     /// What a render must read when earlier frames may have changed. Frames between analyses are
     /// no analysis's input.
     fn frames_feeding_analysis(&self) -> BTreeSet<i64> {
@@ -453,9 +466,23 @@ impl IncrementalRenderer {
                         .collect(),
                     false => BTreeSet::new(),
                 };
+                let analysis_inputs: BTreeSet<i64> = plan
+                    .newest_analysis_inputs()
+                    .into_iter()
+                    .filter(|f| {
+                        *f != number && *f >= oldest_held_frame && !self.kept.contains_key(f)
+                    })
+                    .collect();
                 let unverified = BTreeSet::from_iter(unverified);
-                let reads =
-                    Self::budgeted_reads(rebuild, &unverified, &verified, &ahead, number, budget);
+                let reads = Self::budgeted_reads(
+                    rebuild,
+                    &unverified,
+                    &verified,
+                    &analysis_inputs,
+                    &ahead,
+                    number,
+                    budget,
+                );
                 (checks, deferred) = (reads.checks, reads.deferred);
                 reads.read
             }
@@ -532,8 +559,8 @@ impl IncrementalRenderer {
             }
         }
         // Frames that use a deferred frame without a grid go stale, and so does
-        // the current frame if its face source is deferred. Reads go oldest
-        // first, so of this render's work that is only the current frame's.
+        // the current frame if its face source is deferred. A deferred frame can
+        // be older than frames this render analysed, which its range covers.
         if deferred.contains(&face_source_frame(s, number, plan.first)) {
             self.mark_stale(number..=number);
         }
@@ -1060,19 +1087,35 @@ impl IncrementalRenderer {
         }
     }
 
-    /// The frames a render of `number` reads under a budget of `budget`
-    /// earlier frames: `ahead`, then the oldest of `rebuild` and `unverified`
-    /// together, then the first of `verified`.
+    /// The frames a render of `number` reads under a budget of `budget` earlier
+    /// frames: the newest of `analysis_inputs`, up to twice the budget, then `ahead`,
+    /// then the oldest of `rebuild` and `unverified`, then the first of `verified`.
     fn budgeted_reads(
         rebuild: BTreeSet<i64>,
         unverified: &BTreeSet<i64>,
         verified: &[i64],
+        analysis_inputs: &BTreeSet<i64>,
         ahead: &BTreeSet<i64>,
         number: i64,
         budget: usize,
     ) -> BudgetedReads {
-        let rest = rebuild.union(unverified).filter(|f| !ahead.contains(f));
-        let mut oldest = ahead.iter().chain(rest).copied().filter(|&f| f != number);
+        let analysis_inputs: BTreeSet<i64> = analysis_inputs
+            .iter()
+            .rev()
+            .take(budget.saturating_mul(2))
+            .copied()
+            .collect();
+        let budget = budget.max(analysis_inputs.len());
+        let rest = rebuild
+            .union(unverified)
+            .filter(|f| !ahead.contains(f) && !analysis_inputs.contains(f));
+        let ahead = ahead.iter().filter(|f| !analysis_inputs.contains(f));
+        let mut oldest = analysis_inputs
+            .iter()
+            .chain(ahead)
+            .chain(rest)
+            .copied()
+            .filter(|&f| f != number);
         let mut read: BTreeSet<i64> = oldest.by_ref().take(budget).collect();
         let deferred = oldest.filter(|f| rebuild.contains(f)).collect();
         let room = budget - read.len();
@@ -2680,11 +2723,14 @@ mod tests {
         let n = frames.len() - 1;
         let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
         let mut state = IncrementalRenderer::default();
-        let renders = (1..=catch_up_renders(&s, 2)).find(|_| {
+        // Only the first render reads past the budget, for its frame's
+        // background of 4; once that is kept every render keeps to 2.
+        let renders = (1..=catch_up_renders(&s, 2)).find(|&r| {
             let render = render_budgeted(&mut state, &s, &frames, n, 2);
+            let limit = if r == 1 { 4 } else { 2 };
             assert!(
-                render.earlier.len() <= 2,
-                "read {} earlier frames",
+                render.earlier.len() <= limit,
+                "render {r} read {} earlier frames",
                 render.earlier.len()
             );
             render.pixels == cold
@@ -2695,6 +2741,77 @@ mod tests {
         );
         let again = render_budgeted(&mut state, &s, &frames, n, 2);
         assert!(again.pixels == cold, "stays caught up");
+        assert!(again.earlier.len() <= 2, "read {}", again.earlier.len());
+    }
+
+    /// A budget of 8 under a background of 16, as a 4K seek in Resolve: the first
+    /// render reads the whole background and analyses its frame, since Resolve
+    /// may not render a still frame again.
+    #[test]
+    fn budget_seek_analyses_current_frame() {
+        let s = RenderSettings {
+            background_frames: 16,
+            trail_frames: 12,
+            ..swarm_settings()
+        };
+        let frames: Vec<_> = (0..80).map(|f| crossing()[f % 14].clone()).collect();
+        let n = 60;
+        let start = n - crate::previous_frames_needed(&s) as usize;
+        let mut state = IncrementalRenderer::default();
+        let render = render_budgeted(&mut state, &s, &frames, n, 8);
+        let background: BTreeSet<usize> = (n - 16..n).map(|f| f - start).collect();
+        assert!(
+            render.earlier.is_superset(&background),
+            "read {:?}",
+            render.earlier
+        );
+        assert_eq!(render.earlier.len(), 16, "nothing past the background");
+        assert!(
+            state
+                .kept
+                .get(&(n as i64))
+                .is_some_and(|kept| kept.record.analysis.is_some()),
+            "the seek's own frame is analysed"
+        );
+    }
+
+    /// A background over twice the budget, as Background 64 at 4K: the seek keeps
+    /// a stale analysis from the newest frames and catches up once it reads the rest.
+    #[test]
+    fn budget_seek_redoes_partial_analysis() {
+        let s = RenderSettings {
+            background_frames: 16,
+            trail_frames: 12,
+            ..swarm_settings()
+        };
+        let frames: Vec<_> = (0..80).map(|f| crossing()[f % 14].clone()).collect();
+        let n = 60;
+        let start = n - crate::previous_frames_needed(&s) as usize;
+        let mut state = IncrementalRenderer::default();
+        let seek = render_budgeted(&mut state, &s, &frames, n, 4);
+        let newest: BTreeSet<usize> = (n - 8..n).map(|f| f - start).collect();
+        assert_eq!(seek.earlier, newest, "the newest 8 background frames");
+        let kept = &state.kept[&(n as i64)];
+        assert!(kept.record.analysis.is_some(), "frame {n} analysed");
+        assert!(
+            kept.stale,
+            "frame {n} kept as done from part of its background"
+        );
+        let cold = render_budgeted(
+            &mut IncrementalRenderer::default(),
+            &s,
+            &frames,
+            n,
+            usize::MAX,
+        );
+        let renders = catch_up_renders(&s, 4);
+        let caught_up = (1..=renders).any(|_| {
+            let render = render_budgeted(&mut state, &s, &frames, n, 4);
+            assert!(render.earlier.len() <= 8, "read {}", render.earlier.len());
+            render.pixels == cold.pixels
+        });
+        assert!(caught_up, "not caught up in {renders} renders");
+        assert!(!state.kept[&(n as i64)].stale, "frame {n} still stale");
     }
 
     /// With a background several times the budget, an edit to every frame is
@@ -2771,7 +2888,7 @@ mod tests {
 
     /// An edit to the frame a settled held frame's checks just read waits for the
     /// rotation to come back, and the frames checked before then are read again:
-    /// 25 renders here, where a jump takes at most 15.
+    /// 27 renders here, where a jump takes at most 15.
     #[test]
     fn budget_catches_up_after_one_frame_edit() {
         let s = RenderSettings {
@@ -2798,7 +2915,7 @@ mod tests {
         );
         let renders =
             (1..=40).find(|_| render_budgeted(&mut state, &s, &frames, n, 2).pixels == cold.pixels);
-        assert_eq!(renders, Some(25), "frame {just_checked} edited");
+        assert_eq!(renders, Some(27), "frame {just_checked} edited");
         let again = render_budgeted(&mut state, &s, &frames, n, 2);
         assert!(again.pixels == cold.pixels, "stays caught up");
     }
