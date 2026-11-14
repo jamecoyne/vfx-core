@@ -145,12 +145,12 @@ struct Found {
 }
 
 /// Vision's box, flipped to a top-left origin.
-fn flipped(b: CGRect) -> Rect {
+fn flipped(bounds: CGRect) -> Rect {
     Rect {
-        x: b.origin.x,
-        y: 1.0 - b.origin.y - b.size.height,
-        w: b.size.width,
-        h: b.size.height,
+        x: bounds.origin.x,
+        y: 1.0 - bounds.origin.y - bounds.size.height,
+        w: bounds.size.width,
+        h: bounds.size.height,
     }
 }
 
@@ -254,6 +254,9 @@ fn detect(bgra: &mut [u8], width: usize, height: usize, faces: bool, bodies: boo
     })
 }
 
+/// # Safety
+///
+/// `request` must be a performed `VNDetectHumanRectanglesRequest`.
 unsafe fn read_bodies(request: &AnyObject) -> Vec<Rect> {
     // SAFETY: results is an NSArray of VNHumanObservation.
     unsafe {
@@ -266,13 +269,16 @@ unsafe fn read_bodies(request: &AnyObject) -> Vec<Rect> {
             .filter_map(|i| {
                 let body: Option<Retained<AnyObject>> = msg_send![&results, objectAtIndex: i];
                 let body = body?;
-                let b: CGRect = msg_send![&body, boundingBox];
-                Some(flipped(b))
+                let bounds: CGRect = msg_send![&body, boundingBox];
+                Some(flipped(bounds))
             })
             .collect()
     }
 }
 
+/// # Safety
+///
+/// `request` must be a performed `VNDetectFaceLandmarksRequest`.
 unsafe fn read_faces(request: &AnyObject, width: f64, height: f64) -> Vec<VisionFace> {
     // SAFETY: results is an NSArray of VNFaceObservation, and each landmark region holds
     // `pointCount` CGPoints.
@@ -286,17 +292,9 @@ unsafe fn read_faces(request: &AnyObject, width: f64, height: f64) -> Vec<Vision
             .filter_map(|i| {
                 let face: Option<Retained<AnyObject>> = msg_send![&results, objectAtIndex: i];
                 let face = face?;
-                let b: CGRect = msg_send![&face, boundingBox];
+                let bounds: CGRect = msg_send![&face, boundingBox];
                 let landmarks: Option<Retained<AnyObject>> = msg_send![&face, landmarks];
-                let region = |name: &str| -> Vec<(f64, f64)> {
-                    let Some(landmarks) = &landmarks else {
-                        return Vec::new();
-                    };
-                    let region: Option<Retained<AnyObject>> = match name {
-                        "leftEye" => msg_send![landmarks, leftEye],
-                        "rightEye" => msg_send![landmarks, rightEye],
-                        _ => msg_send![landmarks, outerLips],
-                    };
+                let points = |region: Option<Retained<AnyObject>>| -> Vec<(f64, f64)> {
                     let Some(region) = region else {
                         return Vec::new();
                     };
@@ -311,11 +309,19 @@ unsafe fn read_faces(request: &AnyObject, width: f64, height: f64) -> Vec<Vision
                         .map(|p| (p.x / width, 1.0 - p.y / height))
                         .collect()
                 };
+                let (left_eye, right_eye, outer_lips) = match &landmarks {
+                    Some(landmarks) => (
+                        points(msg_send![landmarks, leftEye]),
+                        points(msg_send![landmarks, rightEye]),
+                        points(msg_send![landmarks, outerLips]),
+                    ),
+                    None => Default::default(),
+                };
                 Some(VisionFace {
-                    rect: flipped(b),
-                    left_eye: region("leftEye"),
-                    right_eye: region("rightEye"),
-                    outer_lips: region("outerLips"),
+                    rect: flipped(bounds),
+                    left_eye,
+                    right_eye,
+                    outer_lips,
                 })
             })
             .collect()
@@ -368,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn biggest_first_ignores_the_order_given() {
+    fn biggest_first_ignores_input_order() {
         let rect = |x, w| Rect {
             x,
             y: 0.1,
