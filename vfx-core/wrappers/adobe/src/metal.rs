@@ -1,9 +1,8 @@
-//! GPU-native rendering on After Effects' own Metal device (macOS).
+//! Rendering on After Effects' own Metal device (macOS).
 //!
-//! With GPU acceleration on, After Effects keeps frames on the GPU as `MTLBuffer`s
-//! (BGRA, four floats per pixel). The plugin opens a wgpu device on the same `MTLDevice`, wraps
-//! those buffers without copying, and converts between them and the chain's textures in
-//! shaders. No frame passes through the CPU. The CPU path stays as the fallback.
+//! After Effects' GPU worlds are `MTLBuffer`s of BGRA floats. A wgpu device on
+//! the same `MTLDevice` wraps them without a copy, and shaders convert them to
+//! and from the chain's textures.
 
 use std::ffi::c_void;
 
@@ -18,6 +17,19 @@ use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
 /// Bytes per pixel in After Effects' GPU worlds (`PF_PixelFormat_GPU_BGRA128`).
 pub const BYTES_PER_PIXEL: usize = 16;
+
+/// Why After Effects' Metal device or a GPU world can't be used.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("After Effects reported no Metal device")]
+    NoDevice,
+    #[error("no wgpu adapter matches After Effects' Metal device")]
+    NoAdapter,
+    #[error(transparent)]
+    RequestDevice(#[from] wgpu::RequestDeviceError),
+    #[error("After Effects returned no buffer")]
+    NoBuffer,
+}
 
 // Buffer (BGRA, row pitch in pixels) → canvas texture (RGBA), placed at an offset.
 // Pixels outside the source are transparent, like the CPU path's canvas.
@@ -80,11 +92,13 @@ impl AeDevice {
     ///
     /// # Safety
     /// `mtl_device` must be the `id<MTLDevice>` After Effects reports for this device.
-    pub unsafe fn open(mtl_device: *mut c_void, device_index: usize) -> Result<Self, String> {
+    pub unsafe fn open(mtl_device: *mut c_void, device_index: usize) -> Result<Self, Error> {
         if mtl_device.is_null() {
-            return Err("After Effects reported no Metal device".into());
+            return Err(Error::NoDevice);
         }
-        let target = unsafe { &*(mtl_device as *const ProtocolObject<dyn MTLDevice>) };
+        // SAFETY: the caller passes a live `id<MTLDevice>`, checked non-null
+        // above, and the reference ends with this function.
+        let target = unsafe { &*mtl_device.cast::<ProtocolObject<dyn MTLDevice>>() };
         let target_id = target.registryID();
 
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -94,19 +108,20 @@ impl AeDevice {
         // Match by registry ID, which identifies the physical GPU, not the object.
         let adapter = adapters
             .into_iter()
-            .find(|a| unsafe {
-                a.as_hal::<hal::api::Metal>()
-                    .is_some_and(|h| h.raw_device().registryID() == target_id)
+            .find(|adapter| {
+                // SAFETY: the raw device is only read, never destroyed.
+                unsafe { adapter.as_hal::<hal::api::Metal>() }
+                    .is_some_and(|hal| hal.raw_device().registryID() == target_id)
             })
-            .ok_or("no wgpu adapter matches After Effects' Metal device")?;
-        // Ask for the adapter's real limits. The defaults cap storage buffers at
-        // 128 MiB, which a 4K float frame nearly fills.
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("vfx-ae on After Effects GPU"),
-            required_limits: adapter.limits(),
-            ..Default::default()
-        }))
-        .map_err(|e| e.to_string())?;
+            .ok_or(Error::NoAdapter)?;
+        // The default limits cap a storage buffer at 128 MiB, about one 4K float
+        // frame (3840 x 2160 x 16 bytes).
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("vfx-ae on After Effects GPU"),
+                required_limits: adapter.limits(),
+                ..Default::default()
+            }))?;
         let gpu = Gpu::from_parts(device, queue);
         Ok(Self::with_pipelines(gpu, device_index + 1))
     }
@@ -229,11 +244,15 @@ impl AeDevice {
     ///
     /// # Safety
     /// `raw` must be a live `id<MTLBuffer>` on this device, at least `size` bytes.
-    pub unsafe fn wrap_buffer(&self, raw: *mut c_void, size: u64) -> Result<wgpu::Buffer, String> {
+    pub unsafe fn wrap_buffer(&self, raw: *mut c_void, size: u64) -> Result<wgpu::Buffer, Error> {
+        // SAFETY: the caller passes a live `id<MTLBuffer>` or null.
         let mtl: Retained<ProtocolObject<dyn MTLBuffer>> =
-            unsafe { Retained::retain(raw.cast()) }.ok_or("After Effects returned no buffer")?;
+            unsafe { Retained::retain(raw.cast()) }.ok_or(Error::NoBuffer)?;
+        // SAFETY: the caller promises `size` bytes in `mtl`.
         let hal_buffer = unsafe { hal::metal::Device::buffer_from_raw(mtl, size) };
-        Ok(unsafe {
+        // SAFETY: the buffer is on this device, as the caller promises, holds
+        // `size` bytes of initialised frame data and allows these usages.
+        let buffer = unsafe {
             self.gpu.device.create_buffer_from_hal::<hal::api::Metal>(
                 hal_buffer,
                 &wgpu::BufferDescriptor {
@@ -245,7 +264,8 @@ impl AeDevice {
                     mapped_at_creation: false,
                 },
             )
-        })
+        };
+        Ok(buffer)
     }
 }
 
@@ -254,23 +274,23 @@ pub struct World {
     pub buffer: wgpu::Buffer,
     pub width: u32,
     pub height: u32,
-    /// Row pitch in pixels (row bytes ÷ 16).
+    /// Row pitch in pixels: row bytes over [`BYTES_PER_PIXEL`].
     pub pitch: u32,
     /// Buffer origin in layer pixel coordinates.
     pub origin: [i32; 2],
 }
 
-/// Renders one frame entirely on After Effects' GPU. Point values are already in the
-/// output canvas's normalised coordinates.
+/// Renders one frame on After Effects' GPU. Point values in `values` must
+/// already be in the output canvas's normalised coordinates.
 pub fn render(
-    dev: &AeDevice,
+    device: &AeDevice,
     values: &ParamValues,
     ctx: Context,
     input: &World,
     layer: Option<&World>,
     output: &World,
 ) {
-    let gpu = &dev.gpu;
+    let gpu = &device.gpu;
     let spec = Spec {
         values,
         ctx,
@@ -278,16 +298,16 @@ pub fn render(
         height: output.height,
         has_layer: layer.is_some(),
     };
-    let mut lease = Lease::new(gpu, dev.pool_key, &spec);
+    let mut lease = Lease::new(gpu, device.pool_key, &spec);
 
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     // Uniform buffers live until the submit below, so each import gets its own.
-    let mut keep = Vec::new();
+    let mut params_buffers = Vec::new();
     for (world, target) in [(Some(input), lease.input()), (layer, lease.layer())] {
         let Some(world) = world else { continue };
-        let u: [i32; 8] = [
+        let params: [i32; 8] = [
             world.width as i32,
             world.height as i32,
             world.pitch as i32,
@@ -297,10 +317,10 @@ pub fn render(
             0,
             0,
         ];
-        let ubuf = uniform_buffer(gpu, bytemuck::bytes_of(&u));
+        let params_buffer = uniform_buffer(gpu, bytemuck::bytes_of(&params));
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("import"),
-            layout: &dev.import_layout,
+            layout: &device.import_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -308,7 +328,7 @@ pub fn render(
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: ubuf.as_entire_binding(),
+                    resource: params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -329,21 +349,21 @@ pub fn render(
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&dev.import);
+            pass.set_pipeline(&device.import);
             pass.set_bind_group(0, &bind, &[]);
             pass.draw(0..3, 0..1);
         }
-        keep.push(ubuf);
+        params_buffers.push(params_buffer);
     }
     gpu.queue.submit(Some(encoder.finish()));
 
     lease.render(gpu);
 
-    let u: [u32; 4] = [output.width, output.height, output.pitch, 0];
-    let ubuf = uniform_buffer(gpu, bytemuck::bytes_of(&u));
+    let params: [u32; 4] = [output.width, output.height, output.pitch, 0];
+    let params_buffer = uniform_buffer(gpu, bytemuck::bytes_of(&params));
     let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("export"),
-        layout: &dev.export_layout,
+        layout: &device.export_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -355,7 +375,7 @@ pub fn render(
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: ubuf.as_entire_binding(),
+                resource: params_buffer.as_entire_binding(),
             },
         ],
     });
@@ -364,7 +384,7 @@ pub fn render(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-        pass.set_pipeline(&dev.export);
+        pass.set_pipeline(&device.export);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(output.width.div_ceil(8), output.height.div_ceil(8), 1);
     }
@@ -388,31 +408,26 @@ fn uniform_buffer(gpu: &Gpu, bytes: &[u8]) -> wgpu::Buffer {
 mod tests {
     use super::*;
 
-    /// Opens the device on a real `MTLDevice`, as After Effects would hand over, and checks
-    /// it really is the same GPU.
     #[test]
-    fn opens_on_an_existing_metal_device() {
+    fn open_matches_given_device() {
         let mtl = objc2_metal::MTLCreateSystemDefaultDevice().expect("a Metal device");
         let ptr = Retained::as_ptr(&mtl) as *mut c_void;
-        let dev = unsafe { AeDevice::open(ptr, 0) }.expect("open on that device");
-        let same = unsafe {
-            dev.gpu
-                .device
-                .as_hal::<hal::api::Metal>()
-                .is_some_and(|d| d.raw_device().registryID() == mtl.registryID())
-        };
+        // SAFETY: `mtl` is a live `id<MTLDevice>` for the whole test.
+        let device = unsafe { AeDevice::open(ptr, 0) }.expect("open on that device");
+        // SAFETY: the raw device is only read, never destroyed.
+        let same = unsafe { device.gpu.device.as_hal::<hal::api::Metal>() }
+            .is_some_and(|hal| hal.raw_device().registryID() == mtl.registryID());
         assert!(same, "wgpu device is on the given GPU");
-        assert_eq!(dev.pool_key, 1);
+        assert_eq!(device.pool_key, 1);
     }
 
-    /// Exercises the import → chain → export path on a plain Metal device, using wgpu
-    /// buffers in place of After Effects' GPU worlds.
+    // wgpu buffers stand in for After Effects' GPU worlds.
     #[test]
     fn buffer_round_trip_swizzles_and_offsets() {
         let gpu = pollster::block_on(Gpu::headless()).expect("GPU");
-        let dev = AeDevice::with_pipelines(gpu, 1000);
-        let make = |data: &[f32]| {
-            let buffer = dev.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let device = AeDevice::with_pipelines(gpu, 1000);
+        let storage_buffer = |data: &[f32]| {
+            let buffer = device.gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: (data.len() * 4) as u64,
                 usage: wgpu::BufferUsages::STORAGE
@@ -420,14 +435,15 @@ mod tests {
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            dev.gpu
+            device
+                .gpu
                 .queue
                 .write_buffer(&buffer, 0, bytemuck::cast_slice(data));
             buffer
         };
         // Input: one BGRA pixel (b=0.25, g=0.5, r=1.0, a=1.0), in a 2-pixel-wide row.
         let input = World {
-            buffer: make(&[0.25, 0.5, 1.0, 1.0, 9.0, 9.0, 9.0, 9.0]),
+            buffer: storage_buffer(&[0.25, 0.5, 1.0, 1.0, 9.0, 9.0, 9.0, 9.0]),
             width: 1,
             height: 1,
             pitch: 2,
@@ -435,7 +451,7 @@ mod tests {
         };
         // Output: 2x1 with origin 0, so the input lands at x = 1.
         let output = World {
-            buffer: make(&[7.0; 8]),
+            buffer: storage_buffer(&[7.0; 8]),
             width: 2,
             height: 1,
             pitch: 2,
@@ -443,23 +459,24 @@ mod tests {
         };
         crate::tests::register_test_plugin();
         let values = vfx_host::plugin().defaults();
-        render(&dev, &values, Context::at(0.0), &input, None, &output);
+        render(&device, &values, Context::at(0.0), &input, None, &output);
 
-        let readback = dev.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let readback = device.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: 32,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut encoder = dev
+        let mut encoder = device
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_buffer_to_buffer(&output.buffer, 0, &readback, 0, 32);
-        dev.gpu.queue.submit(Some(encoder.finish()));
+        device.gpu.queue.submit(Some(encoder.finish()));
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        dev.gpu
+        device
+            .gpu
             .device
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
