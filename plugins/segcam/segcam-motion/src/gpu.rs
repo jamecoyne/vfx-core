@@ -660,7 +660,7 @@ fn on_shared(gpu: vfx_core::Gpu) -> GpuContext {
     GpuContext::build(gpu.device, gpu.queue, info, faults, true)
 }
 
-// Browsers can't wait for a device inside a render, so this draws on the one the host shared.
+// Browsers can't wait for a device inside a render: draw on the one the host shared.
 #[cfg(target_arch = "wasm32")]
 fn open_on(_choice: &str, _lost_adapter: Option<&str>) -> Result<GpuContext, NoGpu> {
     let gpu =
