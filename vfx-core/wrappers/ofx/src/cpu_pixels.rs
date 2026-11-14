@@ -207,6 +207,7 @@ mod tests {
     ///
     /// # Safety
     /// `image` must describe a live host image.
+    // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
     unsafe fn decode_reference<C: Channel>(image: &Image, canvas: Rect) -> Vec<Argb<C>> {
         let mut out = vec![Argb::default(); canvas.width() * canvas.height()];
         let r = canvas.intersect(&image.bounds);
@@ -214,6 +215,7 @@ mod tests {
             for x in r.x1..r.x2 {
                 // SAFETY: intersection confines the pointer and four channels to the host image.
                 let p = unsafe { pixel_address(image, x, y) };
+                // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
                 let read = |i| unsafe {
                     match image.depth {
                         Depth::Byte => C::from_unit(f32::from(*p.add(i)) / 255.0),
@@ -238,6 +240,7 @@ mod tests {
     ///
     /// # Safety
     /// `image` must describe a live host image, and `window` lie inside both it and `canvas`.
+    // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
     unsafe fn encode_reference<C: Channel>(
         pixels: &[Argb<C>],
         canvas: Rect,
@@ -293,7 +296,7 @@ mod tests {
 
     /// Every byte `decode` reads shows up in the bytes handed out, and bytes it doesn't read don't.
     #[test]
-    fn image_bytes_are_what_decode_reads() {
+    fn image_bytes_match_decode_reads() {
         let bounds = Rect {
             x1: -1,
             y1: -1,
@@ -330,7 +333,7 @@ mod tests {
 
     /// The same pixels elsewhere on the canvas, or at another depth, are a different frame.
     #[test]
-    fn image_bytes_differ_with_placement_and_depth() {
+    fn image_bytes_vary_with_placement_depth() {
         let canvas = Rect {
             x1: 0,
             y1: 0,
@@ -354,7 +357,7 @@ mod tests {
     /// out are the pixels alone, the same for every layout, so neither padding nor layout reads as
     /// a changed frame, and they're what `decode` reads.
     #[test]
-    fn image_bytes_are_the_pixels_whatever_the_row_layout() {
+    fn image_bytes_match_pixels_for_any_row_layout() {
         let canvas = Rect {
             x1: 0,
             y1: 0,
@@ -411,7 +414,7 @@ mod tests {
 
     /// A reused buffer holds the last frame: pixels off this image come out clear all the same.
     #[test]
-    fn decode_into_clears_what_the_image_does_not_cover() {
+    fn decode_into_clears_uncovered_canvas() {
         let canvas = Rect {
             x1: 0,
             y1: 0,
@@ -457,7 +460,7 @@ mod tests {
 
     /// The conversions themselves, on bytes alone.
     #[test]
-    fn short_and_float_rows_round_trip() {
+    fn short_float_rows_round_trip() {
         let byte_lut: [f32; 256] = std::array::from_fn(|v| v as f32 / 255.0);
         let mut row = [Argb::<f32>::default(); 2];
         let shorts: Vec<u8> = [0u16, 65535, 32768, 65535, 65535, 0, 0, 13107]
@@ -479,7 +482,7 @@ mod tests {
 
     /// Row conversions match the per-pixel ones.
     #[test]
-    fn row_conversions_match_the_per_pixel_ones() {
+    fn row_conversions_match_reference() {
         let (w, h) = (37usize, 5usize);
         for depth in [Depth::Byte, Depth::Short, Depth::Float] {
             let bytes = 4 * depth.bytes_per_channel();
@@ -512,6 +515,7 @@ mod tests {
         }
 
         fn for_both(image: &Image, canvas: Rect) {
+            // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
             unsafe {
                 assert_eq!(
                     decode::<u8>(image, canvas),
@@ -536,11 +540,15 @@ mod tests {
             let window = canvas.intersect(&image.bounds);
             let size = image.row_bytes as usize * image.bounds.height();
             let read =
+                // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
                 |image: &Image| unsafe { std::slice::from_raw_parts(image.data, size).to_vec() };
             let before = read(image);
+            // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
             unsafe { encode_reference(&pixels, canvas, image, window) };
             let expected = read(image);
+            // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
             unsafe { std::ptr::copy_nonoverlapping(before.as_ptr(), image.data, size) };
+            // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
             unsafe { encode(&pixels, canvas, image, window) };
             assert_eq!(read(image), expected);
         }
