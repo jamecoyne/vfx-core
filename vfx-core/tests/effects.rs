@@ -1,7 +1,6 @@
-//! Headless render tests. Each one runs an effect on an offscreen frame and
-//! checks pixels against values worked out from the formula, with a small
-//! tolerance for 8-bit quantisation. Tests need a GPU adapter (Metal here;
-//! Vulkan via lavapipe on Linux CI).
+//! Headless render tests: each runs an effect on an offscreen frame and checks pixels
+//! against values worked out from the formula, within 8-bit quantisation. They need a GPU
+//! adapter.
 
 use vfx_core::effects::{ColorAdjust, FeedbackTrail, GaussianBlur};
 use vfx_core::{EffectChain, Frame, Gpu, ParamValue};
@@ -80,7 +79,7 @@ fn color_adjust_brightness_offsets_each_channel() {
 }
 
 #[test]
-fn blur_spreads_an_impulse_and_keeps_its_energy() {
+fn blur_impulse_spreads_and_conserves_energy() {
     let gpu = gpu();
     let mut input = solid(OPAQUE_BLACK);
     let centre = ((4 * W + 4) * 4) as usize;
@@ -94,7 +93,8 @@ fn blur_spreads_an_impulse_and_keeps_its_energy() {
         .unwrap();
     let out = run(&gpu, &mut chain, &input);
 
-    // sigma = 1 gives taps 1, 0.6065, 0.1353; the 2-D centre weight is (1 / 2.4836)^2 ≈ 0.162.
+    // sigma = 1 gives taps 1, 0.6065, 0.1353; the 2-D centre weight is
+    // (1 / 2.4836)^2 ≈ 0.162.
     assert_close(pixel(&out, 4, 4)[0], 41, 2, "centre");
     let neighbour = pixel(&out, 3, 4)[0];
     assert!(
@@ -168,7 +168,7 @@ fn feedback_trail_fades_across_frames() {
 }
 
 #[test]
-fn chain_of_three_stages_matches_composed_formula() {
+fn chain_three_stages_match_formula() {
     let gpu = gpu();
     let input = solid([128, 64, 200, 255]);
     // Three stages exercise both scratch frames. A zero-radius blur passes through,
