@@ -733,7 +733,7 @@ mod tests {
     /// In a process of its own: the device has to be shared before segcam opens one, and segcam
     /// opens one once per process.
     #[test]
-    fn output_frame_test_in_own_process() {
+    fn output_frame_runs_in_own_process() {
         let test = "cpu_stage::tests::output_frame_matches_ram_path";
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--ignored"])
@@ -745,7 +745,7 @@ mod tests {
     /// After a switch to a new source of the same size, Record has nothing until a new frame, and
     /// a first picture equal to the old one still reaches the output frame.
     #[test]
-    fn source_switch_leaves_no_old_picture() {
+    fn restart_clears_old_picture() {
         let (_turn, gpu) = crate::test_gpu();
         let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu(false)));
         let effect = CpuInstance::new(make, true).expect("a CPU effect");
@@ -783,13 +783,14 @@ mod tests {
     /// A swarm drawn straight into the output frame against the same swarm kept in RAM, then the
     /// switch Record makes, to RAM on the frame already shown.
     #[test]
-    #[ignore = "run by output_frame_test_in_own_process"]
+    #[ignore = "run by output_frame_runs_in_own_process"]
     fn output_frame_matches_ram_path() {
         let (_turn, gpu) = crate::test_gpu();
-        if gpu.device.adapter_info().device_type == wgpu::DeviceType::Cpu {
-            eprintln!("no hardware GPU adapter: skipped");
-            return;
-        }
+        assert_ne!(
+            gpu.device.adapter_info().device_type,
+            wgpu::DeviceType::Cpu,
+            "needs a hardware GPU adapter"
+        );
         gpu.share();
         segcam_motion::gpu::status().expect("segcam draws on the shared device");
         let (w, h) = (320usize, 180usize);
@@ -873,7 +874,7 @@ mod tests {
 
     /// A frame read from a lost device is skipped, on the main thread, with no panic.
     #[test]
-    fn lost_device_skips_the_frame() {
+    fn lost_device_read_skips_frame() {
         let (_turn, gpu) = crate::test_gpu();
         let _faults = vfx_core::DeviceFaults::watch(&gpu.device);
         let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu(false)));
@@ -898,7 +899,7 @@ mod tests {
 
     /// Within 1 level of the float readback: the GPU rounds a tie its own way.
     #[test]
-    fn float_frame_reads_at_8_bit() {
+    fn float_frame_matches_rgba8_readback() {
         let (_turn, gpu) = crate::test_gpu();
         let mut controls = crate::controls::Controls::default();
         controls.effect = find("segcam").unwrap();

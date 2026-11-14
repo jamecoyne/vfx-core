@@ -79,7 +79,7 @@ pub fn remove(gpu: &Gpu) {
 }
 
 /// Waits up to 5 s for D3D12 to offer the adapter called `name` again.
-pub fn assert_offered_again(name: &str) {
+pub fn assert_adapter_offered(name: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !offered(name) {
         assert!(
