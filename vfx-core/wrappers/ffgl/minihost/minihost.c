@@ -1061,23 +1061,9 @@ static void segcam_device_reopen(void) {
     Frame f = frame(w, h, w, h);
     GLuint textures[2] = {segcam_texture(w, h, 0), segcam_texture(w, h, 1)};
     GLuint original = f.input;
-    /* What a render through RAM takes on this machine and load, from an instance forced there: the
-     * renders in the gap go that way, and none of them may wait for the open on top. */
-    _putenv_s("VFX_FFGL_PATH", "ram");
-    void *ram = instantiate(w, h);
-    _putenv_s("VFX_FFGL_PATH", "");
-    segcam_options(ram, 3, 0);
-    double ram_worst = 0;
-    for (int n = 0; n < 20; n++) {
-        f.input = textures[n & 1];
-        double time = n / 30.0;
-        CHECK(call(SET_TIME, ptr(&time), ram).u == 0, "set time failed");
-        double started = now();
-        CHECK(render(ram, &f), "RAM render %d failed", n);
-        if (n >= 5 && now() - started > ram_worst) ram_worst = now() - started;
-    }
-    CHECK(call(DEINSTANTIATE_GL, u(0), ram).u == 0, "delete the RAM instance");
-    int back_frames = 0;
+    /* When each render returned, up to the one that brought the new device into use. */
+    static double returned[3000];
+    int back_frames = 0, back_render = -1;
     double waited_at = 0, worst_render = 0;
     for (int n = 0; n < 3000 && back_frames < 60; n++) {
         f.input = textures[n & 1];
@@ -1091,26 +1077,40 @@ static void segcam_device_reopen(void) {
         _putenv_s("VFX_FFGL_LOSE_DEVICE_IN_PRESENT", "");
         if (!waited_at && logged_message("shared GPU render failed, using RAM")) waited_at = now();
         if (waited_at && took > worst_render) worst_render = took;
-        if (logged_message("shared frames back on a new device")) back_frames++;
+        returned[n] = now();
+        if (logged_message("shared frames back on a new device")) {
+            if (back_render < 0) back_render = n;
+            back_frames++;
+        }
         Sleep(2);
     }
-    /* A render that waited for the new device to open would take a RAM render plus what was left
-     * of the open. The bound is three RAM renders, at least 100 ms as in device_reopen, since a
-     * render that overlaps the open's Vulkan device creation is held back by the driver (see
-     * device_reopen) with nothing waiting. The one render that finishes the setup on the render
-     * thread adds the time the log line gives. */
+    /* A render that waited for the open would fill the open's time alone, so renders that returned
+     * while it ran on its thread are counted, not timed: a render that overlaps the open's Vulkan
+     * device creation is held back by the driver (see device_reopen), and under load that alone
+     * takes longer than the open, so no time bound tells a wait from load. Load slows the open
+     * and the renders alike, so the count holds. The open starts after a backoff, which the log
+     * doesn't mark. Its window ends where the log's times start, counted back from the return of
+     * the render that took the new device into use: that render's finish of the setup, then the
+     * open. A render that waited would hold the whole window itself. */
     double open_ms = 0, finish_ms = 0;
     int timed = logged_entry("shared frames back on a new device: ", &open_ms)
                 && logged_entry(" ms on a thread, ", &finish_ms);
-    printf("  worst render through the reopen: %.1f ms, the open on its thread: %.0f ms, finishing "
-           "it on the render thread: %.0f ms, a forced RAM render: %.1f ms\n",
-           worst_render * 1000, open_ms, finish_ms, ram_worst * 1000);
+    int gap_renders = 0;
+    if (back_render >= 0) {
+        double open_started = returned[back_render] - (finish_ms + open_ms) / 1000;
+        for (int i = 0; i < back_render; i++) {
+            if (returned[i] > open_started) gap_renders++;
+        }
+    }
+    printf("  renders during the open: %d, the worst render through the reopen: %.1f ms, the open "
+           "on its thread: %.0f ms, finishing it on the render thread: %.0f ms\n",
+           gap_renders, worst_render * 1000, open_ms, finish_ms);
     CHECK(waited_at, "the present never found the loss");
     CHECK(back_frames >= 60, "no new device after the loss");
     CHECK(timed, "no time for the open in the log");
-    double render_bound_ms = (3 * ram_worst > 0.1 ? 3 * ram_worst : 0.1) * 1000 + finish_ms;
-    CHECK(worst_render * 1000 < render_bound_ms, "a render waited %.1f ms, over %.0f ms",
-          worst_render * 1000, render_bound_ms);
+    /* A render that waits for the open leaves none; 4 to 7 finish beside a full build. */
+    CHECK(gap_renders >= 2, "only %d renders finished during the open: a render waited for it",
+          gap_renders);
     /* The interop being back isn't enough: the swarm must be drawn on the new device again. The
      * note is written once per process, which holds here since this check runs alone in its own
      * process (`segcam-device-reopen` in main). */
