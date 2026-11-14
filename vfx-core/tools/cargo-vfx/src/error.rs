@@ -51,9 +51,8 @@ pub enum Error {
     #[error("{}: the DXC download doesn't match its sha256", .0.display())]
     DxcChecksum(PathBuf),
 
-    /// `vfx_build` reports an unreadable identity as text.
-    #[error("{0}")]
-    Metadata(String),
+    #[error(transparent)]
+    Metadata(#[from] vfx_build::MetadataError),
     #[error("{}", .0.join("\n"))]
     Identities(Vec<String>),
     #[error("cargo metadata: {0}")]

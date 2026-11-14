@@ -224,7 +224,7 @@ impl CpuStage {
         self.rendered_with = None;
         let before = self.effect.frames_before(values, frame_rate);
         let held = self.effect.frames_held(values, frame_rate);
-        self.history.next(before, held)
+        self.history.push_slot(before, held)
     }
 
     fn push_input(

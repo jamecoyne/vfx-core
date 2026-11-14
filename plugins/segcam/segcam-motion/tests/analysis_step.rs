@@ -269,7 +269,7 @@ fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]
         .map(|frame| {
             let before = effect.frames_before(&values, Some(120.0));
             let held = effect.frames_held(&values, Some(120.0));
-            history.next(before, held).copy_from_slice(frame);
+            history.push_slot(before, held).copy_from_slice(frame);
             let ctx = Context {
                 frame: history.frame_number(),
                 frame_rate: Some(120.0),
@@ -325,7 +325,7 @@ fn live(
         .map(|frame| {
             let before = effect.frames_before(values, rate);
             let held = held.unwrap_or(before);
-            history.next(before, held).copy_from_slice(frame);
+            history.push_slot(before, held).copy_from_slice(frame);
             let ctx = Context {
                 frame: history.frame_number(),
                 frame_rate: rate,
@@ -393,7 +393,7 @@ fn live_setting_change_keeps_windows() {
         }
         let before = effect.frames_before(&values, None);
         let held = effect.frames_held(&values, None);
-        history.next(before, held).copy_from_slice(frame);
+        history.push_slot(before, held).copy_from_slice(frame);
         let ctx = Context {
             frame: history.frame_number(),
             ..Context::at(0.0)

@@ -587,7 +587,7 @@ unsafe fn process_cpu(
             input_texture.Handle,
             (input_texture.HardwareWidth, input_texture.HardwareHeight),
             args.HostFBO,
-            cpu.history.next(frames_before, frames_held),
+            cpu.history.push_slot(frames_before, frames_held),
         )
     };
     cpu.history.drop_repeat();

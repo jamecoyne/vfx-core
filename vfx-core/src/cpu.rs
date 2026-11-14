@@ -479,7 +479,7 @@ impl<C: Depth> History<C> {
 
     /// Room for a new frame, the newest, to be filled by the caller. Counts `before` frames
     /// before it and holds the pixels of `held` of them.
-    pub fn next(&mut self, before: usize, held: usize) -> &mut [Argb<C>] {
+    pub fn push_slot(&mut self, before: usize, held: usize) -> &mut [Argb<C>] {
         self.count_before = self.count;
         self.count = (self.count + 1).min(before + 1);
         let keep = held.min(before) + 1;
@@ -539,7 +539,7 @@ impl<C: Depth> FrameSource for History<C> {
         true
     }
 
-    /// Frames go in through [`History::next`] only, so earlier ones never change.
+    /// Frames go in through [`History::push_slot`] only, so earlier ones never change.
     fn fixed(&self) -> bool {
         true
     }
@@ -572,25 +572,25 @@ mod tests {
         };
         let mut h = History::<u8>::default();
         h.resize(2, 1);
-        h.next(1, 1).fill(grey(255));
+        h.push_slot(1, 1).fill(grey(255));
         let first = h.frames[0].as_ptr();
-        h.next(1, 1).fill(grey(0));
-        h.next(1, 1).fill(grey(128));
+        h.push_slot(1, 1).fill(grey(0));
+        h.push_slot(1, 1).fill(grey(128));
         assert_eq!(h.len(), 2);
         assert_eq!((h.frames[0][0].red, h.frames[1][0].red), (0, 128));
         assert_eq!(h.frame_number(), 2);
-        h.next(1, 1).fill(grey(64));
+        h.push_slot(1, 1).fill(grey(64));
         assert_eq!(h.frames[1].as_ptr(), first, "the oldest buffer is reused");
         for _ in 0..5 {
-            h.next(3, 3);
+            h.push_slot(3, 3);
         }
         assert_eq!(h.len(), 4);
-        h.next(0, 0);
+        h.push_slot(0, 0);
         assert_eq!(h.len(), 1);
         h.clear();
         assert!(h.is_empty() && h.frame_number() == 0);
         h.resize(3, 2);
-        assert_eq!(h.next(0, 0).len(), 6);
+        assert_eq!(h.push_slot(0, 0).len(), 6);
     }
 
     /// Frames not held still count, so numbering is what a full history's would be.
@@ -599,7 +599,7 @@ mod tests {
         let mut h = History::<u8>::default();
         h.resize(1, 1);
         for v in 0..6u8 {
-            h.next(3, 1)[0].red = v;
+            h.push_slot(3, 1)[0].red = v;
         }
         assert_eq!((h.len(), h.held(), h.frame_number()), (4, 2, 5));
         let mut read = Vec::new();
@@ -634,7 +634,7 @@ mod tests {
             let mut h = History::<u8>::default();
             h.resize(2, 1);
             let push = |h: &mut History<u8>, v: u8| {
-                h.next(3, held)[0].red = v;
+                h.push_slot(3, held)[0].red = v;
                 h.frames.back_mut().unwrap()[1].red = 0;
                 h.drop_repeat()
             };
@@ -662,10 +662,10 @@ mod tests {
         for before in [0, 3] {
             let mut h = History::<f32>::default();
             h.resize(2, 2);
-            h.next(before, 0).fill(Argb::default());
-            h.next(before, 0).fill(Argb::default());
+            h.push_slot(before, 0).fill(Argb::default());
+            h.push_slot(before, 0).fill(Argb::default());
             assert_eq!(h.drop_repeat(), before > 0);
-            let frame = h.next(before, 0);
+            let frame = h.push_slot(before, 0);
             frame.fill(Argb::default());
             frame[3].blue = 0.001;
             assert!(!h.drop_repeat());

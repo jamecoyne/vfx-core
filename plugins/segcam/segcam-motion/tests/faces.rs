@@ -112,7 +112,7 @@ fn live_faces_arrive_and_stay() {
         );
         let before = effect.frames_before(&params, None);
         let pixels = &clip.frames[f % clip.frames.len()];
-        history.next(before, before).copy_from_slice(pixels);
+        history.push_slot(before, before).copy_from_slice(pixels);
         let ctx = Context {
             frame: history.frame_number(),
             ..Context::at(f as f64 / 30.0)
@@ -167,9 +167,9 @@ fn kept_history_faces_match_fresh_render() {
         lean_history.resize(W, H);
         for (f, pixels) in clip.frames.iter().enumerate() {
             let before = kept.frames_before(params, frame_rate);
-            history.next(before, before).copy_from_slice(pixels);
+            history.push_slot(before, before).copy_from_slice(pixels);
             let held = lean.frames_held(params, frame_rate);
-            lean_history.next(before, held).copy_from_slice(pixels);
+            lean_history.push_slot(before, held).copy_from_slice(pixels);
             let ctx = Context {
                 frame: history.frame_number(),
                 frame_rate,
@@ -224,7 +224,7 @@ fn readings_match_model_output() {
     let mut history = History::<u8>::default();
     history.resize(W, H);
     let before = effect.frames_before(&params, None);
-    history.next(before, before).copy_from_slice(&pixels);
+    history.push_slot(before, before).copy_from_slice(&pixels);
     let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
     let view = ViewMut::from_pixels(&mut out, W, H);
     let count = history.len();

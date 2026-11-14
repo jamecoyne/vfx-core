@@ -41,30 +41,65 @@ pub struct Metadata {
     pub features: BTreeMap<String, Vec<String>>,
 }
 
+/// Why an effect crate's identity can't be read or would fail in a host.
+#[derive(Debug, thiserror::Error)]
+pub enum MetadataError {
+    #[error("{}: {source}", .path.display())]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{}: {source}", .path.display())]
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    #[error("no [package]")]
+    NoPackage,
+    #[error("{} has no [package.metadata.vfx]", .path.display())]
+    NoMetadata { path: PathBuf },
+    #[error("[package.metadata.vfx] needs {0}")]
+    MissingField(&'static str),
+    #[error("[package.metadata.vfx] features must be a table")]
+    FeaturesNotTable,
+    #[error("features.{0} must be a list of feature names")]
+    FeatureList(String),
+    /// A value a host would refuse; the text names the key and the host's limit.
+    #[error("[package.metadata.vfx] {0}")]
+    Invalid(String),
+}
+
+/// Reads and parses the manifest at `path`.
+fn read_manifest(path: &Path) -> Result<toml::Table, MetadataError> {
+    let text = std::fs::read_to_string(path).map_err(|source| MetadataError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    text.parse().map_err(|source| MetadataError::Parse {
+        path: path.to_owned(),
+        source,
+    })
+}
+
 /// The keys `[package.metadata.vfx.features]` takes.
 pub const FEATURE_KEYS: [&str; 4] = ["all", "macos", "windows", "linux"];
 
 impl Metadata {
     /// Reads `<dir>/Cargo.toml`.
-    pub fn read(dir: &Path) -> Result<Self, String> {
+    pub fn read(dir: &Path) -> Result<Self, MetadataError> {
         let path = dir.join("Cargo.toml");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let doc: toml::Table = text
-            .parse()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let package = doc.get("package").ok_or("no [package]")?;
+        let doc = read_manifest(&path)?;
+        let package = doc.get("package").ok_or(MetadataError::NoPackage)?;
         let meta = package
             .get("metadata")
             .and_then(|m| m.get("vfx"))
-            .ok_or_else(|| format!("{} has no [package.metadata.vfx]", path.display()))?;
+            .ok_or(MetadataError::NoMetadata { path })?;
         let field = |key: &str| {
             meta.get(key)
                 .and_then(toml::Value::as_str)
                 .map(str::to_owned)
         };
-        let need =
-            |key: &str| field(key).ok_or_else(|| format!("[package.metadata.vfx] needs {key}"));
+        let need = |key: &'static str| field(key).ok_or(MetadataError::MissingField(key));
         let package_field = |key: &str| {
             package
                 .get(key)
@@ -74,14 +109,12 @@ impl Metadata {
         };
         let mut features = BTreeMap::new();
         if let Some(table) = meta.get("features") {
-            let table = table
-                .as_table()
-                .ok_or("[package.metadata.vfx] features must be a table")?;
+            let table = table.as_table().ok_or(MetadataError::FeaturesNotTable)?;
             for (key, list) in table {
                 let names = list
                     .as_array()
                     .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_owned)).collect())
-                    .ok_or_else(|| format!("features.{key} must be a list of feature names"))?;
+                    .ok_or_else(|| MetadataError::FeatureList(key.clone()))?;
                 features.insert(key.clone(), names);
             }
         }
@@ -116,8 +149,8 @@ impl Metadata {
 
     /// What each host requires of the identity, so a mistake fails the build rather than
     /// showing up in a host.
-    pub fn check(&self) -> Result<(), String> {
-        let fail = |what: String| Err(format!("[package.metadata.vfx] {what}"));
+    pub fn check(&self) -> Result<(), MetadataError> {
+        let fail = |what: String| Err(MetadataError::Invalid(what));
         // After Effects keeps names, categories and match names to 31 bytes.
         for (key, value) in [
             ("name", &self.name),
@@ -243,12 +276,8 @@ pub fn check_workspace(effects: &[(String, Metadata)]) -> Result<(), Vec<String>
 /// The path dependencies of the crate in `manifest_dir` that are effect crates, in the order
 /// its `[dependencies]` lists them: each as the name code refers to it by, and its metadata.
 /// A host that links effects in (the preview) builds its list from this.
-pub fn effect_dependencies(manifest_dir: &Path) -> Result<Vec<(String, Metadata)>, String> {
-    let path = manifest_dir.join("Cargo.toml");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let doc: toml::Table = text
-        .parse()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+pub fn effect_dependencies(manifest_dir: &Path) -> Result<Vec<(String, Metadata)>, MetadataError> {
+    let doc = read_manifest(&manifest_dir.join("Cargo.toml"))?;
     let mut found = Vec::new();
     let Some(deps) = doc.get("dependencies").and_then(toml::Value::as_table) else {
         return Ok(found);
@@ -378,7 +407,8 @@ mod tests {
 
     #[test]
     fn check_rejects_invalid_identity() {
-        assert_eq!(meta().check(), Ok(()));
+        let checked = meta().check();
+        assert!(checked.is_ok(), "{checked:?}");
         let broken: [fn(&mut Metadata); 8] = [
             |m| m.ffgl_code = "TOOLONG".into(),
             |m| m.short_name = "Seventeen bytes!!".into(),

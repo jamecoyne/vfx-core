@@ -66,7 +66,7 @@ fn renders_match_faces_off_until_models_load() {
     let mut next = |history: &mut History<u8>, values: &ParamValues| {
         let before = SegcamMotion::default().frames_before(values, None);
         let frame = &clip.frames[pushed % clip.frames.len()];
-        history.next(before, before).copy_from_slice(frame);
+        history.push_slot(before, before).copy_from_slice(frame);
         pushed += 1;
     };
     let mut kept = SegcamMotion::default();

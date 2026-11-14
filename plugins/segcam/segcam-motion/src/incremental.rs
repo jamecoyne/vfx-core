@@ -1693,7 +1693,7 @@ mod tests {
             for frame in &frames {
                 let mut shown = None;
                 for _ in 0..=repeats {
-                    history.next(needed, 0).copy_from_slice(frame);
+                    history.push_slot(needed, 0).copy_from_slice(frame);
                     history.drop_repeat();
                     let count = history.len();
                     let number = history.frame_number();
@@ -1820,7 +1820,7 @@ mod tests {
         let before = crate::previous_frames_needed(&with_faces(ALL_PARTS)) as usize;
         for (n, frame) in frames.iter().enumerate() {
             state.simulate_models_loading = n < 7;
-            history.next(before, before).copy_from_slice(frame);
+            history.push_slot(before, before).copy_from_slice(frame);
             let count = history.len();
             let face_detection_calls =
                 face_detection_calls_in(&mut state, &mut history, count, n as i64);
@@ -1846,7 +1846,7 @@ mod tests {
             history.resize(W, H);
             let before = crate::previous_frames_needed(&with_faces(ALL_PARTS)) as usize;
             for (n, frame) in frames.iter().enumerate() {
-                history.next(before, before).copy_from_slice(frame);
+                history.push_slot(before, before).copy_from_slice(frame);
                 let count = history.len();
                 face_detection_calls_in(&mut state, &mut history, count, n as i64);
             }
@@ -1874,7 +1874,7 @@ mod tests {
         let mut history = vfx_core::cpu::History::<u8>::default();
         history.resize(W, H);
         let mut show = |state: &mut IncrementalRenderer, frame: &[Argb<u8>]| {
-            history.next(before, before).copy_from_slice(frame);
+            history.push_slot(before, before).copy_from_slice(frame);
             history.drop_repeat();
             let (count, number) = (history.len(), history.frame_number());
             let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
@@ -1928,7 +1928,9 @@ mod tests {
         history.resize(W, H);
         let started = std::time::Instant::now();
         while started.elapsed() < Duration::from_secs(2) {
-            history.next(before, before).copy_from_slice(&frames[0]);
+            history
+                .push_slot(before, before)
+                .copy_from_slice(&frames[0]);
             history.drop_repeat();
             let (count, number) = (history.len(), history.frame_number());
             let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
@@ -1953,7 +1955,7 @@ mod tests {
         while !state.analyser.live_faces.holds_faces() {
             assert!(started.elapsed() < Duration::from_secs(120), "no detection");
             history
-                .next(before, before)
+                .push_slot(before, before)
                 .copy_from_slice(&frames[n as usize % frames.len()]);
             let count = history.len();
             face_detection_calls_in(&mut state, &mut history, count, n);
@@ -1963,7 +1965,7 @@ mod tests {
         // Two renders in, so the lower number is certain whichever frame the detection landed on.
         for _ in 0..2 {
             history
-                .next(before, before)
+                .push_slot(before, before)
                 .copy_from_slice(&frames[n as usize % frames.len()]);
             let count = history.len();
             face_detection_calls_in(&mut state, &mut history, count, n);
@@ -1972,7 +1974,9 @@ mod tests {
 
         let mut restarted = vfx_core::cpu::History::<u8>::default();
         restarted.resize(W, H);
-        restarted.next(before, before).copy_from_slice(&frames[0]);
+        restarted
+            .push_slot(before, before)
+            .copy_from_slice(&frames[0]);
         let count = restarted.len();
         face_detection_calls_in(&mut state, &mut restarted, count, 0);
         assert!(!state.analyser.live_faces.holds_faces());
@@ -2009,7 +2013,7 @@ mod tests {
         let renders = 200;
         for n in 0..renders {
             history
-                .next(before, before)
+                .push_slot(before, before)
                 .copy_from_slice(&frames[n as usize % frames.len()]);
             let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
@@ -2078,7 +2082,7 @@ mod tests {
         history.resize(W, H);
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         for (n, frame) in frames.iter().enumerate().take(2) {
-            history.next(before, before).copy_from_slice(frame);
+            history.push_slot(before, before).copy_from_slice(frame);
             // Past the first render, which takes in the frame format and clears everything.
             if n == 1 {
                 state
@@ -3438,7 +3442,7 @@ mod tests {
         let before = crate::previous_frames_needed(&s) as usize;
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         for (n, frame) in frames.iter().enumerate() {
-            history.next(before, 0).copy_from_slice(frame);
+            history.push_slot(before, 0).copy_from_slice(frame);
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             let count = history.len();
             state.render_frame(&s, &mut history, count, n as i64, view);
@@ -3521,7 +3525,7 @@ mod tests {
         history.resize(W, H);
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         for (n, frame) in frames.iter().enumerate() {
-            history.next(needed, 1).copy_from_slice(frame);
+            history.push_slot(needed, 1).copy_from_slice(frame);
             let count = history.len();
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             state.render_frame(&s, &mut history, count, n as i64, view);
@@ -3555,7 +3559,7 @@ mod tests {
         history.resize(W, H);
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         for (n, frame) in frames.iter().enumerate() {
-            history.next(needed, 1).copy_from_slice(frame);
+            history.push_slot(needed, 1).copy_from_slice(frame);
             let count = history.len();
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             state.render_frame(&s, &mut history, count, n as i64, view);
