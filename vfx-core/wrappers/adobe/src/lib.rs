@@ -342,7 +342,10 @@ fn gpu_device_setup(
     let opened = ae::pf::suites::GPUDevice::new()
         .and_then(|suite| suite.device_info(in_data.effect_ref(), index))
         .map_err(|e| format!("{e:?}"))
-        .and_then(|info| unsafe { metal::AeDevice::open(info.devicePV, index) });
+        .and_then(|info| {
+            // SAFETY: with Metal as the framework, `devicePV` is the device's `id<MTLDevice>`.
+            unsafe { metal::AeDevice::open(info.devicePV, index) }.map_err(|e| e.to_string())
+        });
     match opened {
         Ok(device) => {
             LOG.note(&format!(
@@ -399,8 +402,10 @@ fn gpu_render_native(
         let world = RawWorld(l.as_mut_ptr());
         let data = suite.gpu_world_data(in_data.effect_ref(), &mut *l)?;
         let size = suite.gpu_world_size(in_data.effect_ref(), world)?;
+        // SAFETY: After Effects returned `data` as this world's `id<MTLBuffer>` on
+        // this device, and `size` as its length.
         let buffer = unsafe { device.wrap_buffer(data, size as u64) }.map_err(|e| {
-            warn_once(&e);
+            warn_once(&e.to_string());
             ae::Error::BadCallbackParameter
         })?;
         Ok(metal::World {
