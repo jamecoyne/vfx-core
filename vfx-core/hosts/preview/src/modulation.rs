@@ -503,7 +503,7 @@ impl Expr {
             Expr::Smooth(x, amount, state) => {
                 let x = x.eval(env);
                 // Frame-rate independent one-pole smoothing: `amount` is the share kept
-                // per reference frame.
+                // per 1/60 s.
                 let keep = amount.eval(env).clamp(0.0, 0.999).powf(env.dt * 60.0);
                 let v = match *state {
                     Some(prev) if prev.is_finite() => prev + (x - prev) * (1.0 - keep),

@@ -840,7 +840,7 @@ mod tests {
     /// restart from the start then loops.
     #[test]
     #[ignore = "needs ffmpeg"]
-    fn seek_away_from_start_ends_without_loop() {
+    fn seek_from_middle_ends_and_restart_loops() {
         let video = Video::open(Input::File(test_clip("seek-loop-test")), 1920).unwrap();
         video.seek(2.5, true).unwrap();
         let mut pixels = Vec::new();
