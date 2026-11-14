@@ -243,15 +243,16 @@ impl AeDevice {
     /// Wraps an After Effects GPU world's buffer. No copy is made.
     ///
     /// # Safety
-    /// `raw` must be a live `id<MTLBuffer>` on this device, at least `size` bytes.
+    /// `raw` must be null or a live `id<MTLBuffer>` on this device, of at least
+    /// `size` bytes, and `size` must not be zero.
     pub unsafe fn wrap_buffer(&self, raw: *mut c_void, size: u64) -> Result<wgpu::Buffer, Error> {
-        // SAFETY: the caller passes a live `id<MTLBuffer>` or null.
+        // SAFETY: the caller passes null or a live `id<MTLBuffer>`.
         let mtl: Retained<ProtocolObject<dyn MTLBuffer>> =
             unsafe { Retained::retain(raw.cast()) }.ok_or(Error::NoBuffer)?;
         // SAFETY: the caller promises `size` bytes in `mtl`.
         let hal_buffer = unsafe { hal::metal::Device::buffer_from_raw(mtl, size) };
-        // SAFETY: the buffer is on this device, as the caller promises, holds
-        // `size` bytes of initialised frame data and allows these usages.
+        // SAFETY: the caller promises a buffer on this device of `size` bytes, not
+        // zero, and a Metal buffer has no usage flags for the descriptor to break.
         let buffer = unsafe {
             self.gpu.device.create_buffer_from_hal::<hal::api::Metal>(
                 hal_buffer,
@@ -461,27 +462,61 @@ mod tests {
         let values = vfx_host::plugin().defaults();
         render(&device, &values, Context::at(0.0), &input, None, &output);
 
-        let readback = device.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let out = read_back(&device, &output.buffer);
+        // x = 0 is uncovered canvas: transparent. x = 1 is the input, back in BGRA order.
+        assert_eq!(out, vec![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn wrap_buffer_shares_metal_memory() {
+        let mtl = objc2_metal::MTLCreateSystemDefaultDevice().expect("a Metal device");
+        // SAFETY: `mtl` is a live `id<MTLDevice>` for the whole test.
+        let device = unsafe { AeDevice::open(Retained::as_ptr(&mtl) as *mut c_void, 0) }
+            .expect("open on that device");
+        let data: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let bytes = std::mem::size_of_val(&data);
+        // SAFETY: `data` is valid for `bytes` bytes, which Metal copies.
+        let raw = unsafe {
+            mtl.newBufferWithBytes_length_options(
+                std::ptr::NonNull::from(&data).cast(),
+                bytes,
+                objc2_metal::MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("a Metal buffer");
+        let ptr = Retained::as_ptr(&raw) as *mut c_void;
+        // SAFETY: `raw` is a live buffer of `bytes` bytes on the device `device` opened on.
+        let buffer = unsafe { device.wrap_buffer(ptr, bytes as u64) }.expect("wrap");
+        assert_eq!(read_back(&device, &buffer), data);
+    }
+
+    #[test]
+    fn wrap_buffer_rejects_null() {
+        let gpu = pollster::block_on(Gpu::headless()).expect("GPU");
+        let device = AeDevice::with_pipelines(gpu, 1);
+        // SAFETY: null is allowed and nothing is wrapped.
+        let err = unsafe { device.wrap_buffer(std::ptr::null_mut(), 32) }.unwrap_err();
+        assert!(matches!(err, Error::NoBuffer), "{err}");
+    }
+
+    fn read_back(device: &AeDevice, buffer: &wgpu::Buffer) -> Vec<f32> {
+        let gpu = &device.gpu;
+        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 32,
+            size: buffer.size(),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut encoder = device
-            .gpu
+        let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.copy_buffer_to_buffer(&output.buffer, 0, &readback, 0, 32);
-        device.gpu.queue.submit(Some(encoder.finish()));
+        encoder.copy_buffer_to_buffer(buffer, 0, &readback, 0, buffer.size());
+        gpu.queue.submit(Some(encoder.finish()));
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        device
-            .gpu
-            .device
+        gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
-        let out: Vec<f32> = bytemuck::pod_collect_to_vec(&slice.get_mapped_range().unwrap());
-        // x = 0 is uncovered canvas: transparent. x = 1 is the input, back in BGRA order.
-        assert_eq!(out, vec![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 1.0, 1.0]);
+        bytemuck::pod_collect_to_vec(&slice.get_mapped_range().unwrap())
     }
 }
