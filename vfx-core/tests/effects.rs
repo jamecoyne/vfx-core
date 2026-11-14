@@ -45,11 +45,6 @@ fn assert_close(actual: u8, expected: u8, tolerance: u8, what: &str) {
     );
 }
 
-/// Expected channel value after adding `offset` in normalised space, rounded to 8 bits.
-fn brightened(channel: u8, offset: f32) -> u8 {
-    ((f32::from(channel) / 255.0 + offset).clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
 #[test]
 fn color_adjust_defaults_are_identity() {
     let gpu = gpu();
@@ -72,8 +67,9 @@ fn color_adjust_brightness_offsets_each_channel() {
 
     let out = run(&gpu, &mut chain, &input);
     let px = pixel(&out, 4, 4);
-    for (channel, &source) in [128u8, 64, 200].iter().enumerate() {
-        assert_close(px[channel], brightened(source, 0.25), 1, "brightness");
+    // 0.25 is 63.75 of 255 levels; 200 clamps at white.
+    for (channel, expected) in [192u8, 128, 255].into_iter().enumerate() {
+        assert_close(px[channel], expected, 1, "brightness");
     }
     assert_eq!(px[3], 255, "alpha is untouched");
 }
@@ -192,14 +188,9 @@ fn chain_three_stages_match_formula() {
 
     let out = run(&gpu, &mut chain, &input);
     let px = pixel(&out, 4, 4);
-    for (channel, &source) in [128u8, 64, 200].iter().enumerate() {
-        // Each stage quantises to 8 bits, so allow 2 levels of drift.
-        assert_close(
-            px[channel],
-            brightened(source, 0.2),
-            2,
-            "composed brightness",
-        );
+    // 0.2 is 51 of 255 levels. Each stage quantises to 8 bits, so allow 2 levels of drift.
+    for (channel, expected) in [179u8, 115, 251].into_iter().enumerate() {
+        assert_close(px[channel], expected, 2, "composed brightness");
     }
 }
 
