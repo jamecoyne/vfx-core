@@ -11,7 +11,7 @@
 # The names come from each effect crate's [package.metadata.vfx] (`cargo vfx env`).
 # Usage: ./package-win.sh   (run from Git Bash)
 #   VERSION   the release version, default "dev"
-#   ISCC      Inno Setup's compiler, if it isn't on PATH or in its default folders
+#   ISCC      Inno Setup's compiler, if it isn't on PATH or the newest in its default folders
 #   TEST_ROOT a folder the installer then installs everything under, without administrator
 #             rights, for testing it
 set -euo pipefail
@@ -27,10 +27,11 @@ version="${VERSION:-dev}"
 
 iscc="${ISCC:-$(command -v iscc || true)}"
 if [ -z "$iscc" ]; then
-  for c in "/c/Program Files/Inno Setup "*/ISCC.exe "/c/Program Files (x86)/Inno Setup "*/ISCC.exe \
+  # The newest major version installed, per machine or per user: 6 and 7 install side by side.
+  iscc="$(for c in "/c/Program Files/Inno Setup "*/ISCC.exe "/c/Program Files (x86)/Inno Setup "*/ISCC.exe \
     "$(cygpath -u "${LOCALAPPDATA:-C:\\}")/Programs/Inno Setup "*/ISCC.exe; do
-    [ -f "$c" ] && iscc="$c"
-  done
+    if [ -f "$c" ]; then printf '%s\t%s\n' "${c##*/Inno Setup }" "$c"; fi
+  done | sort -V | tail -n 1 | cut -f 2)"
 fi
 if [ -z "$iscc" ]; then
   echo "Inno Setup's ISCC.exe not found (install Inno Setup, or set ISCC)" >&2

@@ -25,7 +25,7 @@ jobs:
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,7 +72,7 @@ jobs:
           mkdir -p dist
           cp target/vfx-plugin/*-macOS.pkg target/vfx-plugin/*-macOS-*.zip dist/
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: release-macOS
           path: dist/*
@@ -81,7 +81,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -91,16 +91,28 @@ jobs:
           shared-key: plugins
           save-if: false
 
-      # 6.6 or later for the wizard's dark mode; pinned so a new major doesn't change the build.
+      # Inno Setup 7.1.1 from its own release, checked against the hash in its signed .issig.
+      # Chocolatey has no 7.x and the runner image has 6.7.1, so package-win.sh gets this
+      # compiler through ISCC. Portable mode leaves no uninstaller or registry entries.
       - name: Install Inno Setup
-        run: choco install innosetup --version 6.7.1 --no-progress -y
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download is-7_1_1 --repo jrsoftware/issrc --pattern innosetup-7.1.1-x64.exe --dir $env:RUNNER_TEMP
+          $setup = Join-Path $env:RUNNER_TEMP innosetup-7.1.1-x64.exe
+          $sha256 = '8a5a6711c3766a6e5fb74f280ba0e3551e719ce94538d901fdbd1f8f9920b3f0'
+          if ((Get-FileHash $setup -Algorithm SHA256).Hash -ne $sha256) { throw "$setup does not match its sha256" }
+          $dir = Join-Path $env:RUNNER_TEMP inno-setup
+          $install = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/PORTABLE=1', '/CURRENTUSER', "/DIR=$dir"
+          if ($install.ExitCode -ne 0) { throw "Inno Setup's installer exited with $($install.ExitCode)" }
+          "ISCC=$($dir -replace '\\', '/')/ISCC.exe" >> $env:GITHUB_ENV
 
       # One installer with every effect for every host, and segcam's zips.
       - name: Build the installer and zips
         shell: bash
         run: VERSION="${VERSION#v}" ./vfx-core/wrappers/package-win.sh
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: release-Windows
           path: |
@@ -113,7 +125,7 @@ jobs:
     needs: [macos, windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           merge-multiple: true
