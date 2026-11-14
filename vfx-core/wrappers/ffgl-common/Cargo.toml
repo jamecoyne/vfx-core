@@ -8,3 +8,9 @@ publish = false
 
 [lib]
 crate-type = ["rlib"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Graphics_OpenGL",
+    "Win32_System_LibraryLoader",
+] }

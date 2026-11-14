@@ -7,7 +7,7 @@
 use std::ffi::CString;
 
 use vfx_core::{ParamKind, ParamSpec, ParamValue, ParamValues};
-use vfx_ffgl_common::ffi::*;
+use vfx_ffgl_common::sys::*;
 
 /// Which part of an effect parameter an FFGL parameter drives.
 #[derive(Clone, Copy, Debug, PartialEq)]

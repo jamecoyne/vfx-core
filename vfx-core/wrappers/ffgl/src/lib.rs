@@ -34,10 +34,10 @@ use vfx_host::{Kind, diag, pipeline};
 use vfx_ffgl_common::float_transfer;
 #[cfg(not(target_os = "windows"))]
 use vfx_ffgl_common::frame;
-use vfx_ffgl_common::{ffi, gl};
+use vfx_ffgl_common::{gl, sys};
 
-use ffi::*;
 use params::Param;
+use sys::*;
 
 /// For the export macro.
 pub use vfx_host;
@@ -84,10 +84,11 @@ unsafe impl Send for PluginDescriptors {}
 unsafe impl Sync for PluginDescriptors {}
 
 /// `text` in a fixed FFGL field, zero-padded and cut to fit.
-fn padded<const N: usize>(text: &str) -> [u8; N] {
+fn padded<const N: usize>(text: &str) -> [c_char; N] {
     let mut out = [0; N];
-    let bytes = &text.as_bytes()[..text.len().min(N)];
-    out[..bytes.len()].copy_from_slice(bytes);
+    for (slot, byte) in out.iter_mut().zip(text.bytes()) {
+        *slot = byte as c_char;
+    }
     out
 }
 
@@ -104,19 +105,19 @@ fn descriptors() -> &'static PluginDescriptors {
         .unwrap_or_default();
         PluginDescriptors {
             info: PluginInfoStruct {
-                api_major_version: 2,
-                api_minor_version: 1,
-                plugin_unique_id: padded(info.ffgl_code),
-                plugin_name: padded(info.short_name),
-                plugin_type: FF_EFFECT,
+                APIMajorVersion: 2,
+                APIMinorVersion: 1,
+                PluginUniqueID: padded(info.ffgl_code),
+                PluginName: padded(info.short_name),
+                PluginType: FF_EFFECT,
             },
             extended: PluginExtendedInfoStruct {
-                plugin_major_version: info.version[0],
-                plugin_minor_version: info.version[1],
-                description: description.as_ptr(),
-                about: about.as_ptr(),
-                free_frame_extended_data_size: 0,
-                free_frame_extended_data_block: std::ptr::null_mut(),
+                PluginMajorVersion: info.version[0],
+                PluginMinorVersion: info.version[1],
+                Description: description.as_ptr(),
+                About: about.as_ptr(),
+                FreeFrameExtendedDataSize: 0,
+                FreeFrameExtendedDataBlock: std::ptr::null_mut(),
             },
             short_name: CString::new(info.short_name).unwrap_or_default(),
             _description: description,
@@ -265,8 +266,8 @@ fn param_index(index: u32) -> Option<usize> {
 
 /// Copies `text` into a host string buffer, as the FFGL SDK does (no terminator).
 unsafe fn write_string(buffer: &StringBufferStruct, text: &str) {
-    let n = text.len().min(buffer.max_to_write as usize);
-    // SAFETY: the host owns `max_to_write` bytes at `address`.
+    let n = text.len().min(buffer.maxToWrite as usize);
+    // SAFETY: the host owns `maxToWrite` bytes at `address`.
     unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), buffer.address.cast(), n) };
 }
 
@@ -274,7 +275,7 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
     // SAFETY: the host passes an instance from FF_INSTANTIATE_GL or null.
     let instance = unsafe { instance_ptr.as_mut() };
     // SAFETY (all reads of `input`): the host puts the value type `code` defines there.
-    let index = unsafe { input.uint };
+    let index = unsafe { input.UIntValue };
     let table = param_table();
     match code {
         FF_GET_INFO => FFMixed::ptr(&descriptors().info),
@@ -301,11 +302,11 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
             None => FFMixed::fail(),
         },
         FF_GET_PARAMETER_USAGE => FFMixed::uint(FF_USAGE_STANDARD),
-        FF_GET_PARAMETER_VISIBILITY => FFMixed::uint(FF_TRUE),
+        FF_GET_PRAMETER_VISIBILITY => FFMixed::uint(FF_TRUE),
         FF_GET_RANGE => {
             // SAFETY: a host-owned GetRangeStruct.
-            let range_query = unsafe { &mut *input.ptr.cast::<GetRangeStruct>() };
-            match param_index(range_query.parameter_number) {
+            let range_query = unsafe { &mut *input.PointerValue.cast::<GetRangeStruct>() };
+            match param_index(range_query.parameterNumber) {
                 Some(i) => {
                     range_query.range = RangeStruct {
                         min: table[i].min,
@@ -318,15 +319,16 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
         }
         FF_GET_PARAM_GROUP | FF_GET_PARAM_DISPLAY_NAME => {
             // SAFETY: a host-owned GetStringStruct.
-            let string_query = unsafe { &*input.ptr.cast::<GetStringStruct>() };
-            match param_index(string_query.parameter_number) {
-                Some(i) if string_query.string_buffer.max_to_write > 0 => {
+            let string_query = unsafe { &*input.PointerValue.cast::<GetStringStruct>() };
+            match param_index(string_query.parameterNumber) {
+                Some(i) if string_query.stringBuffer.maxToWrite > 0 => {
                     let text = if code == FF_GET_PARAM_GROUP {
                         table[i].group.clone()
                     } else {
                         table[i].name.to_string_lossy().into_owned()
                     };
-                    unsafe { write_string(&string_query.string_buffer, &text) };
+                    // SAFETY: the host owns `maxToWrite` bytes at the buffer's address.
+                    unsafe { write_string(&string_query.stringBuffer, &text) };
                     FFMixed::success()
                 }
                 _ => FFMixed::fail(),
@@ -338,12 +340,13 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
         },
         FF_GET_PARAMETER_ELEMENT_NAME | FF_GET_PARAMETER_ELEMENT_VALUE => {
             // SAFETY: a host-owned GetParameterElement*Struct (same layout).
-            let element_query = unsafe { &*input.ptr.cast::<GetParameterElementStruct>() };
-            let option = param_index(element_query.parameter_number)
-                .and_then(|i| table[i].options.get(element_query.element_number as usize));
+            let element_query =
+                unsafe { &*input.PointerValue.cast::<GetParameterElementNameStruct>() };
+            let option = param_index(element_query.ParameterNumber)
+                .and_then(|i| table[i].options.get(element_query.ElementNumber as usize));
             match (code, option) {
                 (FF_GET_PARAMETER_ELEMENT_NAME, Some(name)) => FFMixed::ptr(name.as_ptr()),
-                (_, Some(_)) => FFMixed::float(element_query.element_number as f32),
+                (_, Some(_)) => FFMixed::float(element_query.ElementNumber as f32),
                 (FF_GET_PARAMETER_ELEMENT_NAME, None) => FFMixed::ptr(std::ptr::null::<c_char>()),
                 (_, None) => FFMixed::fail(),
             }
@@ -351,14 +354,14 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
         FF_GET_NUM_ELEMENT_SEPARATORS => FFMixed::uint(0),
         FF_GET_PARAMETER_EVENTS => {
             // SAFETY: a host-owned GetParamEventsStruct; the plugin never raises events.
-            let events = unsafe { &mut *input.ptr.cast::<GetParamEventsStruct>() };
-            events.num_events = 0;
+            let events = unsafe { &mut *input.PointerValue.cast::<GetParamEventsStruct>() };
+            events.numEvents = 0;
             FFMixed::ok(instance.is_some())
         }
 
         FF_INSTANTIATE_GL => {
             // SAFETY: the host passes a viewport and has its context current.
-            let viewport = unsafe { input.ptr.cast::<FFGLViewportStruct>().as_ref() };
+            let viewport = unsafe { input.PointerValue.cast::<FFGLViewportStruct>().as_ref() };
             if viewport.is_none() {
                 return FFMixed::fail();
             }
@@ -432,9 +435,9 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
             _ => FFMixed::fail(),
         },
         FF_SET_TIME => match instance {
-            Some(instance) if !unsafe { input.ptr }.is_null() => {
+            Some(instance) if !unsafe { input.PointerValue }.is_null() => {
                 // SAFETY: the host passes a pointer to a double, in seconds.
-                let time = unsafe { *input.ptr.cast::<f64>() };
+                let time = unsafe { *input.PointerValue.cast::<f64>() };
                 if time.is_finite() {
                     // A CPU effect's earlier frames are the ones before this time, so going
                     // back starts over.
@@ -452,10 +455,12 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
         },
         FF_SET_PARAMETER => {
             // SAFETY: a host-owned SetParameterStruct.
-            let set_parameter = unsafe { &*input.ptr.cast::<SetParameterStruct>() };
-            match (instance, param_index(set_parameter.parameter_number)) {
+            let set_parameter = unsafe { &*input.PointerValue.cast::<SetParameterStruct>() };
+            match (instance, param_index(set_parameter.ParameterNumber)) {
                 (Some(instance), Some(i)) => {
-                    let value = f32::from_bits(unsafe { set_parameter.new_parameter_value.uint });
+                    // SAFETY: FFGL passes a parameter value as float bits in the integer.
+                    let value =
+                        f32::from_bits(unsafe { set_parameter.NewParameterValue.UIntValue });
                     instance.values[i] = params::clamp_to_range(&table[i], value);
                     if let Some(cpu) = &instance.cpu_effect {
                         cpu.effect.values_known(&instance.effect_values());
@@ -482,7 +487,9 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
         },
         FF_PROCESS_OPENGL => match instance {
             // SAFETY: the host passes a ProcessOpenGLStruct with its context current.
-            Some(instance) => FFMixed::ok(unsafe { process_frame(instance, input.ptr.cast()) }),
+            Some(instance) => {
+                FFMixed::ok(unsafe { process_frame(instance, input.PointerValue.cast()) })
+            }
             None => FFMixed::fail(),
         },
         _ => FFMixed::fail(),
@@ -495,21 +502,21 @@ unsafe fn process_frame(instance: &mut Instance, args: *const ProcessOpenGLStruc
     let Some(args) = (unsafe { args.as_ref() }) else {
         return false;
     };
-    if args.num_input_textures < 1 || args.input_textures.is_null() {
+    if args.numInputTextures < 1 || args.inputTextures.is_null() {
         return false;
     }
-    // SAFETY: the host passes `num_input_textures` texture pointers.
-    let Some(input_texture) = (unsafe { (*args.input_textures).as_ref() }) else {
+    // SAFETY: the host passes `numInputTextures` texture pointers.
+    let Some(input_texture) = (unsafe { (*args.inputTextures).as_ref() }) else {
         return false;
     };
-    let (w, h) = (input_texture.width, input_texture.height);
+    let (w, h) = (input_texture.Width, input_texture.Height);
     if w == 0 || h == 0 {
         return true;
     }
     if w > i32::MAX as u32
         || h > i32::MAX as u32
-        || input_texture.hardware_width < w
-        || input_texture.hardware_height < h
+        || input_texture.HardwareWidth < w
+        || input_texture.HardwareHeight < h
     {
         return false;
     }
@@ -530,7 +537,7 @@ unsafe fn process_cpu(
 ) -> bool {
     let values = instance.effect_values();
     let time = instance.time.unwrap_or(0.0);
-    let (w, h) = (input_texture.width, input_texture.height);
+    let (w, h) = (input_texture.Width, input_texture.Height);
     // SAFETY: the host's context is current.
     #[cfg(target_os = "windows")]
     let gpu_output_ready = unsafe { prepare_gpu_output(instance, &values, (w, h)) };
@@ -578,9 +585,9 @@ unsafe fn process_cpu(
     // SAFETY: the context is current and the canvas has the declared image size.
     unsafe {
         canvas.read(
-            input_texture.handle,
-            (input_texture.hardware_width, input_texture.hardware_height),
-            args.host_fbo,
+            input_texture.Handle,
+            (input_texture.HardwareWidth, input_texture.HardwareHeight),
+            args.HostFBO,
             cpu.history.next(frames_before, frames_held),
         )
     };
@@ -634,11 +641,11 @@ unsafe fn process_cpu(
             instance.interop.record_render_error(e);
             if let Some(blit) = &instance.pass_through_blit {
                 let max_uv = [
-                    w as f32 / input_texture.hardware_width.max(1) as f32,
-                    h as f32 / input_texture.hardware_height.max(1) as f32,
+                    w as f32 / input_texture.HardwareWidth.max(1) as f32,
+                    h as f32 / input_texture.HardwareHeight.max(1) as f32,
                 ];
                 // SAFETY: the context is current with the host's framebuffer bound.
-                unsafe { blit.draw(input_texture.handle, gl::TEXTURE_2D, max_uv) };
+                unsafe { blit.draw(input_texture.Handle, gl::TEXTURE_2D, max_uv) };
             }
             return true;
         }
@@ -731,13 +738,13 @@ unsafe fn process_gpu(
     let Some(blit) = instance.pass_through_blit.as_ref() else {
         return false;
     };
-    let (w, h) = (input_texture.width, input_texture.height);
+    let (w, h) = (input_texture.Width, input_texture.Height);
     let pass_through = |blit: &gl::Blit| unsafe {
         let max_uv = [
-            w as f32 / input_texture.hardware_width.max(1) as f32,
-            h as f32 / input_texture.hardware_height.max(1) as f32,
+            w as f32 / input_texture.HardwareWidth.max(1) as f32,
+            h as f32 / input_texture.HardwareHeight.max(1) as f32,
         ];
-        blit.draw(input_texture.handle, gl::TEXTURE_2D, max_uv);
+        blit.draw(input_texture.Handle, gl::TEXTURE_2D, max_uv);
         true
     };
     let values = instance.effect_values();
@@ -751,9 +758,9 @@ unsafe fn process_gpu(
             interop.render(
                 &values,
                 ctx,
-                input_texture.handle,
-                (input_texture.hardware_width, input_texture.hardware_height),
-                args.host_fbo,
+                input_texture.Handle,
+                (input_texture.HardwareWidth, input_texture.HardwareHeight),
+                args.HostFBO,
             )
         }));
         match rendered {
@@ -802,10 +809,10 @@ unsafe fn process_gpu(
         }
         if let Some(interop) = &instance.interop {
             LOG.note("render path: GPU-native (IOSurface shared with OpenGL, no CPU copies)");
-            let hardware = (input_texture.hardware_width, input_texture.hardware_height);
+            let hardware = (input_texture.HardwareWidth, input_texture.HardwareHeight);
             // SAFETY: the context is current; the texture is the host's input.
             let rendered = catch_unwind(AssertUnwindSafe(|| unsafe {
-                interop.render(&values, ctx, input_texture.handle, hardware, args.host_fbo)
+                interop.render(&values, ctx, input_texture.Handle, hardware, args.HostFBO)
             }));
             if rendered.is_err() {
                 LOG.note("warning: GPU render failed, passing frames through");
@@ -839,9 +846,9 @@ unsafe fn process_gpu(
         // SAFETY: the host's texture has its declared hardware size; the context is current.
         unsafe {
             instance.float_transfer.as_ref().unwrap().read(
-                input_texture.handle,
-                (input_texture.hardware_width, input_texture.hardware_height),
-                args.host_fbo,
+                input_texture.Handle,
+                (input_texture.HardwareWidth, input_texture.HardwareHeight),
+                args.HostFBO,
             )
         }
     };
@@ -850,11 +857,11 @@ unsafe fn process_gpu(
         // SAFETY: the host's texture is a 2D texture of its hardware size.
         let texels = unsafe {
             gl::read_texture(
-                input_texture.handle,
-                (input_texture.hardware_width, input_texture.hardware_height),
+                input_texture.Handle,
+                (input_texture.HardwareWidth, input_texture.HardwareHeight),
             )
         };
-        frame::texture_to_canvas(&texels, input_texture.hardware_width, w, h)
+        frame::texture_to_canvas(&texels, input_texture.HardwareWidth, w, h)
     };
     let job = pipeline::Job {
         spec: pipeline::Spec {

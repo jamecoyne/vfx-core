@@ -3561,6 +3561,9 @@ dependencies = [
 [[package]]
 name = "vfx-ffgl-common"
 version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "vfx-host"

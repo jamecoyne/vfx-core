@@ -52,6 +52,12 @@ impl From<String> for InteropError {
     }
 }
 
+impl From<gl::Error> for InteropError {
+    fn from(error: gl::Error) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
 impl std::fmt::Display for InteropError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -302,7 +308,7 @@ fn retire(device: Arc<SharedDevice>) {
 /// The host's GL context must be current, with the GL functions loaded.
 pub unsafe fn share_device_with_cpu_effects() -> Result<(), String> {
     // SAFETY: the caller has the context current.
-    let luid = unsafe { gl::shared_memory_luid()? };
+    let luid = unsafe { gl::shared_memory_luid() }.map_err(|e| e.to_string())?;
     match SharedDevice::state(luid) {
         DeviceState::Working(device) => device.gpu.share(),
         DeviceState::NeverOpened => SharedDevice::open(luid)?.gpu.share(),
@@ -490,7 +496,7 @@ impl SharedImage {
     ///
     /// # Safety
     /// The host's context must be current and optional GL interop functions loaded.
-    unsafe fn import_to_gl(&mut self, size: (u32, u32)) -> Result<(), String> {
+    unsafe fn import_to_gl(&mut self, size: (u32, u32)) -> Result<(), gl::Error> {
         // SAFETY: the caller has the context current, and the handle stays open until deletion.
         unsafe {
             gl::glCreateMemoryObjectsEXT(1, &mut self.gl_memory);
@@ -596,7 +602,7 @@ impl SharedSemaphore {
     ///
     /// # Safety
     /// The host's GL context must be current.
-    unsafe fn import_to_gl(&mut self) -> Result<(), String> {
+    unsafe fn import_to_gl(&mut self) -> Result<(), gl::Error> {
         let handle = self.handle.as_ref().expect("made with its handle");
         // SAFETY: the caller has the context current. NT handles stay application-owned after GL
         // import and are closed by OwnedHandle.
@@ -678,7 +684,8 @@ impl VulkanParts {
     /// The host's GL context must be current.
     unsafe fn open_here(size: (u32, u32)) -> Result<Self, InteropError> {
         // SAFETY: the caller has the current context.
-        let luid = unsafe { gl::shared_memory_luid() }.map_err(InteropError::Unsupported)?;
+        let luid = unsafe { gl::shared_memory_luid() }
+            .map_err(|e| InteropError::Unsupported(e.to_string()))?;
         let device = SharedDevice::open(luid).map_err(InteropError::Unsupported)?;
         Self::new(device, size)
     }
@@ -982,7 +989,7 @@ impl Interop {
                 GL_TRANSFER_LAYOUTS.as_ptr(),
             );
             gl::finish_shared();
-            gl::check_error("GL to Vulkan handoff")?;
+            gl::check_error("GL to Vulkan handoff").map_err(|e| e.to_string())?;
         }
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         // SAFETY: GL released both images and signalled gl_finished; the caller holds the lock.
@@ -1338,7 +1345,7 @@ impl InteropSlot {
     unsafe fn start_setup_on_thread(&mut self, size: (u32, u32)) {
         // SAFETY: the caller has the context current.
         let started = unsafe { gl::shared_memory_luid() }
-            .map_err(InteropError::Unsupported)
+            .map_err(|e| InteropError::Unsupported(e.to_string()))
             .and_then(|luid| SetupOnThread::start(luid, size));
         match started {
             Ok(setup) => self.setup_on_thread = Some(setup),
