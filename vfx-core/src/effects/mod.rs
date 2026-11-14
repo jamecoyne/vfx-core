@@ -2,12 +2,11 @@
 //! - [`ColorAdjust`]: one pass, no state
 //! - [`GaussianBlur`]: two passes with an internal scratch frame
 //! - [`FeedbackTrail`]: persistent state carried between frames
-//!
 //! - [`Vignette`]: point, colour and float parameters together
 //! - [`Blend`]: reads a second layer supplied by the host
 //! - [`Flip`]: reads from another pixel than the one it writes
 //!
-//! [`PixelConvert`] is plumbing rather than a look: it converts alpha form (straight or
+//! [`PixelConvert`] is plumbing, not a look: it converts alpha form (straight or
 //! premultiplied) or transfer curve (sRGB or linear), so each effect can run in the
 //! space it is correct in.
 
