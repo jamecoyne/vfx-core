@@ -99,7 +99,7 @@ fn swarm_holds_contract() {
     }
 }
 
-/// The swarm on the GPU keeps it too.
+/// The GPU swarm holds the same contract.
 #[test]
 fn gpu_swarm_holds_contract() {
     segcam_motion::gpu::status().expect("a GPU adapter");

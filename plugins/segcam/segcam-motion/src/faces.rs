@@ -23,7 +23,7 @@ mod models {
     static RUNS_ON: Mutex<Option<&'static str>> = Mutex::new(None);
 
     /// The models, once they have loaded or failed to. A panic while they ran leaves them usable:
-    /// each find starts over, so only that detection's faces are lost.
+    /// each detection starts over, so only that detection's faces are lost.
     pub(super) fn lock() -> Option<MutexGuard<'static, Option<Segmenter>>> {
         let models = MODELS.get()?;
         Some(models.lock().unwrap_or_else(|poisoned| {
@@ -470,7 +470,7 @@ mod live {
     const DETECTION_PACE: u32 = 2;
 
     /// Bodies are looked for no more often than once per their detection's time times this; the
-    /// detections between keep the bodies found last, since bodies move less than faces.
+    /// detections between keep the last detected bodies, since bodies move less than faces.
     const BODY_PACE: u32 = 4;
 
     /// The faces found in one frame, and that frame's pixels.
@@ -1011,7 +1011,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn held_faces_are_found_on_own_frame() {
+    fn held_faces_use_own_frame() {
         let mut live = LiveFaces::default();
         live.hold(
             FaceParts::default(),

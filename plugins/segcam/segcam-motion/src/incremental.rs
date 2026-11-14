@@ -501,7 +501,7 @@ impl IncrementalRenderer {
         for frame in frames_to_read {
             let index = (frame - plan.window_start) as usize;
             let before = self.read_before(frame);
-            // Whether this read has to show the frame is unchanged.
+            // A fixed source needs a read only to verify the frames in `checks`.
             let verify = !plan.fixed || checks.contains(&frame);
             let read_known = if !verify && before.is_some() {
                 before
@@ -812,8 +812,8 @@ impl IncrementalRenderer {
         crate::faces::ready()
     }
 
-    /// The frames from `window_start` a render of `number` must read: those without cached motion or
-    /// tiles, the analyses before them without grids, and `number`, which it draws and, outside
+    /// The frames from `window_start` a render of `number` must read: those without cached
+    /// motion or tiles, the analyses before them without grids, and `number`, which it draws and, outside
     /// the swarm, may analyse. None before `oldest_held_frame`.
     fn frames_to_read(
         &self,
@@ -2263,7 +2263,7 @@ mod tests {
     fn own_device() -> Arc<gpu::GpuContext> {
         let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
         let dev = gpu::open(&choice).or_else(|_| gpu::open("fallback"));
-        Arc::new(dev.expect("an adapter: CI has lavapipe, WARP or Metal"))
+        Arc::new(dev.expect("an adapter, hardware or software"))
     }
 
     /// An instance drawing every swarm render on `dev`.

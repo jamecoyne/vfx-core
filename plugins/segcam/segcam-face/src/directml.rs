@@ -1,10 +1,10 @@
-//! Loads the `DirectML.dll` beside the plugin in place of the host's copy, which can be too old
-//! for ONNX Runtime (DaVinci Resolve's is).
+//! Loads the `DirectML.dll` beside the plugin in place of the host's copy, which can be too
+//! old for ONNX Runtime (DaVinci Resolve's is).
 //!
 //! The plugin's build script must delay-load it with
-//! `cargo:rustc-link-arg-cdylib=/DELAYLOAD:DirectML.dll`, and its bundle must ship the file next
-//! to the binary. Without them DirectML loads as usual, and [`crate::runtime::fastest`] picks the
-//! CPU if that copy is too old.
+//! `cargo:rustc-link-arg-cdylib=/DELAYLOAD:DirectML.dll`, and its bundle must ship the file
+//! next to the binary. Without them DirectML loads as usual, and [`crate::runtime::fastest`]
+//! picks the CPU if that copy is too old.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr::null_mut;
@@ -43,7 +43,8 @@ unsafe extern "system" fn hook(notify: u32, info: *const DelayLoadInfo) -> *mut 
         return null_mut();
     }
     let mut module = HMODULE::default();
-    // SAFETY: `hook` is inside this module, and the unchanged-refcount flag leaves nothing to free.
+    // SAFETY: `hook` is inside this module, and the unchanged-refcount flag leaves nothing
+    // to free.
     let found = unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
