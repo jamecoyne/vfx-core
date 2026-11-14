@@ -46,9 +46,34 @@ pub enum InteropError {
     Lost(String),
 }
 
-impl From<String> for InteropError {
-    fn from(message: String) -> Self {
-        Self::Failed(message)
+/// Why a shared device, image or semaphore couldn't be made.
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error(transparent)]
+    Gl(#[from] gl::Error),
+    #[error("{operation}: {source}")]
+    Vulkan {
+        operation: &'static str,
+        source: vk::Result,
+    },
+    #[error(transparent)]
+    OpenDevice(#[from] hal::DeviceError),
+    #[error(transparent)]
+    RequestDevice(#[from] wgpu::RequestDeviceError),
+    #[error("{0}")]
+    Unavailable(&'static str),
+}
+
+impl SetupError {
+    /// For `map_err`: the failed Vulkan call named `operation`.
+    fn vulkan(operation: &'static str) -> impl FnOnce(vk::Result) -> Self {
+        move |source| Self::Vulkan { operation, source }
+    }
+}
+
+impl From<SetupError> for InteropError {
+    fn from(error: SetupError) -> Self {
+        Self::Failed(error.to_string())
     }
 }
 
@@ -115,7 +140,7 @@ impl SharedDevice {
     /// Opens the device, blocking for as long as the driver takes. On the render thread only for
     /// the process's first open of a LUID, which comes with an instance's first frames and not
     /// during a reset.
-    fn open(luid: [u8; 8]) -> Result<Arc<Self>, String> {
+    fn open(luid: [u8; 8]) -> Result<Arc<Self>, SetupError> {
         Self::open_with(luid, || Self::make(luid))
     }
 
@@ -124,8 +149,8 @@ impl SharedDevice {
     /// render thread, and whichever try works shares its device with a CPU effect left on the old.
     fn open_with(
         luid: [u8; 8],
-        make: impl FnOnce() -> Result<Arc<Self>, String>,
-    ) -> Result<Arc<Self>, String> {
+        make: impl FnOnce() -> Result<Arc<Self>, SetupError>,
+    ) -> Result<Arc<Self>, SetupError> {
         let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
         let replaces_lost = match Self::state(luid) {
             DeviceState::Working(device) => return Ok(device),
@@ -165,7 +190,7 @@ impl SharedDevice {
     }
 
     /// A new device on the adapter with this LUID.
-    fn make(luid: [u8; 8]) -> Result<Arc<Self>, String> {
+    fn make(luid: [u8; 8]) -> Result<Arc<Self>, SetupError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -174,10 +199,14 @@ impl SharedDevice {
         let adapter = adapters
             .into_iter()
             .find(|adapter| Self::luid_of(adapter) == Some(luid))
-            .ok_or("no Vulkan adapter matches the OpenGL device LUID (single node required)")?;
+            .ok_or(SetupError::Unavailable(
+                "no Vulkan adapter matches the OpenGL device LUID (single node required)",
+            ))?;
         let features = wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
         if !adapter.features().contains(features) {
-            return Err("Vulkan adapter lacks VULKAN_EXTERNAL_MEMORY_WIN32".into());
+            return Err(SetupError::Unavailable(
+                "Vulkan adapter lacks VULKAN_EXTERNAL_MEMORY_WIN32",
+            ));
         }
         // CPU effects read a canvas back in one buffer, as large as allowed.
         let supported = adapter.limits();
@@ -196,26 +225,24 @@ impl SharedDevice {
         let (device, queue) = unsafe {
             let a = adapter
                 .as_hal::<hal::api::Vulkan>()
-                .ok_or("not a Vulkan adapter")?;
+                .ok_or(SetupError::Unavailable("not a Vulkan adapter"))?;
             if !a
                 .physical_device_capabilities()
                 .supports_extension(khr::external_semaphore_win32::NAME)
             {
-                return Err("Vulkan adapter lacks VK_KHR_external_semaphore_win32".into());
+                return Err(SetupError::Unavailable(
+                    "Vulkan adapter lacks VK_KHR_external_semaphore_win32",
+                ));
             }
-            let opened = a
-                .open_with_callback(
-                    features,
-                    &desc.required_limits,
-                    &desc.memory_hints,
-                    Some(Box::new(|args| {
-                        args.extensions.push(khr::external_semaphore_win32::NAME)
-                    })),
-                )
-                .map_err(|e| e.to_string())?;
-            adapter
-                .create_device_from_hal::<hal::api::Vulkan>(opened, &desc)
-                .map_err(|e| e.to_string())?
+            let opened = a.open_with_callback(
+                features,
+                &desc.required_limits,
+                &desc.memory_hints,
+                Some(Box::new(|args| {
+                    args.extensions.push(khr::external_semaphore_win32::NAME)
+                })),
+            )?;
+            adapter.create_device_from_hal::<hal::api::Vulkan>(opened, &desc)?
         };
         let gpu = Gpu::from_parts(device, queue);
         // Only CPU effects share it, and a GPU effect's instance has to learn of a loss too.
@@ -306,9 +333,9 @@ fn retire(device: Arc<SharedDevice>) {
 ///
 /// # Safety
 /// The host's GL context must be current, with the GL functions loaded.
-pub unsafe fn share_device_with_cpu_effects() -> Result<(), String> {
+pub unsafe fn share_device_with_cpu_effects() -> Result<(), SetupError> {
     // SAFETY: the caller has the context current.
-    let luid = unsafe { gl::shared_memory_luid() }.map_err(|e| e.to_string())?;
+    let luid = unsafe { gl::shared_memory_luid() }?;
     match SharedDevice::state(luid) {
         DeviceState::Working(device) => device.gpu.share(),
         DeviceState::NeverOpened => SharedDevice::open(luid)?.gpu.share(),
@@ -330,7 +357,7 @@ struct SharedImage {
 
 impl SharedImage {
     /// The Vulkan image and its memory, on any thread. [`Self::import_to_gl`] finishes it.
-    fn new(device: &SharedDevice, size: (u32, u32), input: bool) -> Result<Self, String> {
+    fn new(device: &SharedDevice, size: (u32, u32), input: bool) -> Result<Self, SetupError> {
         let d = &device.raw;
         let usage = vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST
@@ -376,17 +403,19 @@ impl SharedImage {
                     &query,
                     &mut properties,
                 )
-                .map_err(|e| format!("external RGBA32F image: {e}"))?;
+                .map_err(SetupError::vulkan("external RGBA32F image"))?;
             if !external_properties
                 .external_memory_properties
                 .external_memory_features
                 .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
             {
-                return Err("RGBA32F OPAQUE_WIN32 memory isn't exportable".into());
+                return Err(SetupError::Unavailable(
+                    "RGBA32F OPAQUE_WIN32 memory isn't exportable",
+                ));
             }
             let image = d
                 .create_image(&info, None)
-                .map_err(|e| format!("vkCreateImage: {e}"))?;
+                .map_err(SetupError::vulkan("vkCreateImage"))?;
             let requirements = d.get_image_memory_requirements(image);
             let types = device
                 .instance
@@ -404,7 +433,9 @@ impl SharedImage {
                 .map(|(i, _)| i as u32)
             else {
                 d.destroy_image(image, None);
-                return Err("no device-local memory for shared image".into());
+                return Err(SetupError::Unavailable(
+                    "no device-local memory for shared image",
+                ));
             };
             let mut export = vk::ExportMemoryAllocateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
@@ -418,13 +449,19 @@ impl SharedImage {
                 Ok(memory) => memory,
                 Err(e) => {
                     d.destroy_image(image, None);
-                    return Err(format!("vkAllocateMemory: {e}"));
+                    return Err(SetupError::Vulkan {
+                        operation: "vkAllocateMemory",
+                        source: e,
+                    });
                 }
             };
             if let Err(e) = d.bind_image_memory(image, memory, 0) {
                 d.destroy_image(image, None);
                 d.free_memory(memory, None);
-                return Err(format!("vkBindImageMemory: {e}"));
+                return Err(SetupError::Vulkan {
+                    operation: "vkBindImageMemory",
+                    source: e,
+                });
             }
             let uses = if input {
                 wgpu::TextureUses::COPY_SRC
@@ -479,7 +516,7 @@ impl SharedImage {
                         .memory(memory)
                         .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32),
                 )
-                .map_err(|e| format!("vkGetMemoryWin32HandleKHR: {e}"))?;
+                .map_err(SetupError::vulkan("vkGetMemoryWin32HandleKHR"))?;
             let handle = OwnedHandle::from_raw_handle(handle as *mut _);
             Ok(Self {
                 texture,
@@ -552,7 +589,7 @@ struct SharedSemaphore {
 
 impl SharedSemaphore {
     /// The Vulkan semaphore, on any thread. [`Self::import_to_gl`] finishes it.
-    fn new(device: &SharedDevice) -> Result<Self, String> {
+    fn new(device: &SharedDevice) -> Result<Self, SetupError> {
         // SAFETY: the extension is supported and enabled on this device.
         unsafe {
             let mut properties = vk::ExternalSemaphoreProperties::default();
@@ -568,7 +605,9 @@ impl SharedSemaphore {
                 .external_semaphore_features
                 .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE)
             {
-                return Err("OPAQUE_WIN32 semaphore isn't exportable".into());
+                return Err(SetupError::Unavailable(
+                    "OPAQUE_WIN32 semaphore isn't exportable",
+                ));
             }
             let mut export = vk::ExportSemaphoreCreateInfo::default()
                 .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_WIN32);
@@ -578,7 +617,7 @@ impl SharedSemaphore {
                     &vk::SemaphoreCreateInfo::default().push_next(&mut export),
                     None,
                 )
-                .map_err(|e| format!("vkCreateSemaphore: {e}"))?;
+                .map_err(SetupError::vulkan("vkCreateSemaphore"))?;
             let mut semaphore = Self {
                 raw,
                 gl: 0,
@@ -592,7 +631,7 @@ impl SharedSemaphore {
                         .semaphore(raw)
                         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_WIN32),
                 )
-                .map_err(|e| format!("vkGetSemaphoreWin32HandleKHR: {e}"))?;
+                .map_err(SetupError::vulkan("vkGetSemaphoreWin32HandleKHR"))?;
             semaphore.handle = Some(OwnedHandle::from_raw_handle(handle as *mut _));
             Ok(semaphore)
         }
@@ -686,14 +725,16 @@ impl VulkanParts {
         // SAFETY: the caller has the current context.
         let luid = unsafe { gl::shared_memory_luid() }
             .map_err(|e| InteropError::Unsupported(e.to_string()))?;
-        let device = SharedDevice::open(luid).map_err(InteropError::Unsupported)?;
+        let device =
+            SharedDevice::open(luid).map_err(|e| InteropError::Unsupported(e.to_string()))?;
         Self::new(device, size)
     }
 
     /// All of a reopen's work that can leave the render thread. A panic is a failed try.
     fn open_and_make(luid: [u8; 8], size: (u32, u32)) -> Result<Self, InteropError> {
         catch_unwind(|| {
-            let device = SharedDevice::open(luid).map_err(InteropError::Unsupported)?;
+            let device =
+                SharedDevice::open(luid).map_err(|e| InteropError::Unsupported(e.to_string()))?;
             device.answers()?;
             Self::new(device, size)
         })
@@ -975,7 +1016,7 @@ impl Interop {
     /// # Safety
     /// The host's context must be current, GL must own both images, and the queue lock must be
     /// held until the wait's submission, which this makes.
-    unsafe fn hand_images_to_vulkan(&self) -> Result<(), String> {
+    unsafe fn hand_images_to_vulkan(&self) -> Result<(), gl::Error> {
         let gpu = &self.device.gpu;
         // SAFETY: GL owns both images until it signals.
         unsafe {
@@ -989,7 +1030,7 @@ impl Interop {
                 GL_TRANSFER_LAYOUTS.as_ptr(),
             );
             gl::finish_shared();
-            gl::check_error("GL to Vulkan handoff").map_err(|e| e.to_string())?;
+            gl::check_error("GL to Vulkan handoff")?;
         }
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         // SAFETY: GL released both images and signalled gl_finished; the caller holds the lock.
@@ -1231,9 +1272,9 @@ pub struct InteropSlot {
     setup_on_thread: Option<SetupOnThread>,
     /// When the latest interop was set up.
     set_up_at: Option<Instant>,
-    /// See [`Self::force_loss_for_tests`].
+    /// See [`Self::inject_loss`].
     calls_until_forced_loss: Option<u32>,
-    /// See [`Self::force_loss_before_present_for_tests`].
+    /// See [`Self::inject_loss_before_present`].
     presents_until_forced_loss: Option<u32>,
 }
 
@@ -1263,7 +1304,7 @@ impl InteropSlot {
     /// # Safety
     /// The host's GL context must be current.
     pub unsafe fn ready(&mut self, size: (u32, u32)) -> Option<&Interop> {
-        self.force_loss_for_tests();
+        self.inject_loss();
         self.check_device();
         if let Some(hung) = self.hung.take() {
             if hung.gpu_is_idle() {
@@ -1410,7 +1451,7 @@ impl InteropSlot {
 
     /// Destroys the interop's device when `VFX_FFGL_LOSE_DEVICE_AFTER`, read at setup, has counted
     /// down. A test of the way back; a driver's loss takes another way through wgpu.
-    fn force_loss_for_tests(&mut self) {
+    fn inject_loss(&mut self) {
         let Some(calls) = &mut self.calls_until_forced_loss else {
             return;
         };
@@ -1428,7 +1469,7 @@ impl InteropSlot {
     /// Destroys the interop's device when `VFX_FFGL_LOSE_DEVICE_IN_PRESENT`, read at setup, has
     /// counted down, so that [`Interop::present`] is what finds the loss: nothing polls here, and
     /// it fails before Vulkan has reported it.
-    pub fn force_loss_before_present_for_tests(&mut self) {
+    pub fn inject_loss_before_present(&mut self) {
         let Some(presents) = &mut self.presents_until_forced_loss else {
             return;
         };
@@ -1574,22 +1615,16 @@ mod tests {
         assert!(gpu.faults().lost().is_some(), "the loss wasn't reported");
     }
 
-    fn two_devices() -> Option<(Gpu, Gpu)> {
-        let open = || pollster::block_on(Gpu::headless()).ok();
-        let devices = open().zip(open());
-        if devices.is_none() {
-            eprintln!("no GPU adapter: skipped");
-        }
-        devices
+    fn two_devices() -> (Gpu, Gpu) {
+        let open = || pollster::block_on(Gpu::headless()).expect("no GPU adapter available");
+        (open(), open())
     }
 
     /// The path a stale frame takes: an interop on a new device, of the same size, with the frame
     /// still kept from the old one.
     #[test]
-    fn output_frame_follows_the_device() {
-        let Some((a, b)) = two_devices() else {
-            return;
-        };
+    fn output_frame_keep_follows_device_and_size() {
+        let (a, b) = two_devices();
         let mut kept = None;
         OutputFrame::keep_or_make(&mut kept, &a, (64, 32));
         let on_a = kept.as_ref().unwrap().frame.texture.clone();
@@ -1615,12 +1650,10 @@ mod tests {
     /// Effects that share a device: one being lost leaves the other's slot alone, whichever was
     /// shared last.
     #[test]
-    fn losing_one_shared_device_stops_only_its_slots() {
+    fn shared_device_loss_spares_other_slots() {
         let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
         for lose_the_last_shared in [true, false] {
-            let Some((a, b)) = two_devices() else {
-                return;
-            };
+            let (a, b) = two_devices();
             a.share();
             b.share();
             let (lost, healthy) = if lose_the_last_shared { (b, a) } else { (a, b) };
@@ -1641,10 +1674,8 @@ mod tests {
 
     /// A failure before the loss is known turns the slot off, and the loss turns it on again.
     #[test]
-    fn a_loss_undoes_a_failure_that_came_first() {
-        let Some((a, _b)) = two_devices() else {
-            return;
-        };
+    fn loss_clears_earlier_render_failure() {
+        let (a, _b) = two_devices();
         a.watch_faults();
         let mut slot = slot_on(&a);
         slot.record_render_error(InteropError::Failed("GL to Vulkan handoff".into()));
@@ -1657,11 +1688,9 @@ mod tests {
     /// A handoff that hung turns the slot off until its device is lost, in an instance's first
     /// setup as in a reopen.
     #[test]
-    fn a_loss_undoes_a_hung_setup() {
+    fn loss_clears_hung_setup() {
         for reopen in [false, true] {
-            let Some((a, _b)) = two_devices() else {
-                return;
-            };
+            let (a, _b) = two_devices();
             a.watch_faults();
             let mut slot = InteropSlot::new(false);
             if reopen {
@@ -1689,27 +1718,27 @@ mod tests {
     /// A try that fails leaves the device lost, and the try that works shares its device with a CPU
     /// effect still on the lost one.
     #[test]
-    fn a_failed_try_leaves_the_device_lost() {
+    #[ignore = "needs a Vulkan adapter that shares memory with OpenGL"]
+    fn failed_open_keeps_device_lost() {
         let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
-        let Some(first) = adapters
+        let first = adapters
             .iter()
             .filter_map(SharedDevice::luid_of)
             .find_map(|luid| SharedDevice::open(luid).ok())
-        else {
-            eprintln!("no adapter with shared memory: skipped");
-            return;
-        };
+            .expect("no adapter with shared memory");
         let luid = first.luid;
         first.gpu.share();
         lose(&first.gpu);
         assert!(matches!(SharedDevice::state(luid), DeviceState::Lost));
 
-        let failed = SharedDevice::open_with(luid, || Err("the adapter is hidden".into()));
+        let failed = SharedDevice::open_with(luid, || {
+            Err(SetupError::Unavailable("the adapter is hidden"))
+        });
         assert!(failed.is_err());
         assert!(
             matches!(SharedDevice::state(luid), DeviceState::Lost),
@@ -1729,10 +1758,8 @@ mod tests {
 
     /// A slot that left a device for another size isn't sent looking for a new one by its loss.
     #[test]
-    fn a_device_left_behind_says_nothing() {
-        let Some((a, _b)) = two_devices() else {
-            return;
-        };
+    fn leave_size_ignores_later_loss() {
+        let (a, _b) = two_devices();
         a.watch_faults();
         let mut slot = slot_on(&a);
         // SAFETY: the slot has no interop, so nothing touches GL.
@@ -1744,10 +1771,8 @@ mod tests {
 
     /// GPU effects share nothing, so only the slot's own record can tell of a loss.
     #[test]
-    fn loss_of_a_device_nothing_shared_stops_its_slot() {
-        let Some((a, b)) = two_devices() else {
-            return;
-        };
+    fn unshared_device_loss_stops_slot() {
+        let (a, b) = two_devices();
         a.watch_faults();
         b.watch_faults();
         let (mut on_a, mut on_b) = (slot_on(&a), slot_on(&b));
@@ -1766,7 +1791,7 @@ mod tests {
 
     /// After a loss a setup that fails tries again, where before one it's final.
     #[test]
-    fn setup_failures_after_a_loss_retry() {
+    fn setup_error_retries_after_loss() {
         let mut fresh = InteropSlot::new(false);
         fresh.record_setup_error(InteropError::Unsupported("no adapter".into()));
         assert!(fresh.disabled);

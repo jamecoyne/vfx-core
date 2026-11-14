@@ -25,6 +25,7 @@ pub unsafe fn finish_queued_gl() {
     unsafe {
         vfx_ffgl_common::gl::finish_shared()
     };
+    // SAFETY: as above.
     #[cfg(target_os = "macos")]
     unsafe {
         vfx_ffgl_common::gl::finish()

@@ -25,7 +25,7 @@ impl Rect {
         self.width() == 0 || self.height() == 0
     }
 
-    pub fn grow(&self, x: i32, y: i32) -> Rect {
+    pub fn outset(&self, x: i32, y: i32) -> Rect {
         Rect {
             x1: self.x1 - x,
             y1: self.y1 - y,
@@ -218,13 +218,14 @@ mod tests {
     fn canvas_rows_run_top_down() {
         let mut data = [0; 16];
         let img = bottom_up(&mut data);
+        // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
         let canvas = unsafe { decode(&img, img.bounds) };
         assert_eq!(red(&canvas, 2, 0, 0), 30, "canvas row 0 is the top row");
         assert_eq!(red(&canvas, 2, 1, 1), 20);
     }
 
     #[test]
-    fn negative_row_bytes_store_rows_top_down() {
+    fn negative_row_bytes_decode_top_down() {
         // Same picture, but the data pointer is at the bottom row and rows go up in
         // memory by -8 bytes: the top row comes first in memory.
         let mut data = [
@@ -232,21 +233,24 @@ mod tests {
             10, 0, 0, 255, 20, 0, 0, 255, // y = 0 (bottom)
         ];
         let img = Image {
+            // SAFETY: offset 8 is inside `data`, the 16 byte buffer.
             data: unsafe { data.as_mut_ptr().add(8) },
             bounds: rect(0, 0, 2, 2),
             row_bytes: -8,
             depth: Depth::Byte,
             premultiplied: false,
         };
+        // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
         let canvas = unsafe { decode(&img, img.bounds) };
         assert_eq!(red(&canvas, 2, 0, 0), 30);
         assert_eq!(red(&canvas, 2, 1, 1), 20);
     }
 
     #[test]
-    fn larger_canvas_is_transparent_outside_the_image() {
+    fn decode_larger_canvas_is_transparent_outside() {
         let mut data = [0; 16];
         let img = bottom_up(&mut data);
+        // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
         let canvas = unsafe { decode(&img, rect(-1, -1, 3, 3)) };
         assert_eq!(canvas.len(), 4 * 4 * 4);
         assert_eq!(&canvas[0..4], &[0.0; 4]);
@@ -255,15 +259,17 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_through_a_window() {
+    fn encode_window_round_trip() {
         let mut data = [0; 16];
         let img = bottom_up(&mut data);
+        // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
         let canvas = unsafe { decode(&img, img.bounds) };
         let mut out = [0u8; 16];
         let dst = Image {
             data: out.as_mut_ptr(),
             ..img
         };
+        // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
         unsafe { encode(&canvas, img.bounds, &dst, rect(1, 0, 2, 2)) };
         assert_eq!(out[4], 20, "right column written");
         assert_eq!(out[12], 40);
@@ -271,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn premultiplied_images_are_unpremultiplied_and_back() {
+    fn premultiplied_round_trip() {
         // Half-transparent pixel, premultiplied: stored red 0.4 means straight red 0.8.
         let mut data: Vec<u8> = [0.4f32, 0.0, 0.0, 0.5]
             .iter()
@@ -284,6 +290,7 @@ mod tests {
             depth: Depth::Float,
             premultiplied: true,
         };
+        // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
         let canvas = unsafe { decode(&img, img.bounds) };
         assert!((canvas[0] - 0.8).abs() < 1e-6);
         let mut out = vec![0u8; 16];
@@ -291,12 +298,13 @@ mod tests {
             data: out.as_mut_ptr(),
             ..img
         };
+        // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
         unsafe { encode(&canvas, img.bounds, &dst, img.bounds) };
         assert_eq!(out, data);
     }
 
     #[test]
-    fn short_scales_by_65535_and_floats_stay_unclamped() {
+    fn decode_short_scales_to_unit() {
         let mut data: Vec<u8> = [65535u16, 0, 32768, 65535]
             .iter()
             .flat_map(|v| v.to_ne_bytes())
@@ -308,10 +316,14 @@ mod tests {
             depth: Depth::Short,
             premultiplied: false,
         };
+        // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
         let canvas = unsafe { decode(&img, img.bounds) };
         assert_eq!(canvas[0], 1.0);
         assert!((canvas[2] - 0.5).abs() < 1e-4);
+    }
 
+    #[test]
+    fn encode_float_stays_unclamped() {
         let mut out = vec![0u8; 16];
         let float = Image {
             data: out.as_mut_ptr(),
@@ -320,6 +332,7 @@ mod tests {
             depth: Depth::Float,
             premultiplied: false,
         };
+        // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
         unsafe { encode(&[2.5, -0.5, 0.0, 1.0], float.bounds, &float, float.bounds) };
         let r = f32::from_ne_bytes(out[0..4].try_into().unwrap());
         assert_eq!(r, 2.5);

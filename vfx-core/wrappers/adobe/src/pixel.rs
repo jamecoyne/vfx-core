@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_onto_offsets_into_a_larger_canvas() {
+    fn decode_onto_places_at_offset() {
         let placement = Placement {
             canvas_width: 4,
             canvas_height: 4,
@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn argb8_decodes_in_ae_channel_order() {
+    fn decode_argb8_channel_order() {
         // alpha 255, red 10, green 20, blue 30
         let rgba = decode(&[255, 10, 20, 30], 4, 1, 1, Depth::Bpc8);
         assert_eq!(rgba, vec![10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
@@ -234,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn argb16_scales_by_32768() {
+    fn decode_argb16_full_scale() {
         let mut src = Vec::new();
         for v in [32768u16, 0, 16384, 32768] {
             src.extend_from_slice(&v.to_ne_bytes());
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn float32_keeps_out_of_range_values() {
+    fn float32_round_trip_keeps_range() {
         let mut src = Vec::new();
         for v in [1.0f32, 2.5, -0.25, 0.5] {
             src.extend_from_slice(&v.to_ne_bytes());
@@ -258,19 +258,24 @@ mod tests {
     }
 
     #[test]
-    fn integer_encode_clamps() {
+    fn encode_integer_clamps() {
         let mut dst = [0u8; 4];
         encode(&[2.0, -1.0, 0.5, 1.5], &mut dst, 4, 1, 1, Depth::Bpc8);
         assert_eq!(dst, [255, 255, 0, 128]);
     }
 
-    #[test]
-    fn row_padding_is_skipped_on_decode_and_kept_on_encode() {
-        // Two 1-pixel rows with 4 bytes of host padding after each.
-        let src = [255, 1, 2, 3, 0xAA, 0xAA, 0xAA, 0xAA, 255, 4, 5, 6];
-        let rgba = decode(&src, 8, 1, 2, Depth::Bpc8);
-        assert_eq!(rgba.len(), 8);
+    // Two 1-pixel rows with 4 bytes of host padding after each.
+    const PADDED: [u8; 12] = [255, 1, 2, 3, 0xAA, 0xAA, 0xAA, 0xAA, 255, 4, 5, 6];
 
+    #[test]
+    fn decode_skips_row_padding() {
+        let rgba = decode(&PADDED, 8, 1, 2, Depth::Bpc8);
+        assert_eq!(rgba.len(), 8);
+    }
+
+    #[test]
+    fn encode_keeps_row_padding() {
+        let rgba = decode(&PADDED, 8, 1, 2, Depth::Bpc8);
         let mut dst = [0xEEu8; 12];
         encode(&rgba, &mut dst, 8, 1, 2, Depth::Bpc8);
         assert_eq!(&dst[0..4], &[255, 1, 2, 3]);
@@ -279,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_from_bits() {
+    fn depth_from_bits_rejects_unknown() {
         assert_eq!(Depth::from_bits(8), Some(Depth::Bpc8));
         assert_eq!(Depth::from_bits(16), Some(Depth::Bpc16));
         assert_eq!(Depth::from_bits(32), Some(Depth::Bpc32));

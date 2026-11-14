@@ -375,7 +375,8 @@ fn region_of_definition(
     in_args: Props,
     out_args: Props,
 ) -> Result<OfxStatus, OfxStatus> {
-    // A CPU effect never grows, so a host's frequent asks needn't read parameters or make an effect.
+    // A CPU effect never grows, so a host's frequent asks needn't read parameters or make
+    // an effect.
     if vfx_host::plugin().kind == Kind::Cpu {
         return Ok(kOfxStatReplyDefault);
     }
@@ -535,17 +536,18 @@ fn render_gpu(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxSta
     }
     // Render a canvas that also covers the pixels the effect reads around the window.
     let r = gpu_effect_region(&values, scale);
-    let read_area = window.grow(r.reach[0], r.reach[1]);
+    let read_area = window.outset(r.reach[0], r.reach[1]);
     let canvas = match &source {
         Some(s) if !r.grows => read_area.intersect(&s.image.bounds).union(&window),
         _ => read_area,
     };
     map_points(&mut values, plugin.params(), scale, canvas);
-    // SAFETY: images come from the host and are described by their own properties.
     let input = match &source {
+        // SAFETY: images come from the host and are described by their own properties.
         Some(s) => unsafe { image::decode(&s.image, canvas) },
         None => vec![0.0; canvas.width() * canvas.height() * 4],
     };
+    // SAFETY: as for `input`.
     let layer_pixels = layer
         .as_ref()
         .map(|l| unsafe { image::decode(&l.image, canvas) });
@@ -1208,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn seconds_and_frame_rate_agree_on_the_rate() {
+    fn seconds_uses_frame_rate() {
         assert_eq!(seconds(48.0, Some(60.0)), 0.8);
         assert_eq!(seconds(48.0, None), 2.0);
     }
@@ -1237,7 +1239,7 @@ mod tests {
     /// An export's skips at its start aren't dropped frames; playback's later on are, until the
     /// stream breaks.
     #[test]
-    fn only_skips_after_a_run_drop_frames() {
+    fn positions_flag_drops_only_after_run() {
         let dropped = |frames: &[i64]| {
             positions(frames, std::time::Duration::ZERO)
                 .iter()
@@ -1252,11 +1254,11 @@ mod tests {
         assert_eq!(dropped(&playback), want.collect::<Vec<_>>());
     }
 
-    /// The last frame of [`run_then`]'s playback.
+    /// The last frame of [`run_followed_by`]'s playback.
     const RUN_END: i64 = 15;
 
     /// `more` after playback of frames 0 to 13 that then drops a frame.
-    fn run_then(more: &[i64]) -> Vec<i64> {
+    fn run_followed_by(more: &[i64]) -> Vec<i64> {
         let run: Vec<i64> = (0..=13).collect();
         [&run[..], &[RUN_END], more].concat()
     }
@@ -1264,7 +1266,7 @@ mod tests {
     /// The jump to where the playhead stopped is checked, since that frame stays on screen.
     #[test]
     fn stop_jump_breaks_stream() {
-        let frames = run_then(&[RUN_END + MAX_STREAM_STEP + 1]);
+        let frames = run_followed_by(&[RUN_END + MAX_STREAM_STEP + 1]);
         let stop = *positions(&frames, std::time::Duration::ZERO)
             .last()
             .unwrap();
@@ -1277,7 +1279,7 @@ mod tests {
     #[test]
     fn hitch_resumes_after_one_check() {
         let jump = RUN_END + MAX_STREAM_STEP + 1;
-        let frames = run_then(&[jump, jump + 3, jump + 6]);
+        let frames = run_followed_by(&[jump, jump + 3, jump + 6]);
         let streams = positions(&frames, std::time::Duration::ZERO);
         let [hitch, resumed, next] = streams[streams.len() - 3..] else {
             unreachable!()
@@ -1291,7 +1293,7 @@ mod tests {
     #[test]
     fn hitch_resumes_at_any_step() {
         let jump = RUN_END + MAX_STREAM_STEP + 1;
-        let frames = run_then(&[jump, jump + 300]);
+        let frames = run_followed_by(&[jump, jump + 300]);
         let resumed = *positions(&frames, std::time::Duration::ZERO)
             .last()
             .unwrap();
@@ -1305,7 +1307,7 @@ mod tests {
         let jump = RUN_END + MAX_STREAM_STEP + 1;
         let run: Vec<i64> = (jump + 1..jump + 40).collect();
         let stop = jump + 40 + MAX_STREAM_STEP;
-        let frames = run_then(&[&[jump], &run[..], &[stop]].concat());
+        let frames = run_followed_by(&[&[jump], &run[..], &[stop]].concat());
         let streams = positions(&frames, std::time::Duration::ZERO);
         let [hitch, resumed @ .., last] = &streams[streams.len() - run.len() - 2..] else {
             unreachable!()
@@ -1323,7 +1325,7 @@ mod tests {
     #[test]
     fn stream_position_resume_rejects_paused_step() {
         let jump = RUN_END + MAX_STREAM_STEP + 1;
-        let frames = run_then(&[jump, jump + 1]);
+        let frames = run_followed_by(&[jump, jump + 1]);
         let last_index = frames.len() - 1;
         let streams = positions_with_gaps(&frames, std::time::Duration::ZERO, |i| {
             if i == last_index {
@@ -1339,7 +1341,7 @@ mod tests {
     /// The render after a possible stop, starting `gap` after it.
     fn after_possible_stop(gap: std::time::Duration) -> StreamPosition {
         let jump = RUN_END + MAX_STREAM_STEP + 1;
-        let frames = run_then(&[jump, jump + 3]);
+        let frames = run_followed_by(&[jump, jump + 3]);
         let last_index = frames.len() - 1;
         let streams = positions_with_gaps(&frames, std::time::Duration::ZERO, |i| {
             if i == last_index {
@@ -1353,14 +1355,14 @@ mod tests {
 
     /// A person can be this quick, so this doesn't resume, though it follows.
     #[test]
-    fn later_render_after_possible_stop_doesnt_resume() {
+    fn stream_position_slow_follow_does_not_resume() {
         let after = after_possible_stop(std::time::Duration::from_millis(200));
         assert!(after.follows && !after.continues && !after.frames_dropped);
     }
 
     /// Past the stream's gap, what follows a big step is new: an ordinary break.
     #[test]
-    fn big_step_with_a_gap_after_it_stays_a_break() {
+    fn stream_position_gap_after_big_step_breaks() {
         let after = after_possible_stop(std::time::Duration::from_secs(2));
         assert!(!after.follows && !after.continues && !after.frames_dropped);
     }
@@ -1384,7 +1386,7 @@ mod tests {
 
     /// A big step before any run, as at an export's start, is no stop of playback.
     #[test]
-    fn big_step_before_a_run_is_no_stop() {
+    fn stream_position_early_big_step_is_no_stop() {
         let streams = positions(&[0, 1, 2, 50, 53], std::time::Duration::ZERO);
         assert!(
             streams

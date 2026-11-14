@@ -99,7 +99,7 @@ impl<'a> Lease<'a> {
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
         if let Some(prepared) = self.prepared.take() {
-            give_back(prepared);
+            put_back(prepared);
         }
     }
 }
@@ -149,7 +149,7 @@ fn take(gpu: &Gpu, key: Key) -> Prepared {
     found.unwrap_or_else(|| build(gpu, key))
 }
 
-fn give_back(prepared: Prepared) {
+fn put_back(prepared: Prepared) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     if pool.len() >= POOL_LIMIT {
         pool.remove(0);

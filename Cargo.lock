@@ -3557,6 +3557,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-open-gl",
  "pollster",
+ "thiserror 2.0.21",
  "vfx-core",
  "vfx-ffgl-common",
  "vfx-host",
@@ -3577,7 +3578,9 @@ dependencies = [
  "libc",
  "pollster",
  "rayon",
+ "thiserror 2.0.21",
  "vfx-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
