@@ -7,9 +7,11 @@
 //! as an optional "Layer" clip. CPU effects get the host's frames at its depth, with the
 //! earlier frames they ask for fetched through temporal clip access.
 
-pub mod ffi;
 pub mod host;
 pub mod image;
+/// The OpenFX C API, generated from a release's headers by `bindings.sh`.
+#[allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
+pub mod sys;
 
 mod cpu_pixels;
 mod params;
@@ -23,12 +25,22 @@ use vfx_core::cpu::{Argb, Depth as CpuDepth, FrameSource, View, ViewMut};
 use vfx_core::{Context, ParamSpec, ParamValues, Processor, Region};
 use vfx_host::{Kind, diag, pipeline};
 
-use ffi::*;
-use host::{Props, check_status, suites};
+use host::{Props, check_status, required, suites};
 use image::{Depth, Image, Rect};
+use sys::*;
 
 /// For the export macro.
 pub use vfx_host;
+
+// The second clip this plugin defines in the general context.
+const CLIP_LAYER: &CStr = c"Layer";
+// The headers describe these only in prose, as a prefix plus the clip name.
+const CLIP_ROI_SOURCE: &CStr = c"OfxImageClipPropRoI_Source";
+const CLIP_ROI_LAYER: &CStr = c"OfxImageClipPropRoI_Layer";
+const CLIP_FRAME_RANGE_SOURCE: &CStr = c"OfxImageClipPropFrameRange_Source";
+
+// SAFETY: an `OfxPlugin` holds pointers to static strings and functions only.
+unsafe impl Sync for OfxPlugin {}
 
 static LOG: diag::Log = diag::Log::new("-OpenFX.log");
 
@@ -37,14 +49,14 @@ static LOG: diag::Log = diag::Log::new("-OpenFX.log");
 #[macro_export]
 macro_rules! export {
     ($plugin:path) => {
-        static __VFX_OFX_PLUGIN: $crate::ffi::OfxPlugin = $crate::ffi::OfxPlugin {
-            pluginApi: $crate::ffi::IMAGE_EFFECT_PLUGIN_API.as_ptr(),
+        static __VFX_OFX_PLUGIN: $crate::sys::OfxPlugin = $crate::sys::OfxPlugin {
+            pluginApi: $crate::sys::kOfxImageEffectPluginApi.as_ptr(),
             apiVersion: 1,
             pluginIdentifier: $crate::vfx_host::cstr!(env!("VFX_ID")).as_ptr(),
             pluginVersionMajor: $crate::vfx_host::parse_u32(env!("CARGO_PKG_VERSION_MAJOR")),
             pluginVersionMinor: $crate::vfx_host::parse_u32(env!("CARGO_PKG_VERSION_MINOR")),
-            setHost: $crate::host::set_host,
-            mainEntry: $crate::main_entry,
+            setHost: Some($crate::host::set_host),
+            mainEntry: Some($crate::main_entry),
         };
 
         #[unsafe(no_mangle)]
@@ -54,7 +66,7 @@ macro_rules! export {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn OfxGetPlugin(nth: ::std::ffi::c_int) -> *const $crate::ffi::OfxPlugin {
+        pub extern "C" fn OfxGetPlugin(nth: ::std::ffi::c_int) -> *const $crate::sys::OfxPlugin {
             $crate::vfx_host::register(&$plugin);
             if nth == 0 {
                 &__VFX_OFX_PLUGIN
@@ -72,15 +84,15 @@ macro_rules! export {
 pub unsafe extern "C" fn main_entry(
     action: *const c_char,
     handle: *const c_void,
-    in_args: PropSet,
-    out_args: PropSet,
+    in_args: OfxPropertySetHandle,
+    out_args: OfxPropertySetHandle,
 ) -> OfxStatus {
     if action.is_null() {
-        return STAT_FAILED;
+        return kOfxStatFailed;
     }
     // SAFETY: the host passes a NUL-terminated action name.
     let action = unsafe { CStr::from_ptr(action) };
-    let effect = handle as ImageEffect;
+    let effect = handle as OfxImageEffectHandle;
     // A panic must not unwind into the host.
     let result = catch_unwind(AssertUnwindSafe(|| {
         dispatch(action, effect, Props(in_args), Props(out_args))
@@ -90,70 +102,70 @@ pub unsafe extern "C" fn main_entry(
         Ok(Err(status)) => status,
         Err(_) => {
             LOG.note(&format!("warning: {action:?} panicked"));
-            STAT_FAILED
+            kOfxStatFailed
         }
     }
 }
 
 fn dispatch(
     action: &CStr,
-    effect: ImageEffect,
+    effect: OfxImageEffectHandle,
     in_args: Props,
     out_args: Props,
 ) -> Result<OfxStatus, OfxStatus> {
     let cpu = vfx_host::plugin().kind == Kind::Cpu;
-    Ok(if action == ACTION_LOAD {
+    Ok(if action == kOfxActionLoad {
         timing::open_log();
         if host::fetch_suites() {
-            STAT_OK
+            kOfxStatOK
         } else {
-            STAT_ERR_MISSING_HOST_FEATURE
+            kOfxStatErrMissingHostFeature
         }
-    } else if action == ACTION_UNLOAD {
-        STAT_OK
-    } else if action == ACTION_CREATE_INSTANCE {
+    } else if action == kOfxActionUnload {
+        kOfxStatOK
+    } else if action == kOfxActionCreateInstance {
         if cpu {
             create_instance(effect)?;
         }
-        STAT_OK
-    } else if action == ACTION_DESTROY_INSTANCE {
+        kOfxStatOK
+    } else if action == kOfxActionDestroyInstance {
         if cpu {
             destroy_instance(effect)?;
         }
-        STAT_OK
-    } else if action == ACTION_DESCRIBE {
+        kOfxStatOK
+    } else if action == kOfxActionDescribe {
         describe(effect)?;
-        STAT_OK
-    } else if action == ACTION_DESCRIBE_IN_CONTEXT {
+        kOfxStatOK
+    } else if action == kOfxImageEffectActionDescribeInContext {
         describe_in_context(effect, in_args)?;
-        STAT_OK
-    } else if action == ACTION_GET_FRAMES_NEEDED && cpu {
+        kOfxStatOK
+    } else if action == kOfxImageEffectActionGetFramesNeeded && cpu {
         frames_needed(effect, in_args, out_args)?;
-        STAT_OK
-    } else if action == ACTION_GET_ROD {
+        kOfxStatOK
+    } else if action == kOfxImageEffectActionGetRegionOfDefinition {
         region_of_definition(effect, in_args, out_args)?
-    } else if action == ACTION_GET_ROIS {
+    } else if action == kOfxImageEffectActionGetRegionsOfInterest {
         regions_of_interest(effect, in_args, out_args)?;
-        STAT_OK
-    } else if action == ACTION_RENDER {
+        kOfxStatOK
+    } else if action == kOfxImageEffectActionRender {
         if cpu {
             render_cpu(effect, in_args)?;
         } else {
             render_gpu(effect, in_args)?;
         }
-        STAT_OK
-    } else if action == ACTION_BEGIN_SEQUENCE_RENDER && cpu {
+        kOfxStatOK
+    } else if action == kOfxImageEffectActionBeginSequenceRender && cpu {
         begin_sequence(effect, in_args)?;
-        STAT_OK
+        kOfxStatOK
     } else {
-        STAT_REPLY_DEFAULT
+        kOfxStatReplyDefault
     })
 }
 
-fn effect_props(effect: ImageEffect) -> Result<Props, OfxStatus> {
+fn effect_props(effect: OfxImageEffectHandle) -> Result<Props, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a descriptor or instance handle from the host.
-    check_status(unsafe { (suites().effect.getPropertySet)(effect, &mut props) })?;
+    check_status(unsafe { (required(suites().effect.getPropertySet)?)(effect, &mut props) })?;
     Ok(Props(props))
 }
 
@@ -168,80 +180,99 @@ pub(crate) fn note_if_rejected(name: &CStr, result: Result<(), OfxStatus>) {
     }
 }
 
-fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
+fn describe(effect: OfxImageEffectHandle) -> Result<(), OfxStatus> {
     let plugin = vfx_host::plugin();
     let cpu = plugin.kind == Kind::Cpu;
     let p = effect_props(effect)?;
-    p.set_string(PROP_LABEL, plugin.info.name)?;
-    p.set_strs(PROP_SUPPORTED_CONTEXTS, &[CONTEXT_FILTER, CONTEXT_GENERAL])?;
+    p.set_string(kOfxPropLabel, plugin.info.name)?;
     p.set_strs(
-        PROP_SUPPORTED_PIXEL_DEPTHS,
-        &[DEPTH_BYTE, DEPTH_SHORT, DEPTH_FLOAT],
+        kOfxImageEffectPropSupportedContexts,
+        &[kOfxImageEffectContextFilter, kOfxImageEffectContextGeneral],
+    )?;
+    p.set_strs(
+        kOfxImageEffectPropSupportedPixelDepths,
+        &[kOfxBitDepthByte, kOfxBitDepthShort, kOfxBitDepthFloat],
     )?;
     note_if_rejected(
-        PROP_GROUPING,
-        p.set_string(PROP_GROUPING, plugin.info.category),
+        kOfxImageEffectPluginPropGrouping,
+        p.set_string(kOfxImageEffectPluginPropGrouping, plugin.info.category),
     );
     // DaVinci Resolve 21 rejects this one with kOfxStatErrUnknown.
     note_if_rejected(
-        PROP_PLUGIN_DESCRIPTION,
-        p.set_string(PROP_PLUGIN_DESCRIPTION, plugin.info.description),
+        kOfxPropPluginDescription,
+        p.set_string(kOfxPropPluginDescription, plugin.info.description),
     );
     // GPU effects scale pixel distances themselves; CPU effects see whole frames.
     note_if_rejected(
-        PROP_SUPPORTS_MULTI_RESOLUTION,
-        p.set_int(PROP_SUPPORTS_MULTI_RESOLUTION, 0, i32::from(!cpu)),
-    );
-    note_if_rejected(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
-    note_if_rejected(
-        PROP_TEMPORAL_CLIP_ACCESS,
+        kOfxImageEffectPropSupportsMultiResolution,
         p.set_int(
-            PROP_TEMPORAL_CLIP_ACCESS,
+            kOfxImageEffectPropSupportsMultiResolution,
+            0,
+            i32::from(!cpu),
+        ),
+    );
+    note_if_rejected(
+        kOfxImageEffectPropSupportsTiles,
+        p.set_int(kOfxImageEffectPropSupportsTiles, 0, 0),
+    );
+    note_if_rejected(
+        kOfxImageEffectPropTemporalClipAccess,
+        p.set_int(
+            kOfxImageEffectPropTemporalClipAccess,
             0,
             i32::from(declares_temporal_access(cpu)),
         ),
     );
     note_if_rejected(
-        PROP_MULTIPLE_CLIP_DEPTHS,
-        p.set_int(PROP_MULTIPLE_CLIP_DEPTHS, 0, 0),
+        kOfxImageEffectPropSupportsMultipleClipDepths,
+        p.set_int(kOfxImageEffectPropSupportsMultipleClipDepths, 0, 0),
     );
     // Each render makes or leases its own instance, so concurrent renders are safe. An effect
     // that keeps state has one per instance, so its renders take turns.
     let safety = if effect_keeps_state() {
-        RENDER_INSTANCE_SAFE
+        kOfxImageEffectRenderInstanceSafe
     } else {
-        RENDER_FULLY_SAFE
+        kOfxImageEffectRenderFullySafe
     };
     note_if_rejected(
-        PROP_RENDER_THREAD_SAFETY,
-        p.set_str(PROP_RENDER_THREAD_SAFETY, 0, safety),
+        kOfxImageEffectPluginRenderThreadSafety,
+        p.set_str(kOfxImageEffectPluginRenderThreadSafety, 0, safety),
     );
     note_if_rejected(
-        PROP_HOST_FRAME_THREADING,
-        p.set_int(PROP_HOST_FRAME_THREADING, 0, 0),
+        kOfxImageEffectPluginPropHostFrameThreading,
+        p.set_int(kOfxImageEffectPluginPropHostFrameThreading, 0, 0),
     );
     Ok(())
 }
 
 fn define_clip(
-    effect: ImageEffect,
+    effect: OfxImageEffectHandle,
     name: &CStr,
     is_optional: bool,
     is_temporal: bool,
 ) -> Result<(), OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a descriptor handle in the describe-in-context action.
-    check_status(unsafe { (suites().effect.clipDefine)(effect, name.as_ptr(), &mut props) })?;
+    check_status(unsafe {
+        (required(suites().effect.clipDefine)?)(effect, name.as_ptr(), &mut props)
+    })?;
     let p = Props(props);
-    p.set_str(PROP_SUPPORTED_COMPONENTS, 0, COMPONENT_RGBA)?;
-    note_if_rejected(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
+    p.set_str(
+        kOfxImageEffectPropSupportedComponents,
+        0,
+        kOfxImageComponentRGBA,
+    )?;
+    note_if_rejected(
+        kOfxImageEffectPropSupportsTiles,
+        p.set_int(kOfxImageEffectPropSupportsTiles, 0, 0),
+    );
     if is_optional {
-        p.set_int(CLIP_PROP_OPTIONAL, 0, 1)?;
+        p.set_int(kOfxImageClipPropOptional, 0, 1)?;
     }
     if is_temporal {
         note_if_rejected(
-            PROP_TEMPORAL_CLIP_ACCESS,
-            p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, 1),
+            kOfxImageEffectPropTemporalClipAccess,
+            p.set_int(kOfxImageEffectPropTemporalClipAccess, 0, 1),
         );
     }
     Ok(())
@@ -253,50 +284,50 @@ fn has_layer_clip(general: bool) -> bool {
     general && vfx_host::plugin().outline().layers > 0
 }
 
-fn describe_in_context(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+fn describe_in_context(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxStatus> {
     let plugin = vfx_host::plugin();
-    let general = in_args.str_is(PROP_CONTEXT, CONTEXT_GENERAL)?;
+    let general = in_args.str_is(kOfxImageEffectPropContext, kOfxImageEffectContextGeneral)?;
     let layer = has_layer_clip(general);
     define_clip(
         effect,
-        CLIP_SOURCE,
+        kOfxImageEffectSimpleSourceClipName,
         false,
         declares_temporal_access(plugin.kind == Kind::Cpu),
     )?;
     if layer {
         define_clip(effect, CLIP_LAYER, true, false)?;
     }
-    define_clip(effect, CLIP_OUTPUT, false, false)?;
+    define_clip(effect, kOfxImageEffectOutputClipName, false, false)?;
     let mut set = ptr::null_mut();
     // SAFETY: a descriptor handle.
-    check_status(unsafe { (suites().effect.getParamSet)(effect, &mut set) })?;
+    check_status(unsafe { (required(suites().effect.getParamSet)?)(effect, &mut set) })?;
     params::define(set, plugin.params(), layer)
 }
 
-fn clip_handle(effect: ImageEffect, name: &CStr) -> Option<Clip> {
+fn clip_handle(effect: OfxImageEffectHandle, name: &CStr) -> Option<OfxImageClipHandle> {
     let mut clip = ptr::null_mut();
     // SAFETY: an instance handle; fails for clips this context doesn't define.
     let status = unsafe {
-        (suites().effect.clipGetHandle)(effect, name.as_ptr(), &mut clip, ptr::null_mut())
+        (suites().effect.clipGetHandle?)(effect, name.as_ptr(), &mut clip, ptr::null_mut())
     };
-    (status == STAT_OK && !clip.is_null()).then_some(clip)
+    (status == kOfxStatOK && !clip.is_null()).then_some(clip)
 }
 
-fn clip_props(clip: Clip) -> Result<Props, OfxStatus> {
+fn clip_props(clip: OfxImageClipHandle) -> Result<Props, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a clip handle from clipGetHandle.
-    check_status(unsafe { (suites().effect.clipGetPropertySet)(clip, &mut props) })?;
+    check_status(unsafe { (required(suites().effect.clipGetPropertySet)?)(clip, &mut props) })?;
     Ok(Props(props))
 }
 
-fn clip_connected(clip: Clip) -> bool {
+fn clip_connected(clip: OfxImageClipHandle) -> bool {
     clip_props(clip)
-        .and_then(|p| p.get_int(CLIP_PROP_CONNECTED, 0))
+        .and_then(|p| p.get_int(kOfxImageClipPropConnected, 0))
         .unwrap_or(0)
         != 0
 }
 
-fn param_values(effect: ImageEffect, time: OfxTime) -> Result<ParamValues, OfxStatus> {
+fn param_values(effect: OfxImageEffectHandle, time: OfxTime) -> Result<ParamValues, OfxStatus> {
     params::Reader::new(effect, time)?.values(vfx_host::plugin().params())
 }
 
@@ -309,17 +340,28 @@ fn gpu_effect_region(values: &ParamValues, scale: [f64; 2]) -> Region {
     }
 }
 
-fn source_rod(effect: ImageEffect, time: OfxTime) -> Result<[f64; 4], OfxStatus> {
-    let source = clip_handle(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
-    let mut rod = [0.0f64; 4];
-    // SAFETY: a clip handle and a four-double rectangle.
-    check_status(unsafe { (suites().effect.clipGetRegionOfDefinition)(source, time, &mut rod) })?;
-    Ok(rod)
+fn source_rod(effect: OfxImageEffectHandle, time: OfxTime) -> Result<[f64; 4], OfxStatus> {
+    let source = clip_handle(effect, kOfxImageEffectSimpleSourceClipName).ok_or(kOfxStatFailed)?;
+    let mut rod = OfxRectD {
+        x1: 0.0,
+        y1: 0.0,
+        x2: 0.0,
+        y2: 0.0,
+    };
+    // SAFETY: a clip handle and a rectangle the host writes.
+    check_status(unsafe {
+        (required(suites().effect.clipGetRegionOfDefinition)?)(source, time, &mut rod)
+    })?;
+    Ok([rod.x1, rod.y1, rod.x2, rod.y2])
 }
 
 /// The earlier frames a CPU effect reads.
-fn frames_needed(effect: ImageEffect, in_args: Props, out_args: Props) -> Result<(), OfxStatus> {
-    let time = in_args.get_double(PROP_TIME, 0)?;
+fn frames_needed(
+    effect: OfxImageEffectHandle,
+    in_args: Props,
+    out_args: Props,
+) -> Result<(), OfxStatus> {
+    let time = in_args.get_double(kOfxPropTime, 0)?;
     let before = match (vfx_host::plugin().make)() {
         Processor::Cpu(e) => e.frames_before(&param_values(effect, time)?, frame_rate(effect)?),
         Processor::Gpu(_) => 0,
@@ -329,42 +371,42 @@ fn frames_needed(effect: ImageEffect, in_args: Props, out_args: Props) -> Result
 
 /// Where the output reaches past the source, it grows by the effect's reach.
 fn region_of_definition(
-    effect: ImageEffect,
+    effect: OfxImageEffectHandle,
     in_args: Props,
     out_args: Props,
 ) -> Result<OfxStatus, OfxStatus> {
     // A CPU effect never grows, so a host's frequent asks needn't read parameters or make an effect.
     if vfx_host::plugin().kind == Kind::Cpu {
-        return Ok(STAT_REPLY_DEFAULT);
+        return Ok(kOfxStatReplyDefault);
     }
-    let time = in_args.get_double(PROP_TIME, 0)?;
+    let time = in_args.get_double(kOfxPropTime, 0)?;
     let r = gpu_effect_region(&param_values(effect, time)?, [1.0, 1.0]);
     if !r.grows {
-        return Ok(STAT_REPLY_DEFAULT);
+        return Ok(kOfxStatReplyDefault);
     }
     let rod = source_rod(effect, time)?;
     let [rx, ry] = r.reach.map(f64::from);
     out_args.set_doubles(
-        PROP_ROD,
+        kOfxImageEffectPropRegionOfDefinition,
         &[rod[0] - rx, rod[1] - ry, rod[2] + rx, rod[3] + ry],
     )?;
-    Ok(STAT_OK)
+    Ok(kOfxStatOK)
 }
 
 /// GPU effects read their reach past the area they render; CPU effects read whole frames.
 fn regions_of_interest(
-    effect: ImageEffect,
+    effect: OfxImageEffectHandle,
     in_args: Props,
     out_args: Props,
 ) -> Result<(), OfxStatus> {
-    let time = in_args.get_double(PROP_TIME, 0)?;
+    let time = in_args.get_double(kOfxPropTime, 0)?;
     if vfx_host::plugin().kind == Kind::Cpu {
         return out_args.set_doubles(CLIP_ROI_SOURCE, &source_rod(effect, time)?);
     }
     let [rx, ry] = gpu_effect_region(&param_values(effect, time)?, [1.0, 1.0])
         .reach
         .map(f64::from);
-    let r = in_args.get_rect_d(PROP_ROI)?;
+    let r = in_args.get_rect_d(kOfxImageEffectPropRegionOfInterest)?;
     let roi = [r[0] - rx, r[1] - ry, r[2] + rx, r[3] + ry];
     out_args.set_doubles(CLIP_ROI_SOURCE, &roi)?;
     if clip_handle(effect, CLIP_LAYER).is_some() {
@@ -381,16 +423,19 @@ struct FetchedImage {
 
 impl Drop for FetchedImage {
     fn drop(&mut self) {
-        // SAFETY: an image handle from clipGetImage, released once.
-        unsafe { (suites().effect.clipReleaseImage)(self.props.0) };
+        if let Some(release) = suites().effect.clipReleaseImage {
+            // SAFETY: an image handle from clipGetImage, released once.
+            unsafe { release(self.props.0) };
+        }
     }
 }
 
-fn fetch_image(clip: Clip, time: OfxTime) -> Result<Option<FetchedImage>, OfxStatus> {
+fn fetch_image(clip: OfxImageClipHandle, time: OfxTime) -> Result<Option<FetchedImage>, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a clip handle; a null region asks for the whole image.
-    let status = unsafe { (suites().effect.clipGetImage)(clip, time, ptr::null(), &mut props) };
-    if status != STAT_OK || props.is_null() {
+    let status =
+        unsafe { (required(suites().effect.clipGetImage)?)(clip, time, ptr::null(), &mut props) };
+    if status != kOfxStatOK || props.is_null() {
         return Ok(None);
     }
     let p = Props(props);
@@ -410,34 +455,36 @@ fn fetch_image(clip: Clip, time: OfxTime) -> Result<Option<FetchedImage>, OfxSta
             premultiplied: false,
         },
     };
-    if !p.str_is(PROP_COMPONENTS, COMPONENT_RGBA)? {
-        return Err(STAT_ERR_IMAGE_FORMAT);
+    if !p.str_is(kOfxImageEffectPropComponents, kOfxImageComponentRGBA)? {
+        return Err(kOfxStatErrImageFormat);
     }
-    let depth = if p.str_is(PROP_PIXEL_DEPTH, DEPTH_FLOAT)? {
+    let depth = if p.str_is(kOfxImageEffectPropPixelDepth, kOfxBitDepthFloat)? {
         Depth::Float
-    } else if p.str_is(PROP_PIXEL_DEPTH, DEPTH_SHORT)? {
+    } else if p.str_is(kOfxImageEffectPropPixelDepth, kOfxBitDepthShort)? {
         Depth::Short
-    } else if p.str_is(PROP_PIXEL_DEPTH, DEPTH_BYTE)? {
+    } else if p.str_is(kOfxImageEffectPropPixelDepth, kOfxBitDepthByte)? {
         Depth::Byte
     } else {
-        return Err(STAT_ERR_IMAGE_FORMAT);
+        return Err(kOfxStatErrImageFormat);
     };
     fetched.image = Image {
-        data: p.get_pointer(IMAGE_PROP_DATA)?.cast(),
-        bounds: p.get_rect_i(IMAGE_PROP_BOUNDS)?,
-        row_bytes: p.get_int(IMAGE_PROP_ROW_BYTES, 0)? as isize,
+        data: p.get_pointer(kOfxImagePropData)?.cast(),
+        bounds: p.get_rect_i(kOfxImagePropBounds)?,
+        row_bytes: p.get_int(kOfxImagePropRowBytes, 0)? as isize,
         depth,
-        premultiplied: p.str_is(PROP_PREMULTIPLICATION, PREMULTIPLIED)?,
+        premultiplied: p.str_is(kOfxImageEffectPropPreMultiplication, kOfxImagePreMultiplied)?,
     };
     if fetched.image.data.is_null() {
-        return Err(STAT_FAILED);
+        return Err(kOfxStatFailed);
     }
     Ok(Some(fetched))
 }
 
 /// The project's frames a second, if the host gives a usable rate.
-fn frame_rate(effect: ImageEffect) -> Result<Option<f64>, OfxStatus> {
-    let rate = effect_props(effect)?.get_double(PROP_FRAME_RATE, 0).ok();
+fn frame_rate(effect: OfxImageEffectHandle) -> Result<Option<f64>, OfxStatus> {
+    let rate = effect_props(effect)?
+        .get_double(kOfxImageEffectPropFrameRate, 0)
+        .ok();
     Ok(rate.filter(|r| *r > 0.0))
 }
 
@@ -459,17 +506,23 @@ fn map_points(values: &mut ParamValues, specs: &[ParamSpec], scale: [f64; 2], ca
     });
 }
 
-fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+fn render_gpu(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxStatus> {
     let plugin = vfx_host::plugin();
-    let time = in_args.get_double(PROP_TIME, 0)?;
-    let window = in_args.get_rect_i(PROP_RENDER_WINDOW)?;
+    let time = in_args.get_double(kOfxPropTime, 0)?;
+    let window = in_args.get_rect_i(kOfxImageEffectPropRenderWindow)?;
     let scale = [
-        in_args.get_double(PROP_RENDER_SCALE, 0)?,
-        in_args.get_double(PROP_RENDER_SCALE, 1)?,
+        in_args.get_double(kOfxImageEffectPropRenderScale, 0)?,
+        in_args.get_double(kOfxImageEffectPropRenderScale, 1)?,
     ];
-    let output = fetch_image(clip_handle(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?
-        .ok_or(STAT_FAILED)?;
-    let source = fetch_image(clip_handle(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?, time)?;
+    let output = fetch_image(
+        clip_handle(effect, kOfxImageEffectOutputClipName).ok_or(kOfxStatFailed)?,
+        time,
+    )?
+    .ok_or(kOfxStatFailed)?;
+    let source = fetch_image(
+        clip_handle(effect, kOfxImageEffectSimpleSourceClipName).ok_or(kOfxStatFailed)?,
+        time,
+    )?;
     let layer = match clip_handle(effect, CLIP_LAYER) {
         Some(c) if clip_connected(c) => fetch_image(c, time)?,
         _ => None,
@@ -537,7 +590,7 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
 /// Hands a CPU effect the source frames it reads, oldest first, each fetched when asked for,
 /// converted only if its pixels are, and released when the next is fetched or the render ends.
 struct ClipFrames<'a, C> {
-    clip: Clip,
+    clip: OfxImageClipHandle,
     /// The clip's first frame; earlier ones don't exist.
     clip_start_time: f64,
     /// The time of frame 0.
@@ -588,7 +641,7 @@ impl<C> ClipFrames<'_, C> {
                 self.fetched = Some((index, image));
             }
             Ok(None) => {
-                self.error.get_or_insert(STAT_FAILED);
+                self.error.get_or_insert(kOfxStatFailed);
             }
             Err(e) => {
                 self.error.get_or_insert(e);
@@ -822,7 +875,7 @@ fn stream_position(
     }
 }
 
-fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
+fn create_instance(effect: OfxImageEffectHandle) -> Result<(), OfxStatus> {
     let Some(instance) = vfx_host::CpuInstance::new(vfx_host::plugin().make, true) else {
         return Ok(());
     };
@@ -838,24 +891,29 @@ fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     }));
     // SAFETY: an instance handle; the pointer is freed in destroy-instance.
     check_status(unsafe {
-        (suites().prop.propSetPointer)(
+        (required(suites().prop.propSetPointer)?)(
             effect_props(effect)?.0,
-            PROP_INSTANCE_DATA.as_ptr(),
+            kOfxPropInstanceData.as_ptr(),
             0,
             kept.cast(),
         )
     })
 }
 
-fn destroy_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
+fn destroy_instance(effect: OfxImageEffectHandle) -> Result<(), OfxStatus> {
     let props = effect_props(effect)?;
     let kept = props
-        .get_pointer(PROP_INSTANCE_DATA)
+        .get_pointer(kOfxPropInstanceData)
         .unwrap_or(ptr::null_mut());
     if !kept.is_null() {
         // SAFETY: an instance handle; the pointer is cleared before what it points at is freed.
         check_status(unsafe {
-            (suites().prop.propSetPointer)(props.0, PROP_INSTANCE_DATA.as_ptr(), 0, ptr::null_mut())
+            (required(suites().prop.propSetPointer)?)(
+                props.0,
+                kOfxPropInstanceData.as_ptr(),
+                0,
+                ptr::null_mut(),
+            )
         })?;
         // SAFETY: the Box from create-instance, freed once.
         drop(unsafe { Box::from_raw(kept.cast::<KeptEffect>()) });
@@ -863,9 +921,11 @@ fn destroy_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
     Ok(())
 }
 
-fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a KeptEffect>, OfxStatus> {
+fn kept_for_instance<'a>(
+    effect: OfxImageEffectHandle,
+) -> Result<Option<&'a KeptEffect>, OfxStatus> {
     let kept = effect_props(effect)?
-        .get_pointer(PROP_INSTANCE_DATA)
+        .get_pointer(kOfxPropInstanceData)
         .unwrap_or(ptr::null_mut());
     // SAFETY: set from a Box in create-instance and freed only in destroy-instance.
     Ok(unsafe { kept.cast::<KeptEffect>().as_ref() })
@@ -873,9 +933,9 @@ fn kept_for_instance<'a>(effect: ImageEffect) -> Result<Option<&'a KeptEffect>, 
 
 /// Ends the stream, so the next render checks earlier frames. Hosts send this for single frames
 /// too, Resolve around every render, so a range of one frame leaves the stream alone.
-fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+fn begin_sequence(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxStatus> {
     LOG.note("begin sequence render");
-    let range = [0, 1].map(|i| in_args.get_double(PROP_FRAME_RANGE, i));
+    let range = [0, 1].map(|i| in_args.get_double(kOfxImageEffectPropFrameRange, i));
     if let [Ok(first), Ok(last)] = range
         && last > first
         && let Some(kept) = kept_for_instance(effect)?
@@ -888,9 +948,9 @@ fn begin_sequence(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> 
 /// Frames between logging a kept effect's report.
 const FRAMES_PER_REPORT: i64 = 300;
 
-fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+fn render_cpu(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxStatus> {
     if let Some(kept) = kept_for_instance(effect)? {
-        let frame = in_args.get_double(PROP_TIME, 0)?.round() as i64;
+        let frame = in_args.get_double(kOfxPropTime, 0)?.round() as i64;
         let last = *kept.last_render.lock().unwrap_or_else(|p| p.into_inner());
         let stream = stream_position(last, frame, std::time::Instant::now());
         let host_stream = if host::is_resolve() {
@@ -919,22 +979,25 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         });
         return rendered;
     }
-    let fresh = vfx_host::CpuInstance::new(vfx_host::plugin().make, false).ok_or(STAT_FAILED)?;
+    let fresh = vfx_host::CpuInstance::new(vfx_host::plugin().make, false).ok_or(kOfxStatFailed)?;
     render_cpu_effect(&fresh, effect, in_args, StreamPosition::default())
 }
 
 fn render_cpu_effect(
     cpu_effect: &vfx_host::CpuInstance,
-    effect: ImageEffect,
+    effect: OfxImageEffectHandle,
     in_args: Props,
     stream: StreamPosition,
 ) -> Result<(), OfxStatus> {
-    let time = in_args.get_double(PROP_TIME, 0)?;
-    let output = fetch_image(clip_handle(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?
-        .ok_or(STAT_FAILED)?;
-    let source = clip_handle(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
+    let time = in_args.get_double(kOfxPropTime, 0)?;
+    let output = fetch_image(
+        clip_handle(effect, kOfxImageEffectOutputClipName).ok_or(kOfxStatFailed)?,
+        time,
+    )?
+    .ok_or(kOfxStatFailed)?;
+    let source = clip_handle(effect, kOfxImageEffectSimpleSourceClipName).ok_or(kOfxStatFailed)?;
     let source_props = clip_props(source)?;
-    let clip_start_time = source_props.get_double(PROP_FRAME_RANGE, 0)?;
+    let clip_start_time = source_props.get_double(kOfxImageEffectPropFrameRange, 0)?;
     let values = param_values(effect, time)?;
     // Frames go back to the clip's first: earlier ones aren't missing, there are none.
     let rate = frame_rate(effect)?;
@@ -944,12 +1007,17 @@ fn render_cpu_effect(
         time: seconds(time, rate),
         frame: time.round() as i64,
         // CPU effects see whole frames; a host may leave the scale out.
-        scale: [0, 1].map(|i| in_args.get_double(PROP_RENDER_SCALE, i).unwrap_or(1.0) as f32),
-        premultiplied: source_props.str_is(PROP_PREMULTIPLICATION, PREMULTIPLIED)?,
+        scale: [0, 1].map(|i| {
+            in_args
+                .get_double(kOfxImageEffectPropRenderScale, i)
+                .unwrap_or(1.0) as f32
+        }),
+        premultiplied: source_props
+            .str_is(kOfxImageEffectPropPreMultiplication, kOfxImagePreMultiplied)?,
         frame_rate: rate,
     };
     let window = in_args
-        .get_rect_i(PROP_RENDER_WINDOW)?
+        .get_rect_i(kOfxImageEffectPropRenderWindow)?
         .intersect(&output.image.bounds);
     LOG.note(&format!(
         "render path: CPU effect, {:?} frames, {frame_count} read",
@@ -1012,7 +1080,7 @@ impl ScratchBuffers for f32 {
 /// One render of a CPU effect, whichever depth it runs at.
 struct CpuRender<'a> {
     effect: &'a vfx_host::CpuInstance,
-    source: Clip,
+    source: OfxImageClipHandle,
     clip_start_time: f64,
     first_frame_time: f64,
     frame_count: usize,
@@ -1059,7 +1127,7 @@ impl CpuRender<'_> {
             // The host can free what it holds for this render before the output is written.
             frames.release();
             if rendered.is_err() {
-                return Some(STAT_FAILED);
+                return Some(kOfxStatFailed);
             }
             let render = started.map(|s| s.elapsed());
             let started = timing::start(&frames.times);

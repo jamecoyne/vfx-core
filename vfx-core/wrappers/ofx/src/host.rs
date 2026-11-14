@@ -5,12 +5,12 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::ffi::*;
+use crate::sys::*;
 
 pub struct Suites {
-    pub prop: &'static PropertySuiteV1,
-    pub effect: &'static ImageEffectSuiteV1,
-    pub param: &'static ParameterSuiteV1,
+    pub prop: &'static OfxPropertySuiteV1,
+    pub effect: &'static OfxImageEffectSuiteV1,
+    pub param: &'static OfxParameterSuiteV1,
 }
 
 static HOST: AtomicPtr<OfxHost> = AtomicPtr::new(ptr::null_mut());
@@ -30,15 +30,26 @@ pub fn is_resolve() -> bool {
     if host.is_null() {
         return false;
     }
+    // SAFETY: the host pointer stays valid while the plugin is loaded.
+    let Some(fetch_suite) = (unsafe { (*host).fetchSuite }) else {
+        return false;
+    };
     // SAFETY: the host pointer and its property set stay valid while the plugin is loaded.
-    let props = unsafe { ((*host).fetchSuite)((*host).host, PROPERTY_SUITE.as_ptr(), 1) }
-        .cast::<PropertySuiteV1>();
+    let props = unsafe { fetch_suite((*host).host, kOfxPropertySuite.as_ptr(), 1) }
+        .cast::<OfxPropertySuiteV1>();
+    if props.is_null() {
+        return false;
+    }
+    // SAFETY: a property suite of the requested version, valid while the plugin is loaded.
+    let Some(get_string) = (unsafe { (*props).propGetString }) else {
+        return false;
+    };
     let mut name: *mut c_char = ptr::null_mut();
-    // SAFETY: a property suite of the requested version; the name is a NUL-terminated string.
-    let named = !props.is_null()
-        && unsafe { ((*props).propGetString)((*host).host, c"OfxPropName".as_ptr(), 0, &mut name) }
-            == STAT_OK
+    // SAFETY: the host's property set handle; the host writes one string pointer.
+    let named = unsafe { get_string((*host).host, kOfxPropName.as_ptr(), 0, &mut name) }
+        == kOfxStatOK
         && !name.is_null();
+    // SAFETY: a NUL-terminated string the host owns, checked non-null above.
     named
         && unsafe { CStr::from_ptr(name) }
             .to_string_lossy()
@@ -52,14 +63,18 @@ pub fn fetch_suites() -> bool {
     if host.is_null() {
         return false;
     }
+    // SAFETY: the host pointer stays valid while the plugin is loaded.
+    let Some(fetch_suite) = (unsafe { (*host).fetchSuite }) else {
+        return false;
+    };
     let fetch = |name: &CStr| -> *const c_void {
         // SAFETY: the host pointer stays valid while the plugin is loaded.
-        unsafe { ((*host).fetchSuite)((*host).host, name.as_ptr(), 1) }
+        unsafe { fetch_suite((*host).host, name.as_ptr(), 1) }
     };
     let (prop, effect, param) = (
-        fetch(PROPERTY_SUITE),
-        fetch(IMAGE_EFFECT_SUITE),
-        fetch(PARAMETER_SUITE),
+        fetch(kOfxPropertySuite),
+        fetch(kOfxImageEffectSuite),
+        fetch(kOfxParameterSuite),
     );
     if prop.is_null() || effect.is_null() || param.is_null() {
         return false;
@@ -79,9 +94,15 @@ pub fn suites() -> &'static Suites {
     SUITES.get().expect("suites are fetched in the load action")
 }
 
+/// The function a suite field holds, or `kOfxStatErrMissingHostFeature` when the host
+/// left the field null.
+pub fn required<F>(function: Option<F>) -> Result<F, OfxStatus> {
+    function.ok_or(kOfxStatErrMissingHostFeature)
+}
+
 /// Turns a host status into a Result, so `?` can carry failures up to the action.
 pub fn check_status(status: OfxStatus) -> Result<(), OfxStatus> {
-    if status == STAT_OK {
+    if status == kOfxStatOK {
         Ok(())
     } else {
         Err(status)
@@ -90,17 +111,22 @@ pub fn check_status(status: OfxStatus) -> Result<(), OfxStatus> {
 
 /// A property set handle with typed accessors.
 #[derive(Clone, Copy)]
-pub struct Props(pub PropSet);
+pub struct Props(pub OfxPropertySetHandle);
 
 impl Props {
-    fn suite() -> &'static PropertySuiteV1 {
+    fn suite() -> &'static OfxPropertySuiteV1 {
         suites().prop
     }
 
     pub fn set_str(&self, name: &CStr, index: usize, value: &CStr) -> Result<(), OfxStatus> {
         // SAFETY: valid handle and NUL-terminated strings; the host copies the value.
         check_status(unsafe {
-            (Self::suite().propSetString)(self.0, name.as_ptr(), index as c_int, value.as_ptr())
+            (required(Self::suite().propSetString)?)(
+                self.0,
+                name.as_ptr(),
+                index as c_int,
+                value.as_ptr(),
+            )
         })
     }
 
@@ -113,21 +139,26 @@ impl Props {
 
     /// Sets a string built at run time, such as a label.
     pub fn set_string(&self, name: &CStr, value: &str) -> Result<(), OfxStatus> {
-        let value = CString::new(value).map_err(|_| STAT_FAILED)?;
+        let value = CString::new(value).map_err(|_| kOfxStatFailed)?;
         self.set_str(name, 0, &value)
     }
 
     pub fn set_int(&self, name: &CStr, index: usize, value: i32) -> Result<(), OfxStatus> {
         // SAFETY: valid handle and property name.
         check_status(unsafe {
-            (Self::suite().propSetInt)(self.0, name.as_ptr(), index as c_int, value)
+            (required(Self::suite().propSetInt)?)(self.0, name.as_ptr(), index as c_int, value)
         })
     }
 
     pub fn set_double(&self, name: &CStr, index: usize, value: f64) -> Result<(), OfxStatus> {
         // SAFETY: valid handle and property name.
         check_status(unsafe {
-            (Self::suite().propSetDouble)(self.0, name.as_ptr(), index as c_int, value as c_double)
+            (required(Self::suite().propSetDouble)?)(
+                self.0,
+                name.as_ptr(),
+                index as c_int,
+                value as c_double,
+            )
         })
     }
 
@@ -142,7 +173,7 @@ impl Props {
         let mut v = 0;
         // SAFETY: valid handle; the host writes one int.
         check_status(unsafe {
-            (Self::suite().propGetInt)(self.0, name.as_ptr(), index as c_int, &mut v)
+            (required(Self::suite().propGetInt)?)(self.0, name.as_ptr(), index as c_int, &mut v)
         })?;
         Ok(v)
     }
@@ -151,7 +182,7 @@ impl Props {
         let mut v = 0.0;
         // SAFETY: valid handle; the host writes one double.
         check_status(unsafe {
-            (Self::suite().propGetDouble)(self.0, name.as_ptr(), index as c_int, &mut v)
+            (required(Self::suite().propGetDouble)?)(self.0, name.as_ptr(), index as c_int, &mut v)
         })?;
         Ok(v)
     }
@@ -159,7 +190,9 @@ impl Props {
     pub fn get_pointer(&self, name: &CStr) -> Result<*mut c_void, OfxStatus> {
         let mut v = ptr::null_mut();
         // SAFETY: valid handle; the host writes one pointer.
-        check_status(unsafe { (Self::suite().propGetPointer)(self.0, name.as_ptr(), 0, &mut v) })?;
+        check_status(unsafe {
+            (required(Self::suite().propGetPointer)?)(self.0, name.as_ptr(), 0, &mut v)
+        })?;
         Ok(v)
     }
 
@@ -167,7 +200,9 @@ impl Props {
     pub fn str_is(&self, name: &CStr, expected: &CStr) -> Result<bool, OfxStatus> {
         let mut v: *mut c_char = ptr::null_mut();
         // SAFETY: valid handle; the host returns a string it owns.
-        check_status(unsafe { (Self::suite().propGetString)(self.0, name.as_ptr(), 0, &mut v) })?;
+        check_status(unsafe {
+            (required(Self::suite().propGetString)?)(self.0, name.as_ptr(), 0, &mut v)
+        })?;
         // SAFETY: a NUL-terminated string the host keeps alive for this call.
         Ok(!v.is_null() && unsafe { CStr::from_ptr(v) } == expected)
     }
