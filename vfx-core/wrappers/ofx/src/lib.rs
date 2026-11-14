@@ -542,8 +542,8 @@ fn render_gpu(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxSta
         _ => read_area,
     };
     map_points(&mut values, plugin.params(), scale, canvas);
-    // SAFETY: images come from the host and are described by their own properties.
     let input = match &source {
+        // SAFETY: images come from the host and are described by their own properties.
         Some(s) => unsafe { image::decode(&s.image, canvas) },
         None => vec![0.0; canvas.width() * canvas.height() * 4],
     };

@@ -789,8 +789,8 @@ unsafe fn process_gpu(
     if !instance.interop_disabled {
         if (instance.interop.as_ref()).is_none_or(|i| i.size() != (w, h) || !i.renders_on(&device))
         {
-            // SAFETY: the context is current; the old interop belongs to it.
             if let Some(old) = instance.interop.take() {
+                // SAFETY: the context is current; the old interop belongs to it.
                 unsafe { old.delete() };
             }
             // SAFETY: as above, the context is current.
@@ -833,8 +833,8 @@ unsafe fn process_gpu(
             .as_ref()
             .is_none_or(|canvas| canvas.size != (w, h))
         {
-            // SAFETY: the context is current; the old canvas belongs to it.
             if let Some(old) = instance.float_transfer.take() {
+                // SAFETY: the context is current; the old canvas belongs to it.
                 unsafe { old.delete() };
             }
             // SAFETY: as above, the context is current.
