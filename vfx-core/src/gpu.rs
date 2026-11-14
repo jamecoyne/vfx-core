@@ -423,7 +423,7 @@ mod dxc {
         }
 
         #[test]
-        fn load_first_skips_invalid_shared_dll() {
+        fn load_first_falls_back_to_beside_on_invalid_shared() {
             let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
             std::fs::write(shared.path().join("dxcompiler.dll"), b"not a DLL").unwrap();
             put_loadable_dll(beside.path());

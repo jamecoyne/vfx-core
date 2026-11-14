@@ -820,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn drawn_on_adds_runs() {
+    fn drawn_on_add_sums_gpu_and_cpu_frames() {
         let mut drawn = DrawnOn::default();
         for log in [
             "segcam-motion: 300 frames, kept, 297 on the GPU (RTX 4070)\n",

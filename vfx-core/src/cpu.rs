@@ -341,7 +341,8 @@ impl Depth for f32 {
 }
 
 /// The frames a CPU render reads, numbered oldest first, `0..count`; the last is the frame
-/// being rendered. A host may take a frame back as soon as `f` returns.
+/// being rendered. A host may take a frame back as soon as `f` returns. An effect may skip
+/// frames, or ask for one again.
 pub trait FrameSource {
     /// Calls `f` with frame `index`, or with `None` if that frame isn't there.
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>));
@@ -389,7 +390,8 @@ pub trait FrameSource {
     }
 
     /// How many of the newest frames a [fixed](Self::fixed) source still has the pixels of, or
-    /// will fetch. Older ones come as `None` for as long as it says so.
+    /// will fetch. Older ones come as `None` for as long as it says so. An effect that keeps work
+    /// works those frames out again if the source later stops being fixed.
     fn held(&self) -> usize {
         usize::MAX
     }

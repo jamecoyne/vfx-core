@@ -7,7 +7,7 @@ use vfx_core::{Gpu, poll_device, wgpu};
 /// the large one goes. Metal and browsers reserve no blocks to report.
 #[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
 #[test]
-fn memory_hints_release_block_of_large_buffer() {
+fn memory_hints_small_buffer_leaves_block_free() {
     let gpu =
         pollster::block_on(Gpu::headless()).expect("no GPU adapter available for headless tests");
     let reserved = || {

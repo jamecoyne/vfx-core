@@ -589,8 +589,9 @@ fn build_windows(
         bundles.push(path);
     }
     // The FFGL DLL and the .aex share the output folder, and so the compiler. The effect's
-    // `windows-dlls` go in the OFX bundle only: Resolume and the Adobe hosts ship a newer
-    // DirectML.dll in their program folder, which Windows searches first; Resolve's is older.
+    // `windows-dlls` go in the OFX bundle only: Resolume and the Adobe hosts ship a
+    // DirectML.dll new enough in their program folder, which Windows searches first;
+    // Resolve's is too old.
     if o.hosts.iter().any(|h| *h != Host::Ofx) {
         copy_beside(&dxc, out)?;
     }

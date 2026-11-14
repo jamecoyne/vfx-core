@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_clashes_finds_same_match_name() {
+    fn installed_clashes_lists_same_match_name() {
         let dir = std::env::temp_dir().join(format!("cargo-vfx-check-{}", std::process::id()));
         let bundle = |name: &str, rsrc: &[u8]| {
             let res = dir.join(name).join("Contents/Resources");
