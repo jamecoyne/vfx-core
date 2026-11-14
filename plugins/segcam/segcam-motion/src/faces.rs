@@ -19,6 +19,7 @@ mod models {
     use vfx_core::ReopenBackoff;
 
     pub(super) static MODELS: OnceLock<Mutex<Option<Segmenter>>> = OnceLock::new();
+    static START: Once = Once::new();
     static RUNS_ON: Mutex<Option<&'static str>> = Mutex::new(None);
 
     /// The models, once they have loaded or failed to. A panic while they ran leaves them usable:
@@ -36,7 +37,6 @@ mod models {
     /// Loads the models every instance shares, on first use, in the background: timing each device
     /// and loading on the best takes seconds, which would stall a live render.
     pub fn start() {
-        static START: Once = Once::new();
         START.call_once(|| {
             let spawned = std::thread::Builder::new()
                 .name("segcam faces".into())
@@ -124,12 +124,7 @@ mod models {
         ) {
             if let Some(old) = models.take_if(|m| failing(m)) {
                 eprintln!("segcam Motion: the face models stopped working");
-                if let Some(loaded_at) = self.loaded_at.take() {
-                    self.backoff.lost(loaded_at.elapsed());
-                }
-                self.had.get_or_insert(optional(&old));
-                release(old);
-                self.next_try = Some(Instant::now() + self.backoff.next_delay());
+                self.release_lost(old, &optional, &release);
             }
             if self.next_try.is_some_and(|at| Instant::now() >= at) {
                 if let Some(partial) = models.take() {
@@ -153,27 +148,107 @@ mod models {
                 }
             }
         }
+
+        /// Releases `old`, which can't work any more, and plans the next load on the
+        /// backoff.
+        fn release_lost<T>(
+            &mut self,
+            old: T,
+            optional: impl Fn(&T) -> (bool, bool),
+            release: impl Fn(T),
+        ) {
+            if let Some(loaded_at) = self.loaded_at.take() {
+                self.backoff.lost(loaded_at.elapsed());
+            }
+            self.had.get_or_insert(optional(&old));
+            release(old);
+            self.next_try = Some(Instant::now() + self.backoff.next_delay());
+        }
+
+        /// Releases `old`, which works, so the next find loads again at once, with
+        /// no backoff.
+        fn set_aside<T>(&mut self, old: T, release: impl Fn(T)) {
+            release(old);
+            self.next_try = Some(Instant::now());
+        }
+    }
+
+    /// Whether models that run on `runs_on`, as "DirectML 0 (NVIDIA GeForce RTX
+    /// 4070)", share the D3D12 device of `adapter`.
+    pub(super) fn on_d3d12_adapter(runs_on: &str, adapter: &vfx_core::wgpu::AdapterInfo) -> bool {
+        adapter.backend == vfx_core::wgpu::Backend::Dx12
+            && runs_on.starts_with("DirectML")
+            && runs_on.ends_with(&format!("({})", adapter.name))
+    }
+
+    static RELOAD: LazyLock<Mutex<Reload>> = LazyLock::new(Default::default);
+
+    fn reload() -> MutexGuard<'static, Reload> {
+        RELOAD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn release(old: Segmenter) {
+        let _device_lock = segcam_face::d3d12_device_lock();
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(old)));
     }
 
     /// See [`Reload::keep_working`]. The caller holds the models' lock.
     pub(super) fn keep_working(models: &mut Option<Segmenter>) {
-        static RELOAD: LazyLock<Mutex<Reload>> = LazyLock::new(Default::default);
-        RELOAD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keep_working(
-                models,
-                Segmenter::failing,
-                Segmenter::optional_models,
-                |old| {
-                    let _device_lock = segcam_face::d3d12_device_lock();
-                    let _ = catch_unwind(AssertUnwindSafe(move || drop(old)));
-                },
-                || {
-                    let _device_lock = segcam_face::d3d12_device_lock();
-                    new_segmenter()
-                },
-            );
+        reload().keep_working(
+            models,
+            Segmenter::failing,
+            Segmenter::optional_models,
+            release,
+            || {
+                let _device_lock = segcam_face::d3d12_device_lock();
+                new_segmenter()
+            },
+        );
+    }
+
+    /// Releases the models if they run with DirectML on `adapter`'s D3D12 device,
+    /// on a thread of its own, since a render can call it. They load again on the
+    /// reload backoff.
+    pub(crate) fn release_on_d3d12_adapter(adapter: &vfx_core::wgpu::AdapterInfo) {
+        release_on(adapter, true);
+    }
+
+    /// Like [`release_on_d3d12_adapter`] for models that still work: the next find
+    /// loads them again at once, on the device the first load chose.
+    pub(crate) fn set_aside_on_d3d12_adapter(adapter: &vfx_core::wgpu::AdapterInfo) {
+        release_on(adapter, false);
+    }
+
+    fn release_on(adapter: &vfx_core::wgpu::AdapterInfo, lost: bool) {
+        if adapter.backend != vfx_core::wgpu::Backend::Dx12 {
+            return;
+        }
+        let adapter = adapter.clone();
+        let release_models = move || {
+            // A first load in flight may land on the lost device.
+            if START.is_completed() {
+                MODELS.wait();
+            }
+            let Some(mut models) = lock() else {
+                return;
+            };
+            let Some(old) = models.take_if(|m| on_d3d12_adapter(&m.runs_on(), &adapter)) else {
+                return;
+            };
+            if lost {
+                eprintln!("segcam Motion: the face models' device was lost; releasing them");
+                reload().release_lost(old, Segmenter::optional_models, release);
+            } else {
+                eprintln!("segcam Motion: no instance left; releasing the face models");
+                reload().set_aside(old, release);
+            }
+        };
+        let spawned = std::thread::Builder::new()
+            .name("segcam faces release".into())
+            .spawn(release_models.clone());
+        if spawned.is_err() {
+            release_models();
+        }
     }
 
     /// The best segmenter after a first run, since Vision loads its own models on its first
@@ -299,6 +374,44 @@ mod models {
             }
             assert_eq!(models, Some(1));
             assert!(reload.next_try.is_none(), "goes on reloading");
+        }
+
+        #[test]
+        fn on_d3d12_adapter_matches_directml_on_same_adapter() {
+            use vfx_core::wgpu::{AdapterInfo, Backend, DeviceType};
+            let adapter = |name: &str, backend| AdapterInfo {
+                name: name.to_owned(),
+                ..AdapterInfo::new(DeviceType::DiscreteGpu, backend)
+            };
+            let on = super::on_d3d12_adapter;
+            let dml = "DirectML 0 (NVIDIA GeForce RTX 4070)";
+            assert!(on(dml, &adapter("NVIDIA GeForce RTX 4070", Backend::Dx12)));
+            assert!(!on(
+                dml,
+                &adapter("NVIDIA GeForce RTX 4070", Backend::Vulkan)
+            ));
+            assert!(!on(
+                dml,
+                &adapter("Intel(R) UHD Graphics 770", Backend::Dx12)
+            ));
+            assert!(!on(
+                "CPU",
+                &adapter("NVIDIA GeForce RTX 4070", Backend::Dx12)
+            ));
+        }
+
+        #[test]
+        fn set_aside_reloads_without_backoff() {
+            let optional = |_: &i32| (true, true);
+            let mut reload = Reload::default();
+            let mut models = Some(1);
+            for next in [2, 3] {
+                let old = models.take().expect("models");
+                reload.set_aside(old, drop);
+                reload.keep_working(&mut models, |_| false, optional, drop, || Some(next));
+                assert_eq!(models, Some(next), "waited on a backoff");
+                assert!(reload.next_try.is_none(), "goes on reloading");
+            }
         }
 
         /// Models that lasted start the backoff over, so a reset hours later waits 1 s again.
@@ -679,6 +792,8 @@ pub fn lock_models() -> std::sync::MutexGuard<'static, Option<segcam_face::Segme
 pub use live::LiveFaces;
 #[cfg(not(target_arch = "wasm32"))]
 pub use models::{ready, runs_on, start, wait};
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use models::{release_on_d3d12_adapter, set_aside_on_d3d12_adapter};
 
 #[cfg(target_arch = "wasm32")]
 pub fn start() {}
@@ -834,6 +949,14 @@ impl LiveFaces {
 pub fn runs_on() -> Option<&'static str> {
     None
 }
+
+/// The web build has no face models.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn release_on_d3d12_adapter(_adapter: &vfx_core::wgpu::AdapterInfo) {}
+
+/// The web build has no face models.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn set_aside_on_d3d12_adapter(_adapter: &vfx_core::wgpu::AdapterInfo) {}
 
 /// The best face in `blobs`, 0 to 1 of the source frame: the model's box, not the one segcam
 /// draws. No face: `face` at 0 alone. No models: nothing, so a host's own tracker can run.

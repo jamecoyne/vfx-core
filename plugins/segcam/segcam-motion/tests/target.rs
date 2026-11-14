@@ -103,6 +103,9 @@ fn kept_target_render_matches_fresh() {
         eprintln!("no hardware GPU adapter: skipped");
         return;
     };
+    // segcam keeps its context on a host's device while an instance lives; this one
+    // spans the test, as a host's layer would.
+    let _layer = SegcamMotion::with_gpu(true);
     segcam_motion::gpu::status().expect("segcam draws on the shared device");
     let params = values(&[
         ("output", ParamValue::Int(3)),
@@ -128,6 +131,9 @@ fn swarm_in_host_frame_matches_readback() {
         eprintln!("no hardware GPU adapter: skipped");
         return;
     };
+    // segcam keeps its context on a host's device while an instance lives; this one
+    // spans the test, as a host's layer would.
+    let _layer = SegcamMotion::with_gpu(true);
     segcam_motion::gpu::status().expect("segcam draws on the shared device");
     let frames = clip(24);
     let swarm = [

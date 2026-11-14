@@ -369,6 +369,61 @@ pub struct Effects {
     keep_output_in_ram: bool,
 }
 
+/// What [`Effects::release`] keeps in RAM while there is no device.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct Released {
+    /// Index into the catalog.
+    effect: usize,
+    /// A CPU effect, which goes on with its history on the next device.
+    cpu_stage: Option<cpu_stage::Released>,
+    size: (u32, u32),
+    source_name: Option<String>,
+    video: Option<VideoFrame>,
+    still_pixels: Vec<f32>,
+    layer_pixels: Vec<Argb<u8>>,
+    layer_name: Option<String>,
+    frame_rate: Option<f64>,
+    pattern_size: (u32, u32),
+    keep_output_in_ram: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Released {
+    /// Takes a playing video's next frame, so the source keeps pace while nothing
+    /// can show it.
+    pub fn take_video_frame(&mut self, video: &Video) {
+        if let Some(frame) = &mut self.video
+            && let Some(time) = video.take_oldest(&mut frame.pixels)
+        {
+            frame.time = time;
+        }
+    }
+
+    /// Takes the layer video's newest frame so it doesn't back up, while nothing
+    /// can show it.
+    pub fn discard_layer_frame(&mut self, video: &Video) {
+        let _ = video.take_newest(&mut self.layer_pixels);
+    }
+}
+
+/// The objects [`Effects::release`] split off, all on the lost device, to drop
+/// where the host drops that device.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct OnDevice {
+    _frames: SizedFrames,
+    _source: Option<Frame>,
+    _readback: Option<Readback>,
+    _passes: (FullscreenPass, FullscreenPass),
+    _stage: StageOnDevice,
+}
+
+/// A CPU stage's output and reader, or a GPU effect's whole chain.
+#[cfg(not(target_arch = "wasm32"))]
+struct StageOnDevice {
+    _cpu: Option<cpu_stage::OnDevice>,
+    _gpu: Option<Box<EffectChain>>,
+}
+
 impl Effects {
     /// The pattern and display passes.
     fn passes(gpu: &Gpu) -> (FullscreenPass, FullscreenPass) {
@@ -421,29 +476,131 @@ impl Effects {
         }
     }
 
-    /// Moves to `gpu` after the last device was lost, keeping the source, its size and what's in
-    /// RAM. A CPU effect keeps its instance, so segcam keeps its trail and background. A GPU
-    /// effect's state was on the device, so it starts over.
+    /// Tells a CPU effect the shared device was lost, so it lets go of what it holds
+    /// on it. Called before [`Effects::release`].
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn move_to_device(&mut self, gpu: &Gpu) {
-        let size = self.frames.size;
-        (self.pattern_pass, self.display_pass) = Self::passes(gpu);
-        self.frames = SizedFrames::new(gpu, size);
-        self.readback = None;
-        if let Some((_, frame)) = &mut self.loaded_source {
-            *frame = Frame::new(gpu, size.0, size.1, FRAME_FORMAT);
+    pub fn device_lost(&self) {
+        if let EffectRun::Cpu(stage) = &self.stage.run {
+            stage.device_lost();
         }
-        if !self.still_pixels.is_empty()
-            && let Some((_, frame)) = &self.loaded_source
-        {
-            frame.write(gpu, bytemuck::cast_slice(&self.still_pixels));
-        }
-        if let Some(video) = &mut self.video {
-            video.on_gpu = false;
-        }
-        match &mut self.stage.run {
-            EffectRun::Cpu(stage) => stage.move_to_device(gpu),
-            EffectRun::Gpu { .. } => self.stage = EffectStage::new(gpu, self.stage.effect, size),
+    }
+
+    /// Splits off everything on the device, for a host whose device was lost. A CPU
+    /// effect stays, with its history; a GPU effect's state was on the device and
+    /// goes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn release(self) -> (Released, OnDevice) {
+        let Effects {
+            last_outcome: _,
+            frames,
+            loaded_source,
+            video,
+            still_pixels,
+            layer_pixels,
+            float_scratch: _,
+            layer_name,
+            frame_rate,
+            readback,
+            pattern_pass,
+            display_pass,
+            stage,
+            pattern_size,
+            keep_output_in_ram,
+        } = self;
+        let size = frames.size;
+        let (source_name, source) = loaded_source.unzip();
+        let EffectStage { effect, run, .. } = stage;
+        let (cpu_stage, stage_on_device) = match run {
+            EffectRun::Cpu(stage) => {
+                let (released, on_device) = stage.release();
+                let on_device = StageOnDevice {
+                    _cpu: Some(on_device),
+                    _gpu: None,
+                };
+                (Some(released), on_device)
+            }
+            EffectRun::Gpu { chain, .. } => {
+                let on_device = StageOnDevice {
+                    _cpu: None,
+                    _gpu: Some(chain),
+                };
+                (None, on_device)
+            }
+        };
+        let released = Released {
+            effect,
+            cpu_stage,
+            size,
+            source_name,
+            video,
+            still_pixels,
+            layer_pixels,
+            layer_name,
+            frame_rate,
+            pattern_size,
+            keep_output_in_ram,
+        };
+        let on_device = OnDevice {
+            _frames: frames,
+            _source: source,
+            _readback: readback,
+            _passes: (pattern_pass, display_pass),
+            _stage: stage_on_device,
+        };
+        (released, on_device)
+    }
+
+    /// Effects on `gpu` again after [`Effects::release`], with the source, sizes,
+    /// layer and a CPU effect kept in RAM. A GPU effect is made new.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn restore(gpu: &Gpu, released: Released) -> Self {
+        let Released {
+            effect,
+            cpu_stage,
+            size,
+            source_name,
+            video,
+            still_pixels,
+            layer_pixels,
+            layer_name,
+            frame_rate,
+            pattern_size,
+            keep_output_in_ram,
+        } = released;
+        let loaded_source = source_name.map(|name| {
+            let frame = Frame::new(gpu, size.0, size.1, FRAME_FORMAT);
+            if !still_pixels.is_empty() {
+                frame.write(gpu, bytemuck::cast_slice(&still_pixels));
+            }
+            (name, frame)
+        });
+        let (pattern_pass, display_pass) = Self::passes(gpu);
+        Self {
+            last_outcome: RenderOutcome::default(),
+            frames: SizedFrames::new(gpu, size),
+            loaded_source,
+            video: video.map(|frame| VideoFrame {
+                on_gpu: false,
+                ..frame
+            }),
+            still_pixels,
+            layer_pixels,
+            float_scratch: Vec::new(),
+            layer_name,
+            frame_rate,
+            readback: None,
+            pattern_pass,
+            display_pass,
+            stage: match cpu_stage {
+                Some(released) => EffectStage {
+                    effect,
+                    layers: 0,
+                    run: EffectRun::Cpu(Box::new(CpuStage::restore(gpu, released))),
+                },
+                None => EffectStage::new(gpu, effect, size),
+            },
+            pattern_size,
+            keep_output_in_ram,
         }
     }
 
@@ -659,12 +816,6 @@ impl Effects {
             frame.write(gpu, bytemuck::cast_slice(pixels));
             self.still_pixels = pixels.to_vec();
         }
-    }
-
-    /// Takes the layer video's newest frame so it doesn't back up, while nothing can show it.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn discard_layer_frame(&mut self, video: &Video) {
-        let _ = video.take_newest(&mut self.layer_pixels);
     }
 
     /// The source made by [`Effects::start_stream`], for frames copied in on the GPU: the
@@ -990,7 +1141,7 @@ mod tests {
         assert!(first.iter().all(|v| (v - 0.75).abs() < 0.01));
     }
 
-    /// A CPU effect goes on after a loss with its source and its history, by `destroy()`.
+    /// A CPU effect goes on after a loss with its source and its history.
     #[test]
     fn new_device_keeps_the_source_and_the_history() {
         let (_turn, lost) = crate::test_gpu();
@@ -1000,10 +1151,13 @@ mod tests {
         effects.start_stream(&lost, "still".into(), (64, 64), None);
         effects.write_source(&lost, &vec![0.25; 64 * 64 * 4]);
         let picture = render_to_float(&mut effects, &lost, &controls, &values, 0.0);
+        effects.device_lost();
+        let (released, on_device) = effects.release();
         lost.device.destroy();
+        drop(on_device);
 
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
-        effects.move_to_device(&gpu);
+        let mut effects = Effects::restore(&gpu, released);
         assert_eq!(effects.source_name(), Some("still"));
         assert_eq!(effects.size(), (64, 64));
         // The same time, so no new frame: this draws what the history holds on the new device.
@@ -1016,6 +1170,28 @@ mod tests {
         assert_eq!(picture, settled, "the still didn't reach the new device");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn release_on_device_frees_removed_adapter() {
+        let (_turn, other) = crate::test_gpu();
+        drop(other);
+        let gpu = crate::warp_gpu();
+        let mut effects = Effects::new(&gpu);
+        let (mut controls, values) = shown("Gaussian Blur");
+        controls.pattern = 1;
+        render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
+
+        crate::app::remove_d3d12_device(&gpu.device).expect("removed");
+        let (_released, on_device) = effects.release();
+        drop(gpu);
+        assert!(
+            !crate::warp_offered(),
+            "the effects' objects don't hold the removed device"
+        );
+        drop(on_device);
+        assert!(crate::warp_offered(), "something kept the removed device");
+    }
+
     /// A GPU effect's state was on the device, so it's rebuilt and draws the same frame again.
     #[test]
     fn gpu_effect_starts_over_on_a_new_device() {
@@ -1024,10 +1200,12 @@ mod tests {
         let (mut controls, values) = shown("Gaussian Blur");
         controls.pattern = 1;
         let picture = render_to_float(&mut effects, &lost, &controls, &values, 0.0);
+        let (released, on_device) = effects.release();
         lost.device.destroy();
+        drop(on_device);
 
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
-        effects.move_to_device(&gpu);
+        let mut effects = Effects::restore(&gpu, released);
         let same = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
         assert_eq!(picture, same);
     }

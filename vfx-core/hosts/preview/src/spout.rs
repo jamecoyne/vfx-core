@@ -386,6 +386,13 @@ impl Receiver {
         state.device_epoch += 1;
         state.ready = None;
         drop(state);
+        self.release_device();
+    }
+
+    /// Drops what this receiver made on the device: the imported textures and the
+    /// conversion pass. A host whose device was lost calls it before the device
+    /// goes, then [`Self::use_device`] with the next one.
+    pub fn release_device(&mut self) {
         self.imported = None;
         self.taken = None;
         self.convert = None;
