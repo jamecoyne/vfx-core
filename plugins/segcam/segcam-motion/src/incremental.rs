@@ -501,8 +501,7 @@ impl IncrementalRenderer {
         for frame in frames_to_read {
             let index = (frame - plan.window_start) as usize;
             let before = self.read_before(frame);
-            // Whether this read has to show the frame unchanged, rather than take it as it
-            // was.
+            // Whether this read has to show the frame is unchanged.
             let verify = !plan.fixed || checks.contains(&frame);
             let read_known = if !verify && before.is_some() {
                 before
