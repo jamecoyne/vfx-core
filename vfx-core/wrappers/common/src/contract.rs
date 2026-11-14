@@ -171,7 +171,7 @@ fn render(
     ))
 }
 
-fn cpu(make: fn() -> Processor) -> Box<dyn CpuEffect> {
+fn make_cpu(make: fn() -> Processor) -> Box<dyn CpuEffect> {
     match make() {
         Processor::Cpu(effect) => effect,
         Processor::Gpu(_) => panic!("the contract is for CPU effects"),
@@ -206,7 +206,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
                    what: &str|
      -> Result<(), String> {
         let got = render(kept, clip, number, missing, values, None, false)?;
-        let want = render(&mut *cpu(make), clip, number, missing, values, None, false)?;
+        let want = render(&mut *make_cpu(make), clip, number, missing, values, None, false)?;
         if got == want {
             Ok(())
         } else {
@@ -231,7 +231,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
         ("shuffled", shuffled),
     ];
     for (name, order) in orders {
-        let mut kept = cpu(make);
+        let mut kept = make_cpu(make);
         for (i, &number) in order.iter().enumerate() {
             let values = &values[i % values.len()];
             compare(&mut *kept, clip, number, &[], values, name)?;
@@ -249,7 +249,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
     let last = n - 1;
     let (values, values_after) = (&values[0], &values[1..]);
     let edited = clip.edited_before(last);
-    let mut kept = cpu(make);
+    let mut kept = make_cpu(make);
     compare(&mut *kept, clip, last, &[], values, "before an edit")?;
     compare(
         &mut *kept,
@@ -260,7 +260,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
         "earlier frames edited",
     )?;
     if last > 0 {
-        let mut kept = cpu(make);
+        let mut kept = make_cpu(make);
         compare(&mut *kept, clip, last - 1, &[], values, "before an edit")?;
         compare(
             &mut *kept,
@@ -273,12 +273,12 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
     }
 
     let missing: Vec<i64> = (last.saturating_sub(3).max(0)..last).collect();
-    let mut kept = cpu(make);
+    let mut kept = make_cpu(make);
     compare(&mut *kept, clip, last, &missing, values, "frames missing")?;
     compare(&mut *kept, clip, last, &[], values, "missing frames back")?;
 
     // A clip loop or new source reuses frame numbers for other pixels.
-    let mut kept = cpu(make);
+    let mut kept = make_cpu(make);
     compare(
         &mut *kept,
         clip,
@@ -303,12 +303,12 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
     let budget = Some(FETCH_BUDGET);
     let catch_up = Some(2 * FETCH_BUDGET);
     let all_values = std::iter::once(values).chain(values_after);
-    let frames_read = |values: &ParamValues| cpu(make).frames_before(values, clip.frame_rate) + 1;
+    let frames_read = |values: &ParamValues| make_cpu(make).frames_before(values, clip.frame_rate) + 1;
     for values in all_values.clone() {
-        let mut kept = cpu(make);
+        let mut kept = make_cpu(make);
         for number in 0..n {
             let got = render(&mut *kept, clip, number, &[], values, budget, false)?;
-            if got != render(&mut *cpu(make), clip, number, &[], values, None, false)? {
+            if got != render(&mut *make_cpu(make), clip, number, &[], values, None, false)? {
                 return Err(format!(
                     "in order under a fetch budget: frame {number} differs from a fresh render"
                 ));
@@ -321,7 +321,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
                       values: &ParamValues,
                       renders: usize,
                       what: &str| {
-        let want = render(&mut *cpu(make), clip, last, missing, values, None, false)?;
+        let want = render(&mut *make_cpu(make), clip, last, missing, values, None, false)?;
         let mut caught_up = false;
         for _ in 0..renders {
             let matches = render(kept, clip, last, missing, values, catch_up, false)? == want;
@@ -348,7 +348,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
     let frames = frames_read(values).min(n as usize);
     // One render more than the frames a render reads: a cap, not a promise.
     let (held, changed) = (held_catch_up_renders(frames, FETCH_BUDGET), frames + 1);
-    let mut kept = cpu(make);
+    let mut kept = make_cpu(make);
     catches_up(&mut *kept, clip, &[], values, held, "after a jump")?;
     catches_up(
         &mut *kept,
@@ -393,10 +393,10 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
         // From a frame with a whole render's frames before it, to a few past the bound.
         let jump = frames as i64;
         let long = clip.cycled(frames + renders + 2);
-        let mut kept = cpu(make);
+        let mut kept = make_cpu(make);
         for (render_index, number) in (jump..long.len()).enumerate() {
             let got = render(&mut *kept, &long, number, &[], values, catch_up, true)?;
-            let want = render(&mut *cpu(make), &long, number, &[], values, None, false)?;
+            let want = render(&mut *make_cpu(make), &long, number, &[], values, None, false)?;
             if render_index + 1 >= renders && got != want {
                 return Err(format!(
                     "streaming after a jump under a fetch budget of {FETCH_BUDGET}: frame \
@@ -463,10 +463,10 @@ pub fn check_target(
     let target = Frame::new(gpu, clip.width as u32, clip.height as u32, format);
     let n = clip.len();
     let edited = clip.edited_before(n - 1);
-    let mut kept = cpu(make);
+    let mut kept = make_cpu(make);
     let compare = |kept: &mut dyn CpuEffect, clip: &Clip, number: i64, what: &str| {
         let got = render_offering(kept, clip, number, values, gpu, &target);
-        let want = render_offering(&mut *cpu(make), clip, number, values, gpu, &target);
+        let want = render_offering(&mut *make_cpu(make), clip, number, values, gpu, &target);
         match got == want {
             true => Ok(usize::from(got.0)),
             false => Err(format!(
@@ -565,13 +565,13 @@ mod tests {
     }
 
     #[test]
-    fn effect_rereading_frames_passes_contract() {
+    fn check_accepts_rereading_effect() {
         let make = || Processor::Cpu(Box::new(Sums::default()));
         assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
     }
 
     #[test]
-    fn effect_trusting_cached_frames_fails_contract() {
+    fn check_rejects_stale_cache() {
         let make = || {
             Processor::Cpu(Box::new(Sums {
                 trust: true,
@@ -614,21 +614,21 @@ mod tests {
     }
 
     #[test]
-    fn clear_history_differing_from_fresh_breaks_contract() {
+    fn check_rejects_bad_clear_history() {
         let make = || Processor::Cpu(Box::new(ClearsBadly::default()));
         let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("differs");
         assert!(err.contains("after clearing history"), "{err}");
     }
 
     /// Leaves each frame's first render unfinished with a wrong pixel, as a browser's GPU draw
-    /// does, and draws the frame at the next render of it; `never` stays unfinished.
+    /// does, and draws the frame at the next render of it; `stuck` stays unfinished.
     #[derive(Default)]
-    struct Late {
+    struct Deferred {
         waiting: Option<i64>,
-        never: bool,
+        stuck: bool,
     }
 
-    impl CpuEffect for Late {
+    impl CpuEffect for Deferred {
         fn params(&self) -> &[ParamSpec] {
             &[]
         }
@@ -646,7 +646,7 @@ mod tests {
             let ImageMut::U8(mut out) = output else {
                 return;
             };
-            if self.never || self.waiting != Some(ctx.frame) {
+            if self.stuck || self.waiting != Some(ctx.frame) {
                 self.waiting = Some(ctx.frame);
                 out.row_mut(0)[0].red = 1;
                 return;
@@ -664,17 +664,17 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_render_compared_after_it_finishes() {
-        let make = || Processor::Cpu(Box::new(Late::default()));
+    fn check_waits_for_unfinished_render() {
+        let make = || Processor::Cpu(Box::new(Deferred::default()));
         assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
     }
 
     #[test]
-    fn never_finishing_render_fails_contract() {
+    fn check_rejects_stuck_render() {
         let make = || {
-            Processor::Cpu(Box::new(Late {
-                never: true,
-                ..Late::default()
+            Processor::Cpu(Box::new(Deferred {
+                stuck: true,
+                ..Deferred::default()
             }))
         };
         let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("unfinished");

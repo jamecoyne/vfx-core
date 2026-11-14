@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn threads_match_a_single_thread() {
+    fn on_threads_matches_serial() {
         // (width, height, pitch): a padded pitch, an odd height, fewer rows than threads,
         // one row, and more bands than rows.
         for (w, h, p) in [(5, 64, 8), (7, 37, 7), (3, 3, 4), (9, 1, 16), (2, 10, 2)] {

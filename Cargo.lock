@@ -3573,6 +3573,7 @@ dependencies = [
  "libc",
  "pollster",
  "rayon",
+ "thiserror 2.0.21",
  "vfx-core",
  "windows-sys 0.61.2",
 ]

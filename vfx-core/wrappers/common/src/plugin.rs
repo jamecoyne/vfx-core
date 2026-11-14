@@ -75,7 +75,6 @@ impl Plugin {
         &self.outline().params
     }
 
-    /// Default values for every parameter.
     pub fn defaults(&self) -> ParamValues {
         ParamValues::new(self.params())
     }
@@ -88,7 +87,6 @@ pub fn register(plugin: &'static Plugin) {
     let _ = PLUGIN.set(plugin);
 }
 
-/// The registered plugin.
 pub fn plugin() -> &'static Plugin {
     PLUGIN
         .get()
@@ -143,9 +141,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requirements_and_points() {
+    fn served_gates_layer_requirement() {
         let layer = ParamSpec::float("amount", 0.0, 1.0, 1.0).requires(Requires::Layer);
         assert!(!served(&layer, false, true) && served(&layer, true, false));
+    }
+
+    #[test]
+    fn map_points_leaves_other_kinds() {
         let specs = [
             ParamSpec::point("centre", [0.5, 0.5]),
             ParamSpec::float("x", 0.0, 1.0, 0.5),
@@ -154,6 +156,10 @@ mod tests {
         map_points(&mut values, &specs, |[x, y]| [x * 2.0, 1.0 - y]);
         assert_eq!(values.point("centre"), [1.0, 0.5]);
         assert_eq!(values.float("x"), 0.5);
-        assert!(same("gpu", "gpu") && !same("gpu", "cpu"));
+    }
+
+    #[test]
+    fn same_compares_bytes() {
+        assert!(same("gpu", "gpu") && !same("gpu", "cpu") && !same("gpu", "gp"));
     }
 }

@@ -49,7 +49,7 @@ pub fn layout<'a>(specs: &'a [ParamSpec], host: &Host) -> Vec<Item<'a>> {
         .iter()
         .filter(|s| served(s, host.layer, host.region))
         .collect();
-    let shows = |group: &str| match host.groups {
+    let grouped = |group: &str| match host.groups {
         Groups::None => false,
         Groups::Shown => !group.is_empty(),
         Groups::UnlessNamedLikeAControl => {
@@ -75,7 +75,7 @@ pub fn layout<'a>(specs: &'a [ParamSpec], host: &Host) -> Vec<Item<'a>> {
             }
             run.push(Item::Control(spec));
         }
-        if shows(group) {
+        if grouped(group) {
             items.push(Item::Group {
                 name: group,
                 items: run,
@@ -121,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn after_effects_keeps_controls_reachable_by_name() {
+    fn layout_flattens_group_named_like_control() {
         let host = Host {
             layer: true,
             region: true,
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn hosts_without_a_layer_or_region_leave_those_out() {
+    fn layout_omits_unserved_controls() {
         let host = Host {
             groups: Groups::Shown,
             ..Host::default()
@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_comes_last_when_nothing_needs_it() {
+    fn layout_puts_picker_last_without_layer_control() {
         let host = Host {
             layer: true,
             layer_picker: Some("Layer"),
