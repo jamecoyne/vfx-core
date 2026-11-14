@@ -46,4 +46,4 @@ objc2-vision = { version = "0.3.2", default-features = false, features = ["std"]
 # DirectML runs the models on any Direct3D 12 GPU.
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["directml"] }
-windows = { version = "0.62.2", optional = true, features = ["Win32_Graphics_Dxgi"] }
+windows = { version = "0.62.2", optional = true, features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_System_LibraryLoader"] }
