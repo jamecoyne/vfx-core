@@ -7,9 +7,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use crate::error::{Error, Result};
 use crate::{env_or, run as run_cmd};
 
-const USAGE: &str = "usage: cargo vfx bench CLIP [--preset NAME]... [--depth 8|float] [--runs N] [--cpu] [--reference DIR]
+pub(crate) const USAGE: &str = "usage: cargo vfx bench CLIP [--preset NAME]... [--depth 8|float] [--runs N] [--cpu] [--reference DIR]
   --preset     overlay, overlay-faces, show, show-faces, 1.1 (the first four)
   --depth      one depth (both)
   --runs       runs pooled per row (2)
@@ -82,7 +83,7 @@ struct Options {
     reference: Option<String>,
 }
 
-fn parse(args: &[String]) -> Result<Options, String> {
+fn parse(args: &[String]) -> Result<Options> {
     let mut o = Options {
         clip: String::new(),
         presets: Vec::new(),
@@ -93,21 +94,23 @@ fn parse(args: &[String]) -> Result<Options, String> {
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
-        let mut value = || it.next().ok_or(format!("{arg} needs a value\n{USAGE}"));
+        let mut value = || {
+            it.next()
+                .ok_or_else(|| Error::BenchMissingValue(arg.clone()))
+        };
         match arg.as_str() {
             "--preset" => {
                 let name = value()?.replace('-', " ");
                 let found = PRESETS
                     .iter()
                     .position(|(p, _)| *p == name || p.strip_suffix(" look") == Some(&name));
-                o.presets
-                    .push(found.ok_or(format!("unknown preset `{name}`\n{USAGE}"))?);
+                o.presets.push(found.ok_or(Error::UnknownPreset(name))?);
             }
             "--depth" => {
                 o.depths = match value()?.as_str() {
                     "8" => vec![0],
                     "float" => vec![1],
-                    other => return Err(format!("unknown depth `{other}`\n{USAGE}")),
+                    other => return Err(Error::UnknownDepth(other.to_owned())),
                 }
             }
             "--runs" => {
@@ -115,16 +118,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     .parse()
                     .ok()
                     .filter(|&n| n > 0)
-                    .ok_or(format!("--runs needs a count\n{USAGE}"))?
+                    .ok_or(Error::InvalidRuns)?
             }
             "--cpu" => o.cpu = true,
             "--reference" => o.reference = Some(value()?.clone()),
             clip if !clip.starts_with('-') && o.clip.is_empty() => o.clip = clip.to_owned(),
-            other => return Err(format!("unknown argument `{other}`\n{USAGE}")),
+            other => return Err(Error::UnknownBenchArgument(other.to_owned())),
         }
     }
     if o.clip.is_empty() {
-        return Err(USAGE.into());
+        return Err(Error::BenchUsage);
     }
     if o.presets.is_empty() {
         o.presets = vec![0, 1, 2, 3];
@@ -132,7 +135,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     Ok(o)
 }
 
-pub fn run(args: &[String], root: &Path, target: &Path) -> Result<(), String> {
+pub fn run(args: &[String], root: &Path, target: &Path) -> Result<()> {
     let o = parse(args)?;
     let (width, height, rate) = probe(&o.clip)?;
     run_cmd(
@@ -153,7 +156,7 @@ pub fn run(args: &[String], root: &Path, target: &Path) -> Result<(), String> {
         .join(format!("segcam-motion{}", std::env::consts::EXE_SUFFIX));
     let bench = target.join("bench");
     let hashes = bench.join(hash_folder(&head_commit(root), tree_is_dirty(root), o.cpu));
-    fs::create_dir_all(&hashes).map_err(|e| format!("{}: {e}", hashes.display()))?;
+    fs::create_dir_all(&hashes).map_err(Error::file(&hashes))?;
 
     let raw = bench.join("frames.argb");
     let frame_bytes = width as usize * height as usize * 4;
@@ -189,7 +192,7 @@ struct Row {
 }
 
 impl Row {
-    fn new(o: &Options, preset: usize, depth: usize, clip: u64) -> Result<Self, String> {
+    fn new(o: &Options, preset: usize, depth: usize, clip: u64) -> Result<Self> {
         let (preset_name, depth_name) = (PRESETS[preset].0, DEPTHS[depth].0);
         let file = format!(
             "{}-{}.txt",
@@ -218,7 +221,7 @@ impl Row {
         (width, height, rate): (u32, u32, &str),
         hashes: &Path,
         machine: &str,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         let (preset, preset_args) = PRESETS[self.preset];
         let (depth, depth_args) = DEPTHS[self.depth];
 
@@ -243,18 +246,21 @@ impl Row {
             if (preset_args.contains(&"--face") || preset_args.contains(&"--preset"))
                 && faces_device(&timed.log).is_none()
             {
-                return Err(format!(
-                    "{preset}: no face models, so this row would time no faces:\n{}",
-                    timed.log
-                ));
+                return Err(Error::NoFaceModels {
+                    preset,
+                    log: timed.log,
+                });
             }
             let split = timed.ms.len().min(FIRST_FRAMES);
             first.extend_from_slice(&timed.ms[..split]);
             rest.extend_from_slice(&timed.ms[split..]);
-            drawn.pool(
-                drawn_on(&timed.log)
-                    .ok_or_else(|| format!("{preset}: the CLI named no path:\n{}", timed.log))?,
-            );
+            let Some(run) = drawn_on(&timed.log) else {
+                return Err(Error::NoPathNamed {
+                    preset,
+                    log: timed.log,
+                });
+            };
+            drawn.add(run);
             faces = faces_device(&timed.log).map(str::to_owned);
             if let Some((_, want)) = &self.reference {
                 let (same, total) = count_matches(&timed.hashes, want);
@@ -267,7 +273,7 @@ impl Row {
                     &path,
                     format!("{}\n{}\n", self.header, timed.hashes.join("\n")),
                 )
-                .map_err(|e| format!("{}: {e}", path.display()))?;
+                .map_err(Error::file(&path))?;
             }
         }
         let matches = match &self.reference {
@@ -294,17 +300,20 @@ struct TimedRun {
     log: String,
 }
 
-fn timed_run(cmd: &mut Command, raw: &Path, frame_bytes: usize) -> Result<TimedRun, String> {
-    let input = File::open(raw).map_err(|e| format!("{}: {e}", raw.display()))?;
+fn timed_run(cmd: &mut Command, raw: &Path, frame_bytes: usize) -> Result<TimedRun> {
+    let input = File::open(raw).map_err(Error::file(raw))?;
     let start = Instant::now();
     let mut child = cmd
         .stdin(input)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{cmd:?}: {e}"))?;
-    let mut out = child.stdout.take().ok_or("the CLI has no stdout")?;
-    let mut err = child.stderr.take().ok_or("the CLI has no stderr")?;
+        .map_err(|source| Error::Spawn {
+            command: format!("{cmd:?}"),
+            source,
+        })?;
+    let mut out = child.stdout.take().ok_or(Error::CliPipeMissing("stdout"))?;
+    let mut err = child.stderr.take().ok_or(Error::CliPipeMissing("stderr"))?;
     let log = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = err.read_to_end(&mut bytes);
@@ -318,17 +327,24 @@ fn timed_run(cmd: &mut Command, raw: &Path, frame_bytes: usize) -> Result<TimedR
         match out.read_exact(&mut frame) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(format!("reading the CLI's frames: {e}")),
+            Err(e) => return Err(Error::CliFrames(e)),
         }
         let now = Instant::now();
         ms.push((now - last).as_secs_f64() * 1000.0);
         last = now;
         hashes.push(format!("{:016x}", frame_hash(&frame)));
     }
-    let status = child.wait().map_err(|e| format!("{cmd:?}: {e}"))?;
+    let status = child.wait().map_err(|source| Error::Spawn {
+        command: format!("{cmd:?}"),
+        source,
+    })?;
     let log = log.join().unwrap_or_default();
     if !status.success() || ms.is_empty() {
-        return Err(format!("{cmd:?} failed ({status}):\n{log}"));
+        return Err(Error::CliFailed {
+            command: format!("{cmd:?}"),
+            status,
+            log,
+        });
     }
     Ok(TimedRun { ms, hashes, log })
 }
@@ -337,21 +353,33 @@ fn hash_file_header(clip: u64, preset: &str, depth: &str) -> String {
     format!("clip {clip:016x} preset {preset} depth {depth}")
 }
 
-fn load_reference(dir: &Path, file: &str, header: &str) -> Result<(String, Vec<String>), String> {
+fn load_reference(dir: &Path, file: &str, header: &str) -> Result<(String, Vec<String>)> {
     let path = dir.join(file);
-    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let hashes = parse_reference(&text, header).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = fs::read_to_string(&path).map_err(Error::file(&path))?;
+    let hashes = parse_reference(&text, header).map_err(|source| Error::Reference {
+        path: path.clone(),
+        source,
+    })?;
     let name = dir.file_name().unwrap_or(dir.as_os_str());
     Ok((name.to_string_lossy().into_owned(), hashes))
 }
 
-fn parse_reference(text: &str, header: &str) -> Result<Vec<String>, String> {
+/// A reference file whose first line names another row.
+#[derive(Debug, thiserror::Error)]
+#[error("not a reference for this row: it holds `{found}`, this row is `{expected}`")]
+pub struct HeaderMismatch {
+    found: String,
+    expected: String,
+}
+
+fn parse_reference(text: &str, header: &str) -> std::result::Result<Vec<String>, HeaderMismatch> {
     let mut lines = text.lines();
     let first = lines.next().unwrap_or_default();
     if first != header {
-        return Err(format!(
-            "not a reference for this row: it holds `{first}`, this row is `{header}`"
-        ));
+        return Err(HeaderMismatch {
+            found: first.to_owned(),
+            expected: header.to_owned(),
+        });
     }
     Ok(lines.map(str::to_owned).collect())
 }
@@ -362,9 +390,9 @@ fn count_matches(run: &[String], reference: &[String]) -> (usize, usize) {
     (same, run.len().max(reference.len()))
 }
 
-/// Names the clip without its file name.
-fn decoded_frames_hash(raw: &Path, frame_bytes: usize) -> Result<u64, String> {
-    let mut file = File::open(raw).map_err(|e| format!("{}: {e}", raw.display()))?;
+/// A hash of the decoded frames, so a clip has the same name whatever its file is called.
+fn decoded_frames_hash(raw: &Path, frame_bytes: usize) -> Result<u64> {
+    let mut file = File::open(raw).map_err(Error::file(raw))?;
     let mut frame = vec![0u8; frame_bytes];
     let mut h = 0u64;
     loop {
@@ -375,7 +403,12 @@ fn decoded_frames_hash(raw: &Path, frame_bytes: usize) -> Result<u64, String> {
                     .rotate_left(23)
             }
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(h),
-            Err(e) => return Err(format!("{}: {e}", raw.display())),
+            Err(e) => {
+                return Err(Error::File {
+                    path: raw.to_owned(),
+                    source: e,
+                });
+            }
         }
     }
 }
@@ -389,7 +422,7 @@ struct DrawnOn {
 }
 
 impl DrawnOn {
-    fn pool(&mut self, run: DrawnOn) {
+    fn add(&mut self, run: DrawnOn) {
         self.frames += run.frames;
         self.gpu_frames += run.gpu_frames;
         self.kept = run.kept;
@@ -483,24 +516,24 @@ fn ms_cell(ms: Option<f64>) -> String {
     ms.map_or("no frames".to_owned(), |m| format!("{m:.1} ms"))
 }
 
-fn probe(clip: &str) -> Result<(u32, u32, String), String> {
+fn probe(clip: &str) -> Result<(u32, u32, String)> {
     let out = Command::new("ffprobe")
         .args(["-v", "error", "-select_streams", "v:0", "-of", "json"])
         .args(["-show_entries", "stream=width,height,r_frame_rate", clip])
         .output()
-        .map_err(|e| format!("ffprobe: {e} (the bench needs ffmpeg on the PATH)"))?;
+        .map_err(Error::FfprobeSpawn)?;
     if !out.status.success() {
-        return Err(format!(
-            "ffprobe {clip}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        return Err(Error::FfprobeFailed {
+            clip: clip.to_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
     }
     let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("ffprobe: {e}"))?;
+        serde_json::from_slice(&out.stdout).map_err(Error::FfprobeJson)?;
     let stream = &json["streams"][0];
     let size = |key: &str| stream[key].as_u64().map(|n| n as u32);
     let (Some(width), Some(height)) = (size("width"), size("height")) else {
-        return Err(format!("{clip}: no video stream"));
+        return Err(Error::NoVideoStream(clip.to_owned()));
     };
     let rate = stream["r_frame_rate"].as_str().unwrap_or_default();
     let rate = match rate.split_once('/') {
@@ -513,7 +546,7 @@ fn probe(clip: &str) -> Result<(u32, u32, String), String> {
     Ok((width, height, rate))
 }
 
-fn decode(clip: &str, raw: &Path) -> Result<(), String> {
+fn decode(clip: &str, raw: &Path) -> Result<()> {
     eprintln!("decoding the first {FRAMES} frames");
     // ffmpeg before 5.1 has only -vsync. The size is the coded one, so frames stay unrotated.
     let help = command_stdout("ffmpeg", &["-hide_banner", "-h", "full"]);
@@ -787,13 +820,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_cpu_counts_pool_across_runs() {
+    fn drawn_on_adds_runs() {
         let mut drawn = DrawnOn::default();
         for log in [
             "segcam-motion: 300 frames, kept, 297 on the GPU (RTX 4070)\n",
             "segcam-motion: 300 frames, kept, 300 on the GPU (RTX 4070)\n",
         ] {
-            drawn.pool(drawn_on(log).unwrap());
+            drawn.add(drawn_on(log).unwrap());
         }
         assert_eq!(
             path_cell(&drawn, None),
@@ -821,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_cli_line_names_no_path() {
+    fn drawn_on_rejects_unknown_line() {
         assert_eq!(drawn_on("segcam-motion: 300 frames"), None);
         assert_eq!(drawn_on(""), None);
     }

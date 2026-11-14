@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use crate::env_or;
+use crate::error::{Error, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
@@ -36,12 +37,12 @@ const WASM: &str = "wasm32-unknown-unknown";
 
 /// Runs the tier's steps one after another, each logged to `target/checks/NAME.log`.
 /// `packages` replaces the changed packages that `--quick` tests.
-pub fn run(tier: Tier, packages: &[String], root: &Path, target: &Path) -> Result<(), String> {
+pub fn run(tier: Tier, packages: &[String], root: &Path, target: &Path) -> Result<()> {
     if tier == Tier::Full && !packages.is_empty() {
-        return Err("--full checks every package; -p goes with --quick".into());
+        return Err(Error::FullWithPackages);
     }
     let logs = target.join("checks");
-    fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
+    fs::create_dir_all(&logs).map_err(Error::file(&logs))?;
     let steps = match tier {
         Tier::Quick => quick(packages, root)?,
         Tier::Full => full(root, &logs),
@@ -52,8 +53,8 @@ pub fn run(tier: Tier, packages: &[String], root: &Path, target: &Path) -> Resul
         print!("{name:16} ");
         std::io::stdout().flush().ok();
         let log = logs.join(format!("{name}.log"));
-        let file = File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
-        let err = file.try_clone().map_err(|e| e.to_string())?;
+        let file = File::create(&log).map_err(Error::file(&log))?;
+        let err = file.try_clone()?;
         let step = Instant::now();
         let status = cmd.current_dir(root).stdout(file).stderr(err).status();
         let secs = step.elapsed().as_secs();
@@ -77,17 +78,17 @@ pub fn run(tier: Tier, packages: &[String], root: &Path, target: &Path) -> Resul
     if failed.is_empty() {
         Ok(())
     } else {
-        Err(format!("failed: {}", failed.join(", ")))
+        Err(Error::StepsFailed(failed))
     }
 }
 
-fn quick(packages: &[String], root: &Path) -> Result<Vec<(String, Command)>, String> {
+fn quick(packages: &[String], root: &Path) -> Result<Vec<(String, Command)>> {
     let changed = if packages.is_empty() {
         changed_packages(root)?
     } else {
         packages.to_vec()
     };
-    let mut steps = vec![fmt(), ("clippy-core".into(), clippy(&CORE, &[]))];
+    let mut steps = vec![format_check(), ("clippy-core".into(), clippy(&CORE, &[]))];
     if changed.is_empty() {
         println!("tests: no package changed");
     } else {
@@ -100,7 +101,7 @@ fn quick(packages: &[String], root: &Path) -> Result<Vec<(String, Command)>, Str
 
 fn full(root: &Path, logs: &Path) -> Vec<(String, Command)> {
     let mut steps = vec![
-        fmt(),
+        format_check(),
         ("clippy-core".into(), clippy(&CORE, &[])),
         ("tests-core".into(), test(&CORE, &[])),
         (
@@ -161,7 +162,7 @@ fn full(root: &Path, logs: &Path) -> Vec<(String, Command)> {
         cmd.env_remove("RUSTC_WRAPPER");
         steps.push(("wasm-preview".into(), cmd));
     } else {
-        println!("wasm-preview: skipped, `rustup target add {WASM}` adds it");
+        println!("wasm-preview: not run, `rustup target add {WASM}` adds it");
     }
     steps
 }
@@ -172,7 +173,7 @@ fn cargo(args: &[&str]) -> Command {
     cmd
 }
 
-fn fmt() -> (String, Command) {
+fn format_check() -> (String, Command) {
     ("fmt".into(), cargo(&["fmt", "--all", "--", "--check"]))
 }
 
@@ -227,7 +228,7 @@ fn wasm_installed() -> bool {
 
 /// Packages with files changed since the branch left `origin/main` (or `main`), committed or not.
 /// A change to the workspace manifest, the lock file or `.cargo/` counts as the core crates.
-fn changed_packages(root: &Path) -> Result<Vec<String>, String> {
+fn changed_packages(root: &Path) -> Result<Vec<String>> {
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git")
             .current_dir(root)
@@ -252,9 +253,9 @@ fn changed_packages(root: &Path) -> Result<Vec<String>, String> {
         .current_dir(root)
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .output()
-        .map_err(|e| format!("cargo metadata: {e}"))?;
+        .map_err(Error::CargoMetadataRun)?;
     let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
+        serde_json::from_slice(&out.stdout).map_err(Error::CargoMetadataJson)?;
     let root = Path::new(json["workspace_root"].as_str().unwrap_or("."));
     let dirs: Vec<(PathBuf, String)> = json["packages"]
         .as_array()
