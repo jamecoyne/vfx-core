@@ -36,14 +36,12 @@ impl FrameSource for MovingSquare {
 }
 
 #[test]
-fn target_on_unshared_device_is_declined() {
-    let Some(host) = pollster::block_on(Gpu::headless())
+#[ignore = "needs a hardware GPU adapter"]
+fn unshared_device_target_is_declined() {
+    let host = pollster::block_on(Gpu::headless())
         .ok()
         .filter(|gpu| gpu.device.adapter_info().device_type != wgpu::DeviceType::Cpu)
-    else {
-        eprintln!("no hardware GPU adapter: skipped");
-        return;
-    };
+        .expect("a hardware GPU adapter");
     segcam_motion::gpu::status().expect("segcam opens a device of its own");
     let mut params = motion_only::motion_only(SegcamMotion::with_gpu(false).params());
     params

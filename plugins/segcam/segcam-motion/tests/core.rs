@@ -115,8 +115,8 @@ fn blobs_for_moving_square<C: Channel>() -> Vec<Blob> {
             )
         })
         .collect();
-    let now = downsample(&frame_with_square::<C>(384, 216, 200, 60, 40).view(), 96);
-    motion::detect_motion(&history, &now, &MotionSettings::default()).blobs
+    let current = downsample(&frame_with_square::<C>(384, 216, 200, 60, 40).view(), 96);
+    motion::detect_motion(&history, &current, &MotionSettings::default()).blobs
 }
 
 /// A square that sits for six frames, then jumps.
@@ -150,9 +150,9 @@ fn static_frames_detect_no_motion() {
     let history: Vec<LumaGrid> = (0..10)
         .map(|_| downsample(&frame_with_square::<u8>(W, H, 100, 50, 40).view(), 192))
         .collect();
-    let now = history.last().unwrap();
+    let current = history.last().unwrap();
     assert!(
-        motion::detect_motion(&history, now, &MotionSettings::default())
+        motion::detect_motion(&history, current, &MotionSettings::default())
             .blobs
             .is_empty()
     );
@@ -163,8 +163,8 @@ fn jump_yields_blobs_at_old_and_new_positions() {
     let history: Vec<LumaGrid> = (0..10)
         .map(|_| downsample(&frame_with_square::<u8>(W, H, 40, 60, 48).view(), 192))
         .collect();
-    let now = downsample(&frame_with_square::<u8>(W, H, 260, 120, 48).view(), 192);
-    let m = motion::detect_motion(&history, &now, &MotionSettings::default());
+    let current = downsample(&frame_with_square::<u8>(W, H, 260, 120, 48).view(), 192);
+    let m = motion::detect_motion(&history, &current, &MotionSettings::default());
     assert_eq!(m.blobs.len(), 2);
     let centred = |b: &Blob, x: i32, y: i32| {
         let (cx, cy) = (b.bounds.x + b.bounds.w / 2.0, b.bounds.y + b.bounds.h / 2.0);
@@ -186,14 +186,17 @@ fn jump_yields_blobs_at_old_and_new_positions() {
         sensitivity: 0.0,
         ..MotionSettings::default()
     };
-    assert_eq!(motion::detect_motion(&history, &now, &dull).blobs.len(), 2);
+    assert_eq!(
+        motion::detect_motion(&history, &current, &dull).blobs.len(),
+        2
+    );
     // A min size bigger than the square drops both.
     let picky = MotionSettings {
         min_area_fraction: 0.2,
         ..MotionSettings::default()
     };
     assert!(
-        motion::detect_motion(&history, &now, &picky)
+        motion::detect_motion(&history, &current, &picky)
             .blobs
             .is_empty()
     );
@@ -224,7 +227,7 @@ fn all_depths_detect_same_blobs() {
 }
 
 #[test]
-fn overlay_strokes_the_box_and_mirrors() {
+fn overlay_strokes_box_and_mirrors() {
     let frames = jump();
     for mirror in [false, true] {
         let s = RenderSettings {
@@ -319,17 +322,17 @@ fn swarm_draws_frozen_tiles_on_transparent_canvas() {
 /// Live windows show the current frame where they sit: the square is white only where it is
 /// now, while frozen tiles keep it where each window was cut.
 #[test]
-fn live_windows_show_the_current_frame() {
+fn live_windows_show_current_frame() {
     // The square crosses, then stops, so the windows it left behind stay uncovered.
     let frames: Vec<Image<u8>> = (0..30)
         .map(|f| frame_with_square(W, H, 10 + f.min(24) * 11, 80, 40))
         .collect();
     let (x0, y0, size) = (10 + 24 * 11, 80, 40);
-    let now = |x: i32, y: i32| x >= x0 && x < x0 + size && y >= y0 && y < y0 + size;
+    let on_square = |x: i32, y: i32| x >= x0 && x < x0 + size && y >= y0 && y < y0 + size;
     let white_outside = |out: &Image<u8>| {
         (0..H)
             .flat_map(|y| (0..W).map(move |x| (x, y)))
-            .filter(|&(x, y)| out.at(x, y).red == 255 && !now(x, y))
+            .filter(|&(x, y)| out.at(x, y).red == 255 && !on_square(x, y))
             .count()
     };
     let frozen = render_frames(&swarm_settings(), &frames, 29).0;
@@ -417,7 +420,7 @@ fn frame_sized_segments_keep_trail_windows() {
 }
 
 #[test]
-fn float_swarm_matches_8_bit_within_a_level() {
+fn float_swarm_matches_u8_within_one_level() {
     // Tiles are snapshots at 8 bits whatever the render depth. The 8-bit render quantises
     // after every window it composites; the float one never does.
     let s = swarm_settings();
@@ -436,7 +439,7 @@ fn float_swarm_matches_8_bit_within_a_level() {
 }
 
 #[test]
-fn tile_enforces_its_minimum_size() {
+fn tile_has_minimum_size() {
     let frames = crossing::<u8>();
     let tiny = Blob {
         bounds: NormRect {
@@ -462,7 +465,7 @@ fn tile_enforces_its_minimum_size() {
 /// A window asked for above the canvas moves down until its title bar is on it, at the same size.
 /// One already clear of the top stays where it was asked for, and so does the picture in it.
 #[test]
-fn a_window_keeps_its_title_bar_on_the_canvas() {
+fn window_title_bar_stays_on_canvas() {
     let (w, h) = (1920, 1080);
     let m = SwarmMetrics::new(h);
     let tile_at = |y: f64| {
@@ -606,7 +609,7 @@ fn threshold_settings(t: ThresholdSettings) -> RenderSettings {
 }
 
 #[test]
-fn threshold_finds_bright_regions_in_a_single_frame() {
+fn threshold_finds_bright_regions_in_one_frame() {
     let frame = frame_with_square::<u8>(W, H, 100, 60, 48);
     let grid = downsample(&frame.view(), 192);
     let s = threshold_settings(ThresholdSettings::default());
@@ -653,7 +656,7 @@ fn threshold_finds_bright_regions_in_a_single_frame() {
 }
 
 #[test]
-fn threshold_swarm_renders_the_same_in_any_order() {
+fn threshold_swarm_ignores_frame_order() {
     let frames = crossing::<u8>();
     let s = RenderSettings {
         mode: OutputMode::Swarm,
@@ -816,7 +819,7 @@ fn earlier_frame_edit_invalidates_cache() {
 
 /// A frame the host couldn't hand over is read again next time, not kept as empty.
 #[test]
-fn missing_frame_is_read_again() {
+fn missing_frame_is_not_cached() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let last = frames.len() - 1;
