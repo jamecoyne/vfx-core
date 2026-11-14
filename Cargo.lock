@@ -3615,6 +3615,7 @@ dependencies = [
  "segcam-face",
  "segcam-motion",
  "sysinfo",
+ "thiserror 2.0.21",
  "vfx-build",
  "vfx-chain",
  "vfx-core",
