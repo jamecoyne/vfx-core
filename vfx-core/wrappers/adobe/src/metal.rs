@@ -31,8 +31,8 @@ pub enum Error {
     NoBuffer,
 }
 
-// Buffer (BGRA, row pitch in pixels) → canvas texture (RGBA), placed at an offset.
-// Pixels outside the source are transparent, like the CPU path's canvas.
+/// Draws a BGRA buffer with a row pitch in pixels into an RGBA canvas texture at an
+/// offset. Canvas pixels the buffer doesn't cover are transparent.
 const IMPORT_WGSL: &str = r#"
 struct U {
     src: vec4<i32>,    // x: width, y: height, z: row pitch in pixels
@@ -59,7 +59,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-// Canvas texture (RGBA) → buffer (BGRA, row pitch in pixels).
+/// Writes an RGBA canvas texture into a BGRA buffer with a row pitch in pixels.
 const EXPORT_WGSL: &str = r#"
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<vec4<f32>>;
@@ -75,7 +75,8 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// The plugin's wgpu device on one of After Effects' GPUs, plus the buffer ↔ texture pipelines.
+/// The plugin's wgpu device on one of After Effects' GPUs, with the import and export
+/// pipelines.
 /// Stored as After Effects' per-device GPU data, so it lives as long as the device.
 pub struct AeDevice {
     pub gpu: Gpu,
@@ -244,15 +245,14 @@ impl AeDevice {
     ///
     /// # Safety
     /// `raw` must be null or a live `id<MTLBuffer>` on this device, of at least
-    /// `size` bytes, and `size` must not be zero.
+    /// `size` bytes.
     pub unsafe fn wrap_buffer(&self, raw: *mut c_void, size: u64) -> Result<wgpu::Buffer, Error> {
         // SAFETY: the caller passes null or a live `id<MTLBuffer>`.
         let mtl: Retained<ProtocolObject<dyn MTLBuffer>> =
             unsafe { Retained::retain(raw.cast()) }.ok_or(Error::NoBuffer)?;
         // SAFETY: the caller promises `size` bytes in `mtl`.
         let hal_buffer = unsafe { hal::metal::Device::buffer_from_raw(mtl, size) };
-        // SAFETY: the caller promises a buffer on this device of `size` bytes, not
-        // zero, and a Metal buffer has no usage flags for the descriptor to break.
+        // SAFETY: the caller promises a live buffer on this device of `size` bytes.
         let buffer = unsafe {
             self.gpu.device.create_buffer_from_hal::<hal::api::Metal>(
                 hal_buffer,
@@ -270,7 +270,7 @@ impl AeDevice {
     }
 }
 
-/// One After Effects GPU world, wrapped.
+/// An After Effects GPU world: its buffer and geometry.
 pub struct World {
     pub buffer: wgpu::Buffer,
     pub width: u32,
@@ -488,6 +488,22 @@ mod tests {
         // SAFETY: `raw` is a live buffer of `bytes` bytes on the device `device` opened on.
         let buffer = unsafe { device.wrap_buffer(ptr, bytes as u64) }.expect("wrap");
         assert_eq!(read_back(&device, &buffer), data);
+
+        let written: [f32; 8] = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        device
+            .gpu
+            .queue
+            .write_buffer(&buffer, 0, bytemuck::cast_slice(&written));
+        device.gpu.queue.submit(None);
+        device
+            .gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        // SAFETY: the buffer is shared storage of `bytes` bytes and the GPU is idle.
+        let contents =
+            unsafe { std::slice::from_raw_parts(raw.contents().as_ptr().cast::<f32>(), 8) };
+        assert_eq!(contents, written);
     }
 
     #[test]
