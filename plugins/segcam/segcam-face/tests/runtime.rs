@@ -9,10 +9,8 @@ use segcam_face::{
 /// would fall back to system32's copy, too old on Windows 10. Loads the build's copy first.
 #[cfg(windows)]
 fn load_directml() {
-    use std::os::windows::ffi::OsStrExt;
-    unsafe extern "system" {
-        fn LoadLibraryW(name: *const u16) -> *mut std::ffi::c_void;
-    }
+    use windows::Win32::System::LibraryLoader::LoadLibraryW;
+    use windows::core::HSTRING;
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let exe = std::env::current_exe().expect("the test binary's path");
@@ -25,9 +23,8 @@ fn load_directml() {
         else {
             return;
         };
-        let name: Vec<u16> = dll.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: a null-terminated path; the library stays loaded for the whole test run.
-        unsafe { LoadLibraryW(name.as_ptr()) };
+        // SAFETY: an HSTRING is null-terminated; the library stays loaded for the whole test run.
+        let _ = unsafe { LoadLibraryW(&HSTRING::from(dll.as_os_str())) };
     });
 }
 
@@ -62,7 +59,7 @@ const ALL: Parts = Parts {
 };
 
 #[test]
-fn a_flat_frame_has_no_faces_or_bodies() {
+fn flat_frame_finds_no_faces_or_bodies() {
     let _device_lock = d3d12_device_lock();
     let bytes = vec![90u8; 320 * 180 * 4];
     let floats = vec![0.35f32; 320 * 180 * 4];
@@ -87,7 +84,7 @@ fn a_flat_frame_has_no_faces_or_bodies() {
 }
 
 #[test]
-fn odd_frames_find_nothing_and_do_not_panic() {
+fn odd_frames_find_nothing() {
     let _device_lock = d3d12_device_lock();
     for device in devices() {
         let mut segmenter = FaceSegmenter::new(
@@ -110,7 +107,7 @@ fn odd_frames_find_nothing_and_do_not_panic() {
 }
 
 #[test]
-fn the_fastest_device_loads_everything() {
+fn fastest_loads_every_model() {
     let _device_lock = d3d12_device_lock();
     load_directml();
     let (mut segmenter, device) = runtime::fastest(true, true).expect("a device");
@@ -129,7 +126,7 @@ fn the_fastest_device_loads_everything() {
 }
 
 #[test]
-fn the_best_segmenter_finds_nothing_in_a_flat_frame() {
+fn best_segmenter_finds_nothing_in_flat_frame() {
     let _device_lock = d3d12_device_lock();
     load_directml();
     let mut segmenter = segcam_face::Segmenter::best().expect("a segmenter");
