@@ -23,7 +23,7 @@ pub use yunet::Face;
 
 /// Held while making or releasing a D3D12 device, including through a DirectML session, a
 /// [`runtime::fastest`] trial's losers or a [`Segmenter`]. One made on one thread while another
-/// releases one can deadlock (seen on NVIDIA, inside the driver and D3D12). Nothing in this crate
+/// releases one can deadlock inside the driver and D3D12. Nothing in this crate
 /// takes it, so every caller does, for as long as it makes or drops them.
 pub fn d3d12_device_lock() -> MutexGuard<'static, ()> {
     static D3D12_DEVICE_LOCK: Mutex<()> = Mutex::new(());
@@ -82,7 +82,7 @@ impl Image<'_> {
     /// Red, green and blue from 0 to 255 at a pixel inside a usable image.
     #[inline]
     pub fn rgb(&self, x: usize, y: usize) -> [f32; 3] {
-        // The models were fitted to 8-bit input, so deep ARGB rounds to what an 8-bit frame holds.
+        // The models were fitted to 8-bit input: deep ARGB rounds to its 8-bit value.
         let byte = |unit: f32| (unit.clamp(0.0, 1.0) * 255.0 + 0.5).floor();
         let i = (y * self.stride + x) * 4;
         match self.pixels {
@@ -564,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn a_body_detector_panic_costs_only_that_frames_bodies() {
+    fn body_panic_drops_only_that_frames_bodies() {
         let pixels = [0u8; 4 * 4 * 4];
         let image = Image {
             pixels: Pixels::Argb8(&pixels),
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn a_face_detector_panic_keeps_the_body_detector() {
+    fn face_panic_keeps_body_detector() {
         let pixels = [0u8; 4 * 4 * 4];
         let image = Image {
             pixels: Pixels::Argb8(&pixels),
@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_argb_reads_as_the_8_bit_value() {
+    fn deep_argb_rounds_to_byte_value() {
         assert_eq!(
             rgb(Pixels::Argb8(&[255, 10, 128, 255])),
             [10.0, 128.0, 255.0]

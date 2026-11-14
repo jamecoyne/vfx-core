@@ -146,7 +146,7 @@ fn oldest_trail_frame_between_analyses_spawns_no_windows() {
 /// A frame between analyses is its own picture with the last analysis drawn over it, named
 /// after the frame that was analysed.
 #[test]
-fn overlay_shows_the_last_analysis() {
+fn overlay_shows_latest_analysis() {
     let frames = crossing(24);
     let s = RenderSettings {
         background_frames: 6,

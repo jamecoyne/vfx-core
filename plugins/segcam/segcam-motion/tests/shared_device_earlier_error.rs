@@ -4,14 +4,15 @@
 use vfx_core::{Gpu, wgpu};
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+)]
 fn host_error_before_open_leaves_gpu_usable() {
-    let Some(gpu) = pollster::block_on(Gpu::headless())
+    let gpu = pollster::block_on(Gpu::headless())
         .ok()
         .filter(|gpu| gpu.device.adapter_info().device_type != wgpu::DeviceType::Cpu)
-    else {
-        eprintln!("no hardware GPU adapter: skipped");
-        return;
-    };
+        .expect("a hardware GPU adapter");
     gpu.share();
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("host's misuse"),
