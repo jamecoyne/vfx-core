@@ -733,6 +733,10 @@ mod tests {
     /// In a process of its own: the device has to be shared before segcam opens one, and segcam
     /// opens one once per process.
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+    )]
     fn output_frame_runs_in_own_process() {
         let test = "cpu_stage::tests::output_frame_matches_ram_path";
         let status = std::process::Command::new(std::env::current_exe().unwrap())

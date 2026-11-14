@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_param_finds_menu() {
+    fn mode_param_finds_owning_menu() {
         let specs = [
             ParamSpec::float("sensitivity", 0.0, 1.0, 0.5),
             ParamSpec::choice("output", &["Overlay", "Motion matte", "Swarm"], 0),
@@ -624,7 +624,7 @@ mod tests {
 
     /// The keys name what they count; the render times are there for a CPU effect only.
     #[test]
-    fn stats_line_format() {
+    fn stats_line_lists_keys_and_render_times() {
         let s = Snapshot {
             shown: ShownEffect {
                 effect: "segcam",
@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn pattern_and_camera_lookup() {
+    fn pattern_and_camera_by_name_or_index() {
         assert_eq!(pattern_index(""), Ok(0));
         assert_eq!(pattern_index("colour-bars"), Ok(1));
         assert!(pattern_index("stripes").is_err());
