@@ -431,8 +431,8 @@ fn stats_line(elapsed: f64, span: f64, worst: Duration, s: &Snapshot, delta: Cou
     if let Some(faces) = &s.report.faces {
         text += &format!(" faces={faces:?}");
     }
-    if s.report.out_of_gpu_memory {
-        text += " out_of_gpu_memory=true";
+    if s.report.atlas_full {
+        text += " atlas_full=true";
     }
     if let Some(fault) = &s.device_fault {
         text += &format!(" fault={fault:?}");

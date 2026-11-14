@@ -189,6 +189,11 @@ pub trait CpuEffect: Send {
     fn report(&self) -> Report {
         Report::default()
     }
+
+    /// The device the host shared ([`crate::Gpu::share`]) was lost. After this
+    /// returns the effect holds nothing on that device; the next render may come on
+    /// a new one.
+    fn device_lost(&mut self) {}
 }
 
 /// What an effect tells its host about its last render ([`CpuEffect::report`]). `draw` and `faces`
@@ -204,8 +209,8 @@ pub struct Report {
     pub readings: Vec<Reading>,
     /// The last time the GPU failed a render, why; the render was drawn another way.
     pub gpu_fault: Option<String>,
-    /// Whether it ran out of GPU memory for what it keeps, and draws less to keep its rate.
-    pub out_of_gpu_memory: bool,
+    /// Whether its tile atlas is full, so it leaves out its oldest windows.
+    pub atlas_full: bool,
 }
 
 /// A named number an effect found ([`Report::readings`]).

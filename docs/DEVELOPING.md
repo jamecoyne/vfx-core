@@ -118,17 +118,19 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `CpuEffect::render_to` and `Target` (a host's GPU frame the effect may draw its output into instead) | vfx-core |
 | `CpuEffect::can_draw_to_target` (whether a render can use a `Target`, so a host allocates one only then; default `false`) | vfx-core |
 | `CpuEffect::report`, `Report`, `Reading` (where the last render's work ran and what it found; default empty) | vfx-core |
+| `CpuEffect::device_lost`, `CpuInstance::device_lost` (the host's shared device was lost: the effect lets go of everything on it, so the host can open a new one; default does nothing) | vfx-core |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core |
 | `Context::frame_rate` | vfx-core |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core |
 | `FrameSource`: `with_frame`; `History` | vfx-core |
 | `FrameSource::held`; `History::next(before, held)` | vfx-core |
 | `FrameSource::live` (true for `History`) | vfx-core |
-| `FrameSource::fetch_budget` (a hard cap on the distinct earlier frames one render may ask for, at least 2, for a host that holds every frame it hands out until the render returns; default `None`, as many as it needs) | vfx-core |
+| `FrameSource::fetch_budget` (the distinct earlier frames one render may ask for, at least 2, plus up to as many again that one analysis of the current frame needs and nothing was kept from, for a host that holds every frame it hands out until the render returns; default `None`, as many as it needs) | vfx-core |
 | `DeviceFaults::same_device` (whether two records are one device, across wgpu instances), `ReopenBackoff` (when to try for a new device after a loss) | vfx-core |
 | `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core |
 | `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core |
 | `Gpu::share`, `Gpu::shared` | vfx-core |
+| `Gpu::unshare` (a host whose device was lost stops sharing it before dropping it, which D3D12 needs to offer the adapter again) | vfx-core |
 | `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core |
 | `Gpu::backend_options` (wgpu backend options for every instance: on Windows, D3D12 compiles with the `dxcompiler.dll` beside the binary or in `Common Files/vfx-core/dxc-<tag>`, else FXC) | vfx-core |
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core |

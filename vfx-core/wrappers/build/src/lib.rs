@@ -50,7 +50,7 @@ impl Metadata {
         let path = dir.join("Cargo.toml");
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let doc: toml::Value = text
+        let doc: toml::Table = text
             .parse()
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let package = doc.get("package").ok_or("no [package]")?;
@@ -246,7 +246,7 @@ pub fn check_workspace(effects: &[(String, Metadata)]) -> Result<(), Vec<String>
 pub fn effect_dependencies(manifest_dir: &Path) -> Result<Vec<(String, Metadata)>, String> {
     let path = manifest_dir.join("Cargo.toml");
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let doc: toml::Value = text
+    let doc: toml::Table = text
         .parse()
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let mut found = Vec::new();

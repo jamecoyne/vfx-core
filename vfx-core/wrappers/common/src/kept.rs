@@ -134,6 +134,14 @@ impl CpuInstance {
         }
     }
 
+    /// Tells the kept effect the host's shared device was lost
+    /// ([`CpuEffect::device_lost`]).
+    pub fn device_lost(&self) {
+        if self.kept.is_some() {
+            self.with(|e| e.device_lost());
+        }
+    }
+
     /// Makes the kept effect forget earlier frames (see [`CpuEffect::clear_history`]), rebuilding
     /// it only if it can't.
     pub fn clear_history(&self) {

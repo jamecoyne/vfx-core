@@ -44,7 +44,7 @@ The keys describe the frames as they move from source to screen:
 | `app_cpu` | this process's CPU use, as a share of one core |
 | `gpu` | GPU use. `n/a` where the OS doesn't report it |
 | `fault` | appears once the shared device is lost or reports an error. The bar then starts with it, in colour |
-| `out_of_gpu_memory=true` | appears once the effect has run out of GPU memory for what it keeps, and draws less to keep its rate. The bar shows it too |
+| `atlas_full=true` | appears while the effect's tile atlas is full and it leaves out its oldest windows. Only `--stats` prints it, the status bar doesn't |
 
 - A GPU effect has no `rendered_ms` or `worst_ms`, since its work ends on the GPU. For a CPU effect
   that draws into the output frame, the times stop at its submit.

@@ -2,6 +2,7 @@
 name = "blend"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Blends a second layer over the input: normal, add, multiply or screen, on the GPU."
