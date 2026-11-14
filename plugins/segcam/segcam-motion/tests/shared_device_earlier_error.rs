@@ -4,7 +4,10 @@
 use vfx_core::{Gpu, wgpu};
 
 #[test]
-#[ignore = "needs a hardware GPU adapter"]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+)]
 fn host_error_before_open_leaves_gpu_usable() {
     let gpu = pollster::block_on(Gpu::headless())
         .ok()

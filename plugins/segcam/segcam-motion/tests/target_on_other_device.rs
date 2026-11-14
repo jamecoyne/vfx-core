@@ -36,7 +36,10 @@ impl FrameSource for MovingSquare {
 }
 
 #[test]
-#[ignore = "needs a hardware GPU adapter"]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+)]
 fn unshared_device_target_is_declined() {
     let host = pollster::block_on(Gpu::headless())
         .ok()

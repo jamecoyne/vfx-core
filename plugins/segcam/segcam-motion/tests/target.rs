@@ -1,6 +1,6 @@
 //! A swarm drawn into a host's GPU frame (`CpuEffect::render_to`, as FFGL offers on Windows)
 //! against the same swarm drawn on the GPU and read back: every pixel the same. Its own test
-//! binary, since the host's device has to be shared before segcam opens one. Ignored without a
+//! binary, since the host's device has to be shared before segcam opens one. Ignored except on macOS, where CI has a
 //! hardware adapter.
 
 mod motion_only;
@@ -98,7 +98,10 @@ fn argb(bytes: &[u8]) -> Pixels {
 }
 
 #[test]
-#[ignore = "needs a hardware GPU adapter"]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+)]
 fn kept_target_render_matches_fresh() {
     let gpu = shared().expect("a hardware GPU adapter");
     // segcam keeps its context on a host's device while an instance lives; this one
@@ -124,7 +127,10 @@ fn kept_target_render_matches_fresh() {
 }
 
 #[test]
-#[ignore = "needs a hardware GPU adapter"]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+)]
 fn swarm_in_host_frame_matches_readback() {
     let gpu = shared().expect("a hardware GPU adapter");
     // segcam keeps its context on a host's device while an instance lives; this one
