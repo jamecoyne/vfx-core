@@ -847,6 +847,13 @@ impl IncrementalRenderer {
         };
     }
 
+    /// Drops the drawer, for a host whose shared device was lost. The kept tiles
+    /// and analysis are in RAM, so the trail goes on; the next drawer starts with
+    /// an empty atlas.
+    pub fn device_lost(&mut self) {
+        self.set_drawer(None);
+    }
+
     pub fn report(&self) -> Report {
         let mut report = Report::default();
         report.draw = self.drew_on_gpu.map(|on_gpu| match &self.drawer {

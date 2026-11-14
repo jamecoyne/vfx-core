@@ -213,6 +213,18 @@ impl Gpu {
         }
     }
 
+    /// Stops sharing: [`Gpu::shared`] answers `None` until the next share. A host
+    /// whose device was lost calls it before dropping the device, since D3D12
+    /// opens no new device on the adapter while anything holds the removed one.
+    pub fn unshare() {
+        #[cfg(target_arch = "wasm32")]
+        SHARED.with(|s| *s.borrow_mut() = None);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     /// Takes over the device's error and loss callbacks, for a host that doesn't share it; read
     /// them with [`Gpu::faults`].
     pub fn watch_faults(&self) {
