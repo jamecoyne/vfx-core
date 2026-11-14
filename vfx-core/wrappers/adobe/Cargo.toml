@@ -17,6 +17,6 @@ pollster = "1.0.1"
 # GPU-native rendering on After Effects' Metal device. Same versions wgpu uses.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"
-objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLBuffer", "MTLResource"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLAllocation", "MTLBuffer", "MTLResource"] }
 thiserror = "2.0.21"
 

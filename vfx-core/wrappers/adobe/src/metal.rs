@@ -29,6 +29,8 @@ pub enum Error {
     RequestDevice(#[from] wgpu::RequestDeviceError),
     #[error("After Effects returned no buffer")]
     NoBuffer,
+    #[error("After Effects returned an empty buffer")]
+    EmptyBuffer,
 }
 
 /// Draws a BGRA buffer with a row pitch in pixels into an RGBA canvas texture at an
@@ -250,6 +252,9 @@ impl AeDevice {
         // SAFETY: the caller passes null or a live `id<MTLBuffer>`.
         let mtl: Retained<ProtocolObject<dyn MTLBuffer>> =
             unsafe { Retained::retain(raw.cast()) }.ok_or(Error::NoBuffer)?;
+        if size == 0 {
+            return Err(Error::EmptyBuffer);
+        }
         // SAFETY: the caller promises `size` bytes in `mtl`.
         let hal_buffer = unsafe { hal::metal::Device::buffer_from_raw(mtl, size) };
         // SAFETY: the caller promises a live buffer on this device of `size` bytes.
@@ -305,10 +310,10 @@ pub fn render(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     // Uniform buffers live until the submit below, so each import gets its own.
-    let mut params_buffers = Vec::new();
+    let mut uniform_buffers = Vec::new();
     for (world, target) in [(Some(input), lease.input()), (layer, lease.layer())] {
         let Some(world) = world else { continue };
-        let params: [i32; 8] = [
+        let uniforms: [i32; 8] = [
             world.width as i32,
             world.height as i32,
             world.pitch as i32,
@@ -318,7 +323,7 @@ pub fn render(
             0,
             0,
         ];
-        let params_buffer = uniform_buffer(gpu, bytemuck::bytes_of(&params));
+        let uniform_buffer = new_uniform_buffer(gpu, bytemuck::bytes_of(&uniforms));
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("import"),
             layout: &device.import_layout,
@@ -329,7 +334,7 @@ pub fn render(
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: params_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -354,14 +359,14 @@ pub fn render(
             pass.set_bind_group(0, &bind, &[]);
             pass.draw(0..3, 0..1);
         }
-        params_buffers.push(params_buffer);
+        uniform_buffers.push(uniform_buffer);
     }
     gpu.queue.submit(Some(encoder.finish()));
 
     lease.render(gpu);
 
-    let params: [u32; 4] = [output.width, output.height, output.pitch, 0];
-    let params_buffer = uniform_buffer(gpu, bytemuck::bytes_of(&params));
+    let uniforms: [u32; 4] = [output.width, output.height, output.pitch, 0];
+    let uniform_buffer = new_uniform_buffer(gpu, bytemuck::bytes_of(&uniforms));
     let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("export"),
         layout: &device.export_layout,
@@ -376,7 +381,7 @@ pub fn render(
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: params_buffer.as_entire_binding(),
+                resource: uniform_buffer.as_entire_binding(),
             },
         ],
     });
@@ -394,7 +399,7 @@ pub fn render(
     let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
 }
 
-fn uniform_buffer(gpu: &Gpu, bytes: &[u8]) -> wgpu::Buffer {
+fn new_uniform_buffer(gpu: &Gpu, bytes: &[u8]) -> wgpu::Buffer {
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gpu world params"),
         size: 32,
@@ -410,7 +415,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_matches_given_device() {
+    fn open_matches_metal_device() {
         let mtl = objc2_metal::MTLCreateSystemDefaultDevice().expect("a Metal device");
         let ptr = Retained::as_ptr(&mtl) as *mut c_void;
         // SAFETY: `mtl` is a live `id<MTLDevice>` for the whole test.
@@ -513,6 +518,21 @@ mod tests {
         // SAFETY: null is allowed and nothing is wrapped.
         let err = unsafe { device.wrap_buffer(std::ptr::null_mut(), 32) }.unwrap_err();
         assert!(matches!(err, Error::NoBuffer), "{err}");
+    }
+
+    #[test]
+    fn wrap_buffer_rejects_empty() {
+        let mtl = objc2_metal::MTLCreateSystemDefaultDevice().expect("a Metal device");
+        // SAFETY: `mtl` is a live `id<MTLDevice>` for the whole test.
+        let device = unsafe { AeDevice::open(Retained::as_ptr(&mtl) as *mut c_void, 0) }
+            .expect("open on that device");
+        let raw = mtl
+            .newBufferWithLength_options(16, objc2_metal::MTLResourceOptions::StorageModeShared)
+            .expect("a Metal buffer");
+        let ptr = Retained::as_ptr(&raw) as *mut c_void;
+        // SAFETY: `raw` is a live buffer on the device `device` opened on.
+        let err = unsafe { device.wrap_buffer(ptr, 0) }.unwrap_err();
+        assert!(matches!(err, Error::EmptyBuffer), "{err}");
     }
 
     fn read_back(device: &AeDevice, buffer: &wgpu::Buffer) -> Vec<f32> {
