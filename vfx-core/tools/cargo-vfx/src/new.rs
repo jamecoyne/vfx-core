@@ -102,6 +102,7 @@ impl Identity {
 name = "{crate_name}"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Inverts the picture by an amount."
