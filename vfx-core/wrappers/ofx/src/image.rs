@@ -233,7 +233,7 @@ mod tests {
             10, 0, 0, 255, 20, 0, 0, 255, // y = 0 (bottom)
         ];
         let img = Image {
-            // SAFETY: `img` points into a local buffer that covers its bounds and row bytes.
+            // SAFETY: offset 8 is inside `data`, the 16 byte buffer.
             data: unsafe { data.as_mut_ptr().add(8) },
             bounds: rect(0, 0, 2, 2),
             row_bytes: -8,

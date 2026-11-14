@@ -207,7 +207,6 @@ mod tests {
     ///
     /// # Safety
     /// `image` must describe a live host image.
-    // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
     unsafe fn decode_reference<C: Channel>(image: &Image, canvas: Rect) -> Vec<Argb<C>> {
         let mut out = vec![Argb::default(); canvas.width() * canvas.height()];
         let r = canvas.intersect(&image.bounds);
@@ -215,7 +214,7 @@ mod tests {
             for x in r.x1..r.x2 {
                 // SAFETY: intersection confines the pointer and four channels to the host image.
                 let p = unsafe { pixel_address(image, x, y) };
-                // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
+                // SAFETY: `p` addresses four channels inside the image, as above.
                 let read = |i| unsafe {
                     match image.depth {
                         Depth::Byte => C::from_unit(f32::from(*p.add(i)) / 255.0),
@@ -240,7 +239,6 @@ mod tests {
     ///
     /// # Safety
     /// `image` must describe a live host image, and `window` lie inside both it and `canvas`.
-    // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
     unsafe fn encode_reference<C: Channel>(
         pixels: &[Argb<C>],
         canvas: Rect,
@@ -515,7 +513,7 @@ mod tests {
         }
 
         fn for_both(image: &Image, canvas: Rect) {
-            // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
+            // SAFETY: the caller's `image` is a buffer the test owns, covering its bounds.
             unsafe {
                 assert_eq!(
                     decode::<u8>(image, canvas),
@@ -540,15 +538,15 @@ mod tests {
             let window = canvas.intersect(&image.bounds);
             let size = image.row_bytes as usize * image.bounds.height();
             let read =
-                // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
+                // SAFETY: `size` is the byte length of the buffer `image.data` points to.
                 |image: &Image| unsafe { std::slice::from_raw_parts(image.data, size).to_vec() };
             let before = read(image);
-            // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
+            // SAFETY: `window` lies inside `image` and `canvas`, as built above.
             unsafe { encode_reference(&pixels, canvas, image, window) };
             let expected = read(image);
-            // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
+            // SAFETY: `before` was read from `image.data` with the same `size`; they don't overlap.
             unsafe { std::ptr::copy_nonoverlapping(before.as_ptr(), image.data, size) };
-            // SAFETY: `image` describes a buffer the test owns, sized for its bounds.
+            // SAFETY: as for `encode_reference`.
             unsafe { encode(&pixels, canvas, image, window) };
             assert_eq!(read(image), expected);
         }

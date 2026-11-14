@@ -223,10 +223,7 @@ impl Instance {
     /// Destroys the plugin's own device once `VFX_FFGL_LOSE_OWN_DEVICE_AFTER`, read when the
     /// instance is made, has counted down its RAM path renders. A test of the way back from a
     /// loss: the device's loss callback runs, and this render fails and passes its frame through.
-    fn inject_own_device_loss(
-        renders_until_loss: &mut Option<u32>,
-        device: &vfx_host::OwnDevice,
-    ) {
+    fn inject_own_device_loss(renders_until_loss: &mut Option<u32>, device: &vfx_host::OwnDevice) {
         let Some(renders) = renders_until_loss else {
             return;
         };

@@ -64,7 +64,7 @@ impl StageTimes {
             format!("{:.2}/{:.2}", v[v.len() / 2], v[v.len() * 95 / 100])
         };
         // A stall shows in neither the median nor the p95, so the worst frame and the count of
-        // frames over a tenth of a second go in too.
+        // frames over 100 ms go in too.
         let max = total.iter().copied().fold(0.0, f64::max);
         let frames_over_100_ms = total.iter().filter(|&&t| t > 100.0).count();
         let values: Vec<String> = values.iter().map(|v| format!("{v:.2}")).collect();

@@ -1239,7 +1239,7 @@ mod tests {
     /// An export's skips at its start aren't dropped frames; playback's later on are, until the
     /// stream breaks.
     #[test]
-    fn skips_drop_frames_only_after_run() {
+    fn positions_flag_drops_only_after_run() {
         let dropped = |frames: &[i64]| {
             positions(frames, std::time::Duration::ZERO)
                 .iter()

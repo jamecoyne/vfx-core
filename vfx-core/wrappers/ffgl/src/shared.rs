@@ -234,15 +234,14 @@ impl SharedDevice {
                     "Vulkan adapter lacks VK_KHR_external_semaphore_win32",
                 ));
             }
-            let opened = a
-                .open_with_callback(
-                    features,
-                    &desc.required_limits,
-                    &desc.memory_hints,
-                    Some(Box::new(|args| {
-                        args.extensions.push(khr::external_semaphore_win32::NAME)
-                    })),
-                )?;
+            let opened = a.open_with_callback(
+                features,
+                &desc.required_limits,
+                &desc.memory_hints,
+                Some(Box::new(|args| {
+                    args.extensions.push(khr::external_semaphore_win32::NAME)
+                })),
+            )?;
             adapter.create_device_from_hal::<hal::api::Vulkan>(opened, &desc)?
         };
         let gpu = Gpu::from_parts(device, queue);
@@ -726,14 +725,16 @@ impl VulkanParts {
         // SAFETY: the caller has the current context.
         let luid = unsafe { gl::shared_memory_luid() }
             .map_err(|e| InteropError::Unsupported(e.to_string()))?;
-        let device = SharedDevice::open(luid).map_err(|e| InteropError::Unsupported(e.to_string()))?;
+        let device =
+            SharedDevice::open(luid).map_err(|e| InteropError::Unsupported(e.to_string()))?;
         Self::new(device, size)
     }
 
     /// All of a reopen's work that can leave the render thread. A panic is a failed try.
     fn open_and_make(luid: [u8; 8], size: (u32, u32)) -> Result<Self, InteropError> {
         catch_unwind(|| {
-            let device = SharedDevice::open(luid).map_err(|e| InteropError::Unsupported(e.to_string()))?;
+            let device =
+                SharedDevice::open(luid).map_err(|e| InteropError::Unsupported(e.to_string()))?;
             device.answers()?;
             Self::new(device, size)
         })
@@ -1735,7 +1736,9 @@ mod tests {
         lose(&first.gpu);
         assert!(matches!(SharedDevice::state(luid), DeviceState::Lost));
 
-        let failed = SharedDevice::open_with(luid, || Err(SetupError::Unavailable("the adapter is hidden")));
+        let failed = SharedDevice::open_with(luid, || {
+            Err(SetupError::Unavailable("the adapter is hidden"))
+        });
         assert!(failed.is_err());
         assert!(
             matches!(SharedDevice::state(luid), DeviceState::Lost),

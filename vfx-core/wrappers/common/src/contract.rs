@@ -206,7 +206,15 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
                    what: &str|
      -> Result<(), String> {
         let got = render(kept, clip, number, missing, values, None, false)?;
-        let want = render(&mut *make_cpu(make), clip, number, missing, values, None, false)?;
+        let want = render(
+            &mut *make_cpu(make),
+            clip,
+            number,
+            missing,
+            values,
+            None,
+            false,
+        )?;
         if got == want {
             Ok(())
         } else {
@@ -303,7 +311,8 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
     let budget = Some(FETCH_BUDGET);
     let catch_up = Some(2 * FETCH_BUDGET);
     let all_values = std::iter::once(values).chain(values_after);
-    let frames_read = |values: &ParamValues| make_cpu(make).frames_before(values, clip.frame_rate) + 1;
+    let frames_read =
+        |values: &ParamValues| make_cpu(make).frames_before(values, clip.frame_rate) + 1;
     for values in all_values.clone() {
         let mut kept = make_cpu(make);
         for number in 0..n {
@@ -321,7 +330,15 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
                       values: &ParamValues,
                       renders: usize,
                       what: &str| {
-        let want = render(&mut *make_cpu(make), clip, last, missing, values, None, false)?;
+        let want = render(
+            &mut *make_cpu(make),
+            clip,
+            last,
+            missing,
+            values,
+            None,
+            false,
+        )?;
         let mut caught_up = false;
         for _ in 0..renders {
             let matches = render(kept, clip, last, missing, values, catch_up, false)? == want;
@@ -396,7 +413,15 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
         let mut kept = make_cpu(make);
         for (render_index, number) in (jump..long.len()).enumerate() {
             let got = render(&mut *kept, &long, number, &[], values, catch_up, true)?;
-            let want = render(&mut *make_cpu(make), &long, number, &[], values, None, false)?;
+            let want = render(
+                &mut *make_cpu(make),
+                &long,
+                number,
+                &[],
+                values,
+                None,
+                false,
+            )?;
             if render_index + 1 >= renders && got != want {
                 return Err(format!(
                     "streaming after a jump under a fetch budget of {FETCH_BUDGET}: frame \

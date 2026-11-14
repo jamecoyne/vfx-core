@@ -1,10 +1,11 @@
 //! Whether a host keeps a CPU effect between renders: one policy for every host target.
 //!
-//! An effect that [keeps state](vfx_core::CpuEffect::keeps_state) is kept for the instance by a
-//! host that can keep one (OpenFX, FFGL, the preview), and made anew for every render otherwise,
-//! as After Effects must for its cache and Multi-Frame Rendering. Either way the output must be
-//! what a new effect renders from the same frames: [`crate::contract`] checks that.
-//! A render that panicked can leave the effect half updated, so the effect is made again.
+//! An effect that [keeps state](vfx_core::CpuEffect::keeps_state) is kept for the instance
+//! by a host that can keep one (OpenFX, FFGL, the preview), and made anew for every
+//! render otherwise, as After Effects must for its cache and Multi-Frame Rendering.
+//! Either way the output must be what a new effect renders from the same frames:
+//! [`crate::contract`] checks that. A render that panicked can leave the effect half
+//! updated, so the effect is made again.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
@@ -141,8 +142,8 @@ impl CpuInstance {
     }
 
     /// Makes the kept effect forget earlier frames (see [`CpuEffect::clear_history`]), rebuilding
-    /// it only if it can't. A host calls this when its frames stop following on (a seek back, a
-    /// clip loop, a new size); the effect keeps its GPU resources.
+    /// it only if it can't. A host calls this when its frames stop following on (a seek
+    /// back, a clip loop, a new size); the effect keeps its GPU resources.
     pub fn clear_history(&self) {
         if self.kept.is_some() && !self.with(|e| e.clear_history()) {
             self.rebuild();
