@@ -377,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn identities_hosts_would_reject_fail_the_build() {
+    fn check_rejects_invalid_identity() {
         assert_eq!(meta().check(), Ok(()));
         let broken: [fn(&mut Metadata); 8] = [
             |m| m.ffgl_code = "TOOLONG".into(),
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_identities_are_unique() {
+    fn check_workspace_rejects_shared_identity() {
         let a = ("a".to_owned(), meta());
         let mut other = meta();
         other.name = "Other".into();
@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn the_preview_links_every_effect_crate() {
+    fn effect_dependencies_lists_preview() {
         let preview = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hosts/preview");
         let names: Vec<String> = effect_dependencies(&preview)
             .unwrap()
