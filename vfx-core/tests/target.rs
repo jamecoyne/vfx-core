@@ -10,7 +10,7 @@ fn gpu() -> Gpu {
 }
 
 #[test]
-fn a_shared_device_comes_back() {
+fn share_returns_same_device() {
     let gpu = gpu();
     gpu.share();
     let shared = Gpu::shared().expect("the device shared");
@@ -58,7 +58,7 @@ impl FrameSource for NoFrames {
 
 /// An effect that doesn't draw on the GPU renders into its output as from `render`, and says so.
 #[test]
-fn an_effect_that_takes_no_target_renders_into_its_output() {
+fn render_to_without_target_renders_into_output() {
     let gpu = gpu();
     let frame = Frame::new(&gpu, 2, 2, wgpu::TextureFormat::Rgba32Float);
     let mut out = vec![Argb::<u8>::default(); 4];

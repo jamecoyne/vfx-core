@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn an_old_bundle_with_the_same_match_name_is_found() {
+    fn installed_clashes_lists_same_match_name() {
         let dir = std::env::temp_dir().join(format!("cargo-vfx-check-{}", std::process::id()));
         let bundle = |name: &str, rsrc: &[u8]| {
             let res = dir.join(name).join("Contents/Resources");
@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn the_repository_passes() {
+    fn repository_has_no_problems() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let all = crate::workspace_in(&root).unwrap().0;
         let problems: Vec<String> = check(&all, &root)

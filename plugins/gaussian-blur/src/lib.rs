@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn region_follows_the_radius_and_render_scale() {
+    fn region_reach_scales_with_radius_and_render_scale() {
         let mut p = values();
         p.set("radius", ParamValue::Float(0.0)).unwrap();
         assert_eq!(Blur::default().region(&p, [1.0, 1.0]), Region::default());

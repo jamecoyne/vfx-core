@@ -394,6 +394,7 @@ name = "cargo-vfx"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "thiserror 2.0.21",
  "vfx-build",
 ]
 
@@ -3524,6 +3525,7 @@ name = "vfx-chain"
 version = "1.1.0"
 dependencies = [
  "pollster",
+ "thiserror 2.0.21",
  "vfx-build",
  "vfx-core",
  "vfx-host",
@@ -3538,6 +3540,7 @@ dependencies = [
  "libloading 0.9.0",
  "pollster",
  "tempfile",
+ "thiserror 2.0.21",
  "wgpu",
  "windows-sys 0.61.2",
 ]

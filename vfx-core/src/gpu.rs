@@ -55,10 +55,9 @@ impl DeviceFaults {
     }
 }
 
-/// When to try for a new device after a loss: 1, 2, 4, 8 and 16 s, then every 30 s for as long as
-/// it takes, since a show lasts hours and a device may come back late. A device that lived
-/// [`Self::STABLE_AFTER`] starts the schedule over; one that dies sooner goes on from where it
-/// was, so a GPU that opens and dies isn't reopened every second all night.
+/// When to try for a new device after a loss: 1, 2, 4, 8 and 16 s, then every 30 s with no
+/// limit. A device that lived [`Self::STABLE_AFTER`] starts the schedule over; one that dies
+/// sooner goes on from where it was, so a GPU that opens and dies isn't reopened every second.
 #[derive(Clone, Debug, Default)]
 pub struct ReopenBackoff {
     tries: u32,
@@ -76,9 +75,9 @@ impl ReopenBackoff {
         delay
     }
 
-    /// Whether the next try should wait for the adapter that was lost, for about 30 s. A reset can
-    /// hide an adapter for seconds, and a machine with another GPU would otherwise land there and
-    /// stay for the night. After that any adapter beats none.
+    /// Whether the next try should wait for the adapter that was lost, for about 30 s: a reset
+    /// can hide it for seconds, and another GPU would otherwise take over for good. After that
+    /// any adapter beats none.
     pub fn same_adapter_only(&self) -> bool {
         self.tries <= 4
     }
@@ -92,19 +91,12 @@ impl ReopenBackoff {
 }
 
 /// Why [`poll_device`] failed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PollFailure {
+    #[error("the device was lost during a poll")]
     DeviceLost,
+    #[error(transparent)]
     Other(wgpu::PollError),
-}
-
-impl fmt::Display for PollFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DeviceLost => write!(f, "the device was lost during a poll"),
-            Self::Other(e) => write!(f, "{e}"),
-        }
-    }
 }
 
 /// [`wgpu::Device::poll`], for anything that has to go on after the device is lost: wgpu panics
@@ -180,15 +172,12 @@ impl Gpu {
     }
 
     /// Allocator block sizes for a device that stays open for a whole show, in place of wgpu's
-    /// default of 128 to 256 MiB. Vulkan and D3D12 reserve memory in blocks and place a new
-    /// allocation in the newest block with room, so one small buffer made beside a large one holds
-    /// the whole block once the large one has gone, and on integrated GPUs a reserved block is
-    /// system memory. A buffer larger than the current block gets memory of its own, which it
-    /// returns when it goes.
+    /// default of 128 to 256 MiB. Vulkan and D3D12 reserve memory in blocks, and a small buffer
+    /// made beside a large one holds the whole block once the large one has gone. A buffer
+    /// larger than the current block gets memory of its own, which it returns when it goes.
     ///
-    /// Host blocks are half these sizes, and staging comes from them. A fixed 64 MiB would make
-    /// those 32 MiB, which a 4K frame's staging all but fills: blocks were then made and freed
-    /// about twice a second. The range lets the host blocks reach 64 MiB.
+    /// Host blocks are half these sizes, and staging comes from them: the range lets them
+    /// reach 64 MiB, which a 4K frame's staging needs.
     pub fn memory_hints() -> wgpu::MemoryHints {
         const MIB: u64 = 1 << 20;
         wgpu::MemoryHints::Manual {
@@ -198,10 +187,11 @@ impl Gpu {
 
     /// Lets CPU effects draw on this device: in browsers, where they can't open their own, and
     /// in hosts that offer their output a GPU frame on it ([`crate::CpuEffect::render_to`]).
-    /// Effects pick their device on first use, so a host shares it before they render. This takes
-    /// over the device's error and loss callbacks; read them with [`Gpu::faults`]. Sharing the same
-    /// `Gpu` again keeps its record. Sharing another replaces it for later readers, and a clone
-    /// taken earlier goes on following its own device.
+    /// Effects pick their device on first use, so a host shares it before they render.
+    ///
+    /// This takes over the device's error and loss callbacks; read them with [`Gpu::faults`].
+    /// Sharing the same `Gpu` again keeps its record. Sharing another replaces it for later
+    /// readers, and a clone taken earlier goes on following its own device.
     pub fn share(&self) {
         self.watch_faults();
         let parts = Some(self.parts());
@@ -433,7 +423,7 @@ mod dxc {
         }
 
         #[test]
-        fn load_first_falls_back_past_a_bad_shared_dll() {
+        fn load_first_falls_back_to_beside_on_invalid_shared() {
             let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
             std::fs::write(shared.path().join("dxcompiler.dll"), b"not a DLL").unwrap();
             put_loadable_dll(beside.path());
@@ -442,7 +432,7 @@ mod dxc {
         }
 
         #[test]
-        fn load_first_without_shared_dir_uses_beside() {
+        fn load_first_without_shared_uses_beside() {
             let beside = tempfile::tempdir().unwrap();
             put_loadable_dll(beside.path());
             let path = load_first(None, beside.path()).unwrap();
@@ -473,7 +463,7 @@ mod dxc {
         }
 
         #[test]
-        fn shared_dir_is_in_an_existing_common_files() {
+        fn shared_dir_names_dxc_under_common_files() {
             let dir = shared_dir().unwrap();
             let common = dir.parent().and_then(Path::parent).unwrap();
             assert!(common.is_dir(), "{}", common.display());
@@ -508,14 +498,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_doubles_up_to_the_longest_wait() {
+    fn backoff_delay_doubles_to_limit() {
         let mut backoff = ReopenBackoff::default();
         let delays: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
         assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
     }
 
     #[test]
-    fn backoff_waits_for_the_same_adapter_through_the_short_delays() {
+    fn backoff_same_adapter_only_for_short_delays() {
         let mut backoff = ReopenBackoff::default();
         let same: Vec<bool> = (0..7)
             .map(|_| {
@@ -527,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn backoff_starts_over_only_after_a_device_that_lasted() {
+    fn backoff_resets_only_after_stable_device() {
         let mut backoff = ReopenBackoff::default();
         backoff.next_delay();
         backoff.next_delay();
@@ -538,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn same_device_follows_the_record_and_not_the_clone() {
+    fn same_device_compares_record_not_handle() {
         let (one, other) = (DeviceFaults::default(), DeviceFaults::default());
         assert!(one.same_device(&one.clone()));
         assert!(!one.same_device(&other));

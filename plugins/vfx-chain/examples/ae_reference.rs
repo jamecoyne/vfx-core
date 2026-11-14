@@ -23,10 +23,39 @@
 //! Missing stages are off, matching the plugin's checkboxes.
 
 use std::fs;
+use std::io;
 use std::process::ExitCode;
 
-use vfx_core::{Context, ParamValue, ParamValues};
+use vfx_core::{Context, ParamError, ParamValue, ParamValues};
 use vfx_host::pipeline;
+
+#[derive(Debug, thiserror::Error)]
+enum JobError {
+    #[error("bad number in `{0}`")]
+    BadNumber(String),
+    #[error("`{key}` takes {count} values")]
+    WrongValueCount { key: String, count: usize },
+    #[error("unknown key `{0}`")]
+    UnknownKey(String),
+    #[error("needs size, input and output")]
+    MissingFields,
+    #[error("{path}: expected {width}x{height} RGBA")]
+    WrongImageSize {
+        path: String,
+        width: u32,
+        height: u32,
+    },
+    #[error("no GPU adapter")]
+    NoGpu,
+    #[error("{path}: {source}")]
+    File {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Param(#[from] ParamError),
+}
 
 struct Frame {
     width: u32,
@@ -64,7 +93,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn parse(block: &str) -> Result<Frame, String> {
+fn parse(block: &str) -> Result<Frame, JobError> {
     let mut frame = Frame {
         width: 0,
         height: 0,
@@ -81,20 +110,23 @@ fn parse(block: &str) -> Result<Frame, String> {
     }
     for line in block.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let (key, rest) = line.split_once(' ').unwrap_or((line, ""));
-        let nums = || -> Result<Vec<f32>, String> {
+        let nums = || -> Result<Vec<f32>, JobError> {
             rest.split_whitespace()
                 .map(|v| {
                     v.parse::<f32>()
-                        .map_err(|_| format!("bad number in `{line}`"))
+                        .map_err(|_| JobError::BadNumber(line.to_owned()))
                 })
                 .collect()
         };
-        let want = |n: usize| -> Result<Vec<f32>, String> {
+        let want = |n: usize| -> Result<Vec<f32>, JobError> {
             let v = nums()?;
             if v.len() == n {
                 Ok(v)
             } else {
-                Err(format!("`{key}` takes {n} values"))
+                Err(JobError::WrongValueCount {
+                    key: key.to_owned(),
+                    count: n,
+                })
             }
         };
         let s = &mut frame.values;
@@ -148,23 +180,27 @@ fn parse(block: &str) -> Result<Frame, String> {
                 set(s, "blur_direction", ParamValue::Int(v[2] as i32))?;
                 set(s, "blur_grow", ParamValue::Bool(v[3] != 0.0))?;
             }
-            _ => return Err(format!("unknown key `{key}`")),
+            _ => return Err(JobError::UnknownKey(key.to_owned())),
         }
     }
     if frame.width == 0 || frame.height == 0 || frame.input.is_empty() || frame.output.is_empty() {
-        return Err("needs size, input and output".into());
+        return Err(JobError::MissingFields);
     }
     Ok(frame)
 }
 
-fn run(frame: &Frame) -> Result<(), String> {
-    let read = |path: &str| -> Result<Vec<f32>, String> {
-        let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+fn run(frame: &Frame) -> Result<(), JobError> {
+    let read = |path: &str| -> Result<Vec<f32>, JobError> {
+        let bytes = fs::read(path).map_err(|source| JobError::File {
+            path: path.to_owned(),
+            source,
+        })?;
         if bytes.len() != (frame.width * frame.height * 4) as usize {
-            return Err(format!(
-                "{path}: expected {}x{} RGBA",
-                frame.width, frame.height
-            ));
+            return Err(JobError::WrongImageSize {
+                path: path.to_owned(),
+                width: frame.width,
+                height: frame.height,
+            });
         }
         Ok(bytes.iter().map(|&b| f32::from(b) / 255.0).collect())
     };
@@ -172,7 +208,7 @@ fn run(frame: &Frame) -> Result<(), String> {
     let layer = frame.layer.as_deref().map(read).transpose()?;
     vfx_host::register(&vfx_chain::VFX_PLUGIN);
     static LOG: vfx_host::diag::Log = vfx_host::diag::Log::new("-reference.log");
-    let device = vfx_host::gpu(&LOG).ok_or("no GPU adapter")?;
+    let device = vfx_host::gpu(&LOG).ok_or(JobError::NoGpu)?;
     for _ in 0..frame.repeat {
         let job = pipeline::Job {
             spec: pipeline::Spec {
@@ -190,9 +226,12 @@ fn run(frame: &Frame) -> Result<(), String> {
     // Unclamped f32, so the harness can quantise the way each bit depth does: integer
     // depths clip before premultiplying, 32 bpc keeps values above 1.0 until output.
     let bytes: Vec<u8> = pixels.iter().flat_map(|v| v.to_le_bytes()).collect();
-    fs::write(&frame.output, bytes).map_err(|e| format!("{}: {e}", frame.output))
+    fs::write(&frame.output, bytes).map_err(|source| JobError::File {
+        path: frame.output.clone(),
+        source,
+    })
 }
 
-fn set(values: &mut ParamValues, name: &str, value: ParamValue) -> Result<(), String> {
-    values.set(name, value).map_err(|e| e.to_string())
+fn set(values: &mut ParamValues, name: &str, value: ParamValue) -> Result<(), JobError> {
+    Ok(values.set(name, value)?)
 }
