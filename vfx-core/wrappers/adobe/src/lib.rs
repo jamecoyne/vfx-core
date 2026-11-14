@@ -402,6 +402,8 @@ fn gpu_render_native(
         let world = RawWorld(l.as_mut_ptr());
         let data = suite.gpu_world_data(in_data.effect_ref(), &mut *l)?;
         let size = suite.gpu_world_size(in_data.effect_ref(), world)?;
+        // SAFETY: After Effects returned `data` as this world's `id<MTLBuffer>` on
+        // this device, and `size` as its length.
         let buffer = unsafe { device.wrap_buffer(data, size as u64) }.map_err(|e| {
             warn_once(&e.to_string());
             ae::Error::BadCallbackParameter
