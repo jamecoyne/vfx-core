@@ -99,8 +99,34 @@ struct PendingFile {
     started: Cell<Instant>,
 }
 
+/// Why a recording could not start or be saved; the text is shown in the Record section.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordError {
+    #[error("this browser can't record any video format it was asked for")]
+    NoFormat,
+    #[error("no document")]
+    NoDocument,
+    #[error("no window")]
+    NoWindow,
+    #[error("not a canvas")]
+    NotCanvas,
+    #[error("not a link")]
+    NotLink,
+    #[error("the canvas has no format")]
+    NoCanvasFormat,
+    #[error("{0}")]
+    Surface(#[source] wgpu::CreateSurfaceError),
+    /// A JavaScript exception, as the browser words it.
+    #[error("{0}")]
+    Script(String),
+}
+
 fn error(e: JsValue) -> String {
     e.as_string().unwrap_or_else(|| format!("{e:?}"))
+}
+
+fn script_error(e: JsValue) -> RecordError {
+    RecordError::Script(error(e))
 }
 
 impl WebRecorder {
@@ -110,27 +136,27 @@ impl WebRecorder {
         gpu: &Gpu,
         size: (u32, u32),
         finished: Finished,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, RecordError> {
         let (mime_type, extension) = FORMATS
             .into_iter()
             .find(|(mime_type, _)| MediaRecorder::is_type_supported(mime_type))
-            .ok_or("this browser can't record any video format it was asked for")?;
+            .ok_or(RecordError::NoFormat)?;
         let canvas: HtmlCanvasElement = web_sys::window()
             .and_then(|w| w.document())
-            .ok_or("no document")?
+            .ok_or(RecordError::NoDocument)?
             .create_element("canvas")
-            .map_err(error)?
+            .map_err(script_error)?
             .dyn_into()
-            .map_err(|_| "not a canvas")?;
+            .map_err(|_| RecordError::NotCanvas)?;
         canvas.set_width(size.0);
         canvas.set_height(size.1);
-        let stream = canvas.capture_stream().map_err(error)?;
+        let stream = canvas.capture_stream().map_err(script_error)?;
 
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
-            .map_err(|e| e.to_string())?;
+            .map_err(RecordError::Surface)?;
         let caps = surface.get_capabilities(adapter);
-        let format = *caps.formats.first().ok_or("the canvas has no format")?;
+        let format = *caps.formats.first().ok_or(RecordError::NoCanvasFormat)?;
         surface.configure(
             &gpu.device,
             &wgpu::SurfaceConfiguration {
@@ -161,7 +187,7 @@ impl WebRecorder {
         options.set_video_bits_per_second(BITS_PER_SECOND);
         let recorder =
             MediaRecorder::new_with_media_stream_and_media_recorder_options(&stream, &options)
-                .map_err(error)?;
+                .map_err(script_error)?;
         let file = Rc::new(PendingFile {
             recorder: RefCell::new(Some(recorder.clone())),
             chunks: RefCell::default(),
@@ -337,21 +363,22 @@ impl PendingFile {
         *self.finished.borrow_mut() = Some(outcome);
     }
 
-    fn save(&self) -> Result<String, String> {
+    fn save(&self) -> Result<String, RecordError> {
         let parts: Array = self.chunks.borrow().iter().collect();
         let options = BlobPropertyBag::new();
         options.set_type(&self.mime_type);
-        let blob = Blob::new_with_blob_sequence_and_options(&parts, &options).map_err(error)?;
-        let url = Url::create_object_url_with_blob(&blob).map_err(error)?;
+        let blob =
+            Blob::new_with_blob_sequence_and_options(&parts, &options).map_err(script_error)?;
+        let url = Url::create_object_url_with_blob(&blob).map_err(script_error)?;
         let name = format!("recording.{}", self.extension);
-        let window = web_sys::window().ok_or("no window")?;
+        let window = web_sys::window().ok_or(RecordError::NoWindow)?;
         let link: HtmlAnchorElement = window
             .document()
-            .ok_or("no document")?
+            .ok_or(RecordError::NoDocument)?
             .create_element("a")
-            .map_err(error)?
+            .map_err(script_error)?
             .dyn_into()
-            .map_err(|_| "not a link")?;
+            .map_err(|_| RecordError::NotLink)?;
         link.set_href(&url);
         link.set_download(&name);
         link.click();
@@ -363,7 +390,7 @@ impl PendingFile {
                 revoke.unchecked_ref(),
                 URL_LIFETIME_MS,
             )
-            .map_err(error)?;
+            .map_err(script_error)?;
         Ok(name)
     }
 }
