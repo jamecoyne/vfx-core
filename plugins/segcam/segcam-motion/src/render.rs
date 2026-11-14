@@ -77,7 +77,7 @@ pub enum SwarmBackground {
 }
 
 /// Which frames are analysed: those whose number divides by `every`, the frame rate over
-/// [`Self::ANALYSES_A_SECOND`], rounded, at most 4. A frame between analyses shows the last one.
+/// [`Self::ANALYSIS_RATE`], rounded, at most 4. A frame between analyses shows the last one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnalysisStep {
     pub every: i64,
@@ -86,7 +86,7 @@ pub struct AnalysisStep {
 impl AnalysisStep {
     pub const EVERY_FRAME: Self = Self { every: 1 };
     /// The analyses a second a high frame rate comes down to, as segcam 1.1 plays a file.
-    pub const ANALYSES_A_SECOND: f64 = 60.0;
+    pub const ANALYSIS_RATE: f64 = 60.0;
     /// The largest `every`.
     pub const MAX_EVERY: i64 = 4;
 
@@ -94,7 +94,7 @@ impl AnalysisStep {
     pub fn for_frame_rate(frame_rate: Option<f64>) -> Self {
         let every = frame_rate
             .filter(|r| r.is_finite() && *r > 0.0)
-            .map_or(1, |r| (r / Self::ANALYSES_A_SECOND).round() as i64);
+            .map_or(1, |r| (r / Self::ANALYSIS_RATE).round() as i64);
         Self {
             every: every.clamp(1, Self::MAX_EVERY),
         }

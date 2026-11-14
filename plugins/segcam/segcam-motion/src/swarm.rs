@@ -442,14 +442,7 @@ pub fn render_title_bar(w: i32, title: &str) -> Vec<Color> {
 // ---------------------------------------------------------------------------------------
 // The window
 
-#[cfg(not(target_arch = "wasm32"))]
-unsafe extern "C" {
-    // The platform's C library, as the C++ effect uses; Rust's standard library has no erfc.
-    safe fn erfc(x: f64) -> f64;
-}
-
-// Browsers have no C library; libm is a port of the same musl/FreeBSD routine.
-#[cfg(target_arch = "wasm32")]
+// The standard library has no erfc.
 use libm::erfc;
 
 fn normal_cdf(z: f64) -> f64 {
