@@ -343,6 +343,7 @@ fn gpu_device_setup(
         .and_then(|suite| suite.device_info(in_data.effect_ref(), index))
         .map_err(|e| format!("{e:?}"))
         .and_then(|info| {
+            // SAFETY: with Metal as the framework, `devicePV` is the device's `id<MTLDevice>`.
             unsafe { metal::AeDevice::open(info.devicePV, index) }.map_err(|e| e.to_string())
         });
     match opened {
