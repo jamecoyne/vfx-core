@@ -339,8 +339,9 @@ fn target_os(triple: Option<&str>) -> &'static str {
     }
 }
 
-/// The plugin binary for one target triple (`None`: the host's own).
-fn cargo_build(e: &Effect, o: &Options, triple: Option<&str>) -> Result<(), String> {
+/// Builds the plugin binary for one target triple (`None`: the host's own) and returns
+/// the output directory of the effect's build script, if it has one.
+fn cargo_build(e: &Effect, o: &Options, triple: Option<&str>) -> Result<Option<PathBuf>, String> {
     let mut features: Vec<String> = o.hosts.iter().map(|h| h.feature().to_owned()).collect();
     features.extend(e.meta.features_for(target_os(triple)));
     let mut cmd = Command::new(env_or("CARGO", "cargo"));
@@ -361,7 +362,36 @@ fn cargo_build(e: &Effect, o: &Options, triple: Option<&str>) -> Result<(), Stri
     if target_os(triple) == "macos" {
         cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_MINIMUM);
     }
-    run(&mut cmd)
+    cmd.args(["--message-format", "json-render-diagnostics"]);
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|err| format!("{cmd:?}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("{cmd:?} failed ({})", output.status));
+    }
+    let mut out_dir = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let package = message["package_id"].as_str().and_then(package_name);
+        if message["reason"] == "build-script-executed" && package == Some(e.package.as_str()) {
+            out_dir = message["out_dir"].as_str().map(PathBuf::from);
+        }
+    }
+    Ok(out_dir)
+}
+
+/// The package name in a cargo package ID, such as `path+file:///src/blend#0.1.0`
+/// or `registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228`.
+fn package_name(id: &str) -> Option<&str> {
+    let (source, fragment) = id.rsplit_once('#')?;
+    match fragment.split_once('@') {
+        Some((name, _version)) => Some(name),
+        None => source.rsplit('/').next(),
+    }
 }
 
 fn profile(o: &Options) -> &'static str {
@@ -407,11 +437,16 @@ fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<P
     let mut rsrc = None;
     for arch in &archs {
         let triple = format!("{arch}-apple-darwin");
-        cargo_build(e, o, Some(&triple))?;
+        let out_dir = cargo_build(e, o, Some(&triple))?;
         let dir = target.join(&triple).join(profile(o));
         binaries.push(dir.join(format!("lib{}.dylib", e.lib())));
         if o.hosts.contains(&Host::Ae) {
-            rsrc = Some(newest_rsrc(&dir, &e.package, &m.file)?);
+            let out_dir = out_dir.ok_or_else(|| format!("{} has no build script", e.package))?;
+            let path = out_dir.join(format!("{}.rsrc", m.file));
+            if !path.exists() {
+                return Err(format!("no {}", path.display()));
+            }
+            rsrc = Some(path);
         }
     }
     let binary = out.join(format!(".{}.universal", m.file));
@@ -491,24 +526,6 @@ fn xml(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-}
-
-/// The PiPL resource the effect's build script wrote: the newest one for this crate.
-fn newest_rsrc(profile_dir: &Path, package: &str, file: &str) -> Result<PathBuf, String> {
-    let build = profile_dir.join("build");
-    let prefix = format!("{package}-");
-    let mut found: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(&build)
-        .map_err(|e| format!("{}: {e}", build.display()))?
-        .filter_map(Result::ok)
-        .filter(|d| d.file_name().to_string_lossy().starts_with(&prefix))
-        .map(|d| d.path().join("out").join(format!("{file}.rsrc")))
-        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
-        .collect();
-    found.sort();
-    found
-        .pop()
-        .map(|(_, p)| p)
-        .ok_or_else(|| format!("no {file}.rsrc under {}", build.display()))
 }
 
 fn build_windows(
@@ -925,6 +942,17 @@ fn slug(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_name_reads_both_id_forms() {
+        let path = "path+file:///work/vfx-core/plugins/blend#0.1.0";
+        let registry = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228";
+        let renamed = "path+file:///work/vfx-core/plugins/segcam/segcam-motion#segcam-motion@1.0.0";
+        assert_eq!(package_name(path), Some("blend"));
+        assert_eq!(package_name(registry), Some("serde"));
+        assert_eq!(package_name(renamed), Some("segcam-motion"));
+        assert_eq!(package_name("serde"), None);
+    }
 
     #[test]
     fn slugs_and_hosts() {
