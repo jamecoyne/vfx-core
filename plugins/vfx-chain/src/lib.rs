@@ -83,7 +83,7 @@ struct Stages {
 }
 
 impl Stages {
-    fn of(p: &ParamValues, has_layer: bool) -> Self {
+    fn from_params(p: &ParamValues, has_layer: bool) -> Self {
         Self {
             linear: p.bool("linear"),
             color: p.bool("color_enable"),
@@ -247,7 +247,7 @@ impl Effect for VfxPreview {
     ) {
         let (format, size) = self.prepared.expect("prepare before render");
         let layer = layers.first().copied();
-        let stages = Stages::of(params, layer.is_some());
+        let stages = Stages::from_params(params, layer.is_some());
         let built = self
             .built
             .entry(stages)
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_light_blend_decodes_the_layer() {
+    fn linear_blend_round_trips_layer() {
         // Normal blend at full strength, in linear light: the output is the layer, round
         // tripped through linear, so it must come back unchanged (not double-encoded).
         let mut p = values();
@@ -375,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn region_follows_the_blur_and_render_scale() {
+    fn region_reach_scales_with_blur_and_render_scale() {
         let mut p = values();
         assert_eq!(
             VfxPreview::default().region(&p, [1.0, 1.0]),
