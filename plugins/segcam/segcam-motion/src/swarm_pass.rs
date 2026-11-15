@@ -2483,56 +2483,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SWARM_PASS_ADAPTER and SWARM_PASS_BACKEND pick the GPU"]
-    fn grow_preserves_tiles() {
-        let _lock = gpu::gpu_test_lock();
-        let (_, device, queue) = open(wgpu::Limits::default());
-        let (w, h) = (1920, 1080);
-        let shadow = shadow_kernel(SwarmMetrics::new(h).scale);
-        let s = RenderSettings {
-            mode: OutputMode::Swarm,
-            max_tiles: 1000,
-            trail_frames: 120,
-            ..RenderSettings::default()
-        };
-        let tiles = trail_tiles::<u8>((w, h), 120, 9, false);
-        let windows = visible(&tiles, (w, h), s.max_tiles);
-        let shared = SwarmPipelines::new(&device, &queue);
-        let draw = |pass: &mut SwarmPass, slots: &[Slot]| {
-            let mut drawn = vec![Argb::<u8>::default(); (w * h) as usize];
-            pass.draw(
-                &mut ViewMut::from_pixels(&mut drawn, w, h),
-                windows.iter().map(|&(i, tile)| (tile, slots[i])),
-                None,
-                &s,
-                &shadow,
-                Occlusion::Depth,
-            )
-            .expect("the draw comes back");
-            drawn
-        };
-
-        // Every growth step copies layers that tiles are already in.
-        let mut grown = SwarmPass::new(shared.clone());
-        let frames: Vec<_> = tiles
-            .chunks(9)
-            .map(|frame| grown.upload_tiles(frame, h).expect("the atlas grows"))
-            .collect();
-        let layers = lock(&grown.atlases).tiles.layers;
-        assert!(layers >= 16, "the atlas grew to {layers} layers");
-        let slots: Vec<Slot> = frames.iter().flat_map(|f| f.slots.clone()).collect();
-        let from_grown = draw(&mut grown, &slots);
-
-        // Here the tiles go into an atlas that is already large enough.
-        let mut large = SwarmPass::new(shared);
-        drop(large.upload_tiles(&tiles, h).expect("the atlas grows"));
-        let placed = large.upload_tiles(&tiles, h).expect("the atlas has room");
-        assert_eq!(lock(&large.atlases).tiles.layers, layers);
-        let from_large = draw(&mut large, &placed.slots);
-        assert!(from_grown == from_large, "a tile changed as the atlas grew");
-    }
-
-    #[test]
     #[ignore = "SWARM_PASS_ADAPTER picks the GPU; set SWARM_PASS_BACKEND=gl"]
     fn square_atlas_draws_at_cube_layer_counts() {
         let _lock = gpu::gpu_test_lock();
@@ -2652,40 +2602,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn grow_widens_in_place() {
-        let limits = AtlasLimits {
-            side: 1024,
-            layers: 8,
-            bytes: u64::MAX,
-        };
-        let (device, queue, mut atlas) = test_atlas((256, 256), limits);
-        let first = atlas.place(&device, &queue, 200, 200);
-        let wide = atlas.place(&device, &queue, 1000, 40);
-        assert!(wide.is_some());
-        assert_eq!((atlas.size, atlas.layers), ((1024, 256), 2));
-        let beside = atlas.place(&device, &queue, 800, 200);
-        assert_eq!((first, beside), (Some([0, 0, 0]), Some([200, 0, 0])));
-    }
-
-    #[test]
-    fn grow_stops_at_limits() {
-        let limits = AtlasLimits {
-            side: 1024,
-            layers: 8,
-            bytes: 1024 * 1024 * 4 * 7,
-        };
-        let (device, queue, mut atlas) = test_atlas((256, 256), limits);
-        let mut placed = 0;
-        while atlas.place(&device, &queue, 1024, 1024).is_some() {
-            placed += 1;
-        }
-        assert_eq!((atlas.size, atlas.layers), ((1024, 1024), 7));
-        assert_eq!(placed, 7, "the byte limit allows seven of eight layers");
-        let past_side = atlas.place(&device, &queue, 1025, 16);
-        assert_eq!(past_side, None);
-    }
-
     /// An atlas under a browser's limits with one 1024 x 1024 tile in each of
     /// `layers` layers, the last `freed` of them freed.
     fn filled_atlas(layers: u32, freed: u32) -> (wgpu::Device, wgpu::Queue, Atlas) {
@@ -2706,36 +2622,6 @@ mod tests {
             atlas.free(at, 1024);
         }
         (device, queue, atlas)
-    }
-
-    #[test]
-    fn grow_drops_empty_layers() {
-        // 41 layers of 1024 x 1024 are 164 MB; 41 of 1024 x 2000 would go
-        // over the 256 MB cap, 32 fit.
-        let (device, queue, mut atlas) = filled_atlas(41, 21);
-        assert_eq!((atlas.layers, atlas.used_layers()), (41, 20));
-        let tall = atlas.place(&device, &queue, 1024, 2000);
-        assert_eq!(tall, Some([0, 0, 20]));
-        assert_eq!((atlas.size, atlas.layers), ((1024, 2000), 32));
-        assert_eq!(atlas.rows.len(), 32);
-        let below = atlas.place(&device, &queue, 1024, 976);
-        assert_eq!(below, Some([0, 1024, 0]), "the kept layers gained rows");
-    }
-
-    #[test]
-    fn grow_height_matches_rows() {
-        let limits = AtlasLimits {
-            side: 8192,
-            layers: 256,
-            bytes: 256 << 20,
-        };
-        let (device, queue, mut atlas) = test_atlas((1024, 1024), limits);
-        let mut placed = 0;
-        while atlas.place(&device, &queue, 1024, 1056).is_some() {
-            placed += 1;
-        }
-        assert_eq!((atlas.size, atlas.layers), ((1024, 1056), 62));
-        assert_eq!(placed, 62, "one full height window a layer");
     }
 
     #[test]
@@ -2767,44 +2653,6 @@ mod tests {
     }
 
     #[test]
-    fn grow_stops_after_small_refusal() {
-        // Taller than the device's 8192 texels, so wgpu refuses the texture.
-        let limits = AtlasLimits {
-            side: 16384,
-            layers: 256,
-            bytes: 256 << 20,
-        };
-        let (device, queue, mut atlas) = test_atlas((1024, 8192), limits);
-        let placed: Vec<_> = (0..8)
-            .map(|_| {
-                atlas
-                    .place(&device, &queue, 1024, 8192)
-                    .expect("8 layers fit")
-            })
-            .collect();
-        for at in placed {
-            atlas.free(at, 1024);
-        }
-        assert_eq!(atlas.layers, 8);
-        assert_eq!(atlas.place(&device, &queue, 1024, 16000), None);
-        let four_layers = atlas.bytes((1024, 16000), 4);
-        assert_eq!(
-            atlas.smallest_logged_refusal, four_layers,
-            "refused once at 4 layers, not again at 3 or 2"
-        );
-        assert_eq!(atlas.place(&device, &queue, 1024, 16000), None);
-        assert_eq!(atlas.smallest_logged_refusal, four_layers);
-        assert_eq!(atlas.layers, 8);
-    }
-
-    #[test]
-    fn grow_keeps_used_layers() {
-        let (device, queue, mut atlas) = filled_atlas(41, 0);
-        assert_eq!(atlas.place(&device, &queue, 1024, 2000), None);
-        assert_eq!((atlas.size, atlas.layers), ((1024, 1024), 41));
-    }
-
-    #[test]
     fn atlas_layers_avoid_gl_shapes() {
         assert_eq!(atlas_layers((256, 256), 1, 8), 2);
         for (wanted, layers) in [(6, 7), (12, 13), (24, 25), (8, 8)] {
@@ -2812,27 +2660,6 @@ mod tests {
         }
         assert_eq!(atlas_layers((256, 256), 6, 6), 5);
         assert_eq!(atlas_layers((1024, 256), 6, 256), 6);
-    }
-
-    #[test]
-    fn grow_retries_after_refusal() {
-        let limits = AtlasLimits {
-            side: 64,
-            layers: 8,
-            bytes: u64::MAX,
-        };
-        let (device, queue, mut atlas) = test_atlas((64, 64), limits);
-        let place = |atlas: &mut Atlas| atlas.place(&device, &queue, 64, 64);
-        assert!(place(&mut atlas).is_some() && place(&mut atlas).is_some());
-        // As the GPU's refusal of a larger texture leaves it.
-        atlas.ceiling = atlas.bytes(atlas.size, atlas.layers);
-        atlas.last_refusal = Some(Instant::now());
-        assert_eq!(place(&mut atlas), None, "asked again at once");
-        assert_eq!(atlas.layers, 2);
-        let due = Instant::now().checked_sub(Atlas::GROWTH_RETRY_AFTER);
-        atlas.last_refusal = Some(due.expect("uptime over GROWTH_RETRY_AFTER"));
-        assert!(place(&mut atlas).is_some(), "stayed capped");
-        assert_eq!(atlas.layers, 4);
     }
 
     #[test]
@@ -2899,5 +2726,182 @@ mod tests {
             u64::from(most_layers) * layer <= most_held * 4,
             "{most_layers} layers for at most {most_held} texels held"
         );
+    }
+
+    mod grow {
+        use super::*;
+
+        #[test]
+        #[ignore = "SWARM_PASS_ADAPTER and SWARM_PASS_BACKEND pick the GPU"]
+        fn preserves_tiles() {
+            let _lock = gpu::gpu_test_lock();
+            let (_, device, queue) = open(wgpu::Limits::default());
+            let (w, h) = (1920, 1080);
+            let shadow = shadow_kernel(SwarmMetrics::new(h).scale);
+            let s = RenderSettings {
+                mode: OutputMode::Swarm,
+                max_tiles: 1000,
+                trail_frames: 120,
+                ..RenderSettings::default()
+            };
+            let tiles = trail_tiles::<u8>((w, h), 120, 9, false);
+            let windows = visible(&tiles, (w, h), s.max_tiles);
+            let shared = SwarmPipelines::new(&device, &queue);
+            let draw = |pass: &mut SwarmPass, slots: &[Slot]| {
+                let mut drawn = vec![Argb::<u8>::default(); (w * h) as usize];
+                pass.draw(
+                    &mut ViewMut::from_pixels(&mut drawn, w, h),
+                    windows.iter().map(|&(i, tile)| (tile, slots[i])),
+                    None,
+                    &s,
+                    &shadow,
+                    Occlusion::Depth,
+                )
+                .expect("the draw comes back");
+                drawn
+            };
+
+            // Every growth step copies layers that tiles are already in.
+            let mut grown = SwarmPass::new(shared.clone());
+            let frames: Vec<_> = tiles
+                .chunks(9)
+                .map(|frame| grown.upload_tiles(frame, h).expect("the atlas grows"))
+                .collect();
+            let layers = lock(&grown.atlases).tiles.layers;
+            assert!(layers >= 16, "the atlas grew to {layers} layers");
+            let slots: Vec<Slot> = frames.iter().flat_map(|f| f.slots.clone()).collect();
+            let from_grown = draw(&mut grown, &slots);
+
+            // Here the tiles go into an atlas that is already large enough.
+            let mut large = SwarmPass::new(shared);
+            drop(large.upload_tiles(&tiles, h).expect("the atlas grows"));
+            let placed = large.upload_tiles(&tiles, h).expect("the atlas has room");
+            assert_eq!(lock(&large.atlases).tiles.layers, layers);
+            let from_large = draw(&mut large, &placed.slots);
+            assert!(from_grown == from_large, "a tile changed as the atlas grew");
+        }
+
+        #[test]
+        fn widens_in_place() {
+            let limits = AtlasLimits {
+                side: 1024,
+                layers: 8,
+                bytes: u64::MAX,
+            };
+            let (device, queue, mut atlas) = test_atlas((256, 256), limits);
+            let first = atlas.place(&device, &queue, 200, 200);
+            let wide = atlas.place(&device, &queue, 1000, 40);
+            assert!(wide.is_some());
+            assert_eq!((atlas.size, atlas.layers), ((1024, 256), 2));
+            let beside = atlas.place(&device, &queue, 800, 200);
+            assert_eq!((first, beside), (Some([0, 0, 0]), Some([200, 0, 0])));
+        }
+
+        #[test]
+        fn stops_at_limits() {
+            let limits = AtlasLimits {
+                side: 1024,
+                layers: 8,
+                bytes: 1024 * 1024 * 4 * 7,
+            };
+            let (device, queue, mut atlas) = test_atlas((256, 256), limits);
+            let mut placed = 0;
+            while atlas.place(&device, &queue, 1024, 1024).is_some() {
+                placed += 1;
+            }
+            assert_eq!((atlas.size, atlas.layers), ((1024, 1024), 7));
+            assert_eq!(placed, 7, "the byte limit allows seven of eight layers");
+            let past_side = atlas.place(&device, &queue, 1025, 16);
+            assert_eq!(past_side, None);
+        }
+
+        #[test]
+        fn drops_empty_layers() {
+            // 41 layers of 1024 x 1024 are 164 MB; 41 of 1024 x 2000 would go
+            // over the 256 MB cap, 32 fit.
+            let (device, queue, mut atlas) = filled_atlas(41, 21);
+            assert_eq!((atlas.layers, atlas.used_layers()), (41, 20));
+            let tall = atlas.place(&device, &queue, 1024, 2000);
+            assert_eq!(tall, Some([0, 0, 20]));
+            assert_eq!((atlas.size, atlas.layers), ((1024, 2000), 32));
+            assert_eq!(atlas.rows.len(), 32);
+            let below = atlas.place(&device, &queue, 1024, 976);
+            assert_eq!(below, Some([0, 1024, 0]), "the kept layers gained rows");
+        }
+
+        #[test]
+        fn height_matches_rows() {
+            let limits = AtlasLimits {
+                side: 8192,
+                layers: 256,
+                bytes: 256 << 20,
+            };
+            let (device, queue, mut atlas) = test_atlas((1024, 1024), limits);
+            let mut placed = 0;
+            while atlas.place(&device, &queue, 1024, 1056).is_some() {
+                placed += 1;
+            }
+            assert_eq!((atlas.size, atlas.layers), ((1024, 1056), 62));
+            assert_eq!(placed, 62, "one full height window a layer");
+        }
+
+        #[test]
+        fn stops_after_small_refusal() {
+            // Taller than the device's 8192 texels, so wgpu refuses the texture.
+            let limits = AtlasLimits {
+                side: 16384,
+                layers: 256,
+                bytes: 256 << 20,
+            };
+            let (device, queue, mut atlas) = test_atlas((1024, 8192), limits);
+            let placed: Vec<_> = (0..8)
+                .map(|_| {
+                    atlas
+                        .place(&device, &queue, 1024, 8192)
+                        .expect("8 layers fit")
+                })
+                .collect();
+            for at in placed {
+                atlas.free(at, 1024);
+            }
+            assert_eq!(atlas.layers, 8);
+            assert_eq!(atlas.place(&device, &queue, 1024, 16000), None);
+            let four_layers = atlas.bytes((1024, 16000), 4);
+            assert_eq!(
+                atlas.smallest_logged_refusal, four_layers,
+                "refused once at 4 layers, not again at 3 or 2"
+            );
+            assert_eq!(atlas.place(&device, &queue, 1024, 16000), None);
+            assert_eq!(atlas.smallest_logged_refusal, four_layers);
+            assert_eq!(atlas.layers, 8);
+        }
+
+        #[test]
+        fn keeps_used_layers() {
+            let (device, queue, mut atlas) = filled_atlas(41, 0);
+            assert_eq!(atlas.place(&device, &queue, 1024, 2000), None);
+            assert_eq!((atlas.size, atlas.layers), ((1024, 1024), 41));
+        }
+
+        #[test]
+        fn retries_after_refusal() {
+            let limits = AtlasLimits {
+                side: 64,
+                layers: 8,
+                bytes: u64::MAX,
+            };
+            let (device, queue, mut atlas) = test_atlas((64, 64), limits);
+            let place = |atlas: &mut Atlas| atlas.place(&device, &queue, 64, 64);
+            assert!(place(&mut atlas).is_some() && place(&mut atlas).is_some());
+            // As the GPU's refusal of a larger texture leaves it.
+            atlas.ceiling = atlas.bytes(atlas.size, atlas.layers);
+            atlas.last_refusal = Some(Instant::now());
+            assert_eq!(place(&mut atlas), None, "asked again at once");
+            assert_eq!(atlas.layers, 2);
+            let due = Instant::now().checked_sub(Atlas::GROWTH_RETRY_AFTER);
+            atlas.last_refusal = Some(due.expect("uptime over GROWTH_RETRY_AFTER"));
+            assert!(place(&mut atlas).is_some(), "stayed capped");
+            assert_eq!(atlas.layers, 4);
+        }
     }
 }

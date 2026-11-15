@@ -658,7 +658,7 @@ mod tests {
 
     /// The last pixel alone is enough to make a frame new.
     #[test]
-    fn drop_repeat_rejects_last_pixel_change() {
+    fn drop_repeat_keeps_last_pixel_change() {
         for before in [0, 3] {
             let mut h = History::<f32>::default();
             h.resize(2, 2);

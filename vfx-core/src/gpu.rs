@@ -1,4 +1,3 @@
-use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -144,8 +143,7 @@ impl Gpu {
                 force_fallback_adapter: false,
                 apply_limit_buckets: false,
             })
-            .await
-            .map_err(|e| GpuError(e.to_string()))?;
+            .await?;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 // Effects blend in 32-bit float targets where the adapter can.
@@ -153,8 +151,7 @@ impl Gpu {
                 memory_hints: Self::memory_hints(),
                 ..wgpu::DeviceDescriptor::default()
             })
-            .await
-            .map_err(|e| GpuError(e.to_string()))?;
+            .await?;
         Ok(Self::from_parts(device, queue))
     }
 
@@ -414,42 +411,6 @@ mod dxc {
         }
 
         #[test]
-        fn load_first_prefers_shared() {
-            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            put_loadable_dll(shared.path());
-            put_loadable_dll(beside.path());
-            let path = load_first(Some(shared.path()), beside.path()).unwrap();
-            assert_eq!(Path::new(&path), shared.path().join("dxcompiler.dll"));
-        }
-
-        #[test]
-        fn load_first_falls_back_to_beside_on_invalid_shared() {
-            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            std::fs::write(shared.path().join("dxcompiler.dll"), b"not a DLL").unwrap();
-            put_loadable_dll(beside.path());
-            let path = load_first(Some(shared.path()), beside.path()).unwrap();
-            assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
-        }
-
-        #[test]
-        fn load_first_without_shared_uses_beside() {
-            let beside = tempfile::tempdir().unwrap();
-            put_loadable_dll(beside.path());
-            let path = load_first(None, beside.path()).unwrap();
-            assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
-        }
-
-        #[test]
-        fn load_first_names_both_folders() {
-            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            let err = load_first(Some(shared.path()), beside.path()).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::NotFound);
-            let shown = err.to_string();
-            assert!(shown.contains(&*shared.path().to_string_lossy()), "{shown}");
-            assert!(shown.contains(&*beside.path().to_string_lossy()), "{shown}");
-        }
-
-        #[test]
         fn load_names_missing_dll() {
             let dir = tempfile::tempdir().unwrap();
             let err = load(&dir.path().join("dxcompiler.dll"))
@@ -470,6 +431,46 @@ mod dxc {
             let name = dir.file_name().unwrap().to_string_lossy();
             assert!(name.starts_with("dxc-"), "{name}");
         }
+
+        mod load_first {
+            use super::*;
+
+            #[test]
+            fn prefers_shared() {
+                let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+                put_loadable_dll(shared.path());
+                put_loadable_dll(beside.path());
+                let path = load_first(Some(shared.path()), beside.path()).unwrap();
+                assert_eq!(Path::new(&path), shared.path().join("dxcompiler.dll"));
+            }
+
+            #[test]
+            fn falls_back_to_beside_on_invalid_shared() {
+                let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+                std::fs::write(shared.path().join("dxcompiler.dll"), b"not a DLL").unwrap();
+                put_loadable_dll(beside.path());
+                let path = load_first(Some(shared.path()), beside.path()).unwrap();
+                assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
+            }
+
+            #[test]
+            fn without_shared_uses_beside() {
+                let beside = tempfile::tempdir().unwrap();
+                put_loadable_dll(beside.path());
+                let path = load_first(None, beside.path()).unwrap();
+                assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
+            }
+
+            #[test]
+            fn names_both_folders() {
+                let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+                let err = load_first(Some(shared.path()), beside.path()).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::NotFound);
+                let shown = err.to_string();
+                assert!(shown.contains(&*shared.path().to_string_lossy()), "{shown}");
+                assert!(shown.contains(&*beside.path().to_string_lossy()), "{shown}");
+            }
+        }
     }
 }
 
@@ -482,55 +483,57 @@ thread_local! {
 #[cfg(not(target_arch = "wasm32"))]
 static SHARED: std::sync::Mutex<Option<GpuParts>> = std::sync::Mutex::new(None);
 
-#[derive(Debug)]
-pub struct GpuError(String);
-
-impl fmt::Display for GpuError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GPU setup failed: {}", self.0)
-    }
+/// Why [`Gpu::headless`] has no device.
+#[derive(Debug, thiserror::Error)]
+pub enum GpuError {
+    #[error("GPU setup failed: {0}")]
+    Adapter(#[from] wgpu::RequestAdapterError),
+    #[error("GPU setup failed: {0}")]
+    Device(#[from] wgpu::RequestDeviceError),
 }
-
-impl std::error::Error for GpuError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn backoff_delay_doubles_to_limit() {
-        let mut backoff = ReopenBackoff::default();
-        let delays: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
-        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
-    }
-
-    #[test]
-    fn backoff_same_adapter_only_for_short_delays() {
-        let mut backoff = ReopenBackoff::default();
-        let same: Vec<bool> = (0..7)
-            .map(|_| {
-                backoff.next_delay();
-                backoff.same_adapter_only()
-            })
-            .collect();
-        assert_eq!(same, [true, true, true, true, false, false, false]);
-    }
-
-    #[test]
-    fn backoff_resets_only_after_stable_device() {
-        let mut backoff = ReopenBackoff::default();
-        backoff.next_delay();
-        backoff.next_delay();
-        backoff.lost(Duration::from_secs(5));
-        assert_eq!(backoff.next_delay().as_secs(), 4, "a device that died soon");
-        backoff.lost(ReopenBackoff::STABLE_AFTER);
-        assert_eq!(backoff.next_delay().as_secs(), 1, "a device that lasted");
-    }
-
-    #[test]
     fn same_device_compares_record_not_handle() {
         let (one, other) = (DeviceFaults::default(), DeviceFaults::default());
         assert!(one.same_device(&one.clone()));
         assert!(!one.same_device(&other));
+    }
+
+    mod reopen_backoff {
+        use super::*;
+
+        #[test]
+        fn delay_doubles_to_limit() {
+            let mut backoff = ReopenBackoff::default();
+            let delays: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
+            assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
+        }
+
+        #[test]
+        fn same_adapter_only_for_short_delays() {
+            let mut backoff = ReopenBackoff::default();
+            let same: Vec<bool> = (0..7)
+                .map(|_| {
+                    backoff.next_delay();
+                    backoff.same_adapter_only()
+                })
+                .collect();
+            assert_eq!(same, [true, true, true, true, false, false, false]);
+        }
+
+        #[test]
+        fn resets_only_after_stable_device() {
+            let mut backoff = ReopenBackoff::default();
+            backoff.next_delay();
+            backoff.next_delay();
+            backoff.lost(Duration::from_secs(5));
+            assert_eq!(backoff.next_delay().as_secs(), 4, "a device that died soon");
+            backoff.lost(ReopenBackoff::STABLE_AFTER);
+            assert_eq!(backoff.next_delay().as_secs(), 1, "a device that lasted");
+        }
     }
 }

@@ -494,50 +494,11 @@ mod tests {
     }
 
     #[test]
-    fn no_trials_pick_nothing() {
-        assert_eq!(preferred_trial_index(&[]), None);
-    }
-
-    #[test]
-    fn preferred_trial_keeps_fastest() {
-        assert_eq!(preferred_trial_index(&[(Device::Cpu, ms(10))]), Some(0));
-        #[cfg(windows)]
-        assert_eq!(
-            preferred_trial_index(&[(Device::DirectMl(0), ms(8)), (Device::Cpu, ms(10))]),
-            Some(0)
-        );
-    }
-
-    #[test]
     fn device_names_parse() {
         assert_eq!(device_named("CPU"), Some(Device::Cpu));
         assert_eq!(device_named("fast"), None);
         #[cfg(windows)]
         assert_eq!(device_named("1"), Some(Device::DirectMl(1)));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn preferred_trial_takes_close_directml() {
-        let times = [
-            (Device::Cpu, ms(10)),
-            (Device::DirectMl(1), ms(14)),
-            (Device::DirectMl(0), ms(15)),
-        ];
-        assert_eq!(preferred_trial_index(&times), Some(2));
-        assert_eq!(
-            preferred_trial_index(&[(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(15))]),
-            Some(1)
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn preferred_trial_takes_lowest_close_adapter() {
-        let times = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(12))];
-        assert_eq!(preferred_trial_index(&times), Some(1));
-        let far = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(40))];
-        assert_eq!(preferred_trial_index(&far), Some(0));
     }
 
     #[cfg(windows)]
@@ -579,10 +540,53 @@ mod tests {
         assert_eq!(trial_adapters(&adapters), [0]);
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn preferred_trial_keeps_cpu_beyond_margin() {
-        let times = [(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(16))];
-        assert_eq!(preferred_trial_index(&times), Some(0));
+    mod preferred_trial_index {
+        use super::*;
+
+        #[test]
+        fn empty_picks_nothing() {
+            assert_eq!(preferred_trial_index(&[]), None);
+        }
+
+        #[test]
+        fn keeps_fastest() {
+            assert_eq!(preferred_trial_index(&[(Device::Cpu, ms(10))]), Some(0));
+            #[cfg(windows)]
+            assert_eq!(
+                preferred_trial_index(&[(Device::DirectMl(0), ms(8)), (Device::Cpu, ms(10))]),
+                Some(0)
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn takes_close_directml() {
+            let times = [
+                (Device::Cpu, ms(10)),
+                (Device::DirectMl(1), ms(14)),
+                (Device::DirectMl(0), ms(15)),
+            ];
+            assert_eq!(preferred_trial_index(&times), Some(2));
+            assert_eq!(
+                preferred_trial_index(&[(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(15))]),
+                Some(1)
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn takes_lowest_close_adapter() {
+            let times = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(12))];
+            assert_eq!(preferred_trial_index(&times), Some(1));
+            let far = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(40))];
+            assert_eq!(preferred_trial_index(&far), Some(0));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn keeps_cpu_beyond_margin() {
+            let times = [(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(16))];
+            assert_eq!(preferred_trial_index(&times), Some(0));
+        }
     }
 }

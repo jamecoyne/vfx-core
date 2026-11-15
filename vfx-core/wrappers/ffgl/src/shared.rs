@@ -1623,7 +1623,7 @@ mod tests {
     /// The path a stale frame takes: an interop on a new device, of the same size, with the frame
     /// still kept from the old one.
     #[test]
-    fn output_frame_keep_follows_device_and_size() {
+    fn keep_or_make_replaces_on_new_device() {
         let (a, b) = two_devices();
         let mut kept = None;
         OutputFrame::keep_or_make(&mut kept, &a, (64, 32));

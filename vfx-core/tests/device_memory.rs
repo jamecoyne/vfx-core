@@ -8,7 +8,7 @@ use vfx_core::{Gpu, poll_device, wgpu};
 /// after it can't go there. In a block of its size, the small one would hold that block after
 /// the large one goes.
 #[test]
-fn memory_hints_small_buffer_leaves_block_free() {
+fn small_buffer_leaves_large_block_free() {
     let gpu =
         pollster::block_on(Gpu::headless()).expect("no GPU adapter available for headless tests");
     let reserved = || {

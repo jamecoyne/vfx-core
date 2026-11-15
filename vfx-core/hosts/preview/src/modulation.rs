@@ -905,13 +905,19 @@ mod tests {
     }
 
     #[test]
-    fn point_axis_and_integer_rounding() {
+    fn point_axis_sets_one_coordinate() {
         let mut exprs = Expressions::default();
         let s = variable_values(0.0, None, [0.0; 5], FACE_NONE);
         let (vignette, base) = effect_with_defaults(VIGNETTE);
         exprs.set(Target::axis(vignette, "center", 1), "0.25");
         let out = exprs.apply(vignette, &base, &s, 1.0 / 60.0);
         assert_eq!(out.point("center"), [0.5, 0.25]);
+    }
+
+    #[test]
+    fn int_params_round_and_clamp() {
+        let mut exprs = Expressions::default();
+        let s = variable_values(0.0, None, [0.0; 5], FACE_NONE);
         let (segcam, base) = effect_with_defaults(SEGCAM);
         exprs.set(Target::new(segcam, "background"), "40.6");
         exprs.set(Target::new(segcam, "output"), "9");

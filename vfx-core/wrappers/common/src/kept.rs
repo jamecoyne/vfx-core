@@ -47,12 +47,12 @@ impl CpuInstance {
                 let mut effect = kept.lock().unwrap_or_else(|poisoned| {
                     kept.clear_poison();
                     let mut effect = poisoned.into_inner();
-                    *effect = make_effect(self.make);
+                    *effect = cpu_effect(self.make);
                     effect
                 });
                 f(&mut **effect)
             }
-            None => f(&mut *make_effect(self.make)),
+            None => f(&mut *cpu_effect(self.make)),
         }
     }
 
@@ -156,15 +156,16 @@ impl CpuInstance {
                 kept.clear_poison();
                 poisoned.into_inner()
             });
-            *effect = make_effect(self.make);
+            *effect = cpu_effect(self.make);
         }
     }
 }
 
-fn make_effect(make: fn() -> Processor) -> Box<dyn CpuEffect> {
+/// The effect `make` returns, which must be a CPU effect.
+pub(crate) fn cpu_effect(make: fn() -> Processor) -> Box<dyn CpuEffect> {
     match make() {
         Processor::Cpu(effect) => effect,
-        Processor::Gpu(_) => unreachable!("a CPU instance's effect is a CPU effect"),
+        Processor::Gpu(_) => panic!("expected a CPU effect, made a GPU one"),
     }
 }
 

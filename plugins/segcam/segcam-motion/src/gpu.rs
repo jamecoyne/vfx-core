@@ -1215,13 +1215,12 @@ mod tests {
 
     /// A try after a loss asks for the adapter that was lost.
     #[test]
-    fn a_new_device_is_asked_for_on_the_lost_adapter() {
+    fn reopen_requests_lost_adapter() {
         let _lock = gpu_test_lock();
         let choice = adapter_choice();
-        if open(&choice).is_err() && open("fallback").is_err() {
-            eprintln!("no adapter: skipped");
-            return;
-        }
+        open(&choice)
+            .or_else(|_| open("fallback"))
+            .expect("a GPU adapter, hardware or fallback");
         let asked = Arc::new(Mutex::new(Vec::new()));
         let told = asked.clone();
         let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |adapter| {
@@ -1247,7 +1246,7 @@ mod tests {
     /// A panic while the device opens, as a broken driver can cause, answers that the GPU
     /// failed instead of leaving every caller waiting.
     #[test]
-    fn panic_while_opening_is_a_failed_gpu() {
+    fn open_panic_reports_failed_gpu() {
         let slot: &'static DeviceSlot =
             Box::leak(Box::new(DeviceSlot::new(|_| panic!("a broken driver"))));
         match slot.status() {
@@ -1256,79 +1255,81 @@ mod tests {
         }
     }
 
-    /// An adapter hidden by a reset during the first open isn't the machine's answer: `status`
-    /// reports it without waiting for another try, renders keep asking, and the next try opens.
-    #[test]
-    fn first_open_without_an_adapter_tries_again() {
-        let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counted = tries.clone();
-        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(NoGpu::NoAdapter("hidden by a reset".into()))
-        })));
-        assert!(matches!(slot.status(), Err(NoGpu::NoAdapter(_))));
-        assert!(!slot.first_open_pending(), "status waits for retries");
-        assert!(
-            matches!(slot.now(), DeviceNow::Waiting),
-            "the first answer was final"
-        );
-        assert!(matches!(slot.next_first_open_try(), DeviceNow::Waiting));
-        // Wait for the try just started to answer.
-        let _ = slot.next_first_open_try();
-        assert!(
-            tries.load(std::sync::atomic::Ordering::Relaxed) >= 2,
-            "no second try"
-        );
-    }
+    mod first_open {
+        use super::*;
 
-    /// A first open that keeps failing, here with a driver panic, becomes final after
-    /// [`FIRST_OPEN_RETRIES`] more tries and keeps its reason.
-    #[test]
-    fn first_open_failures_are_final_after_the_retries() {
-        let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counted = tries.clone();
-        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            panic!("a driver reset")
-        })));
-        assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
-        let deadline = Instant::now() + FIRST_OPEN_TEST_DEADLINE;
-        while !matches!(slot.next_first_open_try(), DeviceNow::Never) {
-            assert!(Instant::now() < deadline, "the slot never gave up");
+        /// An adapter hidden by a reset during the first open isn't the machine's answer: `status`
+        /// reports it without waiting for another try, renders keep asking, and the next try opens.
+        #[test]
+        fn hidden_adapter_retries() {
+            let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let counted = tries.clone();
+            let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(NoGpu::NoAdapter("hidden by a reset".into()))
+            })));
+            assert!(matches!(slot.status(), Err(NoGpu::NoAdapter(_))));
+            assert!(!slot.first_open_pending(), "status waits for retries");
+            assert!(
+                matches!(slot.now(), DeviceNow::Waiting),
+                "the first answer was final"
+            );
+            assert!(matches!(slot.next_first_open_try(), DeviceNow::Waiting));
+            // Wait for the try just started to answer.
+            let _ = slot.next_first_open_try();
+            assert!(
+                tries.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+                "no second try"
+            );
         }
-        assert_eq!(
-            tries.load(std::sync::atomic::Ordering::Relaxed),
-            1 + FIRST_OPEN_RETRIES
-        );
-        match slot.status() {
-            Err(NoGpu::Failed(e)) => assert!(e.contains("a driver reset"), "{e}"),
-            other => panic!("not a failed GPU: {other:?}"),
-        }
-    }
 
-    /// A first open that overlaps a loss isn't the machine's answer: the slot tries again.
-    #[test]
-    fn first_open_overlapping_a_loss_tries_again() {
-        let _lock = gpu_test_lock();
-        if open("fallback").is_err() {
-            eprintln!("no adapter: skipped");
-            return;
+        /// A first open that keeps failing, here with a driver panic, becomes final after
+        /// [`FIRST_OPEN_RETRIES`] more tries and keeps its reason.
+        #[test]
+        fn fails_for_good_after_retries() {
+            let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let counted = tries.clone();
+            let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                panic!("a driver reset")
+            })));
+            assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
+            let deadline = Instant::now() + FIRST_OPEN_TEST_DEADLINE;
+            while !matches!(slot.next_first_open_try(), DeviceNow::Never) {
+                assert!(Instant::now() < deadline, "the slot never gave up");
+            }
+            assert_eq!(
+                tries.load(std::sync::atomic::Ordering::Relaxed),
+                1 + FIRST_OPEN_RETRIES
+            );
+            match slot.status() {
+                Err(NoGpu::Failed(e)) => assert!(e.contains("a driver reset"), "{e}"),
+                other => panic!("not a failed GPU: {other:?}"),
+            }
         }
-        let tries = std::sync::atomic::AtomicU32::new(0);
-        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| match tries
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        {
-            0 => Err(NoGpu::Lost("mid open".into())),
-            _ => open("fallback"),
-        })));
-        assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match slot.now() {
-                DeviceNow::Ready(_) => return,
-                DeviceNow::Never => panic!("the first open's loss was final"),
-                DeviceNow::Waiting if Instant::now() > deadline => panic!("no second try"),
-                DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+
+        /// A first open that overlaps a loss isn't the machine's answer: the slot tries again.
+        #[test]
+        fn loss_during_open_retries() {
+            let _lock = gpu_test_lock();
+            open("fallback").expect("the fallback adapter");
+            let tries = std::sync::atomic::AtomicU32::new(0);
+            let slot: &'static DeviceSlot =
+                Box::leak(Box::new(DeviceSlot::new(move |_| {
+                    match tries.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                        0 => Err(NoGpu::Lost("mid open".into())),
+                        _ => open("fallback"),
+                    }
+                })));
+            assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match slot.now() {
+                    DeviceNow::Ready(_) => return,
+                    DeviceNow::Never => panic!("the first open's loss was final"),
+                    DeviceNow::Waiting if Instant::now() > deadline => panic!("no second try"),
+                    DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+                }
             }
         }
     }

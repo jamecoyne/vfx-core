@@ -699,7 +699,7 @@ fn first_window_shown(s: &RenderSettings, frames: &[Image<u8>], number: i64) -> 
 }
 
 #[test]
-fn window_stays_until_newer_ones_push_it_out() {
+fn window_stays_until_pushed_out() {
     let frames = squares_in_rows(32);
     let s = RenderSettings {
         mode: OutputMode::Swarm,
@@ -819,7 +819,7 @@ fn earlier_frame_edit_invalidates_cache() {
 
 /// A frame the host couldn't hand over is read again next time, not kept as empty.
 #[test]
-fn missing_frame_is_not_cached() {
+fn gap_renders_like_cold_render() {
     for s in [RenderSettings::default(), swarm_settings()] {
         let frames = crossing::<u8>();
         let last = frames.len() - 1;

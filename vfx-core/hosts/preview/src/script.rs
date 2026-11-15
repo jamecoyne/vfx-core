@@ -674,10 +674,14 @@ mod tests {
     }
 
     #[test]
-    fn pattern_and_camera_by_name_or_index() {
+    fn pattern_index_resolves_name() {
         assert_eq!(pattern_index(""), Ok(0));
         assert_eq!(pattern_index("colour-bars"), Ok(1));
         assert!(pattern_index("stripes").is_err());
+    }
+
+    #[test]
+    fn camera_name_resolves_part_and_default() {
         let cams = [
             "Integrated Webcam".to_owned(),
             "OBS Virtual Camera".to_owned(),

@@ -472,69 +472,6 @@ mod tests {
         assert_eq!(out, vec![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 1.0, 1.0]);
     }
 
-    #[test]
-    fn wrap_buffer_shares_metal_memory() {
-        let mtl = objc2_metal::MTLCreateSystemDefaultDevice().expect("a Metal device");
-        // SAFETY: `mtl` is a live `id<MTLDevice>` for the whole test.
-        let device = unsafe { AeDevice::open(Retained::as_ptr(&mtl) as *mut c_void, 0) }
-            .expect("open on that device");
-        let data: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let bytes = std::mem::size_of_val(&data);
-        // SAFETY: `data` is valid for `bytes` bytes, which Metal copies.
-        let raw = unsafe {
-            mtl.newBufferWithBytes_length_options(
-                std::ptr::NonNull::from(&data).cast(),
-                bytes,
-                objc2_metal::MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .expect("a Metal buffer");
-        let ptr = Retained::as_ptr(&raw) as *mut c_void;
-        // SAFETY: `raw` is a live buffer of `bytes` bytes on the device `device` opened on.
-        let buffer = unsafe { device.wrap_buffer(ptr, bytes as u64) }.expect("wrap");
-        assert_eq!(read_back(&device, &buffer), data);
-
-        let written: [f32; 8] = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
-        device
-            .gpu
-            .queue
-            .write_buffer(&buffer, 0, bytemuck::cast_slice(&written));
-        device.gpu.queue.submit(None);
-        device
-            .gpu
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .unwrap();
-        // SAFETY: the buffer is shared storage of `bytes` bytes and the GPU is idle.
-        let contents =
-            unsafe { std::slice::from_raw_parts(raw.contents().as_ptr().cast::<f32>(), 8) };
-        assert_eq!(contents, written);
-    }
-
-    #[test]
-    fn wrap_buffer_rejects_null() {
-        let gpu = pollster::block_on(Gpu::headless()).expect("GPU");
-        let device = AeDevice::with_pipelines(gpu, 1);
-        // SAFETY: null is allowed and nothing is wrapped.
-        let err = unsafe { device.wrap_buffer(std::ptr::null_mut(), 32) }.unwrap_err();
-        assert!(matches!(err, Error::NoBuffer), "{err}");
-    }
-
-    #[test]
-    fn wrap_buffer_rejects_empty() {
-        let mtl = objc2_metal::MTLCreateSystemDefaultDevice().expect("a Metal device");
-        // SAFETY: `mtl` is a live `id<MTLDevice>` for the whole test.
-        let device = unsafe { AeDevice::open(Retained::as_ptr(&mtl) as *mut c_void, 0) }
-            .expect("open on that device");
-        let raw = mtl
-            .newBufferWithLength_options(16, objc2_metal::MTLResourceOptions::StorageModeShared)
-            .expect("a Metal buffer");
-        let ptr = Retained::as_ptr(&raw) as *mut c_void;
-        // SAFETY: `raw` is a live buffer on the device `device` opened on.
-        let err = unsafe { device.wrap_buffer(ptr, 0) }.unwrap_err();
-        assert!(matches!(err, Error::EmptyBuffer), "{err}");
-    }
-
     fn read_back(device: &AeDevice, buffer: &wgpu::Buffer) -> Vec<f32> {
         let gpu = &device.gpu;
         let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -554,5 +491,72 @@ mod tests {
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
         bytemuck::pod_collect_to_vec(&slice.get_mapped_range().unwrap())
+    }
+
+    mod wrap_buffer {
+        use super::*;
+
+        #[test]
+        fn shares_metal_memory() {
+            let mtl = objc2_metal::MTLCreateSystemDefaultDevice().expect("a Metal device");
+            // SAFETY: `mtl` is a live `id<MTLDevice>` for the whole test.
+            let device = unsafe { AeDevice::open(Retained::as_ptr(&mtl) as *mut c_void, 0) }
+                .expect("open on that device");
+            let data: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let bytes = std::mem::size_of_val(&data);
+            // SAFETY: `data` is valid for `bytes` bytes, which Metal copies.
+            let raw = unsafe {
+                mtl.newBufferWithBytes_length_options(
+                    std::ptr::NonNull::from(&data).cast(),
+                    bytes,
+                    objc2_metal::MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .expect("a Metal buffer");
+            let ptr = Retained::as_ptr(&raw) as *mut c_void;
+            // SAFETY: `raw` is a live buffer of `bytes` bytes on the device `device` opened on.
+            let buffer = unsafe { device.wrap_buffer(ptr, bytes as u64) }.expect("wrap");
+            assert_eq!(read_back(&device, &buffer), data);
+
+            let written: [f32; 8] = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+            device
+                .gpu
+                .queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&written));
+            device.gpu.queue.submit(None);
+            device
+                .gpu
+                .device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            // SAFETY: the buffer is shared storage of `bytes` bytes and the GPU is idle.
+            let contents =
+                unsafe { std::slice::from_raw_parts(raw.contents().as_ptr().cast::<f32>(), 8) };
+            assert_eq!(contents, written);
+        }
+
+        #[test]
+        fn rejects_null() {
+            let gpu = pollster::block_on(Gpu::headless()).expect("GPU");
+            let device = AeDevice::with_pipelines(gpu, 1);
+            // SAFETY: null is allowed and nothing is wrapped.
+            let err = unsafe { device.wrap_buffer(std::ptr::null_mut(), 32) }.unwrap_err();
+            assert!(matches!(err, Error::NoBuffer), "{err}");
+        }
+
+        #[test]
+        fn rejects_empty() {
+            let mtl = objc2_metal::MTLCreateSystemDefaultDevice().expect("a Metal device");
+            // SAFETY: `mtl` is a live `id<MTLDevice>` for the whole test.
+            let device = unsafe { AeDevice::open(Retained::as_ptr(&mtl) as *mut c_void, 0) }
+                .expect("open on that device");
+            let raw = mtl
+                .newBufferWithLength_options(16, objc2_metal::MTLResourceOptions::StorageModeShared)
+                .expect("a Metal buffer");
+            let ptr = Retained::as_ptr(&raw) as *mut c_void;
+            // SAFETY: `raw` is a live buffer on the device `device` opened on.
+            let err = unsafe { device.wrap_buffer(ptr, 0) }.unwrap_err();
+            assert!(matches!(err, Error::EmptyBuffer), "{err}");
+        }
     }
 }

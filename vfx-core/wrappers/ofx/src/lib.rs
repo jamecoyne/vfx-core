@@ -1215,45 +1215,6 @@ mod tests {
         assert_eq!(seconds(48.0, None), 2.0);
     }
 
-    #[test]
-    fn only_forward_steps_continue_stream() {
-        // How Resolve 21 starts an export, then playback skipping, a seek back and a jump.
-        let frames = [0, 0, 0, 2, 1, 3, 4, 7, 5, 200, 201, 202];
-        let expected = [
-            false, false, false, false, false, false, true, true, false, false, false, true,
-        ];
-        assert_eq!(streamed(&frames), expected);
-    }
-
-    /// A render that takes long doesn't end its own stream, which would make the next read every
-    /// frame and take long too, for the rest of the playback.
-    #[test]
-    fn slow_render_continues_stream() {
-        let streams = positions(&[0, 1, 2, 3, 4], std::time::Duration::from_secs(8));
-        assert_eq!(
-            streams.iter().map(|p| p.continues).collect::<Vec<_>>(),
-            [false, false, true, true, true]
-        );
-    }
-
-    /// An export's skips at its start aren't dropped frames; playback's later on are, until the
-    /// stream breaks.
-    #[test]
-    fn positions_flag_drops_only_after_run() {
-        let dropped = |frames: &[i64]| {
-            positions(frames, std::time::Duration::ZERO)
-                .iter()
-                .map(|p| p.frames_dropped)
-                .collect::<Vec<_>>()
-        };
-        let export_start = [0, 0, 0, 2, 1, 3, 4, 5, 6];
-        assert!(!dropped(&export_start).contains(&true));
-        let run: Vec<i64> = (0..12).collect();
-        let playback = [&run[..], &[13, 14, 15, 2, 3, 4]].concat();
-        let want = (0..playback.len()).map(|i| (12..=14).contains(&i));
-        assert_eq!(dropped(&playback), want.collect::<Vec<_>>());
-    }
-
     /// The last frame of [`run_followed_by`]'s playback.
     const RUN_END: i64 = 15;
 
@@ -1261,81 +1222,6 @@ mod tests {
     fn run_followed_by(more: &[i64]) -> Vec<i64> {
         let run: Vec<i64> = (0..=13).collect();
         [&run[..], &[RUN_END], more].concat()
-    }
-
-    /// The jump to where the playhead stopped is checked, since that frame stays on screen.
-    #[test]
-    fn stop_jump_breaks_stream() {
-        let frames = run_followed_by(&[RUN_END + MAX_STREAM_STEP + 1]);
-        let stop = *positions(&frames, std::time::Duration::ZERO)
-            .last()
-            .unwrap();
-        assert!(stop.possible_stop);
-        assert!(!stop.continues && !stop.frames_dropped);
-    }
-
-    /// Renders carrying on after a big step were a hitch: one check, then playback goes on dropping
-    /// frames, where checking again would take long enough to step past the limit again.
-    #[test]
-    fn hitch_resumes_after_one_check() {
-        let jump = RUN_END + MAX_STREAM_STEP + 1;
-        let frames = run_followed_by(&[jump, jump + 3, jump + 6]);
-        let streams = positions(&frames, std::time::Duration::ZERO);
-        let [hitch, resumed, next] = streams[streams.len() - 3..] else {
-            unreachable!()
-        };
-        assert!(hitch.possible_stop && !hitch.continues);
-        assert!(resumed.continues && resumed.frames_dropped);
-        assert!(next.continues && next.frames_dropped);
-    }
-
-    /// However long the check took, a render straight after it is playback.
-    #[test]
-    fn hitch_resumes_at_any_step() {
-        let jump = RUN_END + MAX_STREAM_STEP + 1;
-        let frames = run_followed_by(&[jump, jump + 300]);
-        let resumed = *positions(&frames, std::time::Duration::ZERO)
-            .last()
-            .unwrap();
-        assert!(resumed.continues && resumed.frames_dropped);
-    }
-
-    /// A one frame step straight after a possible stop resumes playback, and the
-    /// run after it drops frames until the next big step.
-    #[test]
-    fn stream_position_resume_accepts_single_step() {
-        let jump = RUN_END + MAX_STREAM_STEP + 1;
-        let run: Vec<i64> = (jump + 1..jump + 40).collect();
-        let stop = jump + 40 + MAX_STREAM_STEP;
-        let frames = run_followed_by(&[&[jump], &run[..], &[stop]].concat());
-        let streams = positions(&frames, std::time::Duration::ZERO);
-        let [hitch, resumed @ .., last] = &streams[streams.len() - run.len() - 2..] else {
-            unreachable!()
-        };
-        assert!(hitch.possible_stop && !hitch.continues);
-        assert!(
-            resumed
-                .iter()
-                .all(|p| p.continues && p.frames_dropped && !p.possible_stop)
-        );
-        assert!(last.possible_stop && !last.continues && !last.frames_dropped);
-    }
-
-    /// A person can step one frame 200 ms after a possible stop; that isn't playback.
-    #[test]
-    fn stream_position_resume_rejects_paused_step() {
-        let jump = RUN_END + MAX_STREAM_STEP + 1;
-        let frames = run_followed_by(&[jump, jump + 1]);
-        let last_index = frames.len() - 1;
-        let streams = positions_with_gaps(&frames, std::time::Duration::ZERO, |i| {
-            if i == last_index {
-                std::time::Duration::from_millis(200)
-            } else {
-                std::time::Duration::ZERO
-            }
-        });
-        let after = streams.last().unwrap();
-        assert!(after.follows && !after.continues && !after.frames_dropped);
     }
 
     /// The render after a possible stop, starting `gap` after it.
@@ -1351,48 +1237,6 @@ mod tests {
             }
         });
         *streams.last().unwrap()
-    }
-
-    /// A person can be this quick, so this doesn't resume, though it follows.
-    #[test]
-    fn stream_position_slow_follow_does_not_resume() {
-        let after = after_possible_stop(std::time::Duration::from_millis(200));
-        assert!(after.follows && !after.continues && !after.frames_dropped);
-    }
-
-    /// Past the stream's gap, what follows a big step is new: an ordinary break.
-    #[test]
-    fn stream_position_gap_after_big_step_breaks() {
-        let after = after_possible_stop(std::time::Duration::from_secs(2));
-        assert!(!after.follows && !after.continues && !after.frames_dropped);
-    }
-
-    /// A clip retimed to a constant step has no dropped frames to tell from an export's.
-    #[test]
-    fn constant_step_never_drops_frames() {
-        let frames: Vec<i64> = (0..40).map(|n| n * 2).collect();
-        let streams = positions(&frames, std::time::Duration::ZERO);
-        assert!(streams.iter().all(|p| !p.frames_dropped));
-    }
-
-    /// A 1.5x retime has many steps of one frame, none of them in a row.
-    #[test]
-    fn retime_pattern_never_drops_frames() {
-        let frames: Vec<i64> = (0..60).map(|n| (n * 3 + 1) / 2).collect();
-        assert_eq!(frames[..6], [0, 2, 3, 5, 6, 8]);
-        let streams = positions(&frames, std::time::Duration::ZERO);
-        assert!(streams.iter().all(|p| !p.frames_dropped));
-    }
-
-    /// A big step before any run, as at an export's start, is no stop of playback.
-    #[test]
-    fn stream_position_early_big_step_is_no_stop() {
-        let streams = positions(&[0, 1, 2, 50, 53], std::time::Duration::ZERO);
-        assert!(
-            streams
-                .iter()
-                .all(|p| !p.possible_stop && !p.frames_dropped)
-        );
     }
 
     /// A render from a `testdata/resolve-loop-wrap-*.txt` log and what the
@@ -1466,75 +1310,235 @@ mod tests {
             + 1
     }
 
-    #[test]
-    fn stream_position_matches_logs_before_wrap() {
-        for (system, log) in LOOP_WRAP_LOGS {
-            let renders = parse_log(log);
-            let wrap = wrap_index(&renders);
-            let streams = replay(&renders);
-            for (i, (render, stream)) in renders[..wrap].iter().zip(streams).enumerate() {
-                assert_eq!(
-                    (stream.continues, stream.frames_dropped),
-                    (render.continues, render.frames_dropped),
-                    "{system}: render {i} of frame {}",
-                    render.frame
-                );
-            }
-        }
-    }
+    mod stream_position {
+        use super::*;
 
-    /// Resolve is behind after a loop wrap and mixes steps of 1 and 2, which
-    /// never make a run of one frame steps again.
-    #[test]
-    fn stream_position_loop_wrap_keeps_frames_dropped() {
-        for (system, log) in LOOP_WRAP_LOGS {
-            let renders = parse_log(log);
-            let wrap = wrap_index(&renders);
-            let streams = replay(&renders);
-            assert!(
-                streams[wrap].possible_stop && !streams[wrap].frames_dropped,
-                "{system}: the wrap"
+        #[test]
+        fn only_forward_steps_continue() {
+            // How Resolve 21 starts an export, then playback skipping, a seek back and a jump.
+            let frames = [0, 0, 0, 2, 1, 3, 4, 7, 5, 200, 201, 202];
+            let expected = [
+                false, false, false, false, false, false, true, true, false, false, false, true,
+            ];
+            assert_eq!(streamed(&frames), expected);
+        }
+
+        /// A render that takes long doesn't end its own stream, which would make the next read every
+        /// frame and take long too, for the rest of the playback.
+        #[test]
+        fn slow_render_continues() {
+            let streams = positions(&[0, 1, 2, 3, 4], std::time::Duration::from_secs(8));
+            assert_eq!(
+                streams.iter().map(|p| p.continues).collect::<Vec<_>>(),
+                [false, false, true, true, true]
             );
-            for (render, stream) in renders[wrap + 1..].iter().zip(&streams[wrap + 1..]) {
-                assert!(
-                    stream.continues && stream.frames_dropped,
-                    "{system}: frame {} after the wrap",
-                    render.frame
-                );
-            }
         }
-    }
 
-    #[test]
-    fn stream_position_wrap_past_start_keeps_frames_dropped() {
-        let run: Vec<i64> = (0..=40).collect();
-        let frames = [&run[..], &[42, 6, 15, 24]].concat();
-        let streams = positions(&frames, std::time::Duration::ZERO);
-        let [wrapped, resumed, next] = streams[streams.len() - 3..] else {
-            unreachable!()
-        };
-        assert!(wrapped.possible_stop && !wrapped.frames_dropped);
-        assert!(resumed.frames_dropped && next.frames_dropped);
-    }
+        /// An export's skips at its start aren't dropped frames; playback's later on are, until the
+        /// stream breaks.
+        #[test]
+        fn drops_flagged_only_after_run() {
+            let dropped = |frames: &[i64]| {
+                positions(frames, std::time::Duration::ZERO)
+                    .iter()
+                    .map(|p| p.frames_dropped)
+                    .collect::<Vec<_>>()
+            };
+            let export_start = [0, 0, 0, 2, 1, 3, 4, 5, 6];
+            assert!(!dropped(&export_start).contains(&true));
+            let run: Vec<i64> = (0..12).collect();
+            let playback = [&run[..], &[13, 14, 15, 2, 3, 4]].concat();
+            let want = (0..playback.len()).map(|i| (12..=14).contains(&i));
+            assert_eq!(dropped(&playback), want.collect::<Vec<_>>());
+        }
 
-    #[test]
-    fn stream_position_export_after_playback_reads_every_frame() {
-        let run: Vec<i64> = (0..=40).collect();
-        let playback = [&run[..], &[42]].concat();
-        let export_start = [0, 0, 0, 2, 1, 3, 4, 5, 6];
-        let frames = [&playback[..], &export_start].concat();
-        for pause in [std::time::Duration::ZERO, std::time::Duration::from_secs(2)] {
+        /// The jump to where the playhead stopped is checked, since that frame stays on screen.
+        #[test]
+        fn stop_jump_breaks() {
+            let frames = run_followed_by(&[RUN_END + MAX_STREAM_STEP + 1]);
+            let stop = *positions(&frames, std::time::Duration::ZERO)
+                .last()
+                .unwrap();
+            assert!(stop.possible_stop);
+            assert!(!stop.continues && !stop.frames_dropped);
+        }
+
+        /// Renders carrying on after a big step were a hitch: one check, then playback goes on dropping
+        /// frames, where checking again would take long enough to step past the limit again.
+        #[test]
+        fn hitch_resumes_after_one_check() {
+            let jump = RUN_END + MAX_STREAM_STEP + 1;
+            let frames = run_followed_by(&[jump, jump + 3, jump + 6]);
+            let streams = positions(&frames, std::time::Duration::ZERO);
+            let [hitch, resumed, next] = streams[streams.len() - 3..] else {
+                unreachable!()
+            };
+            assert!(hitch.possible_stop && !hitch.continues);
+            assert!(resumed.continues && resumed.frames_dropped);
+            assert!(next.continues && next.frames_dropped);
+        }
+
+        /// However long the check took, a render straight after it is playback.
+        #[test]
+        fn hitch_resumes_at_any_step() {
+            let jump = RUN_END + MAX_STREAM_STEP + 1;
+            let frames = run_followed_by(&[jump, jump + 300]);
+            let resumed = *positions(&frames, std::time::Duration::ZERO)
+                .last()
+                .unwrap();
+            assert!(resumed.continues && resumed.frames_dropped);
+        }
+
+        /// A one frame step straight after a possible stop resumes playback, and the
+        /// run after it drops frames until the next big step.
+        #[test]
+        fn resume_accepts_single_step() {
+            let jump = RUN_END + MAX_STREAM_STEP + 1;
+            let run: Vec<i64> = (jump + 1..jump + 40).collect();
+            let stop = jump + 40 + MAX_STREAM_STEP;
+            let frames = run_followed_by(&[&[jump], &run[..], &[stop]].concat());
+            let streams = positions(&frames, std::time::Duration::ZERO);
+            let [hitch, resumed @ .., last] = &streams[streams.len() - run.len() - 2..] else {
+                unreachable!()
+            };
+            assert!(hitch.possible_stop && !hitch.continues);
+            assert!(
+                resumed
+                    .iter()
+                    .all(|p| p.continues && p.frames_dropped && !p.possible_stop)
+            );
+            assert!(last.possible_stop && !last.continues && !last.frames_dropped);
+        }
+
+        /// A person can step one frame 200 ms after a possible stop; that isn't playback.
+        #[test]
+        fn resume_rejects_paused_step() {
+            let jump = RUN_END + MAX_STREAM_STEP + 1;
+            let frames = run_followed_by(&[jump, jump + 1]);
+            let last_index = frames.len() - 1;
             let streams = positions_with_gaps(&frames, std::time::Duration::ZERO, |i| {
-                if i == playback.len() {
-                    pause
+                if i == last_index {
+                    std::time::Duration::from_millis(200)
                 } else {
                     std::time::Duration::ZERO
                 }
             });
+            let after = streams.last().unwrap();
+            assert!(after.follows && !after.continues && !after.frames_dropped);
+        }
+
+        /// A person can be this quick, so this doesn't resume, though it follows.
+        #[test]
+        fn slow_follow_does_not_resume() {
+            let after = after_possible_stop(std::time::Duration::from_millis(200));
+            assert!(after.follows && !after.continues && !after.frames_dropped);
+        }
+
+        /// Past the stream's gap, what follows a big step is new: an ordinary break.
+        #[test]
+        fn gap_after_big_step_breaks() {
+            let after = after_possible_stop(std::time::Duration::from_secs(2));
+            assert!(!after.follows && !after.continues && !after.frames_dropped);
+        }
+
+        /// A clip retimed to a constant step has no dropped frames to tell from an export's.
+        #[test]
+        fn constant_step_never_drops_frames() {
+            let frames: Vec<i64> = (0..40).map(|n| n * 2).collect();
+            let streams = positions(&frames, std::time::Duration::ZERO);
+            assert!(streams.iter().all(|p| !p.frames_dropped));
+        }
+
+        /// A 1.5x retime has many steps of one frame, none of them in a row.
+        #[test]
+        fn retime_pattern_never_drops_frames() {
+            let frames: Vec<i64> = (0..60).map(|n| (n * 3 + 1) / 2).collect();
+            assert_eq!(frames[..6], [0, 2, 3, 5, 6, 8]);
+            let streams = positions(&frames, std::time::Duration::ZERO);
+            assert!(streams.iter().all(|p| !p.frames_dropped));
+        }
+
+        /// A big step before any run, as at an export's start, is no stop of playback.
+        #[test]
+        fn early_big_step_is_no_stop() {
+            let streams = positions(&[0, 1, 2, 50, 53], std::time::Duration::ZERO);
             assert!(
-                streams[playback.len()..].iter().all(|p| !p.frames_dropped),
-                "export {pause:?} after playback"
+                streams
+                    .iter()
+                    .all(|p| !p.possible_stop && !p.frames_dropped)
             );
+        }
+
+        #[test]
+        fn matches_logs_before_wrap() {
+            for (system, log) in LOOP_WRAP_LOGS {
+                let renders = parse_log(log);
+                let wrap = wrap_index(&renders);
+                let streams = replay(&renders);
+                for (i, (render, stream)) in renders[..wrap].iter().zip(streams).enumerate() {
+                    assert_eq!(
+                        (stream.continues, stream.frames_dropped),
+                        (render.continues, render.frames_dropped),
+                        "{system}: render {i} of frame {}",
+                        render.frame
+                    );
+                }
+            }
+        }
+
+        /// Resolve is behind after a loop wrap and mixes steps of 1 and 2, which
+        /// never make a run of one frame steps again.
+        #[test]
+        fn loop_wrap_keeps_frames_dropped() {
+            for (system, log) in LOOP_WRAP_LOGS {
+                let renders = parse_log(log);
+                let wrap = wrap_index(&renders);
+                let streams = replay(&renders);
+                assert!(
+                    streams[wrap].possible_stop && !streams[wrap].frames_dropped,
+                    "{system}: the wrap"
+                );
+                for (render, stream) in renders[wrap + 1..].iter().zip(&streams[wrap + 1..]) {
+                    assert!(
+                        stream.continues && stream.frames_dropped,
+                        "{system}: frame {} after the wrap",
+                        render.frame
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn wrap_past_start_keeps_frames_dropped() {
+            let run: Vec<i64> = (0..=40).collect();
+            let frames = [&run[..], &[42, 6, 15, 24]].concat();
+            let streams = positions(&frames, std::time::Duration::ZERO);
+            let [wrapped, resumed, next] = streams[streams.len() - 3..] else {
+                unreachable!()
+            };
+            assert!(wrapped.possible_stop && !wrapped.frames_dropped);
+            assert!(resumed.frames_dropped && next.frames_dropped);
+        }
+
+        #[test]
+        fn export_after_playback_reads_every_frame() {
+            let run: Vec<i64> = (0..=40).collect();
+            let playback = [&run[..], &[42]].concat();
+            let export_start = [0, 0, 0, 2, 1, 3, 4, 5, 6];
+            let frames = [&playback[..], &export_start].concat();
+            for pause in [std::time::Duration::ZERO, std::time::Duration::from_secs(2)] {
+                let streams = positions_with_gaps(&frames, std::time::Duration::ZERO, |i| {
+                    if i == playback.len() {
+                        pause
+                    } else {
+                        std::time::Duration::ZERO
+                    }
+                });
+                assert!(
+                    streams[playback.len()..].iter().all(|p| !p.frames_dropped),
+                    "export {pause:?} after playback"
+                );
+            }
         }
     }
 }
