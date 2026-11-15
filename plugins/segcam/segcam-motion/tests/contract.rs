@@ -101,8 +101,12 @@ fn swarm_holds_contract() {
 
 /// The GPU swarm holds the same contract.
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+)]
 fn gpu_swarm_holds_contract() {
-    segcam_motion::gpu::status().expect("a GPU adapter");
+    segcam_motion::gpu::status().expect("a hardware GPU adapter");
     let swarm = |mirror| {
         with(&[
             ("output", ParamValue::Int(3)),
