@@ -385,6 +385,12 @@ mod tests {
         let region = VfxPreview::default().region(&p, [0.5, 0.25]);
         assert_eq!(region.reach, [5, 3]);
         assert!(!region.grows);
+    }
+
+    #[test]
+    fn region_grows_along_direction() {
+        let mut p = values();
+        p.set("blur_radius", ParamValue::Float(10.0)).unwrap();
         p.set("blur_grow", ParamValue::Bool(true)).unwrap();
         p.set("blur_direction", ParamValue::Int(1)).unwrap();
         let region = VfxPreview::default().region(&p, [1.0, 1.0]);

@@ -737,7 +737,8 @@ unsafe fn process_gpu(
         return false;
     };
     let (w, h) = (input_texture.Width, input_texture.Height);
-    // SAFETY: the closure runs where this function does, with the host's context current.
+    // SAFETY: the closure is only called inside this function, with the host's
+    // context current.
     let pass_through = |blit: &gl::Blit| unsafe {
         let max_uv = [
             w as f32 / input_texture.HardwareWidth.max(1) as f32,

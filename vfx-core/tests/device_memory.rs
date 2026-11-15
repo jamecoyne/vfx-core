@@ -1,14 +1,13 @@
-//! What a device keeps of its memory once a large buffer has gone. Metal and browsers reserve
-//! no blocks to report.
+//! What a device keeps of its memory once a large buffer has gone. Not on Metal or in
+//! browsers, which have no allocator report.
 #![cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
 
 use vfx_core::{Gpu, poll_device, wgpu};
 
-/// A buffer over the largest block, 128 MiB, gets memory of its own, and a small buffer made
-/// after it can't go there. In a block of its size, the small one would hold that block after
-/// the large one goes.
+/// Memory of a buffer larger than the largest block, 128 MiB, goes back when the buffer does,
+/// even with a small buffer made after it.
 #[test]
-fn small_buffer_leaves_large_block_free() {
+fn large_buffer_memory_returns_beside_small_buffer() {
     let gpu =
         pollster::block_on(Gpu::headless()).expect("no GPU adapter available for headless tests");
     let reserved = || {

@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn levels_zero_for_silence_and_empty() {
+    fn levels_read_zero_for_silence_and_empty() {
         assert_eq!(audio_of(vec![0.0; 4096]).levels(0.1), [0.0; 5]);
         assert_eq!(audio_of(Vec::new()).levels(0.1), [0.0; 5]);
     }

@@ -174,7 +174,7 @@ impl Gpu {
     /// larger than the current block gets memory of its own, which it returns when it goes.
     ///
     /// Host blocks are half these sizes, and staging comes from them: the range lets them
-    /// reach 64 MiB, which a 4K frame's staging needs.
+    /// reach 64 MiB, so a 4K frame's staging doesn't fill one.
     pub fn memory_hints() -> wgpu::MemoryHints {
         const MIB: u64 = 1 << 20;
         wgpu::MemoryHints::Manual {
@@ -424,7 +424,7 @@ mod dxc {
         }
 
         #[test]
-        fn shared_dir_names_dxc_under_common_files() {
+        fn shared_dir_names_dxc_under_existing_common_files() {
             let dir = shared_dir().unwrap();
             let common = dir.parent().and_then(Path::parent).unwrap();
             assert!(common.is_dir(), "{}", common.display());
@@ -514,7 +514,7 @@ mod tests {
         }
 
         #[test]
-        fn same_adapter_only_for_short_delays() {
+        fn same_adapter_only_ends_after_short_delays() {
             let mut backoff = ReopenBackoff::default();
             let same: Vec<bool> = (0..7)
                 .map(|_| {

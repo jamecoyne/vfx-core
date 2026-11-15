@@ -117,7 +117,7 @@ fn open_gpu() -> Result<(Gpu, LossRecord), OpenError> {
     Ok((gpu, lost))
 }
 
-/// Why a try to open the plugin's own device failed.
+/// Why opening the plugin's own device failed.
 #[derive(Debug, thiserror::Error)]
 enum OpenError {
     #[error(transparent)]

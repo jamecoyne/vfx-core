@@ -113,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_places_box_at_cell() {
+    fn bodies_places_box_around_cell() {
         let maps = maps(13 * 6 + 6, 2);
         let views: [&[f32]; 8] = std::array::from_fn(|i| maps[i].as_slice());
         let found = bodies(&views, 0.4, 0.5, 0.6);

@@ -163,6 +163,12 @@ mod tests {
         p.set("radius", ParamValue::Float(10.0)).unwrap();
         let region = Blur::default().region(&p, [0.5, 0.25]);
         assert_eq!((region.reach, region.grows), ([5, 3], false));
+    }
+
+    #[test]
+    fn region_grows_along_direction() {
+        let mut p = values();
+        p.set("radius", ParamValue::Float(10.0)).unwrap();
         p.set("grow", ParamValue::Bool(true)).unwrap();
         p.set("direction", ParamValue::Int(1)).unwrap();
         let region = Blur::default().region(&p, [1.0, 1.0]);

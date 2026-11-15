@@ -120,8 +120,7 @@ pub fn stream_catch_up_renders(frames: usize, budget: usize) -> usize {
 /// How often a frame is rendered again while the effect says it is unfinished.
 const MAX_UNFINISHED_RERENDERS: usize = 8;
 
-/// The first way a kept effect broke the contract. `what`, where a variant has it, names the step
-/// of the check that saw it.
+/// The first difference [`check`] found between a kept effect and a fresh one.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Mismatch {
     #[error(
@@ -137,19 +136,25 @@ pub enum Mismatch {
     Unfinished { frame: i64 },
     #[error("{what}: frame {frame} differs from a fresh render, first at pixel {pixel}")]
     Differs {
-        what: String,
+        /// The step of the check that saw it.
+        what: &'static str,
         frame: i64,
         pixel: usize,
     },
     #[error("in order under a fetch budget: frame {frame} differs from a fresh render")]
     InOrder { frame: i64 },
     #[error("{what}: frame {frame} matched a fresh render under a fetch budget, then differed")]
-    Diverged { what: &'static str, frame: i64 },
+    Diverged {
+        /// The step of the check that saw it.
+        what: &'static str,
+        frame: i64,
+    },
     #[error(
         "{what}: frame {frame} differs from a fresh render after {renders} renders under a \
          fetch budget of {FETCH_BUDGET}"
     )]
     NoCatchUp {
+        /// The step of the check that saw it.
         what: &'static str,
         frame: i64,
         renders: usize,
@@ -161,6 +166,7 @@ pub enum Mismatch {
     Stream { frame: i64, render: usize },
     #[error("{what}: frame {frame} differs from a fresh render (drawn {drawn}, fresh {fresh})")]
     Target {
+        /// The step of the check that saw it.
         what: &'static str,
         frame: i64,
         drawn: bool,
@@ -244,7 +250,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
                    number: i64,
                    missing: &[i64],
                    values: &ParamValues,
-                   what: &str|
+                   what: &'static str|
      -> Result<(), Mismatch> {
         let got = render(kept, clip, number, missing, values, None, false)?;
         let want = render(
@@ -260,7 +266,7 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
             Ok(())
         } else {
             Err(Mismatch::Differs {
-                what: what.to_owned(),
+                what,
                 frame: number,
                 pixel: got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(0),
             })
@@ -276,23 +282,16 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
         shuffled.swap(i, (seed % (i as u64 + 1)) as usize);
     }
     let orders = [
-        ("forwards", (0..n).collect::<Vec<_>>()),
-        ("backwards", (0..n).rev().collect()),
-        ("shuffled", shuffled),
+        ("forwards", "forwards, again", (0..n).collect::<Vec<_>>()),
+        ("backwards", "backwards, again", (0..n).rev().collect()),
+        ("shuffled", "shuffled, again", shuffled),
     ];
-    for (name, order) in orders {
+    for (name, again, order) in orders {
         let mut kept = cpu_effect(make);
         for (i, &number) in order.iter().enumerate() {
             let values = &values[i % values.len()];
             compare(&mut *kept, clip, number, &[], values, name)?;
-            compare(
-                &mut *kept,
-                clip,
-                number,
-                &[],
-                values,
-                &format!("{name}, again"),
-            )?;
+            compare(&mut *kept, clip, number, &[], values, again)?;
         }
     }
 
@@ -637,27 +636,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn check_accepts_rereading_effect() {
-        let make = || Processor::Cpu(Box::new(Sums::default()));
-        assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
-    }
-
-    #[test]
-    fn check_rejects_stale_cache() {
-        let make = || {
-            Processor::Cpu(Box::new(Sums {
-                trust: true,
-                ..Sums::default()
-            }))
-        };
-        let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("stale");
-        assert!(
-            matches!(&err, Mismatch::Differs { what, .. } if what.contains("edited")),
-            "{err}"
-        );
-    }
-
     /// Says it cleared its history, but its next renders differ from a fresh effect's.
     #[derive(Default)]
     struct ClearsBadly {
@@ -689,18 +667,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn check_rejects_bad_clear_history() {
-        let make = || Processor::Cpu(Box::new(ClearsBadly::default()));
-        let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("differs");
-        assert!(
-            matches!(&err, Mismatch::Differs { what, .. } if what == "after clearing history"),
-            "{err}"
-        );
-    }
-
-    /// Leaves each frame's first render unfinished with a wrong pixel, as a browser's GPU draw
-    /// does, and draws the frame at the next render of it; `stuck` stays unfinished.
+    /// Reports each frame's first render unfinished, with a wrong pixel, and draws the frame on
+    /// its next render, like a browser's GPU draw. With `stuck` set, it never finishes.
     #[derive(Default)]
     struct Deferred {
         waiting: Option<i64>,
@@ -742,21 +710,56 @@ mod tests {
         }
     }
 
-    #[test]
-    fn check_waits_for_unfinished_render() {
-        let make = || Processor::Cpu(Box::new(Deferred::default()));
-        assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
-    }
+    mod check {
+        use super::*;
 
-    #[test]
-    fn check_rejects_stuck_render() {
-        let make = || {
-            Processor::Cpu(Box::new(Deferred {
-                stuck: true,
-                ..Deferred::default()
-            }))
-        };
-        let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("unfinished");
-        assert!(matches!(err, Mismatch::Unfinished { .. }), "{err}");
+        #[test]
+        fn accepts_rereading_effect() {
+            let make = || Processor::Cpu(Box::new(Sums::default()));
+            assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
+        }
+
+        #[test]
+        fn rejects_stale_cache() {
+            let make = || {
+                Processor::Cpu(Box::new(Sums {
+                    trust: true,
+                    ..Sums::default()
+                }))
+            };
+            let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("stale");
+            assert!(
+                matches!(&err, Mismatch::Differs { what, .. } if what.contains("edited")),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn rejects_clear_history_unlike_fresh() {
+            let make = || Processor::Cpu(Box::new(ClearsBadly::default()));
+            let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("differs");
+            assert!(
+                matches!(&err, Mismatch::Differs { what, .. } if *what == "after clearing history"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn waits_for_unfinished_render() {
+            let make = || Processor::Cpu(Box::new(Deferred::default()));
+            assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
+        }
+
+        #[test]
+        fn rejects_stuck_render() {
+            let make = || {
+                Processor::Cpu(Box::new(Deferred {
+                    stuck: true,
+                    ..Deferred::default()
+                }))
+            };
+            let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("unfinished");
+            assert!(matches!(err, Mismatch::Unfinished { .. }), "{err}");
+        }
     }
 }

@@ -118,7 +118,7 @@ fn wrong_buffer_size_is_rejected() {
 }
 
 #[test]
-fn float_readback_reuse_keeps_padded_rows_clean() {
+fn float_readback_reuse_returns_each_write() {
     let gpu = gpu();
     // 80-byte rows need padding to the GPU's 256-byte copy pitch.
     let frame = Frame::new(&gpu, 5, 3, wgpu::TextureFormat::Rgba32Float);

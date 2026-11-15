@@ -656,7 +656,7 @@ fn threshold_finds_bright_regions_in_one_frame() {
 }
 
 #[test]
-fn threshold_swarm_ignores_frame_order() {
+fn threshold_swarm_matches_cold_render_in_any_order() {
     let frames = crossing::<u8>();
     let s = RenderSettings {
         mode: OutputMode::Swarm,
@@ -817,8 +817,7 @@ fn earlier_frame_edit_invalidates_cache() {
     }
 }
 
-/// A gap renders as a cold render of the same frames does, and the missing frame is read again
-/// once the host hands it over.
+/// A render with frames missing matches a cold render missing the same frames.
 #[test]
 fn gap_renders_like_cold_render() {
     for s in [RenderSettings::default(), swarm_settings()] {
@@ -836,6 +835,20 @@ fn gap_renders_like_cold_render() {
             s.mode
         );
         assert!(without.pixels != full.pixels, "{:?}: the gap shows", s.mode);
+    }
+}
+
+/// A frame the host couldn't hand over is read once the host hands it over.
+#[test]
+fn returned_frame_is_read() {
+    for s in [RenderSettings::default(), swarm_settings()] {
+        let frames = crossing::<u8>();
+        let last = frames.len() - 1;
+        let full = render_frames(&s, &frames, last as i64).0;
+        let gap = [last - 4, last - 3, last - 2, last - 1];
+
+        let mut state = IncrementalRenderer::default();
+        let _ = render_kept(&mut state, &s, &frames, &gap);
         let back = render_kept(&mut state, &s, &frames, &[]);
         assert!(
             back.pixels == full.pixels,

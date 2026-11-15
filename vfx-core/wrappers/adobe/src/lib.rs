@@ -32,7 +32,7 @@ pub use vfx_host;
 /// Render-path notes, in `~/Library/Logs/<file>-AfterEffects.log`.
 static LOG: diag::Log = diag::Log::new("-AfterEffects.log");
 
-/// Runs when the first fallback is logged, so a failing GPU doesn't flood the log.
+/// Lets only the first fallback reach After Effects' error log; `LOG` notes every one.
 static WARNED: Once = Once::new();
 
 fn warn_once(message: &str) {

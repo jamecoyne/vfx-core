@@ -1,7 +1,8 @@
-//! Frames in RAM, for [`crate::CpuEffect`]s, laid out as After Effects does: alpha, red,
-//! green, blue of one channel type. `Argb<u8>`, `Argb<u16>` and `Argb<f32>` match
+//! Frames in RAM, for [`crate::CpuEffect`]s. A pixel is alpha, red, green, blue of one
+//! channel type, in After Effects' order: `Argb<u8>`, `Argb<u16>` and `Argb<f32>` match
 //! `PF_Pixel8`, `PF_Pixel16` and `PF_PixelFloat` byte for byte, so After Effects' buffers
-//! are used in place at their own row stride. Rows run top to bottom.
+//! are used in place at their own row stride; other hosts convert into them. Rows run top
+//! to bottom.
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -347,7 +348,7 @@ pub trait FrameSource {
     /// Calls `f` with frame `index`, or with `None` if that frame isn't there.
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>));
 
-    /// [`Self::with_frame`] that skips the pixels when `wanted` returns false.
+    /// Like [`Self::with_frame`], but calls `f` only if `wanted` returns true.
     ///
     /// `wanted` sees frame `index` as rows of the bytes this source holds it in, so a source
     /// that converts frames needn't convert this one. A missing frame skips `wanted` and calls
@@ -562,113 +563,130 @@ mod tests {
         assert_eq!(f32::from_unit(1.5), 1.5);
     }
 
-    #[test]
-    fn history_recycles_and_bounds() {
-        let grey = |v: u8| Argb {
-            alpha: 255,
-            red: v,
-            green: v,
-            blue: v,
-        };
-        let mut h = History::<u8>::default();
-        h.resize(2, 1);
-        h.push_slot(1, 1).fill(grey(255));
-        let first = h.frames[0].as_ptr();
-        h.push_slot(1, 1).fill(grey(0));
-        h.push_slot(1, 1).fill(grey(128));
-        assert_eq!(h.len(), 2);
-        assert_eq!((h.frames[0][0].red, h.frames[1][0].red), (0, 128));
-        assert_eq!(h.frame_number(), 2);
-        h.push_slot(1, 1).fill(grey(64));
-        assert_eq!(h.frames[1].as_ptr(), first, "the oldest buffer is reused");
-        for _ in 0..5 {
-            h.push_slot(3, 3);
-        }
-        assert_eq!(h.len(), 4);
-        h.push_slot(0, 0);
-        assert_eq!(h.len(), 1);
-        h.clear();
-        assert!(h.is_empty() && h.frame_number() == 0);
-        h.resize(3, 2);
-        assert_eq!(h.push_slot(0, 0).len(), 6);
-    }
+    mod history {
+        use super::*;
 
-    /// Frames not held still count, so numbering is what a full history's would be.
-    #[test]
-    fn history_numbers_unheld_frames() {
-        let mut h = History::<u8>::default();
-        h.resize(1, 1);
-        for v in 0..6u8 {
-            h.push_slot(3, 1)[0].red = v;
-        }
-        assert_eq!((h.len(), h.held(), h.frame_number()), (4, 2, 5));
-        let mut read = Vec::new();
-        for index in 0..4 {
-            h.with_frame(index, &mut |image| {
-                read.push(image.map(|i| match i {
-                    Image::U8(v) => v.row(0)[0].red,
-                    _ => unreachable!(),
-                }));
-            });
-        }
-        assert_eq!(read, [None, None, Some(4), Some(5)]);
-    }
-
-    fn newest_values(h: &mut History<u8>) -> Vec<Option<u8>> {
-        let mut read = Vec::new();
-        for index in 0..h.len() {
-            h.with_frame(index, &mut |image| {
-                read.push(image.map(|i| match i {
-                    Image::U8(v) => v.row(0)[0].red,
-                    _ => unreachable!(),
-                }));
-            });
-        }
-        read
-    }
-
-    /// A repeat leaves the history as it was, whether or not the effect holds earlier frames.
-    #[test]
-    fn drop_repeat_keeps_history() {
-        for held in [0, 1, 3] {
+        #[test]
+        fn recycles_and_bounds() {
+            let grey = |v: u8| Argb {
+                alpha: 255,
+                red: v,
+                green: v,
+                blue: v,
+            };
             let mut h = History::<u8>::default();
             h.resize(2, 1);
-            let push = |h: &mut History<u8>, v: u8| {
-                h.push_slot(3, held)[0].red = v;
-                h.frames.back_mut().unwrap()[1].red = 0;
-                h.drop_repeat()
-            };
-            assert!(!push(&mut h, 1), "the first frame has nothing before it");
-            for v in 2..7 {
-                assert!(!push(&mut h, v));
+            h.push_slot(1, 1).fill(grey(255));
+            let first = h.frames[0].as_ptr();
+            h.push_slot(1, 1).fill(grey(0));
+            h.push_slot(1, 1).fill(grey(128));
+            assert_eq!(h.len(), 2);
+            assert_eq!((h.frames[0][0].red, h.frames[1][0].red), (0, 128));
+            assert_eq!(h.frame_number(), 2);
+            h.push_slot(1, 1).fill(grey(64));
+            assert_eq!(h.frames[1].as_ptr(), first, "the oldest buffer is reused");
+            for _ in 0..5 {
+                h.push_slot(3, 3);
             }
-            let (number, read) = (h.frame_number(), newest_values(&mut h));
-            for _ in 0..3 {
-                assert!(push(&mut h, 6));
-                assert_eq!(
-                    (h.frame_number(), newest_values(&mut h)),
-                    (number, read.clone())
-                );
-            }
-            assert!(!push(&mut h, 7));
-            assert_eq!(h.frame_number(), number + 1);
-            assert_eq!(newest_values(&mut h).last(), Some(&Some(7)));
+            assert_eq!(h.len(), 4);
+            h.push_slot(0, 0);
+            assert_eq!(h.len(), 1);
+            h.clear();
+            assert!(h.is_empty() && h.frame_number() == 0);
+            h.resize(3, 2);
+            assert_eq!(h.push_slot(0, 0).len(), 6);
         }
-    }
 
-    /// The last pixel alone is enough to make a frame new.
-    #[test]
-    fn drop_repeat_keeps_last_pixel_change() {
-        for before in [0, 3] {
-            let mut h = History::<f32>::default();
-            h.resize(2, 2);
-            h.push_slot(before, 0).fill(Argb::default());
-            h.push_slot(before, 0).fill(Argb::default());
-            assert_eq!(h.drop_repeat(), before > 0);
-            let frame = h.push_slot(before, 0);
-            frame.fill(Argb::default());
-            frame[3].blue = 0.001;
-            assert!(!h.drop_repeat());
+        /// Frames not held still count, so numbering is what a full history's would be.
+        #[test]
+        fn numbers_unheld_frames() {
+            let mut h = History::<u8>::default();
+            h.resize(1, 1);
+            for v in 0..6u8 {
+                h.push_slot(3, 1)[0].red = v;
+            }
+            assert_eq!((h.len(), h.held(), h.frame_number()), (4, 2, 5));
+            let mut read = Vec::new();
+            for index in 0..4 {
+                h.with_frame(index, &mut |image| {
+                    read.push(image.map(|i| match i {
+                        Image::U8(v) => v.row(0)[0].red,
+                        _ => unreachable!(),
+                    }));
+                });
+            }
+            assert_eq!(read, [None, None, Some(4), Some(5)]);
+        }
+
+        mod drop_repeat {
+            use super::*;
+
+            fn newest_values(h: &mut History<u8>) -> Vec<Option<u8>> {
+                let mut read = Vec::new();
+                for index in 0..h.len() {
+                    h.with_frame(index, &mut |image| {
+                        read.push(image.map(|i| match i {
+                            Image::U8(v) => v.row(0)[0].red,
+                            _ => unreachable!(),
+                        }));
+                    });
+                }
+                read
+            }
+
+            /// A repeat leaves the history as it was, whether or not the effect holds earlier
+            /// frames.
+            #[test]
+            fn restores_previous_state() {
+                for held in [0, 1, 3] {
+                    let mut h = History::<u8>::default();
+                    h.resize(2, 1);
+                    let push = |h: &mut History<u8>, v: u8| {
+                        h.push_slot(3, held)[0].red = v;
+                        h.frames.back_mut().unwrap()[1].red = 0;
+                        h.drop_repeat()
+                    };
+                    assert!(!push(&mut h, 1), "the first frame has nothing before it");
+                    for v in 2..7 {
+                        assert!(!push(&mut h, v));
+                    }
+                    let (number, read) = (h.frame_number(), newest_values(&mut h));
+                    for _ in 0..3 {
+                        assert!(push(&mut h, 6));
+                        assert_eq!(
+                            (h.frame_number(), newest_values(&mut h)),
+                            (number, read.clone())
+                        );
+                    }
+                    assert!(!push(&mut h, 7));
+                    assert_eq!(h.frame_number(), number + 1);
+                    assert_eq!(newest_values(&mut h).last(), Some(&Some(7)));
+                }
+            }
+
+            #[test]
+            fn needs_earlier_frames() {
+                for before in [0, 3] {
+                    let mut h = History::<f32>::default();
+                    h.resize(2, 2);
+                    h.push_slot(before, 0).fill(Argb::default());
+                    h.push_slot(before, 0).fill(Argb::default());
+                    assert_eq!(h.drop_repeat(), before > 0);
+                }
+            }
+
+            #[test]
+            fn sees_change_in_last_pixel() {
+                for before in [0, 3] {
+                    let mut h = History::<f32>::default();
+                    h.resize(2, 2);
+                    h.push_slot(before, 0).fill(Argb::default());
+                    let frame = h.push_slot(before, 0);
+                    frame.fill(Argb::default());
+                    frame[3].blue = 0.001;
+                    assert!(!h.drop_repeat());
+                }
+            }
         }
     }
 

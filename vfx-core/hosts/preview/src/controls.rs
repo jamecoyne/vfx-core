@@ -723,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn mirror_for_source_follows_camera() {
+    fn mirror_for_source_on_only_for_camera() {
         let mut c = Controls::default();
         let segcam = &c.params[catalog::find("segcam").unwrap()];
         assert!(!segcam.bool("mirror"));

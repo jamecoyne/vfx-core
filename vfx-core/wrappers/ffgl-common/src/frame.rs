@@ -63,7 +63,7 @@ mod tests {
     }
 
     #[test]
-    fn canvas_texture_round_trip() {
+    fn canvas_to_texture_inverts_texture_to_canvas() {
         #[rustfmt::skip]
         let texels = [
             0.1, 0.2, 0.3, 1.0,  0.05, 0.1, 0.0, 0.5,

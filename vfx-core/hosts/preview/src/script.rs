@@ -568,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_value_per_kind() {
+    fn parse_value_reads_each_kind() {
         let menu = ParamSpec::choice("output", &["Overlay", "Motion matte", "Swarm"], 0);
         assert_eq!(parse_value(&menu, "motion-matte"), Ok(ParamValue::Int(1)));
         assert_eq!(parse_value(&menu, "Motion matte"), Ok(ParamValue::Int(1)));

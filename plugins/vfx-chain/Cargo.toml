@@ -37,6 +37,5 @@ vfx-build = { path = "../../vfx-core/wrappers/build" }
 
 [dev-dependencies]
 pollster = "1.0.1"
-thiserror = "2.0.21"
 # The After Effects harness's reference renderer (examples/ae_reference.rs).
 vfx-host = { path = "../../vfx-core/wrappers/common" }

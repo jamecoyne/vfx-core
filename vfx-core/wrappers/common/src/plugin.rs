@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn map_points_leaves_other_kinds() {
+    fn map_points_maps_only_points() {
         let specs = [
             ParamSpec::point("centre", [0.5, 0.5]),
             ParamSpec::float("x", 0.0, 1.0, 0.5),

@@ -96,7 +96,7 @@ fn parse(args: &[String]) -> Result<Options> {
     while let Some(arg) = it.next() {
         let mut value = || {
             it.next()
-                .ok_or_else(|| Error::BenchMissingValue(arg.clone()))
+                .ok_or_else(|| Error::BenchMissingValue { flag: arg.clone() })
         };
         match arg.as_str() {
             "--preset" => {
@@ -123,7 +123,7 @@ fn parse(args: &[String]) -> Result<Options> {
             "--cpu" => o.cpu = true,
             "--reference" => o.reference = Some(value()?.clone()),
             clip if !clip.starts_with('-') && o.clip.is_empty() => o.clip = clip.to_owned(),
-            other => return Err(Error::UnknownBenchArgument(other.to_owned())),
+            other => return Err(Error::BenchUnknownArgument(other.to_owned())),
         }
     }
     if o.clip.is_empty() {
@@ -260,7 +260,7 @@ impl Row {
                     log: timed.log,
                 });
             };
-            drawn.add(run);
+            drawn.pool(run);
             faces = faces_device(&timed.log).map(str::to_owned);
             if let Some((_, want)) = &self.reference {
                 let (same, total) = count_matches(&timed.hashes, want);
@@ -308,12 +308,12 @@ fn timed_run(cmd: &mut Command, raw: &Path, frame_bytes: usize) -> Result<TimedR
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|source| Error::Spawn {
+        .map_err(|source| Error::Run {
             command: format!("{cmd:?}"),
             source,
         })?;
-    let mut out = child.stdout.take().ok_or(Error::CliPipeMissing("stdout"))?;
-    let mut err = child.stderr.take().ok_or(Error::CliPipeMissing("stderr"))?;
+    let mut out = child.stdout.take().ok_or(Error::MissingCliPipe("stdout"))?;
+    let mut err = child.stderr.take().ok_or(Error::MissingCliPipe("stderr"))?;
     let log = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = err.read_to_end(&mut bytes);
@@ -334,7 +334,7 @@ fn timed_run(cmd: &mut Command, raw: &Path, frame_bytes: usize) -> Result<TimedR
         last = now;
         hashes.push(format!("{:016x}", frame_hash(&frame)));
     }
-    let status = child.wait().map_err(|source| Error::Spawn {
+    let status = child.wait().map_err(|source| Error::Run {
         command: format!("{cmd:?}"),
         source,
     })?;
@@ -356,7 +356,7 @@ fn hash_file_header(clip: u64, preset: &str, depth: &str) -> String {
 fn load_reference(dir: &Path, file: &str, header: &str) -> Result<(String, Vec<String>)> {
     let path = dir.join(file);
     let text = fs::read_to_string(&path).map_err(Error::file(&path))?;
-    let hashes = parse_reference(&text, header).map_err(|source| Error::Reference {
+    let hashes = parse_reference(&text, header).map_err(|source| Error::ReferenceMismatch {
         path: path.clone(),
         source,
     })?;
@@ -364,7 +364,7 @@ fn load_reference(dir: &Path, file: &str, header: &str) -> Result<(String, Vec<S
     Ok((name.to_string_lossy().into_owned(), hashes))
 }
 
-/// A reference file whose first line names another row.
+/// The error when a reference file's first line names another row.
 #[derive(Debug, thiserror::Error)]
 #[error("not a reference for this row: it holds `{found}`, this row is `{expected}`")]
 pub struct HeaderMismatch {
@@ -422,7 +422,7 @@ struct DrawnOn {
 }
 
 impl DrawnOn {
-    fn add(&mut self, run: DrawnOn) {
+    fn pool(&mut self, run: DrawnOn) {
         self.frames += run.frames;
         self.gpu_frames += run.gpu_frames;
         self.kept = run.kept;
@@ -820,13 +820,13 @@ mod tests {
     }
 
     #[test]
-    fn drawn_on_add_sums_gpu_and_cpu_frames() {
+    fn drawn_on_pool_sums_gpu_and_cpu_frames() {
         let mut drawn = DrawnOn::default();
         for log in [
             "segcam-motion: 300 frames, kept, 297 on the GPU (RTX 4070)\n",
             "segcam-motion: 300 frames, kept, 300 on the GPU (RTX 4070)\n",
         ] {
-            drawn.add(drawn_on(log).unwrap());
+            drawn.pool(drawn_on(log).unwrap());
         }
         assert_eq!(
             path_cell(&drawn, None),

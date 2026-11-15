@@ -1258,22 +1258,35 @@ mod tests {
     mod first_open {
         use super::*;
 
-        /// An adapter hidden by a reset during the first open isn't the machine's answer: `status`
-        /// reports it without waiting for another try, renders keep asking, and the next try opens.
-        #[test]
-        fn hidden_adapter_retries() {
+        /// A slot whose every open fails with [`NoGpu::NoAdapter`], and the count of its tries.
+        fn hidden_adapter_slot() -> (&'static DeviceSlot, Arc<std::sync::atomic::AtomicU32>) {
             let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
             let counted = tries.clone();
             let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(move |_| {
                 counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err(NoGpu::NoAdapter("hidden by a reset".into()))
             })));
+            (slot, tries)
+        }
+
+        /// `status` reports an adapter hidden by a reset during the first open without waiting
+        /// for another try, and renders keep asking.
+        #[test]
+        fn hidden_adapter_status_is_not_final() {
+            let (slot, _) = hidden_adapter_slot();
             assert!(matches!(slot.status(), Err(NoGpu::NoAdapter(_))));
             assert!(!slot.first_open_pending(), "status waits for retries");
             assert!(
                 matches!(slot.now(), DeviceNow::Waiting),
                 "the first answer was final"
             );
+        }
+
+        #[test]
+        fn hidden_adapter_retries() {
+            let (slot, tries) = hidden_adapter_slot();
+            let _ = slot.status();
+            let _ = slot.now();
             assert!(matches!(slot.next_first_open_try(), DeviceNow::Waiting));
             // Wait for the try just started to answer.
             let _ = slot.next_first_open_try();
@@ -1308,7 +1321,6 @@ mod tests {
             }
         }
 
-        /// A first open that overlaps a loss isn't the machine's answer: the slot tries again.
         #[test]
         fn loss_during_open_retries() {
             let _lock = gpu_test_lock();

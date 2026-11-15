@@ -37,7 +37,7 @@ pub enum WebError {
     NoWindow,
     /// A JavaScript exception, as the browser words it.
     #[error("{0}")]
-    Script(String),
+    Js(String),
     #[error("not a video element")]
     NotVideoElement,
     #[error("not a canvas")]
@@ -155,7 +155,7 @@ fn js_error_text(e: JsValue) -> String {
 }
 
 fn js_error(e: JsValue) -> WebError {
-    WebError::Script(js_error_text(e))
+    WebError::Js(js_error_text(e))
 }
 
 fn new_video_element() -> Result<HtmlVideoElement, WebError> {

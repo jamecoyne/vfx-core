@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_has_no_problems() {
+    fn check_passes_on_repository() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let all = crate::workspace_in(&root).unwrap().0;
         let problems: Vec<String> = check(&all, &root)

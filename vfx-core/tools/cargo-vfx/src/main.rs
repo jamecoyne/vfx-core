@@ -158,7 +158,7 @@ fn workspace_in(dir: &Path) -> Result<(Vec<Effect>, PathBuf, PathBuf)> {
         .current_dir(dir)
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .output()
-        .map_err(Error::CargoMetadataRun)?;
+        .map_err(Error::CargoMetadataSpawn)?;
     if !out.status.success() {
         return Err(Error::CargoMetadataFailed(
             String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -186,7 +186,7 @@ fn workspace_in(dir: &Path) -> Result<(Vec<Effect>, PathBuf, PathBuf)> {
         .iter()
         .map(|e| (e.package.clone(), e.meta.clone()))
         .collect();
-    vfx_build::check_workspace(&identities).map_err(Error::Identities)?;
+    vfx_build::check_workspace(&identities).map_err(Error::DuplicateIdentities)?;
     let root = PathBuf::from(json["workspace_root"].as_str().unwrap_or("."));
     let target = PathBuf::from(json["target_directory"].as_str().unwrap_or("target"));
     Ok((effects, root, target))
@@ -197,7 +197,7 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
-    let status = cmd.status().map_err(|source| Error::Spawn {
+    let status = cmd.status().map_err(|source| Error::Run {
         command: format!("{cmd:?}"),
         source,
     })?;
@@ -390,7 +390,7 @@ fn cargo_build(e: &Effect, o: &Options, triple: Option<&str>) -> Result<Option<P
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
-        .map_err(|source| Error::Spawn {
+        .map_err(|source| Error::Run {
             command: format!("{cmd:?}"),
             source,
         })?;
@@ -589,8 +589,8 @@ fn build_windows(
         bundles.push(path);
     }
     // The FFGL DLL and the .aex share the output folder, and so the compiler. The effect's
-    // `windows-dlls` go in the OFX bundle only: Resolume and the Adobe hosts ship a
-    // DirectML.dll new enough in their program folder, which Windows searches first;
+    // `windows-dlls` go in the OFX bundle only: Resolume and the Adobe hosts ship a new
+    // enough DirectML.dll in their program folder, which Windows searches first;
     // Resolve's is too old.
     if o.hosts.iter().any(|h| *h != Host::Ofx) {
         copy_beside(&dxc, out)?;
@@ -961,14 +961,18 @@ mod tests {
     }
 
     #[test]
-    fn slug_joins_words_with_hyphens() {
+    fn slug_is_lowercase_hyphenated() {
         assert_eq!(slug("segcam Motion"), "segcam-motion");
         assert_eq!(slug("VFX Preview"), "vfx-preview");
     }
 
     #[test]
-    fn host_parse_rejects_unknown() {
+    fn host_parse_reads_feature_name() {
         assert_eq!(Host::parse("ofx").unwrap(), Host::Ofx);
+    }
+
+    #[test]
+    fn host_parse_rejects_unknown() {
         assert!(Host::parse("vst").is_err());
     }
 }

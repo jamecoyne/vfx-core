@@ -117,8 +117,8 @@ impl AeDevice {
                     .is_some_and(|hal| hal.raw_device().registryID() == target_id)
             })
             .ok_or(Error::NoAdapter)?;
-        // The default limits cap a storage buffer at 128 MiB, about one 4K float
-        // frame (3840 x 2160 x 16 bytes).
+        // The adapter's own limits: the defaults cap a storage buffer at 128 MiB,
+        // about one 4K float frame (3840 x 2160 x 16 bytes).
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("vfx-ae on After Effects GPU"),

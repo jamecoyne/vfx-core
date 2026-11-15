@@ -340,7 +340,7 @@ mod tests {
 
     /// The conversions themselves, on bytes alone.
     #[test]
-    fn short_float_rows_round_trip() {
+    fn short_and_float_rows_round_trip() {
         let byte_lut: [f32; 256] = std::array::from_fn(|v| v as f32 / 255.0);
         let mut row = [Argb::<f32>::default(); 2];
         let shorts: Vec<u8> = [0u16, 65535, 32768, 65535, 65535, 0, 0, 13107]

@@ -501,7 +501,8 @@ impl IncrementalRenderer {
         for frame in frames_to_read {
             let index = (frame - plan.window_start) as usize;
             let before = self.read_before(frame);
-            // A fixed source needs a read only to verify the frames in `checks`.
+            // A fixed source's frames are verified only when they are in `checks`; the rest reuse a
+            // known hash.
             let verify = !plan.fixed || checks.contains(&frame);
             let read_known = if !verify && before.is_some() {
                 before
@@ -813,8 +814,8 @@ impl IncrementalRenderer {
     }
 
     /// The frames from `window_start` a render of `number` must read: those without cached
-    /// motion or tiles, the analyses before them without grids, and `number`, which it draws and, outside
-    /// the swarm, may analyse. None before `oldest_held_frame`.
+    /// motion or tiles, the analyses before them without grids, and `number`, which it draws
+    /// and, outside the swarm, may analyse. None before `oldest_held_frame`.
     fn frames_to_read(
         &self,
         s: &RenderSettings,
@@ -1269,8 +1270,8 @@ impl Analyser {
         view: Option<&View<C>>,
     ) -> CutTiles {
         let s = plan.s;
-        // Reused faces need tiles here if a trail of at most the step draws no
-        // earlier analysis, or if the windows of held faces would leave it
+        // Reused faces need tiles here if the trail is at most `every` frames
+        // long, so it draws no earlier analysis, or if the windows of held faces would leave it
         // before the next analysis, as a slow detection's do on a short trail.
         let next_analysis = frame + s.analysis_step.every;
         let held_windows_leaving = self
@@ -2267,7 +2268,7 @@ mod tests {
     fn own_device() -> Arc<gpu::GpuContext> {
         let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
         let dev = gpu::open(&choice).or_else(|_| gpu::open("fallback"));
-        Arc::new(dev.expect("an adapter, hardware or software"))
+        Arc::new(dev.expect("a GPU adapter, hardware or fallback"))
     }
 
     /// An instance drawing every swarm render on `dev`.
@@ -2755,24 +2756,37 @@ mod tests {
         assert!(dev.lost().is_none(), "the device was lost");
     }
 
-    /// Renders frames `0..until` while the GPU fails every other render, checking each against the
-    /// CPU, and returns the GPU instance. The cooldown runs from frame 6 until frame 9, where this
-    /// ends it.
-    fn render_with_gpu_faults(dev: &Arc<gpu::GpuContext>, until: usize) -> IncrementalRenderer {
+    /// The frames [`render_with_gpu_faults`] renders in fault cooldown.
+    const FAULT_COOLDOWN_FRAMES: std::ops::Range<usize> = 6..9;
+
+    /// One render of [`render_with_gpu_faults`].
+    struct FaultedRender {
+        number: usize,
+        failing: bool,
+        /// In fault cooldown before this render, read before the test ends the cooldown.
+        cooldown_before_reset: bool,
+        in_cooldown: bool,
+        matches_cpu: bool,
+        drawn: u64,
+        faulted: u64,
+    }
+
+    /// Renders every frame on `dev` and on the CPU with the GPU failing on renders 1, 3, 5 and
+    /// [`FAULT_COOLDOWN_FRAMES`], ending the cooldown at its last frame.
+    fn render_with_gpu_faults(
+        dev: &Arc<gpu::GpuContext>,
+    ) -> (Vec<FaultedRender>, IncrementalRenderer) {
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
         let mut on_gpu = on_device(dev);
-        // Frame 0 has no windows and draws on the CPU. Frames 1, 3 and 5 fault.
-        let cooldown_frames = 6..9;
-        for n in 0..until.min(frames.len()) {
+        let mut renders = Vec::new();
+        // Frame 0 has no windows and draws on the CPU.
+        for n in 0..frames.len() {
             let drawer = on_gpu.drawer.as_mut().expect("on the GPU");
-            let failing = n < 9 && n % 2 == 1 || cooldown_frames.contains(&n);
+            let failing = n < 9 && n % 2 == 1 || FAULT_COOLDOWN_FRAMES.contains(&n);
             drawer.set_max_buffer_bytes(if failing { 1024 } else { u64::MAX });
-            if n == cooldown_frames.end {
-                assert!(
-                    drawer.in_fault_cooldown(),
-                    "still trying the GPU at frame {n}"
-                );
+            let cooldown_before_reset = drawer.in_fault_cooldown();
+            if n == FAULT_COOLDOWN_FRAMES.end {
                 drawer.set_cooldown(Duration::ZERO);
             }
             let in_cooldown = drawer.in_fault_cooldown();
@@ -2782,18 +2796,17 @@ mod tests {
                 render(&mut on_gpu, &frames, n),
             );
             assert!(within_gpu_bound(&a, &b), "frame {n} is off the CPU's");
-            assert_eq!(in_cooldown, cooldown_frames.contains(&n), "frame {n}");
-            if in_cooldown {
-                assert_eq!(a, b, "cooldown frame {n} isn't the CPU's");
-                assert_eq!(drawn(&on_gpu), before, "cooldown frame {n} drew on the GPU");
-                assert_eq!(faults(&on_gpu), faulted, "cooldown frame {n} tried the GPU");
-            } else if !failing && n > 0 {
-                assert_eq!(drawn(&on_gpu), before + 1, "frame {n} wasn't on the GPU");
-            }
+            renders.push(FaultedRender {
+                number: n,
+                failing,
+                cooldown_before_reset,
+                in_cooldown,
+                matches_cpu: a == b,
+                drawn: drawn(&on_gpu) - before,
+                faulted: faults(&on_gpu) - faulted,
+            });
         }
-        assert_eq!(faults(&on_gpu), u64::from(gpu::MAX_RECENT_FAULTS));
-        assert!(dev.lost().is_none(), "the device was lost");
-        on_gpu
+        (renders, on_gpu)
     }
 
     /// A host holding only the current frame: tiles the pile stopped drawing keep no pixels.
@@ -3209,7 +3222,7 @@ mod tests {
         /// stream checks again after a step it didn't take as a stream, so the next
         /// renders match a fresh render as they do without a budget.
         #[test]
-        fn reads_skipped_frame_first() {
+        fn step_over_matches_unbudgeted_renders() {
             let without = differing_renders_after_step_over(None);
             assert_eq!(without, Vec::<usize>::new(), "without a budget");
             assert_eq!(differing_renders_after_step_over(Some(4)), without);
@@ -3314,12 +3327,11 @@ mod tests {
     mod frame_hash {
         use super::*;
 
-        /// Hashes are compared across renders that may run on different numbers of threads.
-        #[test]
-        fn covers_every_pixel_in_row_order() {
-            // An odd width leaves a row's last pixel out of the words of 8-bit frames.
-            let (w, h) = (201, 130);
-            let mut pixels: Vec<Argb<u8>> = (0..w * h)
+        /// An odd width, so rows of 8-bit pixels don't end on a whole word of the hash.
+        const SIZE: (i32, i32) = (201, 130);
+
+        fn u8_pixels() -> Vec<Argb<u8>> {
+            (0..SIZE.0 * SIZE.1)
                 .map(|i| {
                     let v = (i * 7919 % 256) as u8;
                     Argb {
@@ -3329,7 +3341,39 @@ mod tests {
                         blue: v.wrapping_add(2),
                     }
                 })
+                .collect()
+        }
+
+        /// Hashes are compared across renders that may run on different numbers of threads.
+        #[test]
+        fn equals_folded_row_hashes() {
+            let (w, h) = SIZE;
+            let pixels = u8_pixels();
+            let rows = View::from_pixels(&pixels, w, h).byte_rows();
+            assert_eq!(
+                frame_hash(&rows),
+                fold_hash(rows.iter().map(|row| row_hash(row)))
+            );
+
+            let floats: Vec<Argb<f32>> = (0..w * h)
+                .map(|i| Argb {
+                    alpha: 1.0,
+                    red: i as f32 / 7.0,
+                    green: 0.25,
+                    blue: 0.5,
+                })
                 .collect();
+            let rows = View::from_pixels(&floats, w, h).byte_rows();
+            assert_eq!(
+                frame_hash(&rows),
+                fold_hash(rows.iter().map(|row| row_hash(row)))
+            );
+        }
+
+        #[test]
+        fn changes_with_any_pixel_or_row_order() {
+            let (w, h) = SIZE;
+            let mut pixels = u8_pixels();
             let hash = |pixels: &[Argb<u8>]| {
                 let rows = View::from_pixels(pixels, w, h).byte_rows();
                 let hash = frame_hash(&rows);
@@ -3347,20 +3391,6 @@ mod tests {
             let (top, bottom) = pixels.split_at_mut(w as usize);
             top.swap_with_slice(&mut bottom[..w as usize]);
             assert_ne!(hash(&pixels), before, "two rows swapped");
-
-            let floats: Vec<Argb<f32>> = (0..w * h)
-                .map(|i| Argb {
-                    alpha: 1.0,
-                    red: i as f32 / 7.0,
-                    green: 0.25,
-                    blue: 0.5,
-                })
-                .collect();
-            let rows = View::from_pixels(&floats, w, h).byte_rows();
-            assert_eq!(
-                frame_hash(&rows),
-                fold_hash(rows.iter().map(|row| row_hash(row)))
-            );
         }
 
         /// A Float frame hashes as its bits. Equal bits are the same frame, whatever the values, NaN
@@ -3458,36 +3488,68 @@ mod tests {
         }
 
         /// After `MAX_RECENT_FAULTS` faults in the history, renders match the CPU byte for byte
-        /// without touching the GPU.
+        /// without touching the GPU until the cooldown ends.
         #[test]
-        fn cooldown_blocks_retry() {
+        fn cooldown_draws_on_cpu() {
             let _lock = gpu_test_lock();
-            let on_gpu = render_with_gpu_faults(&own_device(), 9);
-            assert!(on_gpu.drawer().is_some_and(|d| d.in_fault_cooldown()));
+            let (renders, on_gpu) = render_with_gpu_faults(&own_device());
+            for r in &renders {
+                let n = r.number;
+                assert_eq!(
+                    r.in_cooldown,
+                    FAULT_COOLDOWN_FRAMES.contains(&n),
+                    "frame {n}"
+                );
+                if n == FAULT_COOLDOWN_FRAMES.end {
+                    assert!(r.cooldown_before_reset, "still trying the GPU at frame {n}");
+                }
+                if r.in_cooldown {
+                    assert!(r.matches_cpu, "cooldown frame {n} isn't the CPU's");
+                    assert_eq!(r.drawn, 0, "cooldown frame {n} drew on the GPU");
+                    assert_eq!(r.faulted, 0, "cooldown frame {n} tried the GPU");
+                }
+            }
+            assert_eq!(faults(&on_gpu), u64::from(gpu::MAX_RECENT_FAULTS));
         }
 
-        /// The GPU draws again when the cooldown ends.
         #[test]
-        fn recovery_redraws_on_gpu() {
+        fn cooldown_end_returns_to_gpu() {
             let _lock = gpu_test_lock();
-            render_with_gpu_faults(&own_device(), usize::MAX);
+            let dev = own_device();
+            let (renders, _) = render_with_gpu_faults(&dev);
+            for r in &renders {
+                let n = r.number;
+                if !r.in_cooldown && !r.failing && n > 0 {
+                    assert_eq!(r.drawn, 1, "frame {n} wasn't on the GPU");
+                }
+            }
+            assert!(dev.lost().is_none(), "the device was lost");
         }
     }
 
     mod check {
         use super::*;
 
-        /// A check with nothing changed converts only the frame it draws; a change anywhere in an
-        /// earlier frame is still seen, and what it invalidates comes out as a fresh render's.
         #[test]
-        fn converts_only_what_changed() {
-            let mut frames = crossing();
+        fn unchanged_converts_only_drawn_frame() {
+            let frames = crossing();
             let n = frames.len() - 1;
             let mut state = IncrementalRenderer::default();
             let (first, _) = render_converting(&mut state, &frames, n);
             let (same, converted) = render_converting(&mut state, &frames, n);
             assert_eq!(same, first);
             assert_eq!(converted, [n], "nothing changed");
+        }
+
+        /// A change anywhere in an earlier frame converts that frame again and none before it.
+        #[test]
+        fn earlier_edit_matches_cold_render() {
+            let mut frames = crossing();
+            let n = frames.len() - 1;
+            let mut state = IncrementalRenderer::default();
+            for _ in 0..2 {
+                render_converting(&mut state, &frames, n);
+            }
 
             for pixel in [0, frames[4].len() - 1, frames[4].len() / 2] {
                 frames[4][pixel].alpha ^= 1;
@@ -3502,65 +3564,110 @@ mod tests {
             }
         }
 
-        /// A frame that goes missing from a check counts as empty, as in a cold render, and one that
-        /// comes back gives what it gave before.
+        /// [`ConvertingFrames`] with the frame at index `.1` missing.
+        struct Gap<'a>(ConvertingFrames<'a>, usize);
+
+        impl FrameSource for Gap<'_> {
+            fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+                if index == self.1 {
+                    f(None);
+                } else {
+                    self.0.with_frame(index, f);
+                }
+            }
+            fn with_frame_if_wanted(
+                &mut self,
+                index: usize,
+                wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+                f: &mut dyn FnMut(Option<Image<'_>>),
+            ) {
+                if index == self.1 {
+                    f(None);
+                } else {
+                    self.0.with_frame_if_wanted(index, wanted, f);
+                }
+            }
+        }
+
+        /// Renders frame `n` of `frames` with frame 4 missing.
+        fn render_without_frame_4(
+            state: &mut IncrementalRenderer,
+            frames: &[Vec<Argb<u8>>],
+            n: usize,
+        ) -> Vec<Argb<u8>> {
+            let s = swarm_settings();
+            let start = n.saturating_sub(crate::previous_frames_needed(&s) as usize);
+            let clip = &frames[start..=n];
+            let mut pixels = vec![Argb::<u8>::default(); (W * H) as usize];
+            let converting = ConvertingFrames {
+                frames: clip,
+                converted: Vec::new(),
+            };
+            let mut source = Gap(converting, 4 - start);
+            let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
+            state.render_frame(&s, &mut source, clip.len(), n as i64, out);
+            pixels
+        }
+
         #[test]
-        fn missing_frame_counts_as_empty() {
+        fn missing_frame_renders_like_cold_render() {
+            let frames = crossing();
+            let n = frames.len() - 1;
+            let mut state = IncrementalRenderer::default();
+            render_converting(&mut state, &frames, n);
+            let after_gap = render_without_frame_4(&mut state, &frames, n);
+            let cold = render_without_frame_4(&mut IncrementalRenderer::default(), &frames, n);
+            assert_eq!(after_gap, cold, "the missing frame counts as empty");
+        }
+
+        #[test]
+        fn returned_frame_renders_as_before() {
             let frames = crossing();
             let n = frames.len() - 1;
             let mut state = IncrementalRenderer::default();
             let (first, _) = render_converting(&mut state, &frames, n);
-
-            struct Gap<'a>(ConvertingFrames<'a>, usize);
-            impl FrameSource for Gap<'_> {
-                fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
-                    if index == self.1 {
-                        f(None);
-                    } else {
-                        self.0.with_frame(index, f);
-                    }
-                }
-                fn with_frame_if_wanted(
-                    &mut self,
-                    index: usize,
-                    wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
-                    f: &mut dyn FnMut(Option<Image<'_>>),
-                ) {
-                    if index == self.1 {
-                        f(None);
-                    } else {
-                        self.0.with_frame_if_wanted(index, wanted, f);
-                    }
-                }
-            }
-            let s = swarm_settings();
-            let start = n.saturating_sub(crate::previous_frames_needed(&s) as usize);
-            let clip = &frames[start..=n];
-            let with_gap = |state: &mut IncrementalRenderer| {
-                let mut pixels = vec![Argb::<u8>::default(); (W * H) as usize];
-                let converting = ConvertingFrames {
-                    frames: clip,
-                    converted: Vec::new(),
-                };
-                let mut source = Gap(converting, 4 - start);
-                let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
-                state.render_frame(&s, &mut source, clip.len(), n as i64, out);
-                pixels
-            };
-            let after_gap = with_gap(&mut state);
-            let cold = with_gap(&mut IncrementalRenderer::default());
-            assert_eq!(after_gap, cold, "the missing frame counts as empty");
-
+            render_without_frame_4(&mut state, &frames, n);
             let (back, _) = render_converting(&mut state, &frames, n);
             assert_eq!(back, first);
         }
 
-        /// A check that skips converting earlier frames can't hide what a lost device took with it:
-        /// the tiles are in RAM, so the new device's empty atlas fills from them and the whole trail
-        /// draws. A change to an earlier frame is still found on the new device.
-        #[test]
-        fn new_device_draws_whole_trail_unconverted() {
-            let _lock = gpu_test_lock();
+        fn cold_render(frames: &[Vec<Argb<u8>>], n: usize) -> Vec<Argb<u8>> {
+            render_converting(&mut IncrementalRenderer::default(), frames, n).0
+        }
+
+        /// A render of [`render_across_device_loss`]: its pixels, the frames it converted, the
+        /// GPU draws so far and the drawer it reports.
+        struct Step {
+            pixels: Vec<Argb<u8>>,
+            converted: Vec<usize>,
+            drawn: u64,
+            draw: Option<String>,
+        }
+
+        fn step(state: &mut IncrementalRenderer, frames: &[Vec<Argb<u8>>], n: usize) -> Step {
+            let (pixels, converted) = render_converting(state, frames, n);
+            Step {
+                pixels,
+                converted,
+                drawn: drawn(state),
+                draw: state.report().draw,
+            }
+        }
+
+        /// The renders of the last frame of `crossing()` on a first device, after its loss, and
+        /// on the slot's next device.
+        struct DeviceLoss {
+            state: IncrementalRenderer,
+            frames: Vec<Vec<Argb<u8>>>,
+            n: usize,
+            on_first: Step,
+            on_cpu: Step,
+            on_second: Step,
+            second_name: String,
+            devices_differ: bool,
+        }
+
+        fn render_across_device_loss() -> DeviceLoss {
             let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
             gpu::open(&choice)
                 .or_else(|_| gpu::open("fallback"))
@@ -3577,46 +3684,79 @@ mod tests {
                 }
             };
             let first_device = device();
-            let mut frames = crossing();
+            let frames = crossing();
             let n = frames.len() - 1;
-            let cold = |frames: &[Vec<Argb<u8>>]| {
-                render_converting(&mut IncrementalRenderer::default(), frames, n).0
-            };
             let mut state = IncrementalRenderer {
                 test_slot: Some(slot),
                 ..Default::default()
             };
             state.use_gpu(true);
             render_converting(&mut state, &frames, n);
-            let (on_first, converted) = render_converting(&mut state, &frames, n);
-            assert_eq!(converted, [n], "nothing changed");
-            assert!(drawn(&state) > 0, "drawing on the GPU before the loss");
-            assert!(within_gpu_bound(&cold(&frames), &on_first));
-
+            let on_first = step(&mut state, &frames, n);
             first_device.device.destroy();
-            let (on_cpu, converted) = render_converting(&mut state, &frames, n);
-            assert_eq!(converted, [n], "the loss changed no frame");
-            assert_eq!(state.report().draw.as_deref(), Some("CPU"));
-            assert_eq!(on_cpu, cold(&frames), "the render after the loss");
-
+            let on_cpu = step(&mut state, &frames, n);
             let second_device = device();
-            assert!(!Arc::ptr_eq(&first_device, &second_device));
-            let (on_second, converted) = render_converting(&mut state, &frames, n);
-            assert_eq!(converted, [n], "the new device needs no earlier frame");
-            assert!(drawn(&state) > 0, "the instance stayed on the CPU");
-            assert_eq!(
-                state.report().draw,
-                Some(format!("GPU ({})", second_device.info.name))
-            );
-            assert!(within_gpu_bound(&cold(&frames), &on_second));
+            let on_second = step(&mut state, &frames, n);
+            DeviceLoss {
+                state,
+                frames,
+                n,
+                on_first,
+                on_cpu,
+                on_second,
+                second_name: second_device.info.name.clone(),
+                devices_differ: !Arc::ptr_eq(&first_device, &second_device),
+            }
+        }
 
+        /// A check that skips converting earlier frames can't hide what a lost device took with it:
+        /// the tiles are in RAM, so the new device's empty atlas fills from them and the whole trail
+        /// draws.
+        #[test]
+        fn new_device_fills_atlas_without_converting() {
+            let _lock = gpu_test_lock();
+            let loss = render_across_device_loss();
+            let cold = cold_render(&loss.frames, loss.n);
+            let n = loss.n;
+
+            let on_first = &loss.on_first;
+            assert_eq!(on_first.converted, [n], "nothing changed");
+            assert!(on_first.drawn > 0, "drawing on the GPU before the loss");
+            assert!(within_gpu_bound(&cold, &on_first.pixels));
+
+            let on_cpu = &loss.on_cpu;
+            assert_eq!(on_cpu.converted, [n], "the loss changed no frame");
+            assert_eq!(on_cpu.draw.as_deref(), Some("CPU"));
+            assert_eq!(on_cpu.pixels, cold, "the render after the loss");
+
+            assert!(loss.devices_differ);
+            let on_second = &loss.on_second;
+            assert_eq!(
+                on_second.converted,
+                [n],
+                "the new device needs no earlier frame"
+            );
+            assert!(on_second.drawn > 0, "the instance stayed on the CPU");
+            assert_eq!(on_second.draw, Some(format!("GPU ({})", loss.second_name)));
+            assert!(within_gpu_bound(&cold, &on_second.pixels));
+        }
+
+        #[test]
+        fn new_device_finds_earlier_edit() {
+            let _lock = gpu_test_lock();
+            let DeviceLoss {
+                mut state,
+                mut frames,
+                n,
+                ..
+            } = render_across_device_loss();
             frames[4][0].alpha ^= 1;
             let (_, converted) = render_converting(&mut state, &frames, n);
             assert!(converted.contains(&4), "the change on the new device");
             assert!(!converted.contains(&3), "frames before it are unchanged");
             let (edited, converted) = render_converting(&mut state, &frames, n);
             assert_eq!(converted, [n], "the change is taken in");
-            assert!(within_gpu_bound(&cold(&frames), &edited));
+            assert!(within_gpu_bound(&cold_render(&frames, n), &edited));
         }
     }
 }

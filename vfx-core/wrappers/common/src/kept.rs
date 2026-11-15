@@ -161,7 +161,10 @@ impl CpuInstance {
     }
 }
 
-/// The effect `make` returns, which must be a CPU effect.
+/// The CPU effect `make` returns.
+///
+/// # Panics
+/// If `make` returns a GPU effect.
 pub(crate) fn cpu_effect(make: fn() -> Processor) -> Box<dyn CpuEffect> {
     match make() {
         Processor::Cpu(effect) => effect,

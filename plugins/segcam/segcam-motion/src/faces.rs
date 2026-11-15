@@ -23,7 +23,8 @@ mod models {
     static RUNS_ON: Mutex<Option<&'static str>> = Mutex::new(None);
 
     /// The models, once they have loaded or failed to. A panic while they ran leaves them usable:
-    /// each detection starts over, so only that detection's faces are lost.
+    /// each detection starts over, so only that detection's faces are lost; a poisoned lock would
+    /// drop faces from every later render without a word.
     pub(super) fn lock() -> Option<MutexGuard<'static, Option<Segmenter>>> {
         let models = MODELS.get()?;
         Some(models.lock().unwrap_or_else(|poisoned| {
@@ -376,7 +377,7 @@ mod models {
         }
 
         #[test]
-        fn on_d3d12_adapter_matches_directml_name() {
+        fn on_d3d12_adapter_requires_same_name_on_dx12() {
             use vfx_core::wgpu::{AdapterInfo, Backend, DeviceType};
             let adapter = |name: &str, backend| AdapterInfo {
                 name: name.to_owned(),
@@ -469,8 +470,8 @@ mod live {
     /// detections on a GPU that also draws the renders leave the renders waiting behind them.
     const DETECTION_PACE: u32 = 2;
 
-    /// Bodies are looked for no more often than once per their detection's time times this; the
-    /// detections between keep the last detected bodies, since bodies move less than faces.
+    /// [`DETECTION_PACE`] for bodies: on an integrated GPU body detection costs more than faces.
+    /// The detections between keep the last bodies, which move less than faces.
     const BODY_PACE: u32 = 4;
 
     /// The faces found in one frame, and that frame's pixels.
@@ -1011,7 +1012,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn held_faces_use_own_frame() {
+    fn faces_on_marks_reuse_after_found_frame() {
         let mut live = LiveFaces::default();
         live.hold(
             FaceParts::default(),
@@ -1119,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_recut_before_leaving_trail() {
+    fn windows_leave_before_resets_on_cut() {
         let mut live = LiveFaces::default();
         live.hold(FaceParts::default(), vec![Blob::default()], 10, 0);
         assert!(!live.windows_leave_before(16, 6));

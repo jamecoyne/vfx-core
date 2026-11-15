@@ -54,16 +54,16 @@ pub enum MetadataError {
         path: PathBuf,
         source: toml::de::Error,
     },
-    #[error("no [package]")]
-    NoPackage,
+    #[error("{} has no [package]", .path.display())]
+    NoPackage { path: PathBuf },
     #[error("{} has no [package.metadata.vfx]", .path.display())]
     NoMetadata { path: PathBuf },
     #[error("[package.metadata.vfx] needs {0}")]
     MissingField(&'static str),
     #[error("[package.metadata.vfx] features must be a table")]
     FeaturesNotTable,
-    #[error("features.{0} must be a list of feature names")]
-    FeatureList(String),
+    #[error("[package.metadata.vfx] features.{0} must be a list of feature names")]
+    FeatureNotList(String),
     /// A value a host would refuse; the text names the key and the host's limit.
     #[error("[package.metadata.vfx] {0}")]
     Invalid(String),
@@ -89,7 +89,9 @@ impl Metadata {
     pub fn read(dir: &Path) -> Result<Self, MetadataError> {
         let path = dir.join("Cargo.toml");
         let doc = read_manifest(&path)?;
-        let package = doc.get("package").ok_or(MetadataError::NoPackage)?;
+        let Some(package) = doc.get("package") else {
+            return Err(MetadataError::NoPackage { path });
+        };
         let meta = package
             .get("metadata")
             .and_then(|m| m.get("vfx"))
@@ -114,7 +116,7 @@ impl Metadata {
                 let names = list
                     .as_array()
                     .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_owned)).collect())
-                    .ok_or_else(|| MetadataError::FeatureList(key.clone()))?;
+                    .ok_or_else(|| MetadataError::FeatureNotList(key.clone()))?;
                 features.insert(key.clone(), names);
             }
         }
@@ -456,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn effect_dependencies_lists_preview() {
+    fn effect_dependencies_finds_preview_effects() {
         let preview = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hosts/preview");
         let names: Vec<String> = effect_dependencies(&preview)
             .unwrap()

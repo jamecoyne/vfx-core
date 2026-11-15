@@ -1,7 +1,7 @@
 //! A swarm drawn into a host's GPU frame (`CpuEffect::render_to`, as FFGL offers on Windows)
 //! against the same swarm drawn on the GPU and read back: every pixel the same. Its own test
-//! binary, since the host's device has to be shared before segcam opens one. Ignored except on macOS, where CI has a
-//! hardware adapter.
+//! binary, since the host's device has to be shared before segcam opens one. Ignored except on
+//! macOS, where CI has a hardware adapter.
 
 mod motion_only;
 

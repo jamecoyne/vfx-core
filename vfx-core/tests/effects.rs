@@ -164,7 +164,7 @@ fn feedback_trail_fades_across_frames() {
 }
 
 #[test]
-fn chain_three_stages_match_formula() {
+fn chain_of_three_matches_composed_formula() {
     let gpu = gpu();
     let input = solid([128, 64, 200, 255]);
     // Three stages exercise both scratch frames. A zero-radius blur passes through,

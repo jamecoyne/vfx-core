@@ -1,6 +1,6 @@
 //! A live host's renders while the face models load, against renders with faces off, and the
 //! faces arriving once they are up. In a file of its own so its process starts with the models
-//! not loaded. Reads a portrait like `faces.rs` and is ignored without `SEGCAM_FACE_PORTRAIT`.
+//! not loaded. Reads a portrait like `faces.rs`, so it is ignored like them.
 #![cfg(not(target_arch = "wasm32"))]
 
 mod motion_only;
@@ -53,7 +53,7 @@ fn same_path(a: &SegcamMotion, b: &SegcamMotion) -> bool {
 
 #[test]
 #[ignore = "needs SEGCAM_FACE_PORTRAIT, a P6 PPM of a face"]
-fn renders_match_faces_off_until_models_load() {
+fn faces_appear_only_after_models_load() {
     let p = portrait();
     let clip = drifting(&p);
     let all = ["face", "eyes", "mouth", "body"];

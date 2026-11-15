@@ -174,7 +174,8 @@ pub(crate) enum DeviceError {
     NoAdapter(#[source] wgpu::RequestAdapterError),
     #[error("couldn't open the GPU: {0}")]
     Request(#[source] wgpu::RequestDeviceError),
-    /// After a reset the only adapter left can be a software one, which would stay on.
+    /// A hardware device was lost and only a software adapter came back; the preview would
+    /// stay on it for the rest of the show.
     #[cfg(not(target_arch = "wasm32"))]
     #[error("{0} draws in software")]
     Software(String),
@@ -1851,11 +1852,11 @@ fn fit_still(image: &image::RgbaImage, size: (u32, u32)) -> Vec<f32> {
     canvas.as_raw().iter().map(|&b| b as f32 / 255.0).collect()
 }
 
-/// A command line flag the run cannot apply; the text is the one error printed.
+/// Why the command line's options could not be applied.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, thiserror::Error)]
 enum StartError {
-    /// The panel's message when the input failed to open.
+    /// A message the panel would show, returned as an error in a scripted run.
     #[error("{0}")]
     Status(String),
     #[error("--size {}x{}: this GPU's limit is {limit}", size.0, size.1)]
@@ -2177,8 +2178,8 @@ pub(crate) enum RemoveDeviceError {
     #[error("--lose-gpu removed: not on D3D12; WGPU_BACKEND=dx12 asks for it")]
     NotD3d12,
     #[cfg(windows)]
-    #[error(transparent)]
-    Cast(windows::core::Error),
+    #[error("--lose-gpu removed: no ID3D12Device5: {0}")]
+    NoDevice5(#[source] windows::core::Error),
     #[cfg(not(windows))]
     #[error("--lose-gpu removed: D3D12 only")]
     Unsupported,
@@ -2197,7 +2198,7 @@ pub(crate) fn remove_d3d12_device(device: &wgpu::Device) -> Result<(), RemoveDev
             .as_hal::<wgpu::hal::api::Dx12>()
             .ok_or(RemoveDeviceError::NotD3d12)?;
         let device = hal.raw_device().cast::<ID3D12Device5>();
-        device.map_err(RemoveDeviceError::Cast)?.RemoveDevice();
+        device.map_err(RemoveDeviceError::NoDevice5)?.RemoveDevice();
     }
     Ok(())
 }

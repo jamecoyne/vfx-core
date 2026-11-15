@@ -1103,7 +1103,7 @@ mod tests {
     /// segcam through the preview: the disc pattern moves, so after a few frames the
     /// motion matte is opaque somewhere and clear somewhere else.
     #[test]
-    fn segcam_tracks_moving_disc() {
+    fn segcam_matte_separates_moving_disc() {
         let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
@@ -1194,7 +1194,7 @@ mod tests {
 
     /// A GPU effect's state was on the device, so it's rebuilt and draws the same frame again.
     #[test]
-    fn gpu_effect_resets_on_new_device() {
+    fn gpu_effect_redraws_same_frame_on_new_device() {
         let (_turn, lost) = crate::test_gpu();
         let mut effects = Effects::new(&lost);
         let (mut controls, values) = shown("Gaussian Blur");

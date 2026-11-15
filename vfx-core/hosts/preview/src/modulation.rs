@@ -1,6 +1,7 @@
-//! Expressions on effect parameters, like `sin(time / 4)` or `value + bass * 0.5`,
-//! evaluated every frame. An empty box leaves the slider in charge; a valid expression
-//! replaces the slider's value, which it can still read as `value`.
+//! Expressions on effect parameters, typed in a box under each slider, like
+//! `sin(time / 4)` or `value + bass * 0.5`, evaluated every frame. An empty box
+//! leaves the slider in charge; a valid expression replaces the slider's value,
+//! which it can still read as `value`.
 
 use egui::{Color32, RichText, Ui};
 
@@ -502,8 +503,8 @@ impl Expr {
             }
             Expr::Smooth(x, amount, state) => {
                 let x = x.eval(env);
-                // Frame-rate independent one-pole smoothing: `amount` is the share kept
-                // at the frame rate the exponent assumes.
+                // Frame-rate independent one-pole smoothing: `amount` is the share of
+                // the old value kept per 1/60 of a second, scaled to this frame's `dt`.
                 let keep = amount.eval(env).clamp(0.0, 0.999).powf(env.dt * 60.0);
                 let v = match *state {
                     Some(prev) if prev.is_finite() => prev + (x - prev) * (1.0 - keep),
@@ -669,12 +670,12 @@ impl Parser {
                 self.pos += 1;
                 self.unary()
             }
-            _ => self.exponent(),
+            _ => self.power(),
         }
     }
 
     /// `^` binds tighter than unary minus on its left and groups right to left.
-    fn exponent(&mut self) -> Result<Expr, ExprError> {
+    fn power(&mut self) -> Result<Expr, ExprError> {
         let base = self.atom()?;
         if self.peek() == Some(&Token::Op(Op::Pow)) {
             self.pos += 1;

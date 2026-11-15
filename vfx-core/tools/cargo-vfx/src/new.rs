@@ -274,7 +274,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_from_crate_name() {
+    fn identity_from_fills_each_field() {
         let id = Identity::from("my-glow");
         assert_eq!((id.name.as_str(), id.file.as_str()), ("My Glow", "MyGlow"));
         assert_eq!(id.ffgl_code, "MYGL");
@@ -284,12 +284,16 @@ mod tests {
     }
 
     #[test]
-    fn add_member_and_dependency_register_crate() {
+    fn add_member_appends_to_members() {
         let ws = "[workspace]\nmembers = [\".\", \"plugins/a\"]\n";
         assert_eq!(
             add_member(ws, "plugins/b").unwrap(),
             "[workspace]\nmembers = [\".\", \"plugins/a\", \"plugins/b\"]\n"
         );
+    }
+
+    #[test]
+    fn add_effect_dependency_inserts_after_last_effect() {
         let preview = "[dependencies]\nx = 1\na = { path = \"../../../plugins/a\" }\ny = 2\n\n[target.'cfg(windows)'.dependencies]\nf = { path = \"../../../plugins/f\", optional = true }\n";
         assert_eq!(
             add_effect_dependency(preview, "b").unwrap(),

@@ -1115,7 +1115,8 @@ impl D3d {
     /// Blocks until the GPU has done everything submitted before `query` was ended. Fails when
     /// the device was removed (a driver reset), or the copy takes past [`COPY_DEADLINE`].
     fn wait(&self, query: &ID3D11Query) -> Result<(), SpoutError> {
-        // SAFETY: End and GetData on the caller's own query; an event query writes one BOOL.
+        // SAFETY: `query` is an event query made on this device, so End and GetData on this
+        // context are valid and GetData writes one BOOL.
         unsafe { self.context.End(query) };
         let mut flags = 0;
         let finished = wait_until(Instant::now() + COPY_DEADLINE, || {
@@ -1661,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn sender_name_prefers_whole_match() {
+    fn sender_name_ranks_whole_over_part_match() {
         let senders = ["TD out 2".to_owned(), "TD out".to_owned(), "OBS".to_owned()];
         assert_eq!(sender_name(&senders, "").as_deref(), Ok("TD out 2"));
         assert_eq!(sender_name(&senders, "td OUT").as_deref(), Ok("TD out"));
@@ -1711,12 +1712,10 @@ mod tests {
         );
     }
 
-    /// A sender that isn't running is waited for, and nothing the render loop calls waits on it.
-    #[test]
-    fn missing_sender_status_does_not_block() {
-        let name = format!("vfx-preview missing {}", std::process::id());
-        let started = Instant::now();
-        let mut receiver = Receiver::start(
+    /// A receiver for a sender name no process publishes.
+    fn missing_sender_receiver(test: &str) -> (String, Receiver) {
+        let name = format!("vfx-preview {test} {}", std::process::id());
+        let receiver = Receiver::start(
             name.clone(),
             AdapterId {
                 vendor: 0,
@@ -1724,10 +1723,24 @@ mod tests {
             },
             1920,
         );
+        (name, receiver)
+    }
+
+    #[test]
+    fn missing_sender_reports_waiting() {
+        let (name, mut receiver) = missing_sender_receiver("missing");
         assert_eq!(sender_size(&name, 1920), None);
         let waiting = format!("Waiting for the Spout sender {name}");
         assert_eq!(receiver.status_change(), Some(Some(waiting)));
         assert_eq!(receiver.status_change(), None);
+    }
+
+    /// Nothing the render loop calls waits on a sender that isn't running.
+    #[test]
+    fn missing_sender_never_blocks() {
+        let started = Instant::now();
+        let (_, mut receiver) = missing_sender_receiver("missing unblocked");
+        receiver.status_change();
         drop(receiver);
         assert!(
             started.elapsed() < Duration::from_millis(100),
@@ -1845,10 +1858,23 @@ mod tests {
         }
     }
 
-    /// Frames arrive with their colours, on whichever path the adapters allow, and a sender that
-    /// restarts with a new texture is picked up again with no call from the render loop.
     #[test]
-    fn receiver_reads_frames_and_reconnects() {
+    fn receiver_reads_sender_colours() {
+        let (_turn, gpu) = crate::test_gpu();
+        let id = AdapterId::of(&gpu.device.adapter_info());
+        let name = format!("vfx-preview colours {}", std::process::id());
+        let size = (64, 36);
+        let mut receiver = Receiver::start(name.clone(), id, 1920);
+
+        let sender = TestSender::publish(&name, id, size, [10, 200, 30, 255]);
+        assert_eq!(sender_size(&name, 1920), Some(size));
+        assert_eq!(received(&gpu, &mut receiver, size)[..4], [30, 200, 10, 255]);
+        sender.close();
+    }
+
+    /// A sender that restarts with a new texture is picked up with no call from the render loop.
+    #[test]
+    fn receiver_reconnects_to_restarted_sender() {
         let (_turn, gpu) = crate::test_gpu();
         let id = AdapterId::of(&gpu.device.adapter_info());
         let name = format!("vfx-preview restart {}", std::process::id());
@@ -1856,8 +1882,7 @@ mod tests {
         let mut receiver = Receiver::start(name.clone(), id, 1920);
 
         let first = TestSender::publish(&name, id, size, [10, 200, 30, 255]);
-        assert_eq!(sender_size(&name, 1920), Some(size));
-        assert_eq!(received(&gpu, &mut receiver, size)[..4], [30, 200, 10, 255]);
+        received(&gpu, &mut receiver, size);
         first.close();
 
         let second = TestSender::publish(&name, id, size, [250, 40, 120, 128]);
@@ -1891,32 +1916,42 @@ mod tests {
         sender.close();
     }
 
-    /// A failing GetData, as after a driver reset, ends the wait with an error; a copy that never
-    /// finishes ends it at the deadline. Neither spins on.
-    #[test]
-    fn wait_until_stops_on_error_and_deadline() {
-        let removed = || {
-            Err(windows::core::Error::from_hresult(
-                windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
-            ))
-        };
-        let far = Instant::now() + Duration::from_secs(60);
-        assert!(matches!(
-            wait_until(far, removed),
-            Err(SpoutError::CopyFailed(_))
-        ));
+    mod wait_until {
+        use super::*;
 
-        let started = Instant::now();
-        let stalled = wait_until(started + Duration::from_millis(20), || Ok(false));
-        assert!(matches!(stalled, Err(SpoutError::CopyTimeout)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        /// GetData fails this way after a driver reset.
+        #[test]
+        fn fails_on_device_removed() {
+            let removed = || {
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+                ))
+            };
+            let far = Instant::now() + Duration::from_secs(60);
+            assert!(matches!(
+                wait_until(far, removed),
+                Err(SpoutError::CopyFailed(_))
+            ));
+        }
 
-        let mut polls = 0;
-        let finished = wait_until(far, || {
-            polls += 1;
-            Ok(polls == 3)
-        });
-        assert!(finished.is_ok());
+        #[test]
+        fn times_out_at_deadline() {
+            let started = Instant::now();
+            let stalled = wait_until(started + Duration::from_millis(20), || Ok(false));
+            assert!(matches!(stalled, Err(SpoutError::CopyTimeout)));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn returns_when_done() {
+            let far = Instant::now() + Duration::from_secs(60);
+            let mut polls = 0;
+            let finished = wait_until(far, || {
+                polls += 1;
+                Ok(polls == 3)
+            });
+            assert!(finished.is_ok());
+        }
     }
 
     #[test]
@@ -1927,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn fit_matches_video_sizing() {
+    fn fit_scales_to_max_side_rounding_to_even() {
         assert_eq!(fit((1920, 1080), 1920), (1920, 1080));
         assert_eq!(fit((3840, 2160), 1920), (1920, 1080));
         assert_eq!(fit((1281, 721), 1920), (1280, 720));

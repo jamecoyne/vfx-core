@@ -1,4 +1,4 @@
-//! The one error type of `cargo vfx`. `Display` is what the tool prints after `cargo vfx: `.
+//! Errors of `cargo vfx`. `Display` is the text printed after `cargo vfx: `.
 
 use std::io;
 use std::path::PathBuf;
@@ -54,18 +54,18 @@ pub enum Error {
     #[error(transparent)]
     Metadata(#[from] vfx_build::MetadataError),
     #[error("{}", .0.join("\n"))]
-    Identities(Vec<String>),
+    DuplicateIdentities(Vec<String>),
     #[error("cargo metadata: {0}")]
-    CargoMetadataRun(#[source] io::Error),
+    CargoMetadataSpawn(#[source] io::Error),
     #[error("cargo metadata: {0}")]
     CargoMetadataJson(#[source] serde_json::Error),
     #[error("cargo metadata: no packages")]
     CargoMetadataNoPackages,
-    #[error("{0}")]
+    #[error("cargo metadata failed:\n{0}")]
     CargoMetadataFailed(String),
 
     #[error("{command}: {source}")]
-    Spawn {
+    Run {
         command: String,
         #[source]
         source: io::Error,
@@ -94,8 +94,8 @@ pub enum Error {
 
     #[error("{usage}", usage = bench::USAGE)]
     BenchUsage,
-    #[error("{0} needs a value\n{usage}", usage = bench::USAGE)]
-    BenchMissingValue(String),
+    #[error("{flag} needs a value\n{usage}", usage = bench::USAGE)]
+    BenchMissingValue { flag: String },
     #[error("unknown preset `{0}`\n{usage}", usage = bench::USAGE)]
     UnknownPreset(String),
     #[error("unknown depth `{0}`\n{usage}", usage = bench::USAGE)]
@@ -103,13 +103,13 @@ pub enum Error {
     #[error("--runs needs a count\n{usage}", usage = bench::USAGE)]
     InvalidRuns,
     #[error("unknown argument `{0}`\n{usage}", usage = bench::USAGE)]
-    UnknownBenchArgument(String),
+    BenchUnknownArgument(String),
     #[error("{preset}: no face models, so this row would time no faces:\n{log}")]
     NoFaceModels { preset: &'static str, log: String },
     #[error("{preset}: the CLI named no path:\n{log}")]
     NoPathNamed { preset: &'static str, log: String },
     #[error("the CLI has no {0}")]
-    CliPipeMissing(&'static str),
+    MissingCliPipe(&'static str),
     #[error("reading the CLI's frames: {0}")]
     CliFrames(#[source] io::Error),
     #[error("{command} failed ({status}):\n{log}")]
@@ -119,7 +119,7 @@ pub enum Error {
         log: String,
     },
     #[error("{}: {source}", path.display())]
-    Reference {
+    ReferenceMismatch {
         path: PathBuf,
         #[source]
         source: bench::HeaderMismatch,

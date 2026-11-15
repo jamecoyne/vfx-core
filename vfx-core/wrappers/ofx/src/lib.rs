@@ -1337,7 +1337,7 @@ mod tests {
         /// An export's skips at its start aren't dropped frames; playback's later on are, until the
         /// stream breaks.
         #[test]
-        fn drops_flagged_only_after_run() {
+        fn frames_dropped_only_after_run() {
             let dropped = |frames: &[i64]| {
                 positions(frames, std::time::Duration::ZERO)
                     .iter()
@@ -1427,9 +1427,10 @@ mod tests {
             assert!(after.follows && !after.continues && !after.frames_dropped);
         }
 
-        /// A person can be this quick, so this doesn't resume, though it follows.
+        /// A render 200 ms after a possible stop follows it but doesn't resume: a person can
+        /// step that fast.
         #[test]
-        fn slow_follow_does_not_resume() {
+        fn paused_follow_does_not_resume() {
             let after = after_possible_stop(std::time::Duration::from_millis(200));
             assert!(after.follows && !after.continues && !after.frames_dropped);
         }

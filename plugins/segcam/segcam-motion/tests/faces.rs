@@ -1,7 +1,8 @@
 //! Faces run on every 2nd analysis, and the analysis between reuses the faces of the one
 //! before: below 90 fps, even frames run them and odd frames reuse them. Checked on a real portrait
 //! the face models find, read from the file `SEGCAM_FACE_PORTRAIT` names (a binary PPM, P6, at
-//! most 180 pixels tall). The tests are ignored without it.
+//! most 180 pixels tall). The tests are ignored; run them with `--ignored` and
+//! `SEGCAM_FACE_PORTRAIT` set.
 #![cfg(not(target_arch = "wasm32"))]
 
 mod motion_only;
@@ -320,7 +321,7 @@ fn odd_frames_reuse_previous_faces() {
 
 #[test]
 #[ignore = "needs SEGCAM_FACE_PORTRAIT, a P6 PPM of a face"]
-fn high_rate_faces_run_every_other_analysis() {
+fn step_2_faces_run_every_other_analysis() {
     let p = portrait();
     let (left, right) = (frame(&p, 90, 80, None), frame(&p, 230, 80, None));
     let shown = |out: &[Argb<u8>], x: i32| out[(80 * W + x) as usize].alpha == 255;

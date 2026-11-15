@@ -261,7 +261,7 @@ enum ReadbackError {
     #[error(transparent)]
     Poll(#[from] crate::PollFailure),
     #[error(transparent)]
-    Timeout(#[from] std::sync::mpsc::RecvTimeoutError),
+    Recv(#[from] std::sync::mpsc::RecvTimeoutError),
     #[error(transparent)]
     Map(#[from] wgpu::BufferAsyncError),
 }

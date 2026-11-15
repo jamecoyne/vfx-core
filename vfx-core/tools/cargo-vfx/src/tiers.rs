@@ -32,6 +32,15 @@ const CORE: [&str; 11] = [
     "cargo-vfx",
 ];
 const WRAPPERS: [&str; 4] = ["vfx-ae", "vfx-ofx", "vfx-ffgl", "vfx-ffgl-common"];
+/// segcam-motion's test targets whose tests need a GPU segcam draws on, ignored off macOS.
+const HARDWARE_GPU_TESTS: [&str; 6] = [
+    "contract",
+    "device_reopen",
+    "gpu",
+    "shared_device_earlier_error",
+    "target",
+    "target_on_other_device",
+];
 const HOST_FEATURES: &str = "vfx-chain/ae,vfx-chain/ofx,vfx-chain/ffgl,colour-adjust/ae,colour-adjust/ofx,colour-adjust/ffgl,gaussian-blur/ae,gaussian-blur/ofx,gaussian-blur/ffgl,vignette/ae,vignette/ofx,vignette/ffgl,blend/ae,blend/ofx,blend/ffgl,segcam-motion/ae,segcam-motion/ofx,segcam-motion/ffgl";
 const WASM: &str = "wasm32-unknown-unknown";
 
@@ -104,6 +113,17 @@ fn full(root: &Path, logs: &Path) -> Vec<(String, Command)> {
         format_check(),
         ("clippy-core".into(), clippy(&CORE, &[])),
         ("tests-core".into(), test(&CORE, &[])),
+    ];
+    // Windows and Linux CI have only software adapters, so these tests are ignored off macOS.
+    if !cfg!(target_os = "macos") {
+        let mut cmd = test(&["segcam-motion"], &[]);
+        for target in HARDWARE_GPU_TESTS {
+            cmd.args(["--test", target]);
+        }
+        cmd.args(["--", "--include-ignored"]);
+        steps.push(("tests-gpu".into(), cmd));
+    }
+    steps.extend([
         (
             "clippy-noort".into(),
             clippy(&["segcam-face"], &["--no-default-features"]),
@@ -112,7 +132,7 @@ fn full(root: &Path, logs: &Path) -> Vec<(String, Command)> {
             "tests-noort".into(),
             test(&["segcam-face"], &["--no-default-features"]),
         ),
-    ];
+    ]);
     // CI builds the plugins and runs the mini hosts on macOS and Windows only.
     if cfg!(any(target_os = "macos", windows)) {
         let mut plugin_crates = WRAPPERS.to_vec();
@@ -253,7 +273,7 @@ fn changed_packages(root: &Path) -> Result<Vec<String>> {
         .current_dir(root)
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .output()
-        .map_err(Error::CargoMetadataRun)?;
+        .map_err(Error::CargoMetadataSpawn)?;
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(Error::CargoMetadataJson)?;
     let root = Path::new(json["workspace_root"].as_str().unwrap_or("."));

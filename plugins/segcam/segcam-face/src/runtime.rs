@@ -113,7 +113,8 @@ fn device_named(name: &str) -> Option<Device> {
 }
 
 /// The lowest YuNet score that becomes a face window. YuNet's usual 0.6 finds half faces and far
-/// faces that Vision, and so segcam 1.1, leave out; this cut matches Vision's faces best.
+/// faces that Vision, and so segcam 1.1, leave out; this cut agrees best with Vision on which
+/// frames have a face.
 const SEGMENTER_FACE_SCORE: f32 = 0.85;
 
 /// The face models loaded on one device, and how long they took there.
@@ -221,9 +222,10 @@ struct AdapterMemory {
     software: bool,
 }
 
-/// Leaves out software adapters and an integrated GPU beside a discrete one: it can't win, and
-/// compiling the models for it is the slowest part of a first load. Integrated GPUs are told apart
-/// by their little dedicated memory, since asking D3D12 about unified memory opens a device.
+/// Leaves out software adapters, and an integrated GPU beside a discrete one: such a GPU can't
+/// win the trial, and compiling the models for it is the slowest part of a first load.
+/// Integrated GPUs are told apart by their little dedicated memory, since asking D3D12 about
+/// unified memory opens a device.
 #[cfg(windows)]
 fn trial_adapters(adapters: &[AdapterMemory]) -> Vec<u32> {
     let hardware = || adapters.iter().filter(|adapter| !adapter.software);
@@ -279,8 +281,8 @@ fn time_runs(
 /// and compete with the render for its cores. Detection runs no less often with these.
 const CPU_THREADS: usize = 2;
 
-/// Consecutive failed runs that mean a session has stopped working, not that one frame went wrong.
-const MAX_FAILED_RUNS: u32 = 3;
+/// Consecutive failed runs after which a session counts as stopped, not as one bad frame.
+const FAILING_AFTER_RUNS: u32 = 3;
 
 fn session(model: &[u8], device: Device) -> ort::Result<Session> {
     // ONNX Runtime allows one environment per process, and threads load models side by side.
@@ -378,7 +380,7 @@ impl Detector for OrtYuNet {
     }
 
     fn failing(&self) -> bool {
-        self.failed_runs >= MAX_FAILED_RUNS
+        self.failed_runs >= FAILING_AFTER_RUNS
     }
 }
 
@@ -441,7 +443,7 @@ impl BodyDetector for OrtPicoDet {
     }
 
     fn failing(&self) -> bool {
-        self.failed_runs >= MAX_FAILED_RUNS
+        self.failed_runs >= FAILING_AFTER_RUNS
     }
 }
 
@@ -512,7 +514,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn trial_adapters_skip_integrated_beside_discrete() {
+    fn trial_adapters_skip_software_and_integrated_beside_discrete() {
         let adapters = [
             adapter(0, 12, false),
             AdapterMemory {
@@ -578,6 +580,11 @@ mod tests {
         fn takes_lowest_close_adapter() {
             let times = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(12))];
             assert_eq!(preferred_trial_index(&times), Some(1));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn keeps_fastest_adapter_beyond_margin() {
             let far = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(40))];
             assert_eq!(preferred_trial_index(&far), Some(0));
         }

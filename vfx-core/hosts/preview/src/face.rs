@@ -1,7 +1,8 @@
 //! Face tracking for expressions: the most confident face's box, eyes, nose and mouth,
 //! as positions from 0 to 1 across the frame (origin top left, like the vignette
-//! centre), from OpenCV's YuNet: a box and five points, no mesh. macOS runs it
-//! here through ONNX Runtime; elsewhere it is segcam-face's.
+//! centre), from OpenCV's YuNet: a box and five points, no mesh, so no mouth-open
+//! or blink. macOS runs it here on the CPU through ONNX Runtime; elsewhere it is
+//! segcam-face's.
 
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;

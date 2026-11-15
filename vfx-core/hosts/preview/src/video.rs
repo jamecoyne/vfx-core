@@ -186,7 +186,7 @@ pub enum VideoError {
     NoCameraMode,
     #[error("couldn't start ffmpeg (is it on PATH?): {0}")]
     DecodeSpawn(#[source] std::io::Error),
-    #[error("couldn't start ffmpeg: {0}")]
+    #[error("couldn't start ffmpeg (is it on PATH?): {0}")]
     EncodeSpawn(#[source] std::io::Error),
     #[error("ffmpeg stopped accepting frames")]
     EncoderClosed,
@@ -194,8 +194,8 @@ pub enum VideoError {
     FrameSizeChanged,
     #[error("ffmpeg failed ({0})")]
     EncodeFailed(std::process::ExitStatus),
-    #[error(transparent)]
-    Wait(std::io::Error),
+    #[error("couldn't wait for ffmpeg: {0}")]
+    EncodeWait(#[source] std::io::Error),
 }
 
 /// What ffprobe says about an input, plus the size frames are decoded at.
@@ -689,7 +689,7 @@ impl Encoder {
         match self.child.wait() {
             Ok(status) if status.success() => Ok(()),
             Ok(status) => Err(VideoError::EncodeFailed(status)),
-            Err(e) => Err(VideoError::Wait(e)),
+            Err(e) => Err(VideoError::EncodeWait(e)),
         }
     }
 }
@@ -797,7 +797,7 @@ mod tests {
         );
         assert!(!video.ended());
 
-        // Playing on from the paused seek reaches the end of the clip.
+        // A playing seek near the end plays on to the end of the clip.
         video.seek(2.0, true).unwrap();
         wait_for("the end", || {
             video.take_oldest(&mut pixels);

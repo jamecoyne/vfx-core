@@ -166,7 +166,7 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) {
     let needed = segcam_motion::previous_frames_needed(s) as usize;
     let mut cpu = IncrementalRenderer::default();
     let mut gpu = IncrementalRenderer::default();
-    segcam_motion::gpu::status().expect("a hardware GPU adapter");
+    segcam_motion::gpu::status().expect("a GPU adapter");
     gpu.use_gpu(true);
     let mut a = vec![Argb::<C>::default(); (w * h) as usize];
     let mut b = a.clone();
@@ -255,7 +255,7 @@ fn each_case<C: Depth>() {
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
-    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
 )]
 fn gpu_matches_cpu_u8() {
     each_case::<u8>();
@@ -264,7 +264,7 @@ fn gpu_matches_cpu_u8() {
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
-    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
 )]
 fn gpu_matches_cpu_u16() {
     each_case::<u16>();
@@ -273,7 +273,7 @@ fn gpu_matches_cpu_u16() {
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
-    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
 )]
 fn gpu_matches_cpu_f32() {
     each_case::<f32>();

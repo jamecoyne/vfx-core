@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn float32_round_trip_keeps_range() {
+    fn float32_round_trip_keeps_out_of_range_values() {
         let mut src = Vec::new();
         for v in [1.0f32, 2.5, -0.25, 0.5] {
             src.extend_from_slice(&v.to_ne_bytes());
@@ -230,18 +230,18 @@ mod tests {
     }
 
     #[test]
-    fn depth_from_bits_rejects_unknown() {
+    fn depth_from_bits_accepts_only_8_16_32() {
         assert_eq!(Depth::from_bits(8), Some(Depth::Bpc8));
         assert_eq!(Depth::from_bits(16), Some(Depth::Bpc16));
         assert_eq!(Depth::from_bits(32), Some(Depth::Bpc32));
         assert_eq!(Depth::from_bits(12), None);
     }
 
-    mod decode {
+    mod decode_onto {
         use super::*;
 
         #[test]
-        fn onto_places_at_offset() {
+        fn places_at_offset() {
             let placement = Placement {
                 canvas_width: 4,
                 canvas_height: 4,
@@ -255,7 +255,7 @@ mod tests {
         }
 
         #[test]
-        fn onto_clips_negative_offsets() {
+        fn clips_negative_offsets() {
             let placement = Placement {
                 canvas_width: 1,
                 canvas_height: 1,
@@ -270,6 +270,10 @@ mod tests {
                 "only the bottom-right pixel lands"
             );
         }
+    }
+
+    mod decode {
+        use super::*;
 
         #[test]
         fn argb8_uses_ae_channel_order() {
@@ -279,7 +283,7 @@ mod tests {
         }
 
         #[test]
-        fn argb16_scales_to_unit() {
+        fn argb16_maps_32768_to_one() {
             let mut src = Vec::new();
             for v in [32768u16, 0, 16384, 32768] {
                 src.extend_from_slice(&v.to_ne_bytes());

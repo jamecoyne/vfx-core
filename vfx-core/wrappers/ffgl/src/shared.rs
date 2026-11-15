@@ -1616,14 +1616,14 @@ mod tests {
     }
 
     fn two_devices() -> (Gpu, Gpu) {
-        let open = || pollster::block_on(Gpu::headless()).expect("no GPU adapter available");
+        let open = || pollster::block_on(Gpu::headless()).expect("a GPU adapter");
         (open(), open())
     }
 
     /// The path a stale frame takes: an interop on a new device, of the same size, with the frame
     /// still kept from the old one.
     #[test]
-    fn keep_or_make_follows_device_and_size() {
+    fn keep_or_make_reuses_only_same_device_and_size() {
         let (a, b) = two_devices();
         let mut kept = None;
         OutputFrame::keep_or_make(&mut kept, &a, (64, 32));
@@ -1715,12 +1715,9 @@ mod tests {
     /// One test at a time shares a device, since [`Gpu::share`] holds one for the whole process.
     static SHARING: Mutex<()> = Mutex::new(());
 
-    /// A try that fails leaves the device lost, and the try that works shares its device with a CPU
-    /// effect still on the lost one.
-    #[test]
-    #[ignore = "needs a Vulkan adapter that shares memory with OpenGL"]
-    fn failed_open_keeps_device_lost() {
-        let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
+    /// A shared device on the first adapter that shares memory with OpenGL, shared with CPU
+    /// effects and then lost.
+    fn lost_shared_device() -> Arc<SharedDevice> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -1730,12 +1727,19 @@ mod tests {
             .iter()
             .filter_map(SharedDevice::luid_of)
             .find_map(|luid| SharedDevice::open(luid).ok())
-            .expect("no adapter with shared memory");
-        let luid = first.luid;
+            .expect("an adapter with shared memory");
         first.gpu.share();
         lose(&first.gpu);
-        assert!(matches!(SharedDevice::state(luid), DeviceState::Lost));
+        assert!(matches!(SharedDevice::state(first.luid), DeviceState::Lost));
+        first
+    }
 
+    #[test]
+    #[ignore = "needs a Vulkan adapter that shares memory with OpenGL"]
+    fn open_with_failure_keeps_device_lost() {
+        let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
+        let first = lost_shared_device();
+        let luid = first.luid;
         let failed = SharedDevice::open_with(luid, || {
             Err(SetupError::Unavailable("the adapter is hidden"))
         });
@@ -1745,7 +1749,15 @@ mod tests {
             "a failed try forgot the device"
         );
         assert!(Gpu::shared_faults().lost().is_some());
+    }
 
+    /// A new open after a loss replaces the device; a CPU effect stays on the lost one.
+    #[test]
+    #[ignore = "needs a Vulkan adapter that shares memory with OpenGL"]
+    fn open_after_loss_leaves_cpu_effect_on_lost_device() {
+        let _sharing = SHARING.lock().unwrap_or_else(|e| e.into_inner());
+        let first = lost_shared_device();
+        let luid = first.luid;
         let second = SharedDevice::open(luid).expect("a new device");
         assert!(
             matches!(SharedDevice::state(luid), DeviceState::Working(d) if Arc::ptr_eq(&d, &second))
@@ -1789,13 +1801,15 @@ mod tests {
         );
     }
 
-    /// After a loss a setup that fails tries again, where before one it's final.
     #[test]
-    fn setup_error_retries_after_loss() {
+    fn record_setup_error_disables_before_loss() {
         let mut fresh = InteropSlot::new(false);
         fresh.record_setup_error(InteropError::Unsupported("no adapter".into()));
         assert!(fresh.disabled);
+    }
 
+    #[test]
+    fn record_setup_error_retries_after_loss() {
         let mut after_loss = InteropSlot::new(false);
         after_loss.retry_on_backoff();
         let first = after_loss.no_setup_before.expect("a time to try");

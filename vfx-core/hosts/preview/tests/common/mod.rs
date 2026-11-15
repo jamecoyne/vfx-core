@@ -78,7 +78,8 @@ pub fn remove(gpu: &Gpu) {
     }
 }
 
-/// Waits up to 5 s for D3D12 to offer the adapter called `name` again.
+/// Panics unless D3D12 offers the adapter called `name` again before the deadline, as it
+/// does once nothing holds the removed device.
 pub fn assert_adapter_offered(name: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !offered(name) {
