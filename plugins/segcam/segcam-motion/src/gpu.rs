@@ -1312,13 +1312,16 @@ mod tests {
         #[test]
         fn loss_during_open_retries() {
             let _lock = gpu_test_lock();
-            open("fallback").expect("the fallback adapter");
+            let choice = adapter_choice();
+            open(&choice)
+                .or_else(|_| open("fallback"))
+                .expect("a GPU adapter, hardware or fallback");
             let tries = std::sync::atomic::AtomicU32::new(0);
             let slot: &'static DeviceSlot =
                 Box::leak(Box::new(DeviceSlot::new(move |_| {
                     match tries.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
                         0 => Err(NoGpu::Lost("mid open".into())),
-                        _ => open("fallback"),
+                        _ => open(&choice).or_else(|_| open("fallback")),
                     }
                 })));
             assert!(matches!(slot.status(), Err(NoGpu::Failed(_))));
