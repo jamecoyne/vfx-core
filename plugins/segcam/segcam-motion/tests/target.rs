@@ -1,7 +1,7 @@
 //! A swarm drawn into a host's GPU frame (`CpuEffect::render_to`, as FFGL offers on Windows)
 //! against the same swarm drawn on the GPU and read back: every pixel the same. Its own test
-//! binary, since the host's device has to be shared before segcam opens one. Skipped where
-//! there is no hardware adapter.
+//! binary, since the host's device has to be shared before segcam opens one. Ignored except on
+//! macOS, where CI has a hardware adapter.
 
 mod motion_only;
 
@@ -98,11 +98,12 @@ fn argb(bytes: &[u8]) -> Pixels {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+)]
 fn kept_target_render_matches_fresh() {
-    let Some(gpu) = shared() else {
-        eprintln!("no hardware GPU adapter: skipped");
-        return;
-    };
+    let gpu = shared().expect("a hardware GPU adapter");
     // segcam keeps its context on a host's device while an instance lives; this one
     // spans the test, as a host's layer would.
     let _layer = SegcamMotion::with_gpu(true);
@@ -126,11 +127,12 @@ fn kept_target_render_matches_fresh() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+)]
 fn swarm_in_host_frame_matches_readback() {
-    let Some(gpu) = shared() else {
-        eprintln!("no hardware GPU adapter: skipped");
-        return;
-    };
+    let gpu = shared().expect("a hardware GPU adapter");
     // segcam keeps its context on a host's device while an instance lives; this one
     // spans the test, as a host's layer would.
     let _layer = SegcamMotion::with_gpu(true);

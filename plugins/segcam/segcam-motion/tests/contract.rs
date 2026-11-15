@@ -4,7 +4,6 @@
 mod motion_only;
 
 use segcam_motion::SegcamMotion;
-use segcam_motion::gpu::NoGpu;
 use vfx_core::cpu::Argb;
 use vfx_core::{CpuEffect, ParamValue, ParamValues, Processor};
 use vfx_host::contract::{Clip, check};
@@ -58,7 +57,7 @@ fn with(changes: &[(&str, ParamValue)]) -> ParamValues {
 }
 
 #[test]
-fn overlay_and_mattes_keep_the_contract() {
+fn overlay_and_mattes_hold_contract() {
     let sets = [
         with(&[("background", ParamValue::Int(4))]),
         with(&[
@@ -82,7 +81,7 @@ fn overlay_and_mattes_keep_the_contract() {
 }
 
 #[test]
-fn swarm_keeps_the_contract() {
+fn swarm_holds_contract() {
     let swarm = |mirror| {
         with(&[
             ("output", ParamValue::Int(3)),
@@ -100,17 +99,14 @@ fn swarm_keeps_the_contract() {
     }
 }
 
-/// The swarm on the GPU keeps it too; skipped where there is no adapter.
+/// The GPU swarm holds the same contract.
 #[test]
-fn swarm_on_the_gpu_keeps_the_contract() {
-    match segcam_motion::gpu::status() {
-        Ok(()) => {}
-        Err(NoGpu::NoAdapter(e)) => {
-            eprintln!("no GPU adapter ({e}): skipped");
-            return;
-        }
-        Err(e) => panic!("{e}"),
-    }
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
+)]
+fn gpu_swarm_holds_contract() {
+    segcam_motion::gpu::status().expect("a GPU adapter");
     let swarm = |mirror| {
         with(&[
             ("output", ParamValue::Int(3)),

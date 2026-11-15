@@ -394,7 +394,7 @@ mod tests {
             let mut out = vec![Argb::<u8>::default(); (w * h) as usize];
             for &x in xs {
                 let before = effect.frames_before(&params, None);
-                let frame = history.next(before, effect.frames_held(&params, None));
+                let frame = history.push_slot(before, effect.frames_held(&params, None));
                 frame_with_square(frame, x);
                 let ctx = Context {
                     frame: history.frame_number(),
@@ -448,7 +448,7 @@ mod tests {
         let mut out = vec![Argb::<u8>::default(); (w * h) as usize];
         for f in 0..8 {
             let before = effect.frames_before(&params, None);
-            let frame = history.next(before, effect.frames_held(&params, None));
+            let frame = history.push_slot(before, effect.frames_held(&params, None));
             frame.fill(grey(80));
             for y in 20..44 {
                 for x in 10 + f * 12..34 + f * 12 {

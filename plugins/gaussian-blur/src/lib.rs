@@ -156,13 +156,19 @@ mod tests {
     }
 
     #[test]
-    fn region_follows_the_radius_and_render_scale() {
+    fn region_reach_scales_with_radius_and_render_scale() {
         let mut p = values();
         p.set("radius", ParamValue::Float(0.0)).unwrap();
         assert_eq!(Blur::default().region(&p, [1.0, 1.0]), Region::default());
         p.set("radius", ParamValue::Float(10.0)).unwrap();
         let region = Blur::default().region(&p, [0.5, 0.25]);
         assert_eq!((region.reach, region.grows), ([5, 3], false));
+    }
+
+    #[test]
+    fn region_grows_along_direction() {
+        let mut p = values();
+        p.set("radius", ParamValue::Float(10.0)).unwrap();
         p.set("grow", ParamValue::Bool(true)).unwrap();
         p.set("direction", ParamValue::Int(1)).unwrap();
         let region = Blur::default().region(&p, [1.0, 1.0]);

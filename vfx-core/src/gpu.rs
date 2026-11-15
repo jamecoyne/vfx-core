@@ -1,4 +1,3 @@
-use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -55,10 +54,9 @@ impl DeviceFaults {
     }
 }
 
-/// When to try for a new device after a loss: 1, 2, 4, 8 and 16 s, then every 30 s for as long as
-/// it takes, since a show lasts hours and a device may come back late. A device that lived
-/// [`Self::STABLE_AFTER`] starts the schedule over; one that dies sooner goes on from where it
-/// was, so a GPU that opens and dies isn't reopened every second all night.
+/// When to try for a new device after a loss: 1, 2, 4, 8 and 16 s, then every 30 s with no
+/// limit. A device that lived [`Self::STABLE_AFTER`] starts the schedule over; one that dies
+/// sooner goes on from where it was, so a GPU that opens and dies isn't reopened every second.
 #[derive(Clone, Debug, Default)]
 pub struct ReopenBackoff {
     tries: u32,
@@ -76,9 +74,9 @@ impl ReopenBackoff {
         delay
     }
 
-    /// Whether the next try should wait for the adapter that was lost, for about 30 s. A reset can
-    /// hide an adapter for seconds, and a machine with another GPU would otherwise land there and
-    /// stay for the night. After that any adapter beats none.
+    /// Whether the next try should wait for the adapter that was lost, for about 30 s: a reset
+    /// can hide it for seconds, and another GPU would otherwise take over for good. After that
+    /// any adapter beats none.
     pub fn same_adapter_only(&self) -> bool {
         self.tries <= 4
     }
@@ -92,19 +90,12 @@ impl ReopenBackoff {
 }
 
 /// Why [`poll_device`] failed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PollFailure {
+    #[error("the device was lost during a poll")]
     DeviceLost,
+    #[error(transparent)]
     Other(wgpu::PollError),
-}
-
-impl fmt::Display for PollFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DeviceLost => write!(f, "the device was lost during a poll"),
-            Self::Other(e) => write!(f, "{e}"),
-        }
-    }
 }
 
 /// [`wgpu::Device::poll`], for anything that has to go on after the device is lost: wgpu panics
@@ -152,8 +143,7 @@ impl Gpu {
                 force_fallback_adapter: false,
                 apply_limit_buckets: false,
             })
-            .await
-            .map_err(|e| GpuError(e.to_string()))?;
+            .await?;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 // Effects blend in 32-bit float targets where the adapter can.
@@ -161,8 +151,7 @@ impl Gpu {
                 memory_hints: Self::memory_hints(),
                 ..wgpu::DeviceDescriptor::default()
             })
-            .await
-            .map_err(|e| GpuError(e.to_string()))?;
+            .await?;
         Ok(Self::from_parts(device, queue))
     }
 
@@ -180,15 +169,12 @@ impl Gpu {
     }
 
     /// Allocator block sizes for a device that stays open for a whole show, in place of wgpu's
-    /// default of 128 to 256 MiB. Vulkan and D3D12 reserve memory in blocks and place a new
-    /// allocation in the newest block with room, so one small buffer made beside a large one holds
-    /// the whole block once the large one has gone, and on integrated GPUs a reserved block is
-    /// system memory. A buffer larger than the current block gets memory of its own, which it
-    /// returns when it goes.
+    /// default of 128 to 256 MiB. Vulkan and D3D12 reserve memory in blocks, and a small buffer
+    /// made beside a large one holds the whole block once the large one has gone. A buffer
+    /// larger than the current block gets memory of its own, which it returns when it goes.
     ///
-    /// Host blocks are half these sizes, and staging comes from them. A fixed 64 MiB would make
-    /// those 32 MiB, which a 4K frame's staging all but fills: blocks were then made and freed
-    /// about twice a second. The range lets the host blocks reach 64 MiB.
+    /// Host blocks are half these sizes, and staging comes from them: the range lets them
+    /// reach 64 MiB, so a 4K frame's staging doesn't fill one.
     pub fn memory_hints() -> wgpu::MemoryHints {
         const MIB: u64 = 1 << 20;
         wgpu::MemoryHints::Manual {
@@ -198,10 +184,11 @@ impl Gpu {
 
     /// Lets CPU effects draw on this device: in browsers, where they can't open their own, and
     /// in hosts that offer their output a GPU frame on it ([`crate::CpuEffect::render_to`]).
-    /// Effects pick their device on first use, so a host shares it before they render. This takes
-    /// over the device's error and loss callbacks; read them with [`Gpu::faults`]. Sharing the same
-    /// `Gpu` again keeps its record. Sharing another replaces it for later readers, and a clone
-    /// taken earlier goes on following its own device.
+    /// Effects pick their device on first use, so a host shares it before they render.
+    ///
+    /// This takes over the device's error and loss callbacks; read them with [`Gpu::faults`].
+    /// Sharing the same `Gpu` again keeps its record. Sharing another replaces it for later
+    /// readers, and a clone taken earlier goes on following its own device.
     pub fn share(&self) {
         self.watch_faults();
         let parts = Some(self.parts());
@@ -424,42 +411,6 @@ mod dxc {
         }
 
         #[test]
-        fn load_first_prefers_shared() {
-            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            put_loadable_dll(shared.path());
-            put_loadable_dll(beside.path());
-            let path = load_first(Some(shared.path()), beside.path()).unwrap();
-            assert_eq!(Path::new(&path), shared.path().join("dxcompiler.dll"));
-        }
-
-        #[test]
-        fn load_first_falls_back_past_a_bad_shared_dll() {
-            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            std::fs::write(shared.path().join("dxcompiler.dll"), b"not a DLL").unwrap();
-            put_loadable_dll(beside.path());
-            let path = load_first(Some(shared.path()), beside.path()).unwrap();
-            assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
-        }
-
-        #[test]
-        fn load_first_without_shared_dir_uses_beside() {
-            let beside = tempfile::tempdir().unwrap();
-            put_loadable_dll(beside.path());
-            let path = load_first(None, beside.path()).unwrap();
-            assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
-        }
-
-        #[test]
-        fn load_first_names_both_folders() {
-            let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            let err = load_first(Some(shared.path()), beside.path()).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::NotFound);
-            let shown = err.to_string();
-            assert!(shown.contains(&*shared.path().to_string_lossy()), "{shown}");
-            assert!(shown.contains(&*beside.path().to_string_lossy()), "{shown}");
-        }
-
-        #[test]
         fn load_names_missing_dll() {
             let dir = tempfile::tempdir().unwrap();
             let err = load(&dir.path().join("dxcompiler.dll"))
@@ -473,12 +424,52 @@ mod dxc {
         }
 
         #[test]
-        fn shared_dir_is_in_an_existing_common_files() {
+        fn shared_dir_names_dxc_under_existing_common_files() {
             let dir = shared_dir().unwrap();
             let common = dir.parent().and_then(Path::parent).unwrap();
             assert!(common.is_dir(), "{}", common.display());
             let name = dir.file_name().unwrap().to_string_lossy();
             assert!(name.starts_with("dxc-"), "{name}");
+        }
+
+        mod load_first {
+            use super::*;
+
+            #[test]
+            fn prefers_shared() {
+                let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+                put_loadable_dll(shared.path());
+                put_loadable_dll(beside.path());
+                let path = load_first(Some(shared.path()), beside.path()).unwrap();
+                assert_eq!(Path::new(&path), shared.path().join("dxcompiler.dll"));
+            }
+
+            #[test]
+            fn falls_back_to_beside_on_invalid_shared() {
+                let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+                std::fs::write(shared.path().join("dxcompiler.dll"), b"not a DLL").unwrap();
+                put_loadable_dll(beside.path());
+                let path = load_first(Some(shared.path()), beside.path()).unwrap();
+                assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
+            }
+
+            #[test]
+            fn without_shared_uses_beside() {
+                let beside = tempfile::tempdir().unwrap();
+                put_loadable_dll(beside.path());
+                let path = load_first(None, beside.path()).unwrap();
+                assert_eq!(Path::new(&path), beside.path().join("dxcompiler.dll"));
+            }
+
+            #[test]
+            fn names_both_folders() {
+                let (shared, beside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+                let err = load_first(Some(shared.path()), beside.path()).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::NotFound);
+                let shown = err.to_string();
+                assert!(shown.contains(&*shared.path().to_string_lossy()), "{shown}");
+                assert!(shown.contains(&*beside.path().to_string_lossy()), "{shown}");
+            }
         }
     }
 }
@@ -492,55 +483,57 @@ thread_local! {
 #[cfg(not(target_arch = "wasm32"))]
 static SHARED: std::sync::Mutex<Option<GpuParts>> = std::sync::Mutex::new(None);
 
-#[derive(Debug)]
-pub struct GpuError(String);
-
-impl fmt::Display for GpuError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GPU setup failed: {}", self.0)
-    }
+/// Why [`Gpu::headless`] has no device.
+#[derive(Debug, thiserror::Error)]
+pub enum GpuError {
+    #[error("GPU setup failed: {0}")]
+    Adapter(#[from] wgpu::RequestAdapterError),
+    #[error("GPU setup failed: {0}")]
+    Device(#[from] wgpu::RequestDeviceError),
 }
-
-impl std::error::Error for GpuError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn backoff_doubles_up_to_the_longest_wait() {
-        let mut backoff = ReopenBackoff::default();
-        let delays: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
-        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
-    }
-
-    #[test]
-    fn backoff_waits_for_the_same_adapter_through_the_short_delays() {
-        let mut backoff = ReopenBackoff::default();
-        let same: Vec<bool> = (0..7)
-            .map(|_| {
-                backoff.next_delay();
-                backoff.same_adapter_only()
-            })
-            .collect();
-        assert_eq!(same, [true, true, true, true, false, false, false]);
-    }
-
-    #[test]
-    fn backoff_starts_over_only_after_a_device_that_lasted() {
-        let mut backoff = ReopenBackoff::default();
-        backoff.next_delay();
-        backoff.next_delay();
-        backoff.lost(Duration::from_secs(5));
-        assert_eq!(backoff.next_delay().as_secs(), 4, "a device that died soon");
-        backoff.lost(ReopenBackoff::STABLE_AFTER);
-        assert_eq!(backoff.next_delay().as_secs(), 1, "a device that lasted");
-    }
-
-    #[test]
-    fn same_device_follows_the_record_and_not_the_clone() {
+    fn same_device_compares_record_not_handle() {
         let (one, other) = (DeviceFaults::default(), DeviceFaults::default());
         assert!(one.same_device(&one.clone()));
         assert!(!one.same_device(&other));
+    }
+
+    mod reopen_backoff {
+        use super::*;
+
+        #[test]
+        fn delay_doubles_to_limit() {
+            let mut backoff = ReopenBackoff::default();
+            let delays: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
+            assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
+        }
+
+        #[test]
+        fn same_adapter_only_ends_after_short_delays() {
+            let mut backoff = ReopenBackoff::default();
+            let same: Vec<bool> = (0..7)
+                .map(|_| {
+                    backoff.next_delay();
+                    backoff.same_adapter_only()
+                })
+                .collect();
+            assert_eq!(same, [true, true, true, true, false, false, false]);
+        }
+
+        #[test]
+        fn resets_only_after_stable_device() {
+            let mut backoff = ReopenBackoff::default();
+            backoff.next_delay();
+            backoff.next_delay();
+            backoff.lost(Duration::from_secs(5));
+            assert_eq!(backoff.next_delay().as_secs(), 4, "a device that died soon");
+            backoff.lost(ReopenBackoff::STABLE_AFTER);
+            assert_eq!(backoff.next_delay().as_secs(), 1, "a device that lasted");
+        }
     }
 }

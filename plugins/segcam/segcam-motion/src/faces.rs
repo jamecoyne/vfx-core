@@ -23,8 +23,8 @@ mod models {
     static RUNS_ON: Mutex<Option<&'static str>> = Mutex::new(None);
 
     /// The models, once they have loaded or failed to. A panic while they ran leaves them usable:
-    /// each find starts over, so only that detection's faces are lost, where staying poisoned would
-    /// have every later export render without faces and say nothing.
+    /// each detection starts over, so only that detection's faces are lost; a poisoned lock would
+    /// drop faces from every later render without a word.
     pub(super) fn lock() -> Option<MutexGuard<'static, Option<Segmenter>>> {
         let models = MODELS.get()?;
         Some(models.lock().unwrap_or_else(|poisoned| {
@@ -104,8 +104,8 @@ mod models {
         short_loads: u32,
     }
 
-    /// How many short loads to try before keeping what loads. A model that doesn't come back after
-    /// a reset is better missing than a reload of the others every 30 s all show.
+    /// How many short loads to try before keeping what loads: a model that doesn't come back after
+    /// a reset is better missing than reloading the others every 30 s.
     const SHORT_LOADS_TO_TRY: u32 = 5;
 
     impl Reload {
@@ -315,7 +315,7 @@ mod models {
 
         /// A load missing what the old models had is used, and replaced by a later full one.
         #[test]
-        fn a_partial_load_tries_again() {
+        fn partial_load_is_retried() {
             let optional = |m: &i32| (*m >= 10, true);
             let mut reload = Reload::default();
             let mut models = Some(10);
@@ -337,7 +337,7 @@ mod models {
 
         /// A machine that never had the optional models isn't asked for them after a reset.
         #[test]
-        fn a_load_matching_the_old_models_is_complete() {
+        fn load_matching_old_models_is_complete() {
             let optional = |_: &i32| (false, false);
             let mut reload = Reload::default();
             let mut models = Some(1);
@@ -349,7 +349,7 @@ mod models {
 
         /// A load with more than the old models had is complete, and isn't loaded again.
         #[test]
-        fn a_fuller_load_than_before_is_complete() {
+        fn fuller_load_is_complete() {
             let optional = |m: &i32| (*m >= 10, true);
             let mut reload = Reload::default();
             let mut models = Some(1);
@@ -362,7 +362,7 @@ mod models {
 
         /// A model that never comes back stops the reloads after a few tries.
         #[test]
-        fn short_loads_stop_after_a_few() {
+        fn short_loads_stop_at_limit() {
             let optional = |m: &i32| (*m >= 10, true);
             let mut reload = Reload::default();
             let mut models = Some(10);
@@ -377,7 +377,7 @@ mod models {
         }
 
         #[test]
-        fn on_d3d12_adapter_matches_directml_on_same_adapter() {
+        fn on_d3d12_adapter_requires_same_name_on_dx12() {
             use vfx_core::wgpu::{AdapterInfo, Backend, DeviceType};
             let adapter = |name: &str, backend| AdapterInfo {
                 name: name.to_owned(),
@@ -416,7 +416,7 @@ mod models {
 
         /// Models that lasted start the backoff over, so a reset hours later waits 1 s again.
         #[test]
-        fn models_that_lasted_start_the_backoff_over() {
+        fn lasting_models_reset_backoff() {
             let optional = |_: &i32| (true, true);
             let mut reload = Reload::default();
             for _ in 0..5 {
@@ -466,16 +466,12 @@ mod live {
     }
 
     /// The worker runs the models at most one part in this many of the time: a detection that took
-    /// `d` is followed by the next no sooner than `d` times this after it started. On a GPU that
-    /// also draws the renders, an integrated one above all, back to back detections leave the
-    /// renders waiting behind them. Where a detection is short beside a frame, this never waits.
+    /// `d` is followed by the next no sooner than `d` times this after it started. Back to back
+    /// detections on a GPU that also draws the renders leave the renders waiting behind them.
     const DETECTION_PACE: u32 = 2;
 
-    /// Bodies are looked for no more often than once per their detection's time times this; the
-    /// detections between keep the bodies found last. Body detection runs beside the faces on the
-    /// same device, takes longer than they do on an integrated GPU, and bodies move less between
-    /// detections than faces, eyes and mouths. Where it is short beside a frame, every detection
-    /// looks for bodies.
+    /// [`DETECTION_PACE`] for bodies: on an integrated GPU body detection costs more than faces.
+    /// The detections between keep the last bodies, which move less than faces.
     const BODY_PACE: u32 = 4;
 
     /// The faces found in one frame, and that frame's pixels.
@@ -1016,7 +1012,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn held_faces_count_as_found_on_their_own_frame() {
+    fn faces_on_marks_reuse_after_found_frame() {
         let mut live = LiveFaces::default();
         live.hold(
             FaceParts::default(),
@@ -1053,7 +1049,7 @@ mod tests {
 
     /// A slow detection holds the next request back, and a quick one doesn't.
     #[test]
-    fn a_slow_detection_paces_the_next_request() {
+    fn slow_detection_delays_next_request() {
         let _gpu_lock = crate::gpu::gpu_test_lock();
         let models = lock_models();
         let pixels = vec![crate::pixel::Argb::<u8>::default(); 16];
@@ -1077,7 +1073,7 @@ mod tests {
     /// A detection that left bodies out keeps the bodies held, and one that looked for them
     /// replaces them.
     #[test]
-    fn a_detection_without_bodies_keeps_the_held_ones() {
+    fn detection_without_bodies_keeps_held_bodies() {
         let pixels = vec![crate::pixel::Argb::<u8>::default(); 16];
         let view = View::from_pixels(&pixels, 4, 4);
         let parts = FaceParts {
@@ -1103,7 +1099,7 @@ mod tests {
 
     /// An answer that was on its way when the renders moved elsewhere never attaches.
     #[test]
-    fn an_answer_due_when_forgetting_stays_out() {
+    fn forget_discards_answer_in_flight() {
         let _gpu_lock = crate::gpu::gpu_test_lock();
         let models = lock_models();
         let pixels = vec![crate::pixel::Argb::<u8>::default(); 16];
@@ -1124,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_are_cut_again_before_they_leave_the_trail() {
+    fn windows_leave_before_resets_on_cut() {
         let mut live = LiveFaces::default();
         live.hold(FaceParts::default(), vec![Blob::default()], 10, 0);
         assert!(!live.windows_leave_before(16, 6));
@@ -1135,7 +1131,7 @@ mod tests {
 
     /// A panic while the models ran doesn't leave every later find without faces.
     #[test]
-    fn a_panic_with_the_models_locked_leaves_them_usable() {
+    fn panic_under_models_lock_leaves_them_usable() {
         let _gpu_lock = crate::gpu::gpu_test_lock();
         wait();
         let panicked = std::thread::spawn(|| {

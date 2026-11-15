@@ -211,7 +211,7 @@ fn run<C: Depth>(
         }
 
         if let Some(state) = &kept
-            && state.drew_on_gpu()
+            && state.last_draw_on_gpu()
         {
             on_gpu += 1;
             if let Some(drawer) = state.drawer() {

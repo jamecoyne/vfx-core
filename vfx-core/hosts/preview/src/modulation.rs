@@ -1,7 +1,7 @@
-//! Expressions on effect parameters: a text box under each slider, like
-//! `sin(time / 4)` or `value + bass * 0.5`, evaluated every frame. An empty box leaves
-//! the slider in charge; a valid expression replaces the slider's value (which it can
-//! still read as `value`).
+//! Expressions on effect parameters, typed in a box under each slider, like
+//! `sin(time / 4)` or `value + bass * 0.5`, evaluated every frame. An empty box
+//! leaves the slider in charge; a valid expression replaces the slider's value,
+//! which it can still read as `value`.
 
 use egui::{Color32, RichText, Ui};
 
@@ -154,7 +154,7 @@ impl Target {
 struct ExpressionSlot {
     text: String,
     compiled: Option<Expr>,
-    error: Option<String>,
+    error: Option<ExprError>,
     /// What it evaluated to last frame, shown under the box.
     last_value: Option<f32>,
     /// The F(x) toggle: the expression drives the parameter, in place of its slider.
@@ -314,7 +314,7 @@ pub fn expression_field(ui: &mut Ui, exprs: &mut Expressions, target: Target) {
         );
     } else if let Some(error) = &slot.error {
         ui.label(
-            RichText::new(error)
+            RichText::new(error.to_string())
                 .small()
                 .color(Color32::from_rgb(230, 120, 90)),
         );
@@ -391,7 +391,7 @@ enum Expr {
 }
 
 /// Conditions are true when not 0 (NaN counts as false).
-fn truthy(v: f32) -> bool {
+fn is_true(v: f32) -> bool {
     v != 0.0 && !v.is_nan()
 }
 
@@ -436,19 +436,40 @@ const FUNCTIONS: &[Function] = &[
         let t = ((a[2] - a[0]) / (a[1] - a[0])).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     }),
-    ("and", 2, |a| bool_value(truthy(a[0]) && truthy(a[1]))),
-    ("or", 2, |a| bool_value(truthy(a[0]) || truthy(a[1]))),
-    ("not", 1, |a| bool_value(!truthy(a[0]))),
+    ("and", 2, |a| bool_value(is_true(a[0]) && is_true(a[1]))),
+    ("or", 2, |a| bool_value(is_true(a[0]) || is_true(a[1]))),
+    ("not", 1, |a| bool_value(!is_true(a[0]))),
 ];
 
+/// Why an expression did not parse; the text is shown under its box.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+enum ExprError {
+    #[error("unexpected {0}")]
+    UnexpectedToken(Token),
+    #[error("unexpected '{0}'")]
+    UnexpectedChar(char),
+    #[error("bad number '{0}'")]
+    BadNumber(String),
+    #[error("unfinished expression")]
+    Unfinished,
+    #[error("expected {want}, found {found}")]
+    Expected { want: Token, found: Token },
+    #[error("unknown name '{0}'")]
+    UnknownName(String),
+    #[error("unknown function '{0}'")]
+    UnknownFunction(String),
+    #[error("{name}() takes {count} argument{}", if *count == 1 { "" } else { "s" })]
+    Arity { name: String, count: usize },
+}
+
 impl Expr {
-    fn parse(text: &str) -> Result<Self, String> {
+    fn parse(text: &str) -> Result<Self, ExprError> {
         let tokens = tokenize(text)?;
         let mut parser = Parser { tokens, pos: 0 };
         let expr = parser.comparison()?;
         match parser.tokens.get(parser.pos) {
             None => Ok(expr),
-            Some(t) => Err(format!("unexpected {t}")),
+            Some(t) => Err(ExprError::UnexpectedToken(t.clone())),
         }
     }
 
@@ -482,7 +503,8 @@ impl Expr {
             }
             Expr::Smooth(x, amount, state) => {
                 let x = x.eval(env);
-                // Frame-rate independent one-pole smoothing, tuned at 60 fps.
+                // Frame-rate independent one-pole smoothing: `amount` is the share of
+                // the old value kept per 1/60 of a second, scaled to this frame's `dt`.
                 let keep = amount.eval(env).clamp(0.0, 0.999).powf(env.dt * 60.0);
                 let v = match *state {
                     Some(prev) if prev.is_finite() => prev + (x - prev) * (1.0 - keep),
@@ -492,7 +514,7 @@ impl Expr {
                 v
             }
             Expr::If(condition, then, otherwise) => {
-                if truthy(condition.eval(env)) {
+                if is_true(condition.eval(env)) {
                     then.eval(env)
                 } else {
                     otherwise.eval(env)
@@ -525,7 +547,7 @@ impl std::fmt::Display for Token {
     }
 }
 
-fn tokenize(text: &str) -> Result<Vec<Token>, String> {
+fn tokenize(text: &str) -> Result<Vec<Token>, ExprError> {
     let chars: Vec<char> = text.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -549,7 +571,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                     .find(|&j| !(chars[j].is_ascii_digit() || chars[j] == '.'))
                     .unwrap_or(chars.len());
                 let s: String = chars[i..end].iter().collect();
-                let n = s.parse().map_err(|_| format!("bad number '{s}'"))?;
+                let n = s.parse().map_err(|_| ExprError::BadNumber(s))?;
                 (Token::Num(n), end - i)
             }
             c if c.is_alphabetic() || c == '_' => {
@@ -574,7 +596,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             '>' => (Token::Op(Op::Gt), 1),
             '=' if next == Some('=') => (Token::Op(Op::Eq), 2),
             '!' if next == Some('=') => (Token::Op(Op::Ne), 2),
-            c => return Err(format!("unexpected '{c}'")),
+            c => return Err(ExprError::UnexpectedChar(c)),
         };
         tokens.push(token);
         i += len;
@@ -592,29 +614,29 @@ impl Parser {
         self.tokens.get(self.pos)
     }
 
-    fn next(&mut self) -> Result<Token, String> {
+    fn next(&mut self) -> Result<Token, ExprError> {
         let t = self
             .tokens
             .get(self.pos)
             .cloned()
-            .ok_or("unfinished expression")?;
+            .ok_or(ExprError::Unfinished)?;
         self.pos += 1;
         Ok(t)
     }
 
-    fn expect(&mut self, want: Token) -> Result<(), String> {
+    fn expect(&mut self, want: Token) -> Result<(), ExprError> {
         match self.next()? {
             t if t == want => Ok(()),
-            t => Err(format!("expected {want}, found {t}")),
+            found => Err(ExprError::Expected { want, found }),
         }
     }
 
     /// Binary operators from `ops`, left to right, over `operand`.
-    fn binary(
+    fn fold_left(
         &mut self,
         ops: &[Op],
-        operand: fn(&mut Self) -> Result<Expr, String>,
-    ) -> Result<Expr, String> {
+        operand: fn(&mut Self) -> Result<Expr, ExprError>,
+    ) -> Result<Expr, ExprError> {
         let mut left = operand(self)?;
         while let Some(Token::Op(op)) = self.peek().cloned()
             && ops.contains(&op)
@@ -625,20 +647,20 @@ impl Parser {
         Ok(left)
     }
 
-    fn comparison(&mut self) -> Result<Expr, String> {
+    fn comparison(&mut self) -> Result<Expr, ExprError> {
         use Op::*;
-        self.binary(&[Lt, Gt, Le, Ge, Eq, Ne], Self::sum)
+        self.fold_left(&[Lt, Gt, Le, Ge, Eq, Ne], Self::additive)
     }
 
-    fn sum(&mut self) -> Result<Expr, String> {
-        self.binary(&[Op::Add, Op::Sub], Self::product)
+    fn additive(&mut self) -> Result<Expr, ExprError> {
+        self.fold_left(&[Op::Add, Op::Sub], Self::multiplicative)
     }
 
-    fn product(&mut self) -> Result<Expr, String> {
-        self.binary(&[Op::Mul, Op::Div, Op::Rem], Self::unary)
+    fn multiplicative(&mut self) -> Result<Expr, ExprError> {
+        self.fold_left(&[Op::Mul, Op::Div, Op::Rem], Self::unary)
     }
 
-    fn unary(&mut self) -> Result<Expr, String> {
+    fn unary(&mut self) -> Result<Expr, ExprError> {
         match self.peek() {
             Some(Token::Op(Op::Sub)) => {
                 self.pos += 1;
@@ -653,7 +675,7 @@ impl Parser {
     }
 
     /// `^` binds tighter than unary minus on its left and groups right to left.
-    fn power(&mut self) -> Result<Expr, String> {
+    fn power(&mut self) -> Result<Expr, ExprError> {
         let base = self.atom()?;
         if self.peek() == Some(&Token::Op(Op::Pow)) {
             self.pos += 1;
@@ -662,7 +684,7 @@ impl Parser {
         Ok(base)
     }
 
-    fn atom(&mut self) -> Result<Expr, String> {
+    fn atom(&mut self) -> Result<Expr, ExprError> {
         match self.next()? {
             Token::Num(n) => Ok(Expr::Num(n)),
             Token::Open => {
@@ -696,22 +718,22 @@ impl Parser {
                     .iter()
                     .position(|(v, _)| *v == name)
                     .map(Expr::Var)
-                    .ok_or(format!("unknown name '{name}'")),
+                    .ok_or(ExprError::UnknownName(name)),
             },
-            t => Err(format!("unexpected {t}")),
+            t => Err(ExprError::UnexpectedToken(t)),
         }
     }
 }
 
-fn call(name: &str, mut args: Vec<Expr>) -> Result<Expr, String> {
+fn call(name: &str, mut args: Vec<Expr>) -> Result<Expr, ExprError> {
     let arity = |n: usize| {
         if args.len() == n {
             Ok(())
         } else {
-            Err(format!(
-                "{name}() takes {n} argument{}",
-                if n == 1 { "" } else { "s" }
-            ))
+            Err(ExprError::Arity {
+                name: name.to_owned(),
+                count: n,
+            })
         }
     };
     if name == "smooth" {
@@ -734,7 +756,7 @@ fn call(name: &str, mut args: Vec<Expr>) -> Result<Expr, String> {
     let (_, n, f) = FUNCTIONS
         .iter()
         .find(|(f, _, _)| *f == name)
-        .ok_or(format!("unknown function '{name}'"))?;
+        .ok_or_else(|| ExprError::UnknownFunction(name.to_owned()))?;
     arity(*n)?;
     Ok(Expr::Call(*f, args))
 }
@@ -814,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn conditions_pick_a_branch() {
+    fn if_picks_branch() {
         let mut face = FACE_NONE;
         face[3] = 0.1; // facesize
         let small = variable_values(0.0, None, [0.0; 5], face);
@@ -884,13 +906,19 @@ mod tests {
     }
 
     #[test]
-    fn points_take_an_axis_and_integers_round() {
+    fn point_axis_sets_one_coordinate() {
         let mut exprs = Expressions::default();
         let s = variable_values(0.0, None, [0.0; 5], FACE_NONE);
         let (vignette, base) = effect_with_defaults(VIGNETTE);
         exprs.set(Target::axis(vignette, "center", 1), "0.25");
         let out = exprs.apply(vignette, &base, &s, 1.0 / 60.0);
         assert_eq!(out.point("center"), [0.5, 0.25]);
+    }
+
+    #[test]
+    fn int_params_round_and_clamp() {
+        let mut exprs = Expressions::default();
+        let s = variable_values(0.0, None, [0.0; 5], FACE_NONE);
         let (segcam, base) = effect_with_defaults(SEGCAM);
         exprs.set(Target::new(segcam, "background"), "40.6");
         exprs.set(Target::new(segcam, "output"), "9");
@@ -900,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn smooth_moves_part_way_to_target() {
+    fn smooth_eases_toward_target() {
         let mut exprs = Expressions::default();
         let (blur, base) = effect_with_defaults(BLUR);
         exprs.set(Target::new(blur, "radius"), "smooth(bass * 10, 0.9)");

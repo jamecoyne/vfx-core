@@ -1,7 +1,6 @@
 //! The swarm's GPU path against the CPU path, within [`Bound::of`] its depth.
 //! `SEGCAM_GPU_ADAPTER=fallback` runs it on a software adapter (WARP).
 
-use segcam_motion::gpu::NoGpu;
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
     AnalysisStep, Argb, Channel, DetectionMode, IncrementalRenderer, OutputMode, RenderSettings,
@@ -162,28 +161,21 @@ fn cases() -> Vec<(&'static str, RenderSettings)> {
 }
 
 /// Renders the clip on both paths, frame by frame, and checks each output frame.
-fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
+fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) {
     let frames = clip::<C>(w, h, 24);
     let needed = segcam_motion::previous_frames_needed(s) as usize;
     let mut cpu = IncrementalRenderer::default();
     let mut gpu = IncrementalRenderer::default();
-    match segcam_motion::gpu::status() {
-        Ok(()) => {}
-        Err(NoGpu::NoAdapter(e)) => {
-            eprintln!("no GPU adapter ({e}): skipped");
-            return false;
-        }
-        Err(e) => panic!("{e}"),
-    }
+    segcam_motion::gpu::status().expect("a GPU adapter");
     gpu.use_gpu(true);
     let mut a = vec![Argb::<C>::default(); (w * h) as usize];
     let mut b = a.clone();
     let mut on_gpu = Vec::with_capacity(frames.len());
     for n in 0..frames.len() {
-        let first = n.saturating_sub(needed);
-        let count = n - first + 1;
+        let window_start = n.saturating_sub(needed);
+        let count = n - window_start + 1;
         let source = || Frames {
-            frames: &frames[first..=n],
+            frames: &frames[window_start..=n],
             width: w,
             height: h,
         };
@@ -244,36 +236,45 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) -> bool {
     let faults = gpu.drawer().map_or(0, |d| d.faults);
     assert_eq!(faults, 0, "{name}: renders fell back to the CPU");
     // Frames with no windows draw on the CPU: only those before the first windows.
-    let first = on_gpu.iter().position(|&g| g);
-    let first = first.unwrap_or_else(|| panic!("{name}: no render drawn on the GPU"));
+    let first_on_gpu = on_gpu.iter().position(|&g| g);
+    let first_on_gpu = first_on_gpu.unwrap_or_else(|| panic!("{name}: no render drawn on the GPU"));
     assert!(
-        on_gpu[first..].iter().all(|&g| g),
-        "{name}: a render after frame {first} left the GPU: {on_gpu:?}"
+        on_gpu[first_on_gpu..].iter().all(|&g| g),
+        "{name}: a render after frame {first_on_gpu} left the GPU: {on_gpu:?}"
     );
-    true
 }
 
 fn each_case<C: Depth>() {
     for (w, h) in [(320, 180), (640, 360)] {
         for (name, s) in cases() {
-            if !compare::<C>(name, &s, w, h) {
-                return;
-            }
+            compare::<C>(name, &s, w, h);
         }
     }
 }
 
 #[test]
-fn gpu_matches_cpu_at_8_bits() {
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
+)]
+fn gpu_matches_cpu_u8() {
     each_case::<u8>();
 }
 
 #[test]
-fn gpu_matches_cpu_at_16_bits() {
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
+)]
+fn gpu_matches_cpu_u16() {
     each_case::<u16>();
 }
 
 #[test]
-fn gpu_matches_cpu_in_float() {
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
+)]
+fn gpu_matches_cpu_f32() {
     each_case::<f32>();
 }

@@ -26,7 +26,37 @@ use crate::effects::MAX_IMAGE_SIDE;
 pub static CAMERAS: LazyLock<Vec<String>> = LazyLock::new(|| vec!["Webcam".to_string()]);
 
 /// A file pick, dropped file or camera request, filled in when the browser answers.
-pub type Pending = Rc<RefCell<Option<Result<WebVideo, String>>>>;
+pub type Pending = Rc<RefCell<Option<Result<WebVideo, WebError>>>>;
+
+/// Why the browser could not give a video or camera; the text is shown in the panel.
+#[derive(Debug, thiserror::Error)]
+pub enum WebError {
+    #[error("no document")]
+    NoDocument,
+    #[error("no window")]
+    NoWindow,
+    /// A JavaScript exception, as the browser words it.
+    #[error("{0}")]
+    Js(String),
+    #[error("not a video element")]
+    NotVideoElement,
+    #[error("not a canvas")]
+    NotCanvas,
+    #[error("no 2D context")]
+    NoContext2d,
+    #[error("not a 2D context")]
+    NotContext2d,
+    #[error("not an input element")]
+    NotInputElement,
+    #[error("not a media stream")]
+    NotMediaStream,
+    #[error("{0} isn't a video")]
+    NotVideoFile(String),
+    #[error("this browser has no camera access (it needs https or localhost)")]
+    NoCameraAccess,
+    #[error("the camera wasn't allowed or isn't there: {0}")]
+    CameraDenied(String),
+}
 
 /// A `<video>` element playing a file or the camera.
 pub struct WebVideo {
@@ -71,7 +101,7 @@ impl FrameWatch {
             .ok()?;
         let callback: Rc<RefCell<Option<FrameCallback>>> = Rc::new(RefCell::new(None));
         let pending = Rc::new(Cell::new(0.0));
-        let (presented, own, next, video, again) = (
+        let (presented, own, next, video, request_next) = (
             presented.clone(),
             callback.clone(),
             pending.clone(),
@@ -84,7 +114,7 @@ impl FrameWatch {
                 presented.set(Some((time, count as u32)));
             }
             if let Some(callback) = own.borrow().as_ref()
-                && let Ok(id) = again.call1(&video, callback.as_ref().unchecked_ref())
+                && let Ok(id) = request_next.call1(&video, callback.as_ref().unchecked_ref())
             {
                 next.set(id.as_f64().unwrap_or(0.0));
             }
@@ -124,15 +154,19 @@ fn js_error_text(e: JsValue) -> String {
         .unwrap_or_else(|| format!("{e:?}"))
 }
 
-fn new_video_element() -> Result<HtmlVideoElement, String> {
+fn js_error(e: JsValue) -> WebError {
+    WebError::Js(js_error_text(e))
+}
+
+fn new_video_element() -> Result<HtmlVideoElement, WebError> {
     let document = web_sys::window()
         .and_then(|w| w.document())
-        .ok_or("no document")?;
+        .ok_or(WebError::NoDocument)?;
     let video: HtmlVideoElement = document
         .create_element("video")
-        .map_err(js_error_text)?
+        .map_err(js_error)?
         .dyn_into()
-        .map_err(|_| "not a video element")?;
+        .map_err(|_| WebError::NotVideoElement)?;
     // Browsers only autoplay muted video; the preview has no sound in the browser yet.
     video.set_muted(true);
     video.set_autoplay(true);
@@ -224,7 +258,7 @@ impl WebVideo {
     /// Copies the current frame into `frame` (sized as [`WebVideo::size`] says) when it's
     /// new: once per frame the browser presented, so a paused video or a camera between
     /// frames isn't copied again. Returns whether it copied.
-    pub fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> Result<bool, String> {
+    pub fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> Result<bool, WebError> {
         let time = self.video.current_time();
         let presented = self.presented.get().map(|(_, count)| count);
         let fresh = match (self.watch.is_some(), presented) {
@@ -243,19 +277,19 @@ impl WebVideo {
         {
             let canvas: HtmlCanvasElement = web_sys::window()
                 .and_then(|window| window.document())
-                .ok_or("no document")?
+                .ok_or(WebError::NoDocument)?
                 .create_element("canvas")
-                .map_err(js_error_text)?
+                .map_err(js_error)?
                 .dyn_into()
-                .map_err(|_| "not a canvas")?;
+                .map_err(|_| WebError::NotCanvas)?;
             canvas.set_width(w);
             canvas.set_height(h);
             let context: CanvasRenderingContext2d = canvas
                 .get_context("2d")
-                .map_err(js_error_text)?
-                .ok_or("no 2D context")?
+                .map_err(js_error)?
+                .ok_or(WebError::NoContext2d)?
                 .dyn_into()
-                .map_err(|_| "not a 2D context")?;
+                .map_err(|_| WebError::NotContext2d)?;
             self.canvas = Some((canvas, context));
         }
         let (canvas, context) = self.canvas.as_ref().expect("made above");
@@ -267,7 +301,7 @@ impl WebVideo {
                 f64::from(w),
                 f64::from(h),
             )
-            .map_err(js_error_text)?;
+            .map_err(js_error)?;
         gpu.queue.copy_external_image_to_texture(
             &wgpu::CopyExternalImageSourceInfo {
                 source: wgpu::ExternalImageSource::HTMLCanvasElement(canvas.clone()),
@@ -318,11 +352,11 @@ impl Drop for WebVideo {
 /// Starts playing a picked or dropped file. The check is on the type the browser reports: the
 /// picker's filter can be switched to all files, and a drop has no filter. An element given
 /// something else never reports a size, so the source would just not change.
-fn open_file(file: &File) -> Result<WebVideo, String> {
+fn open_file(file: &File) -> Result<WebVideo, WebError> {
     if !file.type_().starts_with("video/") {
-        return Err(format!("{} isn't a video", file.name()));
+        return Err(WebError::NotVideoFile(file.name()));
     }
-    let url = Url::create_object_url_with_blob(file).map_err(js_error_text)?;
+    let url = Url::create_object_url_with_blob(file).map_err(js_error)?;
     let video = new_video_element()?;
     video.set_loop(true);
     video.set_src(&url);
@@ -335,8 +369,8 @@ fn open_file(file: &File) -> Result<WebVideo, String> {
 /// the life of the page.
 pub fn listen_for_dropped_files(pending: &Pending) {
     let answer = pending.clone();
-    let result = (|| -> Result<(), String> {
-        let window = web_sys::window().ok_or("no window")?;
+    let result = (|| -> Result<(), WebError> {
+        let window = web_sys::window().ok_or(WebError::NoWindow)?;
         // The browser only fires `drop` where `dragover` was cancelled.
         let on_drag_over = Closure::<dyn FnMut(DragEvent)>::new(|event: DragEvent| {
             event.prevent_default();
@@ -359,10 +393,10 @@ pub fn listen_for_dropped_files(pending: &Pending) {
                 "dragover",
                 on_drag_over.into_js_value().unchecked_ref(),
             )
-            .map_err(js_error_text)?;
+            .map_err(js_error)?;
         window
             .add_event_listener_with_callback("drop", on_drop.into_js_value().unchecked_ref())
-            .map_err(js_error_text)
+            .map_err(js_error)
     })();
     if let Err(e) = result {
         *pending.borrow_mut() = Some(Err(e));
@@ -372,15 +406,15 @@ pub fn listen_for_dropped_files(pending: &Pending) {
 /// Opens the browser's file picker for a video; the answer lands in `pending`.
 pub fn pick_file(pending: &Pending) {
     let answer = pending.clone();
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<(), WebError> {
         let document = web_sys::window()
             .and_then(|w| w.document())
-            .ok_or("no document")?;
+            .ok_or(WebError::NoDocument)?;
         let input: HtmlInputElement = document
             .create_element("input")
-            .map_err(js_error_text)?
+            .map_err(js_error)?
             .dyn_into()
-            .map_err(|_| "not an input element")?;
+            .map_err(|_| WebError::NotInputElement)?;
         input.set_type("file");
         input.set_accept("video/*");
         let picked = input.clone();
@@ -406,10 +440,10 @@ pub fn open_camera(pending: &Pending) {
     wasm_bindgen_futures::spawn_local(async move {
         let opened = async {
             let devices = web_sys::window()
-                .ok_or("no window")?
+                .ok_or(WebError::NoWindow)?
                 .navigator()
                 .media_devices()
-                .map_err(|_| "this browser has no camera access (it needs https or localhost)")?;
+                .map_err(|_| WebError::NoCameraAccess)?;
             // Ask for the camera's full width, not whatever mode the driver picks first
             // (often a cropped one).
             let size = |ideal: u32| {
@@ -425,20 +459,15 @@ pub fn open_camera(pending: &Pending) {
             constraints.set_audio(&false.into());
             let promise = devices
                 .get_user_media_with_constraints(&constraints)
-                .map_err(js_error_text)?;
+                .map_err(js_error)?;
             let stream: MediaStream = JsFuture::from(promise)
                 .await
-                .map_err(|e| {
-                    format!(
-                        "the camera wasn't allowed or isn't there: {}",
-                        js_error_text(e)
-                    )
-                })?
+                .map_err(|e| WebError::CameraDenied(js_error_text(e)))?
                 .dyn_into()
-                .map_err(|_| "not a media stream")?;
+                .map_err(|_| WebError::NotMediaStream)?;
             let element = new_video_element()?;
             element.set_src_object(Some(&stream));
-            Ok::<_, String>(WebVideo::new(element, "Webcam".into(), Some(stream), None))
+            Ok::<_, WebError>(WebVideo::new(element, "Webcam".into(), Some(stream), None))
         }
         .await;
         *pending.borrow_mut() = Some(opened);

@@ -15,7 +15,7 @@ mod params;
 mod pixel;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 
 use after_effects as ae;
 use pixel::{Depth, Placement};
@@ -32,14 +32,12 @@ pub use vfx_host;
 /// Render-path notes, in `~/Library/Logs/<file>-AfterEffects.log`.
 static LOG: diag::Log = diag::Log::new("-AfterEffects.log");
 
-/// Set once a fallback has been logged, so a failing GPU doesn't flood the log.
-static WARNED: AtomicBool = AtomicBool::new(false);
+/// Lets only the first fallback reach After Effects' error log; `LOG` notes every one.
+static WARNED: Once = Once::new();
 
 fn warn_once(message: &str) {
     LOG.note(&format!("warning: {message}"));
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        ae::log::error!("{}: {message}", vfx_host::plugin().info.name);
-    }
+    WARNED.call_once(|| ae::log::error!("{}: {message}", vfx_host::plugin().info.name));
 }
 
 /// Exports the plugin a `vfx_host::Plugin` static describes (give its full path, such as
@@ -197,6 +195,8 @@ pub unsafe fn entry_v3(
     if host_name.is_null() || host_version.is_null() {
         return 1;
     }
+    // SAFETY: the caller passes a valid `callback` and the host's `in_ptr`; every string is
+    // NUL terminated, and `host_name` and `host_version` are non-null.
     unsafe {
         callback(
             in_ptr,
@@ -249,7 +249,7 @@ pub fn handle_command(
     let cpu = vfx_host::plugin().kind == Kind::Cpu;
     match command {
         // SmartFX: After Effects asks which input area the effect needs, then renders
-        // with buffers it checks out for us. This is the only path that receives 32 bpc.
+        // with buffers it checks out. This is the only path that receives 32 bpc.
         ae::Command::SmartPreRender { mut extra } if cpu => {
             cpu_pre_render(&mut extra, &in_data, params)
         }
@@ -342,7 +342,10 @@ fn gpu_device_setup(
     let opened = ae::pf::suites::GPUDevice::new()
         .and_then(|suite| suite.device_info(in_data.effect_ref(), index))
         .map_err(|e| format!("{e:?}"))
-        .and_then(|info| unsafe { metal::AeDevice::open(info.devicePV, index) });
+        .and_then(|info| {
+            // SAFETY: with Metal as the framework, `devicePV` is the device's `id<MTLDevice>`.
+            unsafe { metal::AeDevice::open(info.devicePV, index) }.map_err(|e| e.to_string())
+        });
     match opened {
         Ok(device) => {
             LOG.note(&format!(
@@ -399,8 +402,10 @@ fn gpu_render_native(
         let world = RawWorld(l.as_mut_ptr());
         let data = suite.gpu_world_data(in_data.effect_ref(), &mut *l)?;
         let size = suite.gpu_world_size(in_data.effect_ref(), world)?;
+        // SAFETY: After Effects returned `data` as this world's `id<MTLBuffer>` on
+        // this device, and `size` as its length.
         let buffer = unsafe { device.wrap_buffer(data, size as u64) }.map_err(|e| {
-            warn_once(&e);
+            warn_once(&e.to_string());
             ae::Error::BadCallbackParameter
         })?;
         Ok(metal::World {
@@ -460,7 +465,7 @@ fn gpu_pre_render(
 
     // An effect that reads past each pixel needs that much more input.
     let mut input_request = request;
-    input_request.rect = grow(request.rect.into(), reach_x, reach_y).into();
+    input_request.rect = outset(request.rect.into(), reach_x, reach_y).into();
 
     let callbacks = extra.callbacks();
     let checkout = |index: i32, id: i32| {
@@ -484,8 +489,8 @@ fn gpu_pre_render(
     // clipped to the layer (or to the input, when an earlier effect already grew it past
     // the layer), not to what the input covers.
     let input_max: ae::Rect = input.max_result_rect.into();
-    let mut result = grow(input.result_rect.into(), reach_x, reach_y);
-    let mut max = grow(input_max, reach_x, reach_y);
+    let mut result = outset(input.result_rect.into(), reach_x, reach_y);
+    let mut max = outset(input_max, reach_x, reach_y);
     if !effect_region.grows {
         let bounds = union(layer_bounds(in_data), input_max);
         result = intersect(result, bounds);
@@ -621,7 +626,7 @@ fn stride(layer: &ae::Layer) -> Result<usize, ae::Error> {
     usize::try_from(layer.row_bytes()).map_err(|_| ae::Error::BadCallbackParameter)
 }
 
-fn grow(r: ae::Rect, x: i32, y: i32) -> ae::Rect {
+fn outset(r: ae::Rect, x: i32, y: i32) -> ae::Rect {
     if r.is_empty() {
         return r;
     }
@@ -695,7 +700,8 @@ fn cpu_pre_render(
 ) -> Result<(), ae::Error> {
     let values = params::read(params, specs())?;
     let ctx = context(in_data);
-    // Slow setup starts here, so a render and Multi-Frame Rendering's other threads don't wait in it.
+    // Slow setup starts here, so a render and Multi-Frame Rendering's other threads don't
+    // wait in it.
     let wanted = cpu_instance()?.with(|effect| {
         effect.values_known(&values);
         effect.frames_before(&values, ctx.frame_rate)
@@ -722,7 +728,7 @@ fn cpu_pre_render(
         time_scale,
     )?;
 
-    // Then the frames before it, nearest first, stopping at the start of the layer.
+    // The frames before it, nearest first, up to the start of the layer.
     let mut frame_count = 1;
     for k in 1..=wanted as i32 {
         let time = now - k * step;

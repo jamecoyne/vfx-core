@@ -81,6 +81,7 @@ struct PluginDescriptors {
 
 // SAFETY: the raw pointers point into the CStrings this struct owns, which never change.
 unsafe impl Send for PluginDescriptors {}
+// SAFETY: as for `Send`: the pointed-to CStrings are never mutated.
 unsafe impl Sync for PluginDescriptors {}
 
 /// `text` in a fixed FFGL field, zero-padded and cut to fit.
@@ -222,10 +223,7 @@ impl Instance {
     /// Destroys the plugin's own device once `VFX_FFGL_LOSE_OWN_DEVICE_AFTER`, read when the
     /// instance is made, has counted down its RAM path renders. A test of the way back from a
     /// loss: the device's loss callback runs, and this render fails and passes its frame through.
-    fn force_own_device_loss_for_tests(
-        renders_until_loss: &mut Option<u32>,
-        device: &vfx_host::OwnDevice,
-    ) {
+    fn inject_own_device_loss(renders_until_loss: &mut Option<u32>, device: &vfx_host::OwnDevice) {
         let Some(renders) = renders_until_loss else {
             return;
         };
@@ -250,6 +248,7 @@ impl Instance {
 /// this function returned from FF_INSTANTIATE_GL.
 pub unsafe fn plug_main(code: u32, input: FFMixed, instance: *mut c_void) -> FFMixed {
     // A panic must not unwind into the host.
+    // SAFETY: the caller upholds the FFGL contract in this function's `# Safety`.
     catch_unwind(AssertUnwindSafe(|| unsafe {
         dispatch(code, input, instance.cast())
     }))
@@ -365,7 +364,6 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
             if viewport.is_none() {
                 return FFMixed::fail();
             }
-            #[cfg(target_os = "windows")]
             if let Err(e) = gl::load() {
                 LOG.note(&format!("warning: {e}"));
                 return FFMixed::fail();
@@ -588,7 +586,7 @@ unsafe fn process_cpu(
             input_texture.Handle,
             (input_texture.HardwareWidth, input_texture.HardwareHeight),
             args.HostFBO,
-            cpu.history.next(frames_before, frames_held),
+            cpu.history.push_slot(frames_before, frames_held),
         )
     };
     cpu.history.drop_repeat();
@@ -624,7 +622,7 @@ unsafe fn process_cpu(
     let render_time = started.elapsed() - read_time;
     #[cfg(target_os = "windows")]
     if on_gpu {
-        instance.interop.force_loss_before_present_for_tests();
+        instance.interop.inject_loss_before_present();
         let presented = (instance.interop.current())
             .zip(instance.gpu_output_frame.as_ref())
             .map(|(interop, output)| {
@@ -739,6 +737,8 @@ unsafe fn process_gpu(
         return false;
     };
     let (w, h) = (input_texture.Width, input_texture.Height);
+    // SAFETY: the closure is only called inside this function, with the host's
+    // context current.
     let pass_through = |blit: &gl::Blit| unsafe {
         let max_uv = [
             w as f32 / input_texture.HardwareWidth.max(1) as f32,
@@ -786,10 +786,11 @@ unsafe fn process_gpu(
     if !instance.interop_disabled {
         if (instance.interop.as_ref()).is_none_or(|i| i.size() != (w, h) || !i.renders_on(&device))
         {
-            // SAFETY: the context is current; the old interop belongs to it.
             if let Some(old) = instance.interop.take() {
+                // SAFETY: the context is current; the old interop belongs to it.
                 unsafe { old.delete() };
             }
+            // SAFETY: as above, the context is current.
             match unsafe { surface::Interop::new(device.clone(), (w, h)) } {
                 Ok(interop) => instance.interop = Some(interop),
                 // A device lost again since it opened: the next replacement builds the interop.
@@ -829,10 +830,11 @@ unsafe fn process_gpu(
             .as_ref()
             .is_none_or(|canvas| canvas.size != (w, h))
         {
-            // SAFETY: the context is current; the old canvas belongs to it.
             if let Some(old) = instance.float_transfer.take() {
+                // SAFETY: the context is current; the old canvas belongs to it.
                 unsafe { old.delete() };
             }
+            // SAFETY: as above, the context is current.
             match unsafe { float_transfer::FloatTransfer::new((w, h)) } {
                 Ok(canvas) => instance.float_transfer = Some(canvas),
                 Err(e) => {
@@ -875,7 +877,7 @@ unsafe fn process_gpu(
         layer: None,
     };
     LOG.note("render path: GPU through RAM (texture readback)");
-    Instance::force_own_device_loss_for_tests(&mut instance.renders_until_own_device_loss, &device);
+    Instance::inject_own_device_loss(&mut instance.renders_until_own_device_loss, &device);
     let Ok(result) = catch_unwind(AssertUnwindSafe(|| {
         pipeline::run(device.gpu(), device.pool_key, &job)
     })) else {

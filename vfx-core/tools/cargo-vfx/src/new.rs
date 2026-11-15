@@ -6,40 +6,39 @@
 use std::fs;
 use std::path::Path;
 
+use crate::error::{Error, Result};
+
 /// Writes the crate and registers it. `name` is the package name, like `my-glow`.
-pub fn new(root: &Path, name: &str) -> Result<(), String> {
+pub fn new(root: &Path, name: &str) -> Result<()> {
     if name.is_empty()
         || !name.starts_with(|c: char| c.is_ascii_lowercase())
         || !name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err(format!(
-            "`{name}`: name the crate in lower case, digits and hyphens, like my-glow"
-        ));
+        return Err(Error::InvalidCrateName(name.to_owned()));
     }
     let dir = root.join("plugins").join(name);
     if dir.exists() {
-        return Err(format!("{} already exists", dir.display()));
+        return Err(Error::AlreadyExists(dir));
     }
     let id = Identity::from(name);
-    fs::create_dir_all(dir.join("src")).map_err(|e| e.to_string())?;
-    let write = |file: &str, text: String| {
-        fs::write(dir.join(file), text).map_err(|e| format!("{file}: {e}"))
-    };
+    fs::create_dir_all(dir.join("src"))?;
+    let write =
+        |file: &str, text: String| fs::write(dir.join(file), text).map_err(Error::file(file));
     write("Cargo.toml", id.manifest(name))?;
     write("build.rs", BUILD_RS.to_owned())?;
     write("src/lib.rs", id.lib())?;
 
     let workspace = root.join("Cargo.toml");
-    let text = fs::read_to_string(&workspace).map_err(|e| e.to_string())?;
+    let text = fs::read_to_string(&workspace)?;
     let text = add_member(&text, &format!("plugins/{name}"))?;
-    fs::write(&workspace, text).map_err(|e| e.to_string())?;
+    fs::write(&workspace, text)?;
 
     let preview = root.join("vfx-core/hosts/preview/Cargo.toml");
-    let text = fs::read_to_string(&preview).map_err(|e| e.to_string())?;
+    let text = fs::read_to_string(&preview)?;
     let text = add_effect_dependency(&text, name)?;
-    fs::write(&preview, text).map_err(|e| e.to_string())?;
+    fs::write(&preview, text)?;
 
     println!("created {} ({})", dir.display(), id.name);
     println!("  cargo vfx preview -p {name}     try it");
@@ -234,11 +233,9 @@ fn guid(seed: &str) -> String {
 }
 
 /// `text` (the workspace manifest) with `member` added to `[workspace] members`.
-fn add_member(text: &str, member: &str) -> Result<String, String> {
-    let start = text
-        .find("members = [")
-        .ok_or("the workspace Cargo.toml has no `members = [`")?;
-    let end = start + text[start..].find(']').ok_or("unclosed members list")?;
+fn add_member(text: &str, member: &str) -> Result<String> {
+    let start = text.find("members = [").ok_or(Error::NoMembersList)?;
+    let end = start + text[start..].find(']').ok_or(Error::UnclosedMembersList)?;
     let list = &text[start..end];
     if list.contains(&format!("\"{member}\"")) {
         return Ok(text.to_owned());
@@ -253,7 +250,7 @@ fn add_member(text: &str, member: &str) -> Result<String, String> {
 
 /// `text` (the preview's manifest) with a path dependency on `plugins/<name>`, after the last
 /// effect crate it already lists.
-fn add_effect_dependency(text: &str, name: &str) -> Result<String, String> {
+fn add_effect_dependency(text: &str, name: &str) -> Result<String> {
     let line = format!("{name} = {{ path = \"../../../plugins/{name}\" }}\n");
     if text.contains(&line) {
         return Ok(text.to_owned());
@@ -268,7 +265,7 @@ fn add_effect_dependency(text: &str, name: &str) -> Result<String, String> {
             after = Some(end);
         }
     }
-    let after = after.ok_or("the preview's Cargo.toml lists no effect crate")?;
+    let after = after.ok_or(Error::NoPreviewEffects)?;
     Ok(format!("{}{line}{}", &text[..after], &text[after..]))
 }
 
@@ -277,7 +274,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_from_a_crate_name() {
+    fn identity_from_fills_each_field() {
         let id = Identity::from("my-glow");
         assert_eq!((id.name.as_str(), id.file.as_str()), ("My Glow", "MyGlow"));
         assert_eq!(id.ffgl_code, "MYGL");
@@ -287,12 +284,16 @@ mod tests {
     }
 
     #[test]
-    fn registers_in_the_workspace_and_the_preview() {
+    fn add_member_appends_to_members() {
         let ws = "[workspace]\nmembers = [\".\", \"plugins/a\"]\n";
         assert_eq!(
             add_member(ws, "plugins/b").unwrap(),
             "[workspace]\nmembers = [\".\", \"plugins/a\", \"plugins/b\"]\n"
         );
+    }
+
+    #[test]
+    fn add_effect_dependency_inserts_after_last_effect() {
         let preview = "[dependencies]\nx = 1\na = { path = \"../../../plugins/a\" }\ny = 2\n\n[target.'cfg(windows)'.dependencies]\nf = { path = \"../../../plugins/f\", optional = true }\n";
         assert_eq!(
             add_effect_dependency(preview, "b").unwrap(),
@@ -302,7 +303,7 @@ mod tests {
 
     /// The new crate's identity passes the build script's checks.
     #[test]
-    fn a_new_identity_builds() {
+    fn new_identity_passes_build_checks() {
         let dir = std::env::temp_dir().join(format!("cargo-vfx-new-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(

@@ -38,7 +38,9 @@ impl fmt::Display for Device {
 #[cfg(windows)]
 fn adapter_name(adapter: u32) -> Option<String> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    // SAFETY: creating a factory takes no pointers.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    // SAFETY: `factory` is a live COM object, and the description is returned by value.
     let desc = unsafe { factory.EnumAdapters1(adapter).and_then(|a| a.GetDesc1()) }.ok()?;
     Some(
         String::from_utf16_lossy(&desc.Description)
@@ -111,8 +113,8 @@ fn device_named(name: &str) -> Option<Device> {
 }
 
 /// The lowest YuNet score that becomes a face window. YuNet's usual 0.6 finds half faces and far
-/// faces that Vision, and so segcam 1.1, leave out. This cut agrees best with Vision on which frames
-/// have a face; higher cuts lose faces Vision finds about as fast as they drop extra ones.
+/// faces that Vision, and so segcam 1.1, leave out; this cut agrees best with Vision on which
+/// frames have a face.
 const SEGMENTER_FACE_SCORE: f32 = 0.85;
 
 /// The face models loaded on one device, and how long they took there.
@@ -129,8 +131,8 @@ const TIMED_RUNS: usize = 9;
 const MAX_ADAPTERS: u32 = 8;
 
 /// How much longer than the fastest device DirectML may take in the trial and still be picked.
-/// The trial runs the models alone with every core free, where in a render the CPU kernels share
-/// the cores with the analysis and the host, so the CPU's time flatters it (#66).
+/// The trial has every core free, but in a render the CPU kernels share them with the analysis
+/// and the host, so the CPU's trial time flatters it.
 #[cfg(windows)]
 pub const DIRECTML_MARGIN: f64 = 1.5;
 
@@ -194,11 +196,13 @@ fn adapters_to_try() -> Vec<u32> {
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
     };
+    // SAFETY: creating a factory takes no pointers.
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
         return Vec::new();
     };
     let adapters: Vec<AdapterMemory> = (0..MAX_ADAPTERS)
         .map_while(|index| {
+            // SAFETY: `factory` is a live COM object, and the description is returned by value.
             let desc = unsafe { factory.EnumAdapters1(index).and_then(|a| a.GetDesc1()) }.ok()?;
             Some(AdapterMemory {
                 index,
@@ -207,7 +211,7 @@ fn adapters_to_try() -> Vec<u32> {
             })
         })
         .collect();
-    adapters_worth_a_trial(&adapters)
+    trial_adapters(&adapters)
 }
 
 /// What decides whether a DXGI adapter gets a trial.
@@ -218,12 +222,12 @@ struct AdapterMemory {
     software: bool,
 }
 
-/// Leaves out software adapters and an integrated GPU beside a discrete one. Such a GPU can't win
-/// the trial, and compiling the models for it is the slowest part of a first load (#83). Integrated
-/// GPUs are told apart by their little dedicated memory, since asking D3D12 whether an adapter has
-/// unified memory would open a device on each.
+/// Leaves out software adapters, and an integrated GPU beside a discrete one: such a GPU can't
+/// win the trial, and compiling the models for it is the slowest part of a first load.
+/// Integrated GPUs are told apart by their little dedicated memory, since asking D3D12 about
+/// unified memory opens a device.
 #[cfg(windows)]
-fn adapters_worth_a_trial(adapters: &[AdapterMemory]) -> Vec<u32> {
+fn trial_adapters(adapters: &[AdapterMemory]) -> Vec<u32> {
     let hardware = || adapters.iter().filter(|adapter| !adapter.software);
     let most = hardware().map(|a| a.dedicated).max().unwrap_or(0);
     hardware()
@@ -277,8 +281,8 @@ fn time_runs(
 /// and compete with the render for its cores. Detection runs no less often with these.
 const CPU_THREADS: usize = 2;
 
-/// Failed runs in a row that mean a session has stopped working, not that one frame went wrong.
-const FAILED_RUNS_IN_A_ROW: u32 = 3;
+/// Consecutive failed runs after which a session counts as stopped, not as one bad frame.
+const FAILING_AFTER_RUNS: u32 = 3;
 
 fn session(model: &[u8], device: Device) -> ort::Result<Session> {
     // ONNX Runtime allows one environment per process, and threads load models side by side.
@@ -376,7 +380,7 @@ impl Detector for OrtYuNet {
     }
 
     fn failing(&self) -> bool {
-        self.failed_runs >= FAILED_RUNS_IN_A_ROW
+        self.failed_runs >= FAILING_AFTER_RUNS
     }
 }
 
@@ -439,7 +443,7 @@ impl BodyDetector for OrtPicoDet {
     }
 
     fn failing(&self) -> bool {
-        self.failed_runs >= FAILED_RUNS_IN_A_ROW
+        self.failed_runs >= FAILING_AFTER_RUNS
     }
 }
 
@@ -492,50 +496,11 @@ mod tests {
     }
 
     #[test]
-    fn no_trials_pick_nothing() {
-        assert_eq!(preferred_trial_index(&[]), None);
-    }
-
-    #[test]
-    fn fastest_trial_kept_when_alone_or_on_directml() {
-        assert_eq!(preferred_trial_index(&[(Device::Cpu, ms(10))]), Some(0));
-        #[cfg(windows)]
-        assert_eq!(
-            preferred_trial_index(&[(Device::DirectMl(0), ms(8)), (Device::Cpu, ms(10))]),
-            Some(0)
-        );
-    }
-
-    #[test]
     fn device_names_parse() {
         assert_eq!(device_named("CPU"), Some(Device::Cpu));
         assert_eq!(device_named("fast"), None);
         #[cfg(windows)]
         assert_eq!(device_named("1"), Some(Device::DirectMl(1)));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn directml_close_behind_cpu_is_picked() {
-        let times = [
-            (Device::Cpu, ms(10)),
-            (Device::DirectMl(1), ms(14)),
-            (Device::DirectMl(0), ms(15)),
-        ];
-        assert_eq!(preferred_trial_index(&times), Some(2));
-        assert_eq!(
-            preferred_trial_index(&[(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(15))]),
-            Some(1)
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn close_adapters_pick_the_lowest_number_whichever_timed_faster() {
-        let times = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(12))];
-        assert_eq!(preferred_trial_index(&times), Some(1));
-        let far = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(40))];
-        assert_eq!(preferred_trial_index(&far), Some(0));
     }
 
     #[cfg(windows)]
@@ -549,7 +514,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn integrated_gpu_beside_a_discrete_one_gets_no_trial() {
+    fn trial_adapters_skip_software_and_integrated_beside_discrete() {
         let adapters = [
             adapter(0, 12, false),
             AdapterMemory {
@@ -560,12 +525,12 @@ mod tests {
             adapter(2, 8, false),
             adapter(3, 0, true),
         ];
-        assert_eq!(adapters_worth_a_trial(&adapters), [0, 2]);
+        assert_eq!(trial_adapters(&adapters), [0, 2]);
     }
 
     #[cfg(windows)]
     #[test]
-    fn integrated_gpu_alone_gets_a_trial() {
+    fn trial_adapters_keep_lone_integrated() {
         let adapters = [
             AdapterMemory {
                 index: 0,
@@ -574,13 +539,61 @@ mod tests {
             },
             adapter(1, 0, true),
         ];
-        assert_eq!(adapters_worth_a_trial(&adapters), [0]);
+        assert_eq!(trial_adapters(&adapters), [0]);
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn cpu_faster_by_more_than_margin_is_kept() {
-        let times = [(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(16))];
-        assert_eq!(preferred_trial_index(&times), Some(0));
+    mod preferred_trial_index {
+        use super::*;
+
+        #[test]
+        fn empty_picks_nothing() {
+            assert_eq!(preferred_trial_index(&[]), None);
+        }
+
+        #[test]
+        fn keeps_fastest() {
+            assert_eq!(preferred_trial_index(&[(Device::Cpu, ms(10))]), Some(0));
+            #[cfg(windows)]
+            assert_eq!(
+                preferred_trial_index(&[(Device::DirectMl(0), ms(8)), (Device::Cpu, ms(10))]),
+                Some(0)
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn takes_close_directml() {
+            let times = [
+                (Device::Cpu, ms(10)),
+                (Device::DirectMl(1), ms(14)),
+                (Device::DirectMl(0), ms(15)),
+            ];
+            assert_eq!(preferred_trial_index(&times), Some(2));
+            assert_eq!(
+                preferred_trial_index(&[(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(15))]),
+                Some(1)
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn takes_lowest_close_adapter() {
+            let times = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(12))];
+            assert_eq!(preferred_trial_index(&times), Some(1));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn keeps_fastest_adapter_beyond_margin() {
+            let far = [(Device::DirectMl(2), ms(10)), (Device::DirectMl(0), ms(40))];
+            assert_eq!(preferred_trial_index(&far), Some(0));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn keeps_cpu_beyond_margin() {
+            let times = [(Device::Cpu, ms(10)), (Device::DirectMl(0), ms(16))];
+            assert_eq!(preferred_trial_index(&times), Some(0));
+        }
     }
 }

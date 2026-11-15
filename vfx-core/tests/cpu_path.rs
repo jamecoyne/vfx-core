@@ -118,7 +118,7 @@ fn wrong_buffer_size_is_rejected() {
 }
 
 #[test]
-fn float_readback_reuses_buffer_without_stale_pixels_or_row_padding() {
+fn float_readback_reuse_returns_each_write() {
     let gpu = gpu();
     // 80-byte rows need padding to the GPU's 256-byte copy pitch.
     let frame = Frame::new(&gpu, 5, 3, wgpu::TextureFormat::Rgba32Float);
@@ -132,7 +132,7 @@ fn float_readback_reuses_buffer_without_stale_pixels_or_row_padding() {
 }
 
 #[test]
-fn readback_rejects_a_different_frame_size() {
+fn readback_rejects_mismatched_size() {
     let gpu = gpu();
     let frame = Frame::new(&gpu, 5, 3, wgpu::TextureFormat::Rgba32Float);
     let other = Frame::new(&gpu, 3, 5, wgpu::TextureFormat::Rgba32Float);

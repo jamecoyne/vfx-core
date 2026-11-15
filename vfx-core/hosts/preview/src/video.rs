@@ -175,6 +175,29 @@ pub fn cameras() -> Vec<String> {
     }
 }
 
+/// Why a video could not be opened, played or recorded; the text is shown in the panel.
+#[derive(Debug, thiserror::Error)]
+pub enum VideoError {
+    #[error("couldn't start ffprobe (is it on PATH?): {0}")]
+    ProbeSpawn(#[source] std::io::Error),
+    #[error("no video stream found")]
+    NoVideoStream,
+    #[error("no frame rate the camera supports worked")]
+    NoCameraMode,
+    #[error("couldn't start ffmpeg (is it on PATH?): {0}")]
+    DecodeSpawn(#[source] std::io::Error),
+    #[error("couldn't start ffmpeg (is it on PATH?): {0}")]
+    EncodeSpawn(#[source] std::io::Error),
+    #[error("ffmpeg stopped accepting frames")]
+    EncoderClosed,
+    #[error("the frame size changed")]
+    FrameSizeChanged,
+    #[error("ffmpeg failed ({0})")]
+    EncodeFailed(std::process::ExitStatus),
+    #[error("couldn't wait for ffmpeg: {0}")]
+    EncodeWait(#[source] std::io::Error),
+}
+
 /// What ffprobe says about an input, plus the size frames are decoded at.
 #[derive(Clone)]
 pub struct Info {
@@ -212,7 +235,7 @@ impl Info {
         }
     }
 
-    pub fn probe(input: Input, max_side: u32) -> Result<Self, String> {
+    pub fn probe(input: Input, max_side: u32) -> Result<Self, VideoError> {
         let candidates = match &input {
             Input::File(_) => vec![input.clone()],
             Input::Camera(name, _) => CAMERA_MODES
@@ -235,7 +258,7 @@ impl Info {
                 .args(input.args())
                 .stdin(Stdio::null())
                 .output()
-                .map_err(|e| format!("couldn't start ffprobe (is it on PATH?): {e}"))?;
+                .map_err(VideoError::ProbeSpawn)?;
             let text = String::from_utf8_lossy(&out.stdout);
             let field = |key: &str| {
                 text.lines()
@@ -249,7 +272,7 @@ impl Info {
                 (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
                 // A camera refuses a mode it doesn't support; try the next one.
                 _ if matches!(input, Input::Camera(..)) => continue,
-                _ => return Err("no video stream found".into()),
+                _ => return Err(VideoError::NoVideoStream),
             };
             let rate = field("avg_frame_rate")
                 .filter(|r| parse_rate(r).is_some())
@@ -281,7 +304,7 @@ impl Info {
                 fit: false,
             });
         }
-        Err("no frame rate the camera supports worked".into())
+        Err(VideoError::NoCameraMode)
     }
 
     fn pixel_count(&self) -> usize {
@@ -383,18 +406,18 @@ struct DecoderState {
 
 impl Video {
     /// Starts playing `input`, scaled to fit `max_side`.
-    pub fn open(input: Input, max_side: u32) -> Result<Self, String> {
+    pub fn open(input: Input, max_side: u32) -> Result<Self, VideoError> {
         let info = Info::probe(input, max_side)?;
         Self::start_playing(info)
     }
 
     /// Starts playing `input` fitted into `size` (see [`Info::fitted`]).
-    pub fn open_fitted(input: Input, size: (u32, u32)) -> Result<Self, String> {
+    pub fn open_fitted(input: Input, size: (u32, u32)) -> Result<Self, VideoError> {
         let info = Info::probe(input, size.0.max(size.1))?.fitted(size);
         Self::start_playing(info)
     }
 
-    fn start_playing(info: Info) -> Result<Self, String> {
+    fn start_playing(info: Info) -> Result<Self, VideoError> {
         let video = Self {
             info,
             state: Arc::new(Mutex::new(DecoderState {
@@ -417,7 +440,7 @@ impl Video {
 
     /// Restarts decoding at `position` seconds, playing on or showing just that
     /// frame. Cameras always play live from now.
-    pub fn seek(&self, position: f64, play: bool) -> Result<(), String> {
+    pub fn seek(&self, position: f64, play: bool) -> Result<(), VideoError> {
         let camera = self.info.file().is_none();
         let position = if camera {
             0.0
@@ -439,7 +462,7 @@ impl Video {
             .info
             .decode_command(position, pace)
             .spawn()
-            .map_err(|e| format!("couldn't start ffmpeg (is it on PATH?): {e}"))?;
+            .map_err(VideoError::DecodeSpawn)?;
         let mut stdout = child.stdout.take().expect("stdout is piped");
         s.generation += 1;
         s.child = Some(child);
@@ -615,7 +638,7 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn record(size: (u32, u32), out: &Path) -> Result<Self, String> {
+    pub fn record(size: (u32, u32), out: &Path) -> Result<Self, VideoError> {
         let mut child = Command::new("ffmpeg")
             .args([
                 "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "argb", "-s",
@@ -629,7 +652,7 @@ impl Encoder {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| format!("couldn't start ffmpeg: {e}"))?;
+            .map_err(VideoError::EncodeSpawn)?;
         let stdin = child.stdin.take();
         Ok(Self {
             child,
@@ -638,15 +661,15 @@ impl Encoder {
         })
     }
 
-    pub fn write(&mut self, pixels: &[Argb<u8>]) -> Result<(), String> {
+    pub fn write(&mut self, pixels: &[Argb<u8>]) -> Result<(), VideoError> {
         self.stdin
             .as_mut()
             .expect("open until finish")
             .write_all(bytemuck::cast_slice(pixels))
-            .map_err(|_| "ffmpeg stopped accepting frames".to_string())
+            .map_err(|_| VideoError::EncoderClosed)
     }
 
-    pub fn write_float(&mut self, pixels: &[f32]) -> Result<(), String> {
+    pub fn write_float(&mut self, pixels: &[f32]) -> Result<(), VideoError> {
         let mut argb_scratch = std::mem::take(&mut self.argb_scratch);
         argb_scratch.clear();
         argb_scratch.extend(pixels.as_chunks::<4>().0.iter().map(|&[r, g, b, a]| Argb {
@@ -661,12 +684,12 @@ impl Encoder {
     }
 
     /// Closes the input and waits for ffmpeg to finish the file.
-    pub fn finish(mut self) -> Result<(), String> {
+    pub fn finish(mut self) -> Result<(), VideoError> {
         drop(self.stdin.take());
         match self.child.wait() {
             Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(format!("ffmpeg failed ({status})")),
-            Err(e) => Err(e.to_string()),
+            Ok(status) => Err(VideoError::EncodeFailed(status)),
+            Err(e) => Err(VideoError::EncodeWait(e)),
         }
     }
 }
@@ -713,7 +736,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_camera_is_the_built_in_one() {
+    fn default_camera_prefers_built_in() {
         let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let list = names(&[
             "Jame iphone Camera",
@@ -754,7 +777,7 @@ mod tests {
     /// Seeks paused and playing, and reports the end. Needs ffmpeg:
     /// `cargo test -p vfx-preview -- --ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "needs ffmpeg"]
     fn seeks_pauses_and_ends() {
         let video = Video::open(Input::File(test_clip("seek-test")), 1920).unwrap();
         assert!(video.playing());
@@ -774,7 +797,7 @@ mod tests {
         );
         assert!(!video.ended());
 
-        // Playing on from 2 s reaches the end of the 3 s clip in about a second.
+        // A playing seek near the end plays on to the end of the clip.
         video.seek(2.0, true).unwrap();
         wait_for("the end", || {
             video.take_oldest(&mut pixels);
@@ -786,7 +809,7 @@ mod tests {
     /// Playing from the start wraps time at the frame count, in the same process and with the
     /// same picture as the first pass, and reports the loop once.
     #[test]
-    #[ignore]
+    #[ignore = "needs ffmpeg"]
     fn file_loops_in_one_process() {
         let video = Video::open(Input::File(test_clip("loop-test")), 1920).unwrap();
         assert_eq!(video.info.frames_per_pass, Some(75));
@@ -816,8 +839,8 @@ mod tests {
     /// A seek away from the start ends with its process, at the file's end, and the caller's
     /// restart from the start then loops.
     #[test]
-    #[ignore]
-    fn seek_plays_to_end_then_restart_loops() {
+    #[ignore = "needs ffmpeg"]
+    fn seek_from_middle_ends_and_restart_loops() {
         let video = Video::open(Input::File(test_clip("seek-loop-test")), 1920).unwrap();
         video.seek(2.5, true).unwrap();
         let mut pixels = Vec::new();
@@ -859,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "needs ffmpeg"]
     fn slow_loop_drops_oldest_frames() {
         let video = Video::open(Input::File(test_clip("queue-test")), 1920).unwrap();
         wait_for("the first frame", || video.take_arrived_count() > 0);
@@ -928,7 +951,7 @@ mod record_tests {
     use super::Encoder;
 
     #[test]
-    fn records_frames_to_an_mp4() {
+    fn encoder_records_mp4() {
         let out = std::env::temp_dir().join("vfx-preview-record-test.mp4");
         let mut encoder = Encoder::record((64, 48), &out).expect("ffmpeg starts");
         let frame = vec![vfx_core::cpu::Argb::<u8>::default(); 64 * 48];

@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
+thiserror = "2.0.21"
 wgpu = "=30.0.2"
 
 # Browsers are single-threaded: lets wgpu's web types satisfy the `Send` bound on effects,

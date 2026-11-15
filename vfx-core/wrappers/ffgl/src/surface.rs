@@ -106,6 +106,7 @@ impl Shared {
             }
             t
         };
+        // SAFETY: `surface` is the live IOSurface just made; `gpu` is the plugin's Metal device.
         let texture = match unsafe { metal_texture(gpu, &surface, size) } {
             Ok(t) => t,
             Err(e) => {
@@ -164,6 +165,7 @@ unsafe fn metal_texture(
             .map(|d| d.raw_device().clone())
             .ok_or(InteropError::NotMetal)?
     };
+    // SAFETY: a descriptor constructor taking plain values.
     let desc = unsafe {
         MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
             MTLPixelFormat::RGBA32Float,

@@ -739,8 +739,8 @@ impl Effects {
 
     /// Loads a PNG or JPEG as the source, scaled to fit MAX_IMAGE_SIDE.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn load_image(&mut self, gpu: &Gpu, path: &std::path::Path) -> Result<(), String> {
-        let img = image::open(path).map_err(|e| e.to_string())?;
+    pub fn load_image(&mut self, gpu: &Gpu, path: &std::path::Path) -> image::ImageResult<()> {
+        let img = image::open(path)?;
         let img = if img.width().max(img.height()) > MAX_IMAGE_SIDE {
             img.resize(
                 MAX_IMAGE_SIDE,
@@ -1057,7 +1057,7 @@ mod tests {
     /// Renders the moving-disc pattern (a left-to-right red gradient underneath) through
     /// Flip, off and then on, and checks the result is mirrored.
     #[test]
-    fn flip_mirrors_the_frame() {
+    fn flip_x_mirrors_output() {
         let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
@@ -1103,7 +1103,7 @@ mod tests {
     /// segcam through the preview: the disc pattern moves, so after a few frames the
     /// motion matte is opaque somewhere and clear somewhere else.
     #[test]
-    fn segcam_finds_the_moving_disc() {
+    fn segcam_matte_separates_moving_disc() {
         let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
@@ -1123,7 +1123,7 @@ mod tests {
 
     /// A clear starts the history over at the next frame, with the source still there.
     #[test]
-    fn clear_history_starts_over_from_the_next_frame() {
+    fn clear_history_restarts_next_frame() {
         let (_turn, gpu) = crate::test_gpu();
         let mut effects = Effects::new(&gpu);
         effects.keep_output_in_ram(true);
@@ -1143,7 +1143,7 @@ mod tests {
 
     /// A CPU effect goes on after a loss with its source and its history.
     #[test]
-    fn new_device_keeps_the_source_and_the_history() {
+    fn new_device_keeps_source_and_history() {
         let (_turn, lost) = crate::test_gpu();
         let mut effects = Effects::new(&lost);
         effects.keep_output_in_ram(true);
@@ -1194,7 +1194,7 @@ mod tests {
 
     /// A GPU effect's state was on the device, so it's rebuilt and draws the same frame again.
     #[test]
-    fn gpu_effect_starts_over_on_a_new_device() {
+    fn gpu_effect_redraws_same_frame_on_new_device() {
         let (_turn, lost) = crate::test_gpu();
         let mut effects = Effects::new(&lost);
         let (mut controls, values) = shown("Gaussian Blur");
@@ -1318,7 +1318,7 @@ mod frame_size_tests {
     use super::frame_fits;
 
     #[test]
-    fn frame_fits_its_size_in_pixels() {
+    fn frame_fits_compares_length_to_size() {
         let frame = vec![0.0f32; 4 * 3 * 4];
         assert!(frame_fits(&frame, (4, 3)));
         assert!(!frame_fits(&frame, (4, 2)));

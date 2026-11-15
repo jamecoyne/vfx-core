@@ -187,44 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_onto_offsets_into_a_larger_canvas() {
-        let placement = Placement {
-            canvas_width: 4,
-            canvas_height: 4,
-            dx: 1,
-            dy: 2,
-        };
-        let canvas = decode_onto(&two_by_two(), 8, 2, 2, Depth::Bpc8, placement);
-        assert_eq!(red_at(&canvas, 4, 1, 2), 10);
-        assert_eq!(red_at(&canvas, 4, 2, 3), 40);
-        assert_eq!(&canvas[0..4], &[0.0; 4], "uncovered canvas is transparent");
-    }
-
-    #[test]
-    fn decode_onto_clips_negative_offsets() {
-        let placement = Placement {
-            canvas_width: 1,
-            canvas_height: 1,
-            dx: -1,
-            dy: -1,
-        };
-        let canvas = decode_onto(&two_by_two(), 8, 2, 2, Depth::Bpc8, placement);
-        assert_eq!(canvas.len(), 4);
-        assert_eq!(
-            red_at(&canvas, 1, 0, 0),
-            40,
-            "only the bottom-right pixel lands"
-        );
-    }
-
-    #[test]
-    fn argb8_decodes_in_ae_channel_order() {
-        // alpha 255, red 10, green 20, blue 30
-        let rgba = decode(&[255, 10, 20, 30], 4, 1, 1, Depth::Bpc8);
-        assert_eq!(rgba, vec![10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
-    }
-
-    #[test]
     fn argb8_round_trips_exactly() {
         let src = [255, 10, 20, 30, 128, 0, 255, 77];
         let rgba = decode(&src, 8, 2, 1, Depth::Bpc8);
@@ -234,17 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn argb16_scales_by_32768() {
-        let mut src = Vec::new();
-        for v in [32768u16, 0, 16384, 32768] {
-            src.extend_from_slice(&v.to_ne_bytes());
-        }
-        let rgba = decode(&src, 8, 1, 1, Depth::Bpc16);
-        assert_eq!(rgba, vec![0.0, 0.5, 1.0, 1.0]);
-    }
-
-    #[test]
-    fn float32_keeps_out_of_range_values() {
+    fn float32_round_trip_keeps_out_of_range_values() {
         let mut src = Vec::new();
         for v in [1.0f32, 2.5, -0.25, 0.5] {
             src.extend_from_slice(&v.to_ne_bytes());
@@ -258,19 +210,18 @@ mod tests {
     }
 
     #[test]
-    fn integer_encode_clamps() {
+    fn encode_integer_clamps() {
         let mut dst = [0u8; 4];
         encode(&[2.0, -1.0, 0.5, 1.5], &mut dst, 4, 1, 1, Depth::Bpc8);
         assert_eq!(dst, [255, 255, 0, 128]);
     }
 
-    #[test]
-    fn row_padding_is_skipped_on_decode_and_kept_on_encode() {
-        // Two 1-pixel rows with 4 bytes of host padding after each.
-        let src = [255, 1, 2, 3, 0xAA, 0xAA, 0xAA, 0xAA, 255, 4, 5, 6];
-        let rgba = decode(&src, 8, 1, 2, Depth::Bpc8);
-        assert_eq!(rgba.len(), 8);
+    // Two 1-pixel rows with 4 bytes of host padding after each.
+    const PADDED: [u8; 12] = [255, 1, 2, 3, 0xAA, 0xAA, 0xAA, 0xAA, 255, 4, 5, 6];
 
+    #[test]
+    fn encode_keeps_row_padding() {
+        let rgba = decode(&PADDED, 8, 1, 2, Depth::Bpc8);
         let mut dst = [0xEEu8; 12];
         encode(&rgba, &mut dst, 8, 1, 2, Depth::Bpc8);
         assert_eq!(&dst[0..4], &[255, 1, 2, 3]);
@@ -279,10 +230,72 @@ mod tests {
     }
 
     #[test]
-    fn depth_from_bits() {
+    fn depth_from_bits_accepts_only_8_16_32() {
         assert_eq!(Depth::from_bits(8), Some(Depth::Bpc8));
         assert_eq!(Depth::from_bits(16), Some(Depth::Bpc16));
         assert_eq!(Depth::from_bits(32), Some(Depth::Bpc32));
         assert_eq!(Depth::from_bits(12), None);
+    }
+
+    mod decode_onto {
+        use super::*;
+
+        #[test]
+        fn places_at_offset() {
+            let placement = Placement {
+                canvas_width: 4,
+                canvas_height: 4,
+                dx: 1,
+                dy: 2,
+            };
+            let canvas = decode_onto(&two_by_two(), 8, 2, 2, Depth::Bpc8, placement);
+            assert_eq!(red_at(&canvas, 4, 1, 2), 10);
+            assert_eq!(red_at(&canvas, 4, 2, 3), 40);
+            assert_eq!(&canvas[0..4], &[0.0; 4], "uncovered canvas is transparent");
+        }
+
+        #[test]
+        fn clips_negative_offsets() {
+            let placement = Placement {
+                canvas_width: 1,
+                canvas_height: 1,
+                dx: -1,
+                dy: -1,
+            };
+            let canvas = decode_onto(&two_by_two(), 8, 2, 2, Depth::Bpc8, placement);
+            assert_eq!(canvas.len(), 4);
+            assert_eq!(
+                red_at(&canvas, 1, 0, 0),
+                40,
+                "only the bottom-right pixel lands"
+            );
+        }
+    }
+
+    mod decode {
+        use super::*;
+
+        #[test]
+        fn argb8_uses_ae_channel_order() {
+            // alpha 255, red 10, green 20, blue 30
+            let rgba = decode(&[255, 10, 20, 30], 4, 1, 1, Depth::Bpc8);
+            assert_eq!(rgba, vec![10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
+        }
+
+        #[test]
+        fn argb16_maps_32768_to_one() {
+            let mut src = Vec::new();
+            for v in [32768u16, 0, 16384, 32768] {
+                src.extend_from_slice(&v.to_ne_bytes());
+            }
+            let rgba = decode(&src, 8, 1, 1, Depth::Bpc16);
+            assert_eq!(rgba, vec![0.0, 0.5, 1.0, 1.0]);
+        }
+
+        #[test]
+        fn skips_row_padding() {
+            let rgba = decode(&PADDED, 8, 1, 2, Depth::Bpc8);
+            assert_eq!(rgba.len(), 8);
+        }
     }
 }

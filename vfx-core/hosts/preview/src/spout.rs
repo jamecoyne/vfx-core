@@ -114,9 +114,69 @@ fn names_in(section: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// No running sender matches the name asked for.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SenderNotFound {
+    #[error("no Spout sender is running")]
+    NoneRunning,
+    #[error("no Spout sender {wanted}; there are {available}")]
+    Named { wanted: String, available: String },
+}
+
+/// Why a sender's frames could not be opened or read; the text is shown in the panel.
+#[derive(Debug, thiserror::Error)]
+pub enum SpoutError {
+    #[error("Vulkan didn't take the shared texture: {0}")]
+    VulkanImport(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("D3D12 didn't open the shared texture: {0}")]
+    Dx12Open(#[source] windows::core::Error),
+    #[error("D3D12 opened no texture")]
+    Dx12NoTexture,
+    #[error("the preview's GPU backend can't import a shared texture")]
+    ImportUnsupported,
+    #[error("no Direct3D 11 device: {0}")]
+    CreateDevice(#[source] windows::core::Error),
+    #[error("no Direct3D 11 device")]
+    NoDevice,
+    #[error("no Direct3D 11 context")]
+    NoContext,
+    #[error("an adapter with no description")]
+    NoAdapterDescription,
+    #[error("couldn't make a texture: {0}")]
+    CreateTexture(#[source] windows::core::Error),
+    #[error("couldn't make a texture")]
+    NoTexture,
+    #[error("its GPU was reset ({0})")]
+    DeviceReset(#[source] windows::core::Error),
+    #[error("the GPU didn't finish a copy in time")]
+    CopyTimeout,
+    #[error("the GPU failed a copy ({0})")]
+    CopyFailed(#[source] windows::core::Error),
+    #[error("its texture didn't open on any GPU")]
+    NotOpened,
+    #[error("its pixel format (DXGI {0}) isn't read; set the sender to 8 bit RGBA")]
+    PixelFormat(i32),
+    #[error("couldn't share a texture: {0}")]
+    ShareTexture(#[source] windows::core::Error),
+    #[error("couldn't make a query: {0}")]
+    CreateQuery(#[source] windows::core::Error),
+    #[error("couldn't make a query")]
+    NoQuery,
+    #[error("its keyed mutex failed ({0})")]
+    KeyedMutex(#[source] windows::core::Error),
+    #[error("its access mutex failed ({0})")]
+    AccessMutex(#[source] windows::core::Error),
+    #[error("couldn't read the sender's frame: {0}")]
+    ReadFrame(#[source] windows::core::Error),
+    #[error("couldn't make a view: {0}")]
+    CreateView(#[source] windows::core::Error),
+    #[error("couldn't make a view")]
+    NoView,
+}
+
 /// The sender `wanted` names: its whole name (any case), else the first containing it, else the
 /// first sender when it is empty.
-pub fn sender_name(senders: &[String], wanted: &str) -> Result<String, String> {
+pub fn sender_name(senders: &[String], wanted: &str) -> Result<String, SenderNotFound> {
     let lower = wanted.to_lowercase();
     let found = if wanted.is_empty() {
         senders.first()
@@ -125,8 +185,11 @@ pub fn sender_name(senders: &[String], wanted: &str) -> Result<String, String> {
             .or_else(|| senders.iter().find(|s| s.to_lowercase().contains(&lower)))
     };
     found.cloned().ok_or_else(|| match senders.len() {
-        0 => "no Spout sender is running".to_owned(),
-        _ => format!("no Spout sender {wanted}; there are {}", senders.join(", ")),
+        0 => SenderNotFound::NoneRunning,
+        _ => SenderNotFound::Named {
+            wanted: wanted.to_owned(),
+            available: senders.join(", "),
+        },
     })
 }
 
@@ -557,7 +620,7 @@ fn fs(v: Vertex) -> @location(0) vec4<f32> {
 /// Imports a link's shared textures, or makes the upload texture of a RAM link. The shared
 /// textures stay busy until a first copy from each has put it in a state wgpu tracks, so the
 /// worker writes none before that.
-fn import(gpu: &Gpu, link: &Link) -> Result<Imported, String> {
+fn import(gpu: &Gpu, link: &Link) -> Result<Imported, SpoutError> {
     let (width, height) = link.size;
     let desc = wgpu::TextureDescriptor {
         label: Some("spout frame"),
@@ -635,7 +698,7 @@ fn import_shared(
     gpu: &Gpu,
     handle: HANDLE,
     desc: &wgpu::TextureDescriptor,
-) -> Result<wgpu::Texture, String> {
+) -> Result<wgpu::Texture, SpoutError> {
     use wgpu::hal::api::{Dx12, Vulkan};
     let hal_desc = wgpu::hal::TextureDescriptor {
         label: None,
@@ -656,7 +719,7 @@ fn import_shared(
         if let Some(device) = gpu.device.as_hal::<Vulkan>() {
             let texture = device
                 .texture_from_d3d11_shared_handle(handle, &hal_desc)
-                .map_err(|e| format!("Vulkan didn't take the shared texture: {e}"))?;
+                .map_err(|e| SpoutError::VulkanImport(e.into()))?;
             drop(device);
             return Ok(gpu.device.create_texture_from_hal::<Vulkan>(
                 texture,
@@ -669,8 +732,8 @@ fn import_shared(
             device
                 .raw_device()
                 .OpenSharedHandle(handle, &mut resource)
-                .map_err(|e| format!("D3D12 didn't open the shared texture: {e}"))?;
-            let resource = resource.ok_or("D3D12 opened no texture")?;
+                .map_err(SpoutError::Dx12Open)?;
+            let resource = resource.ok_or(SpoutError::Dx12NoTexture)?;
             drop(device);
             let texture = wgpu::hal::dx12::Device::texture_from_raw(
                 resource,
@@ -687,7 +750,7 @@ fn import_shared(
             ));
         }
     }
-    Err("the preview's GPU backend can't import a shared texture".into())
+    Err(SpoutError::ImportUnsupported)
 }
 
 /// The worker thread's side: D3D11 devices, the connection to the sender, and the sender's sync
@@ -803,7 +866,7 @@ impl Worker {
     }
 
     /// Connects if needed and delivers a new frame if there is one; returns how long to wait.
-    fn step(&mut self, name: &CStr) -> Result<Duration, String> {
+    fn step(&mut self, name: &CStr) -> Result<Duration, SpoutError> {
         let Some(info) = sender_info(name) else {
             self.disconnect(Some(format!("Waiting for the Spout sender {}", self.name)));
             return Ok(RETRY);
@@ -884,7 +947,7 @@ impl Worker {
     }
 
     /// The D3D11 device on DXGI adapter `index`, made on first use.
-    fn device(&mut self, index: u32, adapter: &IDXGIAdapter1) -> Result<usize, String> {
+    fn device(&mut self, index: u32, adapter: &IDXGIAdapter1) -> Result<usize, SpoutError> {
         if let Some(i) = self.devices.iter().position(|(at, _)| *at == index) {
             return Ok(i);
         }
@@ -903,7 +966,7 @@ impl Worker {
         preview: AdapterId,
         device_epoch: u64,
         fell_back: bool,
-    ) -> Result<Connection, String> {
+    ) -> Result<Connection, SpoutError> {
         let mut adapters = adapters();
         // The preview's adapter first; a texture opens only where it lives.
         adapters.sort_by_key(|(_, adapter)| adapter_id(adapter) != Some(preview));
@@ -944,7 +1007,7 @@ impl Worker {
                 },
             );
         }
-        Err("its texture didn't open on any GPU".into())
+        Err(SpoutError::NotOpened)
     }
 }
 
@@ -1008,7 +1071,7 @@ fn adapter_name(adapter: &IDXGIAdapter1) -> String {
 }
 
 impl D3d {
-    fn new(adapter: &IDXGIAdapter1) -> Result<Self, String> {
+    fn new(adapter: &IDXGIAdapter1) -> Result<Self, SpoutError> {
         let (mut device, mut context) = (None, None);
         // SAFETY: plain device creation; the out pointers live through the call.
         unsafe {
@@ -1023,12 +1086,12 @@ impl D3d {
                 None,
                 Some(&mut context),
             )
-            .map_err(|e| format!("no Direct3D 11 device: {e}"))?;
+            .map_err(SpoutError::CreateDevice)?;
         }
         Ok(Self {
-            device: device.ok_or("no Direct3D 11 device")?,
-            context: context.ok_or("no Direct3D 11 context")?,
-            id: adapter_id(adapter).ok_or("an adapter with no description")?,
+            device: device.ok_or(SpoutError::NoDevice)?,
+            context: context.ok_or(SpoutError::NoContext)?,
+            id: adapter_id(adapter).ok_or(SpoutError::NoAdapterDescription)?,
         })
     }
 
@@ -1041,18 +1104,19 @@ impl D3d {
             .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
     }
 
-    fn texture(&self, desc: &D3D11_TEXTURE2D_DESC) -> Result<ID3D11Texture2D, String> {
+    fn texture(&self, desc: &D3D11_TEXTURE2D_DESC) -> Result<ID3D11Texture2D, SpoutError> {
         let mut texture = None;
         // SAFETY: plain resource creation from a filled description.
         unsafe { self.device.CreateTexture2D(desc, None, Some(&mut texture)) }
-            .map_err(|e| format!("couldn't make a texture: {e}"))?;
-        texture.ok_or_else(|| "couldn't make a texture".into())
+            .map_err(SpoutError::CreateTexture)?;
+        texture.ok_or(SpoutError::NoTexture)
     }
 
     /// Blocks until the GPU has done everything submitted before `query` was ended. Fails when
     /// the device was removed (a driver reset), or the copy takes past [`COPY_DEADLINE`].
-    fn wait(&self, query: &ID3D11Query) -> Result<(), String> {
-        // SAFETY: End and GetData on our own query; an event query writes one BOOL.
+    fn wait(&self, query: &ID3D11Query) -> Result<(), SpoutError> {
+        // SAFETY: `query` is an event query made on this device, so End and GetData on this
+        // context are valid and GetData writes one BOOL.
         unsafe { self.context.End(query) };
         let mut flags = 0;
         let finished = wait_until(Instant::now() + COPY_DEADLINE, || {
@@ -1071,7 +1135,7 @@ impl D3d {
         });
         // SAFETY: GetDeviceRemovedReason only reads the device's state.
         match (finished, unsafe { self.device.GetDeviceRemovedReason() }) {
-            (_, Err(removed)) => Err(format!("its GPU was reset ({removed})")),
+            (_, Err(removed)) => Err(SpoutError::DeviceReset(removed)),
             (Err(why), Ok(())) => Err(why),
             (Ok(()), Ok(())) => Ok(()),
         }
@@ -1082,13 +1146,13 @@ impl D3d {
 fn wait_until(
     until: Instant,
     mut done: impl FnMut() -> windows::core::Result<bool>,
-) -> Result<(), String> {
+) -> Result<(), SpoutError> {
     loop {
         match done() {
             Ok(true) => return Ok(()),
             Ok(false) if Instant::now() < until => std::thread::yield_now(),
-            Ok(false) => return Err("the GPU didn't finish a copy in time".into()),
-            Err(e) => return Err(format!("the GPU failed a copy ({e})")),
+            Ok(false) => return Err(SpoutError::CopyTimeout),
+            Err(e) => return Err(SpoutError::CopyFailed(e)),
         }
     }
 }
@@ -1107,15 +1171,12 @@ impl Connection {
         name: &CStr,
         shared: ID3D11Texture2D,
         setup: ConnectionSetup,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, SpoutError> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: GetDesc fills a plain struct from a live texture.
         unsafe { shared.GetDesc(&mut desc) };
         let Some((format, _)) = texture_format(desc.Format) else {
-            return Err(format!(
-                "its pixel format (DXGI {}) isn't read; set the sender to 8 bit RGBA",
-                desc.Format.0
-            ));
+            return Err(SpoutError::PixelFormat(desc.Format.0));
         };
         let plain = D3D11_TEXTURE2D_DESC {
             Width: desc.Width,
@@ -1153,7 +1214,7 @@ impl Connection {
                             )
                         })
                     }
-                    .map_err(|e| format!("couldn't share a texture: {e}"))?;
+                    .map_err(SpoutError::ShareTexture)?;
                     slots.push(Slot {
                         texture,
                         handle: Handle(handle),
@@ -1182,7 +1243,7 @@ impl Connection {
                 Some(&mut done),
             )
         }
-        .map_err(|e| format!("couldn't make a query: {e}"))?;
+        .map_err(SpoutError::CreateQuery)?;
         Ok(Self {
             generation: setup.generation,
             device_epoch: setup.device_epoch,
@@ -1202,7 +1263,7 @@ impl Connection {
                 .collect(),
             slots,
             staging,
-            done: done.ok_or("couldn't make a query")?,
+            done: done.ok_or(SpoutError::NoQuery)?,
         })
     }
 
@@ -1216,7 +1277,7 @@ impl Connection {
         d3d: &D3d,
         shared: &Mutex<State>,
         count: Option<i32>,
-    ) -> Result<Option<ReadyFrame>, String> {
+    ) -> Result<Option<ReadyFrame>, SpoutError> {
         let context = &d3d.context;
         let (keyed, access) = (self.keyed.as_ref(), self.access.as_ref());
         if count.is_some() && count == self.count.as_ref().and_then(|c| c.last) {
@@ -1315,8 +1376,8 @@ fn ready_slot(shared: &Mutex<State>, generation: u64) -> Option<usize> {
 fn locked(
     keyed: Option<&IDXGIKeyedMutex>,
     access: Option<&Handle>,
-    copy: impl FnOnce() -> Result<(), String>,
-) -> Result<bool, String> {
+    copy: impl FnOnce() -> Result<(), SpoutError>,
+) -> Result<bool, SpoutError> {
     // SAFETY: the sync objects are live; each lock taken is released.
     unsafe {
         if let Some(keyed) = keyed {
@@ -1330,9 +1391,7 @@ fn locked(
             if acquired.0 == WAIT_TIMEOUT.0 as i32 {
                 return Ok(false);
             }
-            acquired
-                .ok()
-                .map_err(|e| format!("its keyed mutex failed ({e})"))?;
+            acquired.ok().map_err(SpoutError::KeyedMutex)?;
             let copied = copy();
             let _ = keyed.ReleaseSync(0);
             copied?;
@@ -1342,10 +1401,7 @@ fn locked(
                 return Ok(false);
             }
             if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
-                return Err(format!(
-                    "its access mutex failed ({})",
-                    windows::core::Error::from_thread()
-                ));
+                return Err(SpoutError::AccessMutex(windows::core::Error::from_thread()));
             }
             let copied = copy();
             let _ = ReleaseMutex(access.0);
@@ -1363,7 +1419,7 @@ fn read_back(
     staging: &ID3D11Texture2D,
     (width, height): (u32, u32),
     mut bytes: Vec<u8>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, SpoutError> {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     // SAFETY: the staging texture is ours; the mapped rows are read within RowPitch * height, and
     // unmapped before return.
@@ -1376,7 +1432,7 @@ fn read_back(
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         context
             .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .map_err(|e| format!("couldn't read the sender's frame: {e}"))?;
+            .map_err(SpoutError::ReadFrame)?;
         let pitch = mapped.RowPitch as usize;
         let rows = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), pitch * height as usize);
         bytes.clear();
@@ -1400,7 +1456,7 @@ struct Probe {
 }
 
 impl Probe {
-    fn new(d3d: &D3d, plain: &D3D11_TEXTURE2D_DESC) -> Result<Self, String> {
+    fn new(d3d: &D3d, plain: &D3D11_TEXTURE2D_DESC) -> Result<Self, SpoutError> {
         let level = (0..16)
             .take_while(|&l| plain.Width >> (l + 1) >= PROBE_WIDTH)
             .count() as u32;
@@ -1423,10 +1479,10 @@ impl Probe {
             d3d.device
                 .CreateShaderResourceView(&texture, None, Some(&mut view))
         }
-        .map_err(|e| format!("couldn't make a view: {e}"))?;
+        .map_err(SpoutError::CreateView)?;
         Ok(Self {
             texture,
-            view: view.ok_or("couldn't make a view")?,
+            view: view.ok_or(SpoutError::NoView)?,
             level,
             staging,
             last: Vec::new(),
@@ -1434,8 +1490,8 @@ impl Probe {
     }
 
     /// The picture now in mip 0 at the smallest level, to compare with `last`.
-    fn picture(&self, context: &ID3D11DeviceContext) -> Result<Vec<u8>, String> {
-        // SAFETY: our own textures; the smallest level and the staging texture match.
+    fn picture(&self, context: &ID3D11DeviceContext) -> Result<Vec<u8>, SpoutError> {
+        // SAFETY: the probe's own textures; the smallest level and the staging texture match.
         unsafe {
             context.GenerateMips(&self.view);
             context.CopySubresourceRegion(
@@ -1606,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn senders_resolve_by_whole_name_then_part() {
+    fn sender_name_ranks_whole_over_part_match() {
         let senders = ["TD out 2".to_owned(), "TD out".to_owned(), "OBS".to_owned()];
         assert_eq!(sender_name(&senders, "").as_deref(), Ok("TD out 2"));
         assert_eq!(sender_name(&senders, "td OUT").as_deref(), Ok("TD out"));
@@ -1616,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn frames_stay_on_the_gpu_only_on_the_same_adapter_with_an_import() {
+    fn choose_path_gpu_needs_same_adapter_and_import() {
         assert_eq!(choose_path(true, false), Path::Gpu);
         assert_eq!(choose_path(true, true), Path::Ram);
         assert_eq!(choose_path(false, false), Path::Ram);
@@ -1625,7 +1681,7 @@ mod tests {
 
     /// The worker never writes the frame waiting for the render loop, nor one the GPU may read.
     #[test]
-    fn worker_writes_only_a_free_slot() {
+    fn free_slot_skips_busy_and_ready() {
         let busy: Vec<_> = (0..SLOTS)
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect();
@@ -1639,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_read_as_their_plain_wgpu_format() {
+    fn texture_format_maps_to_plain_wgpu() {
         let read = |f| texture_format(f).map(|(_, w)| w);
         assert_eq!(
             read(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),
@@ -1656,12 +1712,10 @@ mod tests {
         );
     }
 
-    /// A sender that isn't running is waited for, and nothing the render loop calls waits on it.
-    #[test]
-    fn missing_sender_is_waited_for_without_blocking() {
-        let name = format!("vfx-preview missing {}", std::process::id());
-        let started = Instant::now();
-        let mut receiver = Receiver::start(
+    /// A receiver for a sender name no process publishes.
+    fn missing_sender_receiver(test: &str) -> (String, Receiver) {
+        let name = format!("vfx-preview {test} {}", std::process::id());
+        let receiver = Receiver::start(
             name.clone(),
             AdapterId {
                 vendor: 0,
@@ -1669,10 +1723,24 @@ mod tests {
             },
             1920,
         );
+        (name, receiver)
+    }
+
+    #[test]
+    fn missing_sender_reports_waiting() {
+        let (name, mut receiver) = missing_sender_receiver("missing");
         assert_eq!(sender_size(&name, 1920), None);
         let waiting = format!("Waiting for the Spout sender {name}");
         assert_eq!(receiver.status_change(), Some(Some(waiting)));
         assert_eq!(receiver.status_change(), None);
+    }
+
+    /// Nothing the render loop calls waits on a sender that isn't running.
+    #[test]
+    fn missing_sender_never_blocks() {
+        let started = Instant::now();
+        let (_, mut receiver) = missing_sender_receiver("missing unblocked");
+        receiver.status_change();
         drop(receiver);
         assert!(
             started.elapsed() < Duration::from_millis(100),
@@ -1790,10 +1858,23 @@ mod tests {
         }
     }
 
-    /// Frames arrive with their colours, on whichever path the adapters allow, and a sender that
-    /// restarts with a new texture is picked up again with no call from the render loop.
     #[test]
-    fn sender_frames_arrive_and_a_restart_reconnects() {
+    fn receiver_reads_sender_colours() {
+        let (_turn, gpu) = crate::test_gpu();
+        let id = AdapterId::of(&gpu.device.adapter_info());
+        let name = format!("vfx-preview colours {}", std::process::id());
+        let size = (64, 36);
+        let mut receiver = Receiver::start(name.clone(), id, 1920);
+
+        let sender = TestSender::publish(&name, id, size, [10, 200, 30, 255]);
+        assert_eq!(sender_size(&name, 1920), Some(size));
+        assert_eq!(received(&gpu, &mut receiver, size)[..4], [30, 200, 10, 255]);
+        sender.close();
+    }
+
+    /// A sender that restarts with a new texture is picked up with no call from the render loop.
+    #[test]
+    fn receiver_reconnects_to_restarted_sender() {
         let (_turn, gpu) = crate::test_gpu();
         let id = AdapterId::of(&gpu.device.adapter_info());
         let name = format!("vfx-preview restart {}", std::process::id());
@@ -1801,8 +1882,7 @@ mod tests {
         let mut receiver = Receiver::start(name.clone(), id, 1920);
 
         let first = TestSender::publish(&name, id, size, [10, 200, 30, 255]);
-        assert_eq!(sender_size(&name, 1920), Some(size));
-        assert_eq!(received(&gpu, &mut receiver, size)[..4], [30, 200, 10, 255]);
+        received(&gpu, &mut receiver, size);
         first.close();
 
         let second = TestSender::publish(&name, id, size, [250, 40, 120, 128]);
@@ -1836,42 +1916,53 @@ mod tests {
         sender.close();
     }
 
-    /// A failing GetData, as after a driver reset, ends the wait with an error; a copy that never
-    /// finishes ends it at the deadline. Neither spins on.
-    #[test]
-    fn copy_waits_end_on_failure_and_at_the_deadline() {
-        let removed = || {
-            Err(windows::core::Error::from_hresult(
-                windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
-            ))
-        };
-        let far = Instant::now() + Duration::from_secs(60);
-        assert!(wait_until(far, removed).unwrap_err().contains("failed"));
+    mod wait_until {
+        use super::*;
 
-        let started = Instant::now();
-        let never = wait_until(started + Duration::from_millis(20), || Ok(false));
-        assert!(never.unwrap_err().contains("in time"));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        /// GetData fails this way after a driver reset.
+        #[test]
+        fn fails_on_device_removed() {
+            let removed = || {
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+                ))
+            };
+            let far = Instant::now() + Duration::from_secs(60);
+            assert!(matches!(
+                wait_until(far, removed),
+                Err(SpoutError::CopyFailed(_))
+            ));
+        }
 
-        let mut polls = 0;
-        assert_eq!(
-            wait_until(far, || {
+        #[test]
+        fn times_out_at_deadline() {
+            let started = Instant::now();
+            let stalled = wait_until(started + Duration::from_millis(20), || Ok(false));
+            assert!(matches!(stalled, Err(SpoutError::CopyTimeout)));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn returns_when_done() {
+            let far = Instant::now() + Duration::from_secs(60);
+            let mut polls = 0;
+            let finished = wait_until(far, || {
                 polls += 1;
                 Ok(polls == 3)
-            }),
-            Ok(())
-        );
+            });
+            assert!(finished.is_ok());
+        }
     }
 
     #[test]
-    fn retries_back_off_to_a_cap() {
+    fn retry_after_caps_backoff() {
         let waits: Vec<_> = (1..=8).map(|f| retry_after(f).as_millis()).collect();
         assert_eq!(waits, [100, 200, 400, 800, 1600, 3200, 3200, 3200]);
         assert_eq!(retry_after(u32::MAX), MAX_RETRY);
     }
 
     #[test]
-    fn large_senders_fit_as_videos_do() {
+    fn fit_scales_to_max_side_rounding_to_even() {
         assert_eq!(fit((1920, 1080), 1920), (1920, 1080));
         assert_eq!(fit((3840, 2160), 1920), (1920, 1080));
         assert_eq!(fit((1281, 721), 1920), (1280, 720));

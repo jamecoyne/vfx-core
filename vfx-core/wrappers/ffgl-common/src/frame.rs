@@ -46,7 +46,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flips_crops_and_unpremultiplies() {
+    fn texture_to_canvas_flips_crops_unpremultiplies() {
         // A 3x2 allocation holding a 2x2 image. Bottom row red 0.1, 0.2; top row
         // 0.3 and a half-transparent 0.2 (premultiplied, so straight 0.4).
         #[rustfmt::skip]
@@ -63,7 +63,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip() {
+    fn canvas_to_texture_inverts_texture_to_canvas() {
         #[rustfmt::skip]
         let texels = [
             0.1, 0.2, 0.3, 1.0,  0.05, 0.1, 0.0, 0.5,

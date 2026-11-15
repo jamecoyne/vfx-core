@@ -3,7 +3,7 @@ use crate::{Context, Effect, Frame, Gpu, ParamSpec, ParamValues};
 
 const PARAMS: &[ParamSpec] = &[ParamSpec::float("decay", 0.0, 1.0, 0.9)];
 
-// Each pixel keeps the brighter of the live input and last frame's output scaled by decay.
+// Each pixel keeps the brighter of the input and last frame's output scaled by decay.
 const WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var history: texture_2d<f32>;

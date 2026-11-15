@@ -1,7 +1,8 @@
 //! Faces run on every 2nd analysis, and the analysis between reuses the faces of the one
 //! before: below 90 fps, even frames run them and odd frames reuse them. Checked on a real portrait
 //! the face models find, read from the file `SEGCAM_FACE_PORTRAIT` names (a binary PPM, P6, at
-//! most 180 pixels tall); the tests pass with a note when it isn't set.
+//! most 180 pixels tall). The tests are ignored; run them with `--ignored` and
+//! `SEGCAM_FACE_PORTRAIT` set.
 #![cfg(not(target_arch = "wasm32"))]
 
 mod motion_only;
@@ -35,7 +36,8 @@ fn faces_with(changes: &[(&str, ParamValue)]) -> ParamValues {
 }
 
 #[test]
-fn faces_keep_the_contract() {
+#[ignore = "needs SEGCAM_FACE_PORTRAIT, a P6 PPM of a face"]
+fn faces_hold_contract() {
     // Faces only goes first, since the edits and missing frames use the first set: with no
     // background, only the reused faces carry a change to the next frame.
     let sets = [
@@ -50,7 +52,7 @@ fn faces_keep_the_contract() {
             ("trail", ParamValue::Int(4)),
         ]),
     ];
-    let Some(p) = portrait() else { return };
+    let p = portrait();
     for frame_rate in [None, Some(120.0)] {
         check(
             make,
@@ -85,8 +87,9 @@ impl FrameSource for ExactHistory<'_> {
 /// A live render doesn't wait for faces: they arrive within a few renders of a slow device's time,
 /// and those shown stay on the renders between detections.
 #[test]
+#[ignore = "needs SEGCAM_FACE_PORTRAIT, a P6 PPM of a face"]
 fn live_faces_arrive_and_stay() {
-    let Some(p) = portrait() else { return };
+    let p = portrait();
     segcam_motion::faces::wait();
     let clip = drifting(&p);
     let params = faces_with(&[("output", ParamValue::Int(2))]);
@@ -110,7 +113,7 @@ fn live_faces_arrive_and_stay() {
         );
         let before = effect.frames_before(&params, None);
         let pixels = &clip.frames[f % clip.frames.len()];
-        history.next(before, before).copy_from_slice(pixels);
+        history.push_slot(before, before).copy_from_slice(pixels);
         let ctx = Context {
             frame: history.frame_number(),
             ..Context::at(f as f64 / 30.0)
@@ -135,8 +138,9 @@ fn live_faces_arrive_and_stay() {
 /// A host keeps the effect and hands over frames forward from its own history, which reads only
 /// the frames the effect hasn't seen: each exact render still equals a fresh one.
 #[test]
-fn faces_from_a_kept_history_match_fresh_renders() {
-    let Some(p) = portrait() else { return };
+#[ignore = "needs SEGCAM_FACE_PORTRAIT, a P6 PPM of a face"]
+fn kept_history_faces_match_fresh_render() {
+    let p = portrait();
     segcam_motion::faces::wait();
     let clip = drifting(&p);
     let sets = [
@@ -164,9 +168,9 @@ fn faces_from_a_kept_history_match_fresh_renders() {
         lean_history.resize(W, H);
         for (f, pixels) in clip.frames.iter().enumerate() {
             let before = kept.frames_before(params, frame_rate);
-            history.next(before, before).copy_from_slice(pixels);
+            history.push_slot(before, before).copy_from_slice(pixels);
             let held = lean.frames_held(params, frame_rate);
-            lean_history.next(before, held).copy_from_slice(pixels);
+            lean_history.push_slot(before, held).copy_from_slice(pixels);
             let ctx = Context {
                 frame: history.frame_number(),
                 frame_rate,
@@ -198,11 +202,12 @@ fn faces_from_a_kept_history_match_fresh_renders() {
 /// Within a little, as the report's models can be on DirectML.
 #[cfg(not(target_os = "macos"))]
 #[test]
+#[ignore = "needs SEGCAM_FACE_PORTRAIT, a P6 PPM of a face"]
 fn readings_match_model_output() {
     use segcam_face::runtime::{Device, OrtYuNet};
     use segcam_face::{Detector, Pixels, YUNET_MODEL};
 
-    let Some(p) = portrait() else { return };
+    let p = portrait();
     segcam_motion::faces::wait();
     let pixels = frame(&p, W / 2, H / 2, None);
     let found = OrtYuNet::new(YUNET_MODEL, Device::Cpu)
@@ -220,7 +225,7 @@ fn readings_match_model_output() {
     let mut history = History::<u8>::default();
     history.resize(W, H);
     let before = effect.frames_before(&params, None);
-    history.next(before, before).copy_from_slice(&pixels);
+    history.push_slot(before, before).copy_from_slice(&pixels);
     let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
     let view = ViewMut::from_pixels(&mut out, W, H);
     let count = history.len();
@@ -291,8 +296,9 @@ fn boxes_every(
 }
 
 #[test]
-fn odd_frames_show_the_faces_of_the_frame_before() {
-    let Some(p) = portrait() else { return };
+#[ignore = "needs SEGCAM_FACE_PORTRAIT, a P6 PPM of a face"]
+fn odd_frames_reuse_previous_faces() {
+    let p = portrait();
     let (left, right) = (frame(&p, 90, 80, None), frame(&p, 230, 80, None));
     let shown = |out: &[Argb<u8>], x: i32| out[(80 * W + x) as usize].alpha == 255;
     let pair = || vec![Some(left.as_slice()), Some(right.as_slice())];
@@ -314,8 +320,9 @@ fn odd_frames_show_the_faces_of_the_frame_before() {
 }
 
 #[test]
-fn at_120_fps_faces_run_on_every_2nd_analysis() {
-    let Some(p) = portrait() else { return };
+#[ignore = "needs SEGCAM_FACE_PORTRAIT, a P6 PPM of a face"]
+fn step_2_faces_run_every_other_analysis() {
+    let p = portrait();
     let (left, right) = (frame(&p, 90, 80, None), frame(&p, 230, 80, None));
     let shown = |out: &[Argb<u8>], x: i32| out[(80 * W + x) as usize].alpha == 255;
     let every_2nd = AnalysisStep { every: 2 };

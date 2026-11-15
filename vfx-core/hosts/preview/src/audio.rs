@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn tone_lands_in_its_band() {
+    fn levels_put_tone_in_band() {
         let bass = audio_of(sine(100.0)).levels(0.5);
         assert!(bass[1] > 0.8, "{bass:?}");
         assert!(bass[4] < 0.3, "{bass:?}");
@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn silence_and_no_audio_read_zero() {
+    fn levels_read_zero_for_silence_and_empty() {
         assert_eq!(audio_of(vec![0.0; 4096]).levels(0.1), [0.0; 5]);
         assert_eq!(audio_of(Vec::new()).levels(0.1), [0.0; 5]);
     }

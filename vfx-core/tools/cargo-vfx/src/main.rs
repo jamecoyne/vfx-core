@@ -33,10 +33,13 @@ use vfx_build::Metadata;
 
 mod bench;
 mod check;
+mod error;
 mod new;
 mod tiers;
 
-const USAGE: &str = "usage: cargo vfx <list|build|package|install|preview|env|check> [-p EFFECT]... \
+use error::{Error, Result};
+
+pub(crate) const USAGE: &str = "usage: cargo vfx <list|build|package|install|preview|env|check> [-p EFFECT]... \
 [--hosts ae,ofx,ffgl] [--debug] [--native] [-- ARGS]\n       cargo vfx check [--quick|--full] [-p PACKAGE]...\n       cargo vfx new NAME
        cargo vfx bench CLIP [--preset NAME]... [--depth 8|float] [--runs N] [--cpu] [--reference DIR]";
 
@@ -64,11 +67,11 @@ impl Host {
         }
     }
 
-    fn parse(text: &str) -> Result<Self, String> {
+    fn parse(text: &str) -> Result<Self> {
         Host::ALL
             .into_iter()
             .find(|h| h.feature() == text)
-            .ok_or_else(|| format!("unknown host `{text}` (ae, ofx or ffgl)"))
+            .ok_or_else(|| Error::UnknownHost(text.to_owned()))
     }
 }
 
@@ -94,14 +97,14 @@ struct Options {
     rest: Vec<String>,
 }
 
-fn parse_args() -> Result<Options, String> {
+fn parse_args() -> Result<Options> {
     // Cargo runs `cargo-vfx vfx …` for `cargo vfx …`.
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "vfx") {
         args.remove(0);
     }
     let mut it = args.into_iter();
-    let command = it.next().ok_or(USAGE)?;
+    let command = it.next().ok_or(Error::Usage)?;
     let mut o = Options {
         command,
         packages: Vec::new(),
@@ -117,45 +120,56 @@ fn parse_args() -> Result<Options, String> {
     }
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "-p" | "--package" => o.packages.push(it.next().ok_or("-p needs a package")?),
+            "-p" | "--package" => o.packages.push(it.next().ok_or(Error::MissingValue {
+                flag: "-p",
+                what: "a package",
+            })?),
             "--hosts" => {
-                let list = it.next().ok_or("--hosts needs a list")?;
-                o.hosts = list.split(',').map(Host::parse).collect::<Result<_, _>>()?;
+                let list = it.next().ok_or(Error::MissingValue {
+                    flag: "--hosts",
+                    what: "a list",
+                })?;
+                o.hosts = list
+                    .split(',')
+                    .map(Host::parse)
+                    .collect::<std::result::Result<_, _>>()?;
             }
             "--debug" => o.release = false,
             "--native" => o.native = true,
             "--quick" if o.command == "check" => o.tier = Some(tiers::Tier::Quick),
             "--full" if o.command == "check" => o.tier = Some(tiers::Tier::Full),
             "--" => o.rest.extend(it.by_ref()),
-            "-h" | "--help" => return Err(USAGE.into()),
+            "-h" | "--help" => return Err(Error::Usage),
             name if o.command == "new" && !name.starts_with('-') => o.rest.push(name.to_owned()),
-            other => return Err(format!("unknown argument `{other}`\n{USAGE}")),
+            other => return Err(Error::UnknownArgument(other.to_owned())),
         }
     }
     Ok(o)
 }
 
 /// The workspace's effect crates, and its root and target directory.
-fn workspace() -> Result<(Vec<Effect>, PathBuf, PathBuf), String> {
+fn workspace() -> Result<(Vec<Effect>, PathBuf, PathBuf)> {
     workspace_in(Path::new("."))
 }
 
 /// [`workspace`] for the workspace containing `dir`, its identities checked.
-fn workspace_in(dir: &Path) -> Result<(Vec<Effect>, PathBuf, PathBuf), String> {
+fn workspace_in(dir: &Path) -> Result<(Vec<Effect>, PathBuf, PathBuf)> {
     let out = Command::new(env_or("CARGO", "cargo"))
         .current_dir(dir)
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .output()
-        .map_err(|e| format!("cargo metadata: {e}"))?;
+        .map_err(Error::CargoMetadataSpawn)?;
     if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+        return Err(Error::CargoMetadataFailed(
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
     }
     let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
+        serde_json::from_slice(&out.stdout).map_err(Error::CargoMetadataJson)?;
     let mut effects = Vec::new();
     for p in json["packages"]
         .as_array()
-        .ok_or("cargo metadata: no packages")?
+        .ok_or(Error::CargoMetadataNoPackages)?
     {
         if p["metadata"]["vfx"].is_null() {
             continue;
@@ -164,7 +178,7 @@ fn workspace_in(dir: &Path) -> Result<(Vec<Effect>, PathBuf, PathBuf), String> {
         let dir = manifest.parent().unwrap_or(Path::new(".")).to_path_buf();
         effects.push(Effect {
             package: p["name"].as_str().unwrap_or_default().to_owned(),
-            meta: Metadata::read(&dir)?,
+            meta: Metadata::read(&dir).map_err(Error::Metadata)?,
         });
     }
     effects.sort_by(|a, b| a.package.cmp(&b.package));
@@ -172,7 +186,7 @@ fn workspace_in(dir: &Path) -> Result<(Vec<Effect>, PathBuf, PathBuf), String> {
         .iter()
         .map(|e| (e.package.clone(), e.meta.clone()))
         .collect();
-    vfx_build::check_workspace(&identities).map_err(|errors| errors.join("\n"))?;
+    vfx_build::check_workspace(&identities).map_err(Error::DuplicateIdentities)?;
     let root = PathBuf::from(json["workspace_root"].as_str().unwrap_or("."));
     let target = PathBuf::from(json["target_directory"].as_str().unwrap_or("target"));
     Ok((effects, root, target))
@@ -182,12 +196,18 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
 
-fn run(cmd: &mut Command) -> Result<(), String> {
-    let status = cmd.status().map_err(|e| format!("{cmd:?}: {e}"))?;
+fn run(cmd: &mut Command) -> Result<()> {
+    let status = cmd.status().map_err(|source| Error::Run {
+        command: format!("{cmd:?}"),
+        source,
+    })?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("{cmd:?} failed ({status})"))
+        Err(Error::CommandFailed {
+            command: format!("{cmd:?}"),
+            status,
+        })
     }
 }
 
@@ -201,10 +221,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(o: &Options) -> Result<(), String> {
+fn dispatch(o: &Options) -> Result<()> {
     if o.command == "new" {
         let [name] = o.rest.as_slice() else {
-            return Err("usage: cargo vfx new NAME".into());
+            return Err(Error::NewUsage);
         };
         let (_, root, _) = workspace()?;
         return new::new(&root, name);
@@ -226,10 +246,13 @@ fn dispatch(o: &Options) -> Result<(), String> {
             .map(|name| {
                 all.iter().find(|e| &e.package == name).ok_or_else(|| {
                     let names: Vec<&str> = all.iter().map(|e| e.package.as_str()).collect();
-                    format!("no effect crate `{name}` (effects: {})", names.join(", "))
+                    Error::UnknownEffect {
+                        name: name.clone(),
+                        available: names.join(", "),
+                    }
                 })
             })
-            .collect::<Result<_, _>>()?
+            .collect::<std::result::Result<_, _>>()?
     };
     let out = target.join("vfx-plugin");
     match o.command.as_str() {
@@ -252,7 +275,7 @@ fn dispatch(o: &Options) -> Result<(), String> {
         }
         "env" => {
             let [e] = chosen.as_slice() else {
-                return Err("env takes one -p EFFECT".into());
+                return Err(Error::EnvNeedsOneEffect);
             };
             print_env(e);
             Ok(())
@@ -279,11 +302,11 @@ fn dispatch(o: &Options) -> Result<(), String> {
         }
         "preview" => preview(&chosen, &root, &target, o),
         "check" => report(check::check(&all, &root), all.len()),
-        other => Err(format!("unknown command `{other}`\n{USAGE}")),
+        other => Err(Error::UnknownCommand(other.to_owned())),
     }
 }
 
-fn report(problems: Vec<String>, effects: usize) -> Result<(), String> {
+fn report(problems: Vec<String>, effects: usize) -> Result<()> {
     for p in &problems {
         eprintln!("{p}");
     }
@@ -291,7 +314,7 @@ fn report(problems: Vec<String>, effects: usize) -> Result<(), String> {
         println!("{effects} effects: no problems");
         Ok(())
     } else {
-        Err(format!("{} problems", problems.len()))
+        Err(Error::Problems(problems.len()))
     }
 }
 
@@ -341,7 +364,7 @@ fn target_os(triple: Option<&str>) -> &'static str {
 
 /// Builds the plugin binary for one target triple (`None`: the host's own) and returns
 /// the output directory of the effect's build script, if it has one.
-fn cargo_build(e: &Effect, o: &Options, triple: Option<&str>) -> Result<Option<PathBuf>, String> {
+fn cargo_build(e: &Effect, o: &Options, triple: Option<&str>) -> Result<Option<PathBuf>> {
     let mut features: Vec<String> = o.hosts.iter().map(|h| h.feature().to_owned()).collect();
     features.extend(e.meta.features_for(target_os(triple)));
     let mut cmd = Command::new(env_or("CARGO", "cargo"));
@@ -367,9 +390,15 @@ fn cargo_build(e: &Effect, o: &Options, triple: Option<&str>) -> Result<Option<P
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
-        .map_err(|err| format!("{cmd:?}: {err}"))?;
+        .map_err(|source| Error::Run {
+            command: format!("{cmd:?}"),
+            source,
+        })?;
     if !output.status.success() {
-        return Err(format!("{cmd:?} failed ({})", output.status));
+        return Err(Error::CommandFailed {
+            command: format!("{cmd:?}"),
+            status: output.status,
+        });
     }
     let mut out_dir = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -399,20 +428,14 @@ fn profile(o: &Options) -> &'static str {
 }
 
 /// Builds the effect and wraps the binary into each host's bundle. Returns the bundles.
-fn build(
-    e: &Effect,
-    o: &Options,
-    root: &Path,
-    target: &Path,
-    out: &Path,
-) -> Result<Vec<PathBuf>, String> {
-    fs::create_dir_all(out).map_err(|err| err.to_string())?;
+fn build(e: &Effect, o: &Options, root: &Path, target: &Path, out: &Path) -> Result<Vec<PathBuf>> {
+    fs::create_dir_all(out)?;
     if cfg!(target_os = "macos") {
         build_mac(e, o, target, out)
     } else if cfg!(target_os = "windows") {
         build_windows(e, o, root, target, out)
     } else {
-        Err("plugins build on macOS and Windows".into())
+        Err(Error::UnsupportedOs)
     }
 }
 
@@ -422,7 +445,7 @@ fn bundle_version(m: &Metadata) -> String {
     std::env::var("VFX_VERSION").unwrap_or_else(|_| m.version.clone())
 }
 
-fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<PathBuf>, String> {
+fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<PathBuf>> {
     let m = &e.meta;
     let archs: Vec<&str> = if o.native {
         vec![if cfg!(target_arch = "aarch64") {
@@ -441,10 +464,10 @@ fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<P
         let dir = target.join(&triple).join(profile(o));
         binaries.push(dir.join(format!("lib{}.dylib", e.lib())));
         if o.hosts.contains(&Host::Ae) {
-            let out_dir = out_dir.ok_or_else(|| format!("{} has no build script", e.package))?;
+            let out_dir = out_dir.ok_or_else(|| Error::NoBuildScript(e.package.clone()))?;
             let path = out_dir.join(format!("{}.rsrc", m.file));
             if !path.exists() {
-                return Err(format!("no {}", path.display()));
+                return Err(Error::MissingFile(path));
             }
             rsrc = Some(path);
         }
@@ -481,17 +504,16 @@ fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<P
         let bundle = out.join(bundle);
         let _ = fs::remove_dir_all(&bundle);
         let contents = bundle.join("Contents");
-        fs::create_dir_all(contents.join("MacOS")).map_err(|err| err.to_string())?;
-        fs::copy(&binary, contents.join("MacOS").join(&exe)).map_err(|err| err.to_string())?;
+        fs::create_dir_all(contents.join("MacOS"))?;
+        fs::copy(&binary, contents.join("MacOS").join(&exe))?;
         let signature = if *host == Host::Ae {
-            fs::create_dir_all(contents.join("Resources")).map_err(|err| err.to_string())?;
+            fs::create_dir_all(contents.join("Resources"))?;
             let rsrc = rsrc.as_ref().expect("built with the ae feature");
             fs::copy(
                 rsrc,
                 contents.join("Resources").join(format!("{}.rsrc", m.file)),
-            )
-            .map_err(|err| err.to_string())?;
-            fs::write(contents.join("PkgInfo"), "eFKTFXTC").map_err(|err| err.to_string())?;
+            )?;
+            fs::write(contents.join("PkgInfo"), "eFKTFXTC")?;
             "\n  <key>CFBundleSignature</key><string>FXTC</string>"
         } else {
             ""
@@ -514,7 +536,7 @@ fn build_mac(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<Vec<P
             name = xml(&m.name),
             version = bundle_version(m),
         );
-        fs::write(contents.join("Info.plist"), plist).map_err(|err| err.to_string())?;
+        fs::write(contents.join("Info.plist"), plist)?;
         println!("{}", bundle.display());
         bundles.push(bundle);
     }
@@ -534,7 +556,7 @@ fn build_windows(
     root: &Path,
     target: &Path,
     out: &Path,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<Vec<PathBuf>> {
     let m = &e.meta;
     cargo_build(e, o, None)?;
     let dll = target.join(profile(o)).join(format!("{}.dll", e.lib()));
@@ -549,12 +571,11 @@ fn build_windows(
                 let bundle = out.join(format!("{}.ofx.bundle", m.file));
                 let _ = fs::remove_dir_all(&bundle);
                 let dir = bundle.join("Contents").join("Win64");
-                fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-                fs::copy(&dll, dir.join(format!("{}.ofx", m.file)))
-                    .map_err(|err| err.to_string())?;
+                fs::create_dir_all(&dir)?;
+                fs::copy(&dll, dir.join(format!("{}.ofx", m.file)))?;
                 for name in &m.windows_dlls {
                     fs::copy(target.join(profile(o)).join(name), dir.join(name))
-                        .map_err(|err| format!("{name}: {err}"))?;
+                        .map_err(Error::file(name))?;
                 }
                 copy_beside(&dxc, &dir)?;
                 println!("{}", bundle.display());
@@ -563,13 +584,14 @@ fn build_windows(
             }
             Host::Ffgl => out.join(format!("{}.dll", m.file)),
         };
-        fs::copy(&dll, &path).map_err(|err| err.to_string())?;
+        fs::copy(&dll, &path)?;
         println!("{}", path.display());
         bundles.push(path);
     }
     // The FFGL DLL and the .aex share the output folder, and so the compiler. The effect's
-    // `windows-dlls` go in the OFX bundle only: Resolume and the Adobe hosts ship a new enough
-    // DirectML.dll in their program folder, which Windows searches first; Resolve's is too old.
+    // `windows-dlls` go in the OFX bundle only: Resolume and the Adobe hosts ship a new
+    // enough DirectML.dll in their program folder, which Windows searches first;
+    // Resolve's is too old.
     if o.hosts.iter().any(|h| *h != Host::Ofx) {
         copy_beside(&dxc, out)?;
     }
@@ -580,10 +602,10 @@ fn build_windows(
 const DXC_SHA_MISMATCH: i32 = 3;
 
 /// Runs `fetch-dxc.sh`, which downloads the pinned release once, checks its sha256 and
-/// unpacks it into `target/dxc/files`. A local build goes on without the compiler (wgpu then
-/// uses FXC) when it can't be fetched, offline or without Git Bash; only a zip that doesn't
-/// match the pin stops it. package-win.sh and CI run the script themselves and stay strict.
-fn fetch_dxc(root: &Path, target: &Path) -> Result<(), String> {
+/// unpacks it into `target/dxc/files`. A build that can't fetch it goes on without the
+/// compiler (wgpu then uses FXC); only a zip that doesn't match the pin stops it.
+/// package-win.sh and CI run the script themselves and stay strict.
+fn fetch_dxc(root: &Path, target: &Path) -> Result<()> {
     let script = root.join("vfx-core").join("wrappers").join("fetch-dxc.sh");
     // Git Bash reads C:/ paths; backslashes would need quoting.
     let target_arg = target.to_string_lossy().replace('\\', "/");
@@ -595,10 +617,7 @@ fn fetch_dxc(root: &Path, target: &Path) -> Result<(), String> {
     match status {
         Ok(s) if s.success() => return Ok(()),
         Ok(s) if s.code() == Some(DXC_SHA_MISMATCH) => {
-            return Err(format!(
-                "{}: the DXC download doesn't match its sha256",
-                script.display()
-            ));
+            return Err(Error::DxcChecksum(script));
         }
         Ok(s) => eprintln!("warning: {} failed ({s})", script.display()),
         Err(err) => eprintln!("warning: {}: {err}", script.display()),
@@ -616,20 +635,20 @@ fn dxc_unpacked(target: &Path) -> Vec<PathBuf> {
     let Ok(dir) = fs::read_dir(target.join("dxc").join("files")) else {
         return Vec::new();
     };
-    let mut files: Vec<PathBuf> = dir.filter_map(Result::ok).map(|e| e.path()).collect();
+    let mut files: Vec<PathBuf> = dir.flatten().map(|e| e.path()).collect();
     files.sort();
     files
 }
 
 /// Copies `files` into `dir`, leaving a file that is already the same alone: Windows can't
 /// overwrite a DLL a running preview or host has loaded.
-fn copy_beside(files: &[PathBuf], dir: &Path) -> Result<(), String> {
+fn copy_beside(files: &[PathBuf], dir: &Path) -> Result<()> {
     for file in files {
         let dest = dir.join(file.file_name().unwrap_or_default());
         if same_contents(file, &dest) {
             continue;
         }
-        fs::copy(file, &dest).map_err(|err| format!("{}: {err}", file.display()))?;
+        fs::copy(file, &dest).map_err(Error::file(file))?;
     }
     Ok(())
 }
@@ -644,12 +663,9 @@ fn same_contents(a: &Path, b: &Path) -> bool {
 }
 
 /// macOS installers for the system-wide hosts, signed and notarized when asked.
-fn package(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), String> {
+fn package(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<()> {
     if !cfg!(target_os = "macos") {
-        return Err(
-            "package builds macOS installers; on Windows use vfx-core/wrappers/package-win.sh"
-                .into(),
-        );
+        return Err(Error::PackageOnWindows);
     }
     let release = Options {
         release: true,
@@ -661,7 +677,7 @@ fn package(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), Str
         rest: Vec::new(),
     };
     let m = &e.meta;
-    fs::create_dir_all(out).map_err(|err| err.to_string())?;
+    fs::create_dir_all(out)?;
     for bundle in build_mac(e, &release, target, out)? {
         sign_and_notarize(&bundle, out)?;
         let name = bundle
@@ -690,7 +706,7 @@ fn package(e: &Effect, o: &Options, target: &Path, out: &Path) -> Result<(), Str
     Ok(())
 }
 
-fn sign_and_notarize(bundle: &Path, out: &Path) -> Result<(), String> {
+fn sign_and_notarize(bundle: &Path, out: &Path) -> Result<()> {
     let identity = std::env::var("SIGN_IDENTITY")
         .ok()
         .filter(|s| !s.is_empty());
@@ -714,9 +730,7 @@ fn sign_and_notarize(bundle: &Path, out: &Path) -> Result<(), String> {
     }
     if let Some(profile) = notary {
         if identity.is_none() {
-            return Err(
-                "NOTARY_PROFILE needs SIGN_IDENTITY: Apple only notarizes signed code".into(),
-            );
+            return Err(Error::NotaryNeedsSignIdentity);
         }
         let zip = out.join(".notarize.zip");
         run(Command::new("ditto")
@@ -735,7 +749,7 @@ fn sign_and_notarize(bundle: &Path, out: &Path) -> Result<(), String> {
 
 /// Notarizes and staples an installer, so Gatekeeper opens it without a warning once
 /// downloaded. The bundle inside is notarized too, for copies made without the installer.
-fn notarize_pkg(pkg: &Path) -> Result<(), String> {
+fn notarize_pkg(pkg: &Path) -> Result<()> {
     let Some(profile) = std::env::var("NOTARY_PROFILE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -746,17 +760,14 @@ fn notarize_pkg(pkg: &Path) -> Result<(), String> {
         .unwrap_or_default()
         .is_empty()
     {
-        return Err(
-            "NOTARY_PROFILE needs INSTALLER_IDENTITY: Apple only notarizes signed installers"
-                .into(),
-        );
+        return Err(Error::NotaryNeedsInstallerIdentity);
     }
     notarize(pkg, &profile)?;
     run(Command::new("xcrun").args(["stapler", "staple"]).arg(pkg))
 }
 
 /// Submits a zip or a signed `.pkg` to Apple's notary service and waits for its verdict.
-fn notarize(file: &Path, profile: &str) -> Result<(), String> {
+fn notarize(file: &Path, profile: &str) -> Result<()> {
     run(Command::new("xcrun")
         .args(["notarytool", "submit"])
         .arg(file)
@@ -765,16 +776,10 @@ fn notarize(file: &Path, profile: &str) -> Result<(), String> {
 
 /// A component package that installs `bundle` into `location`, never relocated to a copy
 /// with the same bundle ID elsewhere on disk.
-fn pkgbuild(
-    bundle: &Path,
-    pkg: &Path,
-    id: &str,
-    version: &str,
-    location: &str,
-) -> Result<(), String> {
+fn pkgbuild(bundle: &Path, pkg: &Path, id: &str, version: &str, location: &str) -> Result<()> {
     let stage = std::env::temp_dir().join(format!("vfx-pkg-{}", std::process::id()));
     let _ = fs::remove_dir_all(&stage);
-    fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&stage)?;
     // The payload root's mode becomes the install folder's.
     run(Command::new("chmod").arg("755").arg(&stage))?;
     let name = bundle.file_name().unwrap_or_default();
@@ -820,7 +825,7 @@ fn pkgbuild(
 
 /// Resolume plugins install per user; After Effects and OpenFX plugins go in system
 /// folders, which need the user's password, so for those this prints the command.
-fn install(e: &Effect, o: &Options, root: &Path, target: &Path, out: &Path) -> Result<(), String> {
+fn install(e: &Effect, o: &Options, root: &Path, target: &Path, out: &Path) -> Result<()> {
     let m = &e.meta;
     if o.hosts.contains(&Host::Ffgl) {
         let ffgl = Options {
@@ -837,7 +842,7 @@ fn install(e: &Effect, o: &Options, root: &Path, target: &Path, out: &Path) -> R
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
-            .ok_or("no home directory")?;
+            .ok_or(Error::NoHome)?;
         let mut installed = false;
         for app in ["Resolume Avenue", "Resolume Arena"] {
             let app_dir = home.join("Documents").join(app);
@@ -845,7 +850,7 @@ fn install(e: &Effect, o: &Options, root: &Path, target: &Path, out: &Path) -> R
                 continue;
             }
             let dir = app_dir.join("Extra Effects");
-            fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+            fs::create_dir_all(&dir)?;
             let dest = dir.join(bundle.file_name().unwrap_or_default());
             let _ = fs::remove_dir_all(&dest);
             let _ = fs::remove_file(&dest);
@@ -891,27 +896,28 @@ fn install(e: &Effect, o: &Options, root: &Path, target: &Path, out: &Path) -> R
     Ok(())
 }
 
-fn copy_all(from: &Path, to: &Path) -> Result<(), String> {
+fn copy_all(from: &Path, to: &Path) -> Result<()> {
     if from.is_dir() {
-        fs::create_dir_all(to).map_err(|e| e.to_string())?;
-        for entry in fs::read_dir(from).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
             copy_all(&entry.path(), &to.join(entry.file_name()))?;
         }
         Ok(())
     } else {
-        fs::copy(from, to).map(|_| ()).map_err(|e| e.to_string())
+        fs::copy(from, to)?;
+        Ok(())
     }
 }
 
 /// The preview app, opened on the effect. It links every effect in its catalog.
-fn preview(chosen: &[&Effect], root: &Path, target: &Path, o: &Options) -> Result<(), String> {
+fn preview(chosen: &[&Effect], root: &Path, target: &Path, o: &Options) -> Result<()> {
     if cfg!(target_os = "windows") {
         // vfx-preview.exe loads the shader compiler from its own folder, like the plugins.
         // Once it is there, a second preview needn't fetch.
         let dir = target.join("release");
         if !dir.join("dxcompiler.dll").is_file() {
-            fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+            fs::create_dir_all(&dir)?;
             fetch_dxc(root, target)?;
             copy_beside(&dxc_unpacked(target), &dir)?;
         }
@@ -944,7 +950,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn package_name_reads_both_id_forms() {
+    fn package_name_reads_path_and_registry_ids() {
         let path = "path+file:///work/vfx-core/plugins/blend#0.1.0";
         let registry = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228";
         let renamed = "path+file:///work/vfx-core/plugins/segcam/segcam-motion#segcam-motion@1.0.0";
@@ -955,10 +961,18 @@ mod tests {
     }
 
     #[test]
-    fn slugs_and_hosts() {
+    fn slug_is_lowercase_hyphenated() {
         assert_eq!(slug("segcam Motion"), "segcam-motion");
         assert_eq!(slug("VFX Preview"), "vfx-preview");
-        assert_eq!(Host::parse("ofx"), Ok(Host::Ofx));
+    }
+
+    #[test]
+    fn host_parse_reads_feature_name() {
+        assert_eq!(Host::parse("ofx").unwrap(), Host::Ofx);
+    }
+
+    #[test]
+    fn host_parse_rejects_unknown() {
         assert!(Host::parse("vst").is_err());
     }
 }

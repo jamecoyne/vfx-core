@@ -22,6 +22,7 @@
 //!
 //! Missing stages are off, matching the plugin's checkboxes.
 
+use std::error::Error;
 use std::fs;
 use std::process::ExitCode;
 
@@ -64,7 +65,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn parse(block: &str) -> Result<Frame, String> {
+fn parse(block: &str) -> Result<Frame, Box<dyn Error>> {
     let mut frame = Frame {
         width: 0,
         height: 0,
@@ -81,20 +82,20 @@ fn parse(block: &str) -> Result<Frame, String> {
     }
     for line in block.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let (key, rest) = line.split_once(' ').unwrap_or((line, ""));
-        let nums = || -> Result<Vec<f32>, String> {
+        let nums = || -> Result<Vec<f32>, Box<dyn Error>> {
             rest.split_whitespace()
                 .map(|v| {
                     v.parse::<f32>()
-                        .map_err(|_| format!("bad number in `{line}`"))
+                        .map_err(|_| format!("bad number in `{line}`").into())
                 })
                 .collect()
         };
-        let want = |n: usize| -> Result<Vec<f32>, String> {
+        let want = |n: usize| -> Result<Vec<f32>, Box<dyn Error>> {
             let v = nums()?;
             if v.len() == n {
                 Ok(v)
             } else {
-                Err(format!("`{key}` takes {n} values"))
+                Err(format!("`{key}` takes {n} values").into())
             }
         };
         let s = &mut frame.values;
@@ -148,7 +149,7 @@ fn parse(block: &str) -> Result<Frame, String> {
                 set(s, "blur_direction", ParamValue::Int(v[2] as i32))?;
                 set(s, "blur_grow", ParamValue::Bool(v[3] != 0.0))?;
             }
-            _ => return Err(format!("unknown key `{key}`")),
+            _ => return Err(format!("unknown key `{key}`").into()),
         }
     }
     if frame.width == 0 || frame.height == 0 || frame.input.is_empty() || frame.output.is_empty() {
@@ -157,14 +158,11 @@ fn parse(block: &str) -> Result<Frame, String> {
     Ok(frame)
 }
 
-fn run(frame: &Frame) -> Result<(), String> {
-    let read = |path: &str| -> Result<Vec<f32>, String> {
+fn run(frame: &Frame) -> Result<(), Box<dyn Error>> {
+    let read = |path: &str| -> Result<Vec<f32>, Box<dyn Error>> {
         let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         if bytes.len() != (frame.width * frame.height * 4) as usize {
-            return Err(format!(
-                "{path}: expected {}x{} RGBA",
-                frame.width, frame.height
-            ));
+            return Err(format!("{path}: expected {}x{} RGBA", frame.width, frame.height).into());
         }
         Ok(bytes.iter().map(|&b| f32::from(b) / 255.0).collect())
     };
@@ -190,9 +188,10 @@ fn run(frame: &Frame) -> Result<(), String> {
     // Unclamped f32, so the harness can quantise the way each bit depth does: integer
     // depths clip before premultiplying, 32 bpc keeps values above 1.0 until output.
     let bytes: Vec<u8> = pixels.iter().flat_map(|v| v.to_le_bytes()).collect();
-    fs::write(&frame.output, bytes).map_err(|e| format!("{}: {e}", frame.output))
+    fs::write(&frame.output, bytes).map_err(|e| format!("{}: {e}", frame.output))?;
+    Ok(())
 }
 
-fn set(values: &mut ParamValues, name: &str, value: ParamValue) -> Result<(), String> {
-    values.set(name, value).map_err(|e| e.to_string())
+fn set(values: &mut ParamValues, name: &str, value: ParamValue) -> Result<(), Box<dyn Error>> {
+    Ok(values.set(name, value)?)
 }

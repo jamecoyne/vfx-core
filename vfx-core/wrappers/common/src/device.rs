@@ -25,7 +25,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use vfx_core::{Gpu, ReopenBackoff};
+use vfx_core::{Gpu, GpuError, ReopenBackoff};
 
 use crate::diag::Log;
 use crate::pipeline;
@@ -106,8 +106,8 @@ static GPU: LazyLock<DeviceSlot<Gpu>> = LazyLock::new(|| DeviceSlot::new(open_gp
 /// Opens a headless device and records its loss. Only the loss callback is installed: wgpu's
 /// default error handler stays, so a validation error still panics in the render, where the host
 /// catches it and passes the frame through.
-fn open_gpu() -> Result<(Gpu, LossRecord), String> {
-    let gpu = pollster::block_on(Gpu::headless()).map_err(|e| e.to_string())?;
+fn open_gpu() -> Result<(Gpu, LossRecord), OpenError> {
+    let gpu = pollster::block_on(Gpu::headless())?;
     let lost = LossRecord::default();
     let record = lost.clone();
     gpu.device.set_device_lost_callback(move |reason, message| {
@@ -117,7 +117,20 @@ fn open_gpu() -> Result<(Gpu, LossRecord), String> {
     Ok((gpu, lost))
 }
 
-type Open<D> = Box<dyn Fn() -> Result<(D, LossRecord), String> + Send + Sync>;
+/// Why opening the plugin's own device failed.
+#[derive(Debug, thiserror::Error)]
+enum OpenError {
+    #[error(transparent)]
+    Gpu(#[from] GpuError),
+    #[error("opening the device panicked")]
+    Panicked,
+    #[error("no thread to open a device on: {0}")]
+    NoThread(std::io::Error),
+    #[error("opening a device took over {OPEN_DEADLINE:?}")]
+    Hung,
+}
+
+type Open<D> = Box<dyn Fn() -> Result<(D, LossRecord), OpenError> + Send + Sync>;
 
 enum SlotState<D: Send + 'static> {
     Unopened,
@@ -155,7 +168,7 @@ struct DeviceSlot<D: Send + 'static> {
 }
 
 impl<D: Send + Sync + 'static> DeviceSlot<D> {
-    fn new(open: impl Fn() -> Result<(D, LossRecord), String> + Send + Sync + 'static) -> Self {
+    fn new(open: impl Fn() -> Result<(D, LossRecord), OpenError> + Send + Sync + 'static) -> Self {
         Self {
             open: Box::new(open),
             slot: Mutex::new(Slot {
@@ -263,27 +276,21 @@ impl<D: Send + Sync + 'static> DeviceSlot<D> {
             .name("vfx GPU open".into())
             .spawn(move || {
                 let opened = catch_unwind(AssertUnwindSafe(|| (self.open)()))
-                    .unwrap_or_else(|_| Err("opening the device panicked".into()));
+                    .unwrap_or_else(|_| Err(OpenError::Panicked));
                 self.publish(generation, opened, Instant::now(), log);
             });
         if let Err(e) = spawned {
             // Opening here would stall the render, so this counts as a failed try.
-            Self::failed(
-                slot,
-                format!("no thread to open a device on: {e}"),
-                now,
-                notes,
-            );
+            Self::failed(slot, OpenError::NoThread(e), now, notes);
         }
         None
     }
 
     fn open_hung(slot: &mut Slot<D>, now: Instant, notes: &mut Vec<String>) {
-        let why = format!("opening a device took over {OPEN_DEADLINE:?}");
-        Self::failed(slot, why, now, notes);
+        Self::failed(slot, OpenError::Hung, now, notes);
     }
 
-    fn failed(slot: &mut Slot<D>, why: String, now: Instant, notes: &mut Vec<String>) {
+    fn failed(slot: &mut Slot<D>, why: OpenError, now: Instant, notes: &mut Vec<String>) {
         slot.failures += 1;
         let delay = slot.backoff.next_delay();
         // The log keeps each line once, which holds while wgpu's failure texts carry no addresses
@@ -301,7 +308,7 @@ impl<D: Send + Sync + 'static> DeviceSlot<D> {
     fn publish(
         &self,
         generation: u64,
-        opened: Result<(D, LossRecord), String>,
+        opened: Result<(D, LossRecord), OpenError>,
         now: Instant,
         log: &Log,
     ) {
@@ -396,7 +403,9 @@ mod tests {
             }
             drop(blocked);
             if *fake.fail.lock().unwrap() {
-                return Err("the adapter is gone".into());
+                return Err(
+                    GpuError::Adapter(vfx_core::wgpu::RequestAdapterError::EnvNotSet).into(),
+                );
             }
             let lost = LossRecord::default();
             fake.records.lock().unwrap().push(lost.clone());
@@ -415,26 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn the_live_getter_never_waits_for_the_first_open() {
-        let (slot, fake) = fake_slot();
-        fake.set_blocked(true);
-        let start = Instant::now();
-        assert!(slot.now(start, log()).is_none(), "the open is blocked");
-        assert!(slot.now(start, log()).is_none());
-        fake.set_blocked(false);
-        slot.settle();
-        assert_eq!(slot.now(start, log()).expect("opened").number, 1);
-    }
-
-    #[test]
-    fn the_export_getter_waits_for_the_first_open() {
-        let (slot, _) = fake_slot();
-        let device = slot.wait(Instant::now(), log()).expect("waited for");
-        assert_eq!(device.pool_key, OWN_DEVICE_KEYS | 1);
-    }
-
-    #[test]
-    fn a_failed_first_open_is_tried_again_after_the_backoff() {
+    fn failed_first_open_retries_after_backoff() {
         let (slot, fake) = fake_slot();
         fake.set_fail(true);
         let start = Instant::now();
@@ -448,54 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn the_export_getter_never_waits_for_a_retry_after_a_failed_open() {
-        let (slot, fake) = fake_slot();
-        fake.set_fail(true);
-        let start = Instant::now();
-        assert!(slot.wait(start, log()).is_none(), "the first open fails");
-        fake.set_blocked(true);
-        assert!(
-            slot.wait(start + LATER, log()).is_none(),
-            "the retry is under way and not waited for"
-        );
-        assert!(matches!(slot.slot().state, SlotState::Opening { .. }));
-        fake.set_fail(false);
-        fake.set_blocked(false);
-        slot.settle();
-        assert!(slot.wait(start + LATER, log()).is_some());
-    }
-
-    #[test]
-    fn the_live_getter_replaces_a_lost_device_after_the_backoff() {
-        let (slot, fake) = fake_slot();
-        let start = Instant::now();
-        let first = slot.wait(start, log()).expect("first device");
-        fake.lose(0);
-        assert!(slot.now(start, log()).is_none(), "the loss is seen");
-        assert!(slot.now(start, log()).is_none());
-        assert!(is_waiting(slot), "no new try before the backoff");
-        assert!(slot.now(start + LATER, log()).is_none(), "the try starts");
-        slot.settle();
-        let second = slot.now(start + LATER, log()).expect("the replacement");
-        assert_ne!(first.pool_key, second.pool_key);
-        assert_eq!(second.number, 2);
-        assert!(second.lost().is_none());
-    }
-
-    #[test]
-    fn the_export_getter_replaces_a_lost_device_at_once() {
-        let (slot, fake) = fake_slot();
-        let start = Instant::now();
-        let first = slot.wait(start, log()).expect("first device");
-        fake.lose(0);
-        let second = slot
-            .wait(start, log())
-            .expect("the replacement, waited for");
-        assert_ne!(first.pool_key, second.pool_key);
-    }
-
-    #[test]
-    fn a_replacement_that_fails_is_tried_again() {
+    fn failed_replacement_retries() {
         let (slot, fake) = fake_slot();
         let start = Instant::now();
         slot.wait(start, log()).expect("first device");
@@ -513,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_past_its_deadline_counts_as_failed_and_its_device_is_dropped() {
+    fn hung_open_fails_and_drops_device() {
         let (slot, fake) = fake_slot();
         fake.set_blocked(true);
         let start = Instant::now();
@@ -538,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn a_panicking_open_counts_as_a_failure() {
+    fn open_panic_counts_as_failure() {
         let slot: &'static DeviceSlot<()> =
             Box::leak(Box::new(DeviceSlot::new(|| panic!("driver"))));
         assert!(slot.wait(Instant::now(), log()).is_none());
@@ -546,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn a_retired_device_is_dropped_off_the_thread_that_lets_go_of_it() {
+    fn retired_device_drops_on_another_thread() {
         struct Tell(mpsc::Sender<std::thread::ThreadId>);
         impl Drop for Tell {
             fn drop(&mut self) {
@@ -563,5 +506,79 @@ mod tests {
         drop(device);
         let thread = dropped_on.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_ne!(thread, std::thread::current().id());
+    }
+
+    mod wait {
+        use super::*;
+
+        #[test]
+        fn blocks_until_first_open() {
+            let (slot, _) = fake_slot();
+            let device = slot.wait(Instant::now(), log()).expect("waited for");
+            assert_eq!(device.pool_key, OWN_DEVICE_KEYS | 1);
+        }
+
+        #[test]
+        fn does_not_block_on_retry() {
+            let (slot, fake) = fake_slot();
+            fake.set_fail(true);
+            let start = Instant::now();
+            assert!(slot.wait(start, log()).is_none(), "the first open fails");
+            fake.set_blocked(true);
+            assert!(
+                slot.wait(start + LATER, log()).is_none(),
+                "the retry is under way and not waited for"
+            );
+            assert!(matches!(slot.slot().state, SlotState::Opening { .. }));
+            fake.set_fail(false);
+            fake.set_blocked(false);
+            slot.settle();
+            assert!(slot.wait(start + LATER, log()).is_some());
+        }
+
+        #[test]
+        fn replaces_lost_device_at_once() {
+            let (slot, fake) = fake_slot();
+            let start = Instant::now();
+            let first = slot.wait(start, log()).expect("first device");
+            fake.lose(0);
+            let second = slot
+                .wait(start, log())
+                .expect("the replacement, waited for");
+            assert_ne!(first.pool_key, second.pool_key);
+        }
+    }
+
+    mod now {
+        use super::*;
+
+        #[test]
+        fn never_waits_for_first_open() {
+            let (slot, fake) = fake_slot();
+            fake.set_blocked(true);
+            let start = Instant::now();
+            assert!(slot.now(start, log()).is_none(), "the open is blocked");
+            assert!(slot.now(start, log()).is_none());
+            fake.set_blocked(false);
+            slot.settle();
+            assert_eq!(slot.now(start, log()).expect("opened").number, 1);
+        }
+
+        #[test]
+        fn replaces_lost_device_after_backoff() {
+            let (slot, fake) = fake_slot();
+            let start = Instant::now();
+            let first = slot.wait(start, log()).expect("first device");
+            fake.lose(0);
+            assert!(slot.now(start, log()).is_none(), "the loss is seen");
+            assert!(slot.now(start, log()).is_none());
+            assert!(is_waiting(slot), "no new try before the backoff");
+            assert!(slot.now(start + LATER, log()).is_none(), "the try starts");
+            slot.settle();
+            let second = slot.now(start + LATER, log()).expect("the replacement");
+            assert_ne!(first.pool_key, second.pool_key);
+            assert_eq!(second.number, 2);
+            assert!(second.lost().is_none());
+        }
     }
 }

@@ -1,5 +1,5 @@
-//! The few OpenGL calls the plugin makes, in the host's GL 4.1 core context. Linked
-//! from macOS's OpenGL framework, or loaded from the current context on Windows.
+//! The few OpenGL calls the plugin makes, in the host's GL 4.1 core context. Loaded
+//! from the current context on Windows, or from the system's OpenGL library elsewhere.
 //!
 //! Everything here runs on the host's GL thread with its context current, and leaves
 //! the state FFGL hosts expect: no program, vertex array or texture bound, and texture
@@ -9,12 +9,16 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
+use std::sync::OnceLock;
 
 /// Why a GL call or setup step failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     /// No OpenGL context is current on this thread.
     NoContext,
+    /// The system's OpenGL library didn't load.
+    #[cfg(not(target_os = "windows"))]
+    NoLibrary(&'static str),
     /// The context doesn't provide this function.
     MissingFunction(&'static str),
     /// The context doesn't offer this extension.
@@ -36,6 +40,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoContext => f.write_str("no current OpenGL context"),
+            #[cfg(not(target_os = "windows"))]
+            Self::NoLibrary(path) => write!(f, "can't load {path}"),
             Self::MissingFunction(name) => write!(f, "missing OpenGL function {name}"),
             Self::MissingExtension(name) => write!(f, "missing {name}"),
             Self::Call { operation, code } => write!(f, "{operation}: GL error 0x{code:04x}"),
@@ -89,6 +95,7 @@ pub const VIEWPORT: GLenum = 0x0BA2;
 #[cfg(target_os = "windows")]
 macro_rules! interop_functions {
     ($(fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)?;)*) => {
+        #[allow(non_snake_case)]
         struct InteropFunctions {
             $($name: unsafe extern "system" fn($($ty),*) $(-> $ret)?,)*
         }
@@ -109,6 +116,7 @@ macro_rules! interop_functions {
         }
         $(/// # Safety
           /// The context must be current; arguments must obey the named GL extension.
+          #[allow(non_snake_case)]
           pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
             let functions = FUNCTIONS.get().unwrap().as_ref().unwrap().interop.as_ref().unwrap();
             // SAFETY: interop loading succeeded; the caller supplies GL arguments.
@@ -117,151 +125,162 @@ macro_rules! interop_functions {
     };
 }
 
-// Keep the signatures in one place; Windows calls use the system GL ABI.
+// The signatures in one place. Outside Windows, the "system" ABI is the C ABI.
 macro_rules! gl_functions {
     ($( $(#[$attr:meta])* fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
-        #[cfg(not(target_os = "windows"))]
-        #[cfg_attr(target_os = "macos", link(name = "OpenGL", kind = "framework"))]
-        unsafe extern "C" {
-            $( $(#[$attr])* fn $name($($arg: $ty),*) $(-> $ret)?; )*
+        #[allow(non_snake_case)]
+        struct Functions {
+            $( $(#[$attr])* $name: unsafe extern "system" fn($($ty),*) $(-> $ret)?, )*
+            #[cfg(target_os = "windows")]
+            interop: Result<InteropFunctions, Error>,
         }
 
-        #[cfg(target_os = "windows")]
-        #[allow(non_snake_case, clippy::too_many_arguments)]
-        mod windows {
-            use super::*;
-            use std::sync::OnceLock;
-            use windows_sys::Win32::Graphics::OpenGL::{wglGetCurrentContext, wglGetProcAddress};
-            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-
-            struct Functions {
-                $( $(#[$attr])* $name: unsafe extern "system" fn($($ty),*) $(-> $ret)?, )*
-                interop: Result<InteropFunctions, Error>,
-            }
-            static FUNCTIONS: OnceLock<Result<Functions, Error>> = OnceLock::new();
-
-            fn valid_address(address: *const c_void) -> bool {
-                !matches!(address as usize, 0 | 1 | 2 | 3 | usize::MAX)
-            }
-
-            impl Functions {
-                // SAFETY: the resolver must return each named GL function's address
-                // in the current context, or a null/sentinel address when unavailable.
-                unsafe fn load_with(mut resolve: impl FnMut(&CStr) -> *const c_void) -> Result<Self, Error> {
-                    Ok(Self {
-                        $( $(#[$attr])* $name: {
-                            let name = concat!(stringify!($name), "\0");
-                            let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
-                            let address = resolve(name);
-                            if !valid_address(address) {
-                                return Err(Error::MissingFunction(stringify!($name)));
-                            }
-                            // SAFETY: the resolver supplies this symbol's declared GL ABI.
-                            unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn($($ty),*) $(-> $ret)?>(address) }
-                        }, )*
-                        // SAFETY: the same resolver supplies optional extension entry points.
-                        interop: unsafe { InteropFunctions::load_with(&mut resolve) },
-                    })
-                }
-            }
-
-            interop_functions! {
-                fn glCreateMemoryObjectsEXT(n: GLsizei, objects: *mut GLuint);
-                fn glDeleteMemoryObjectsEXT(n: GLsizei, objects: *const GLuint);
-                fn glMemoryObjectParameterivEXT(memory: GLuint, name: GLenum, value: *const GLint);
-                fn glImportMemoryWin32HandleEXT(memory: GLuint, size: u64, kind: GLenum, handle: *mut c_void);
-                fn glTexStorageMem2DEXT(target: GLenum, levels: GLsizei, format: GLenum, w: GLsizei, h: GLsizei, memory: GLuint, offset: u64);
-                fn glGetUnsignedBytevEXT(name: GLenum, value: *mut u8);
-                fn glGenSemaphoresEXT(n: GLsizei, semaphores: *mut GLuint);
-                fn glDeleteSemaphoresEXT(n: GLsizei, semaphores: *const GLuint);
-                fn glImportSemaphoreWin32HandleEXT(semaphore: GLuint, kind: GLenum, handle: *mut c_void);
-                fn glWaitSemaphoreEXT(semaphore: GLuint, buffers: GLuint, buffer_names: *const GLuint, textures: GLuint, texture_names: *const GLuint, layouts: *const GLenum);
-                fn glSignalSemaphoreEXT(semaphore: GLuint, buffers: GLuint, buffer_names: *const GLuint, textures: GLuint, texture_names: *const GLuint, layouts: *const GLenum);
-            }
-
-            pub(super) fn interop_loaded() -> Result<(), Error> {
-                FUNCTIONS.get().unwrap().as_ref().unwrap().interop.as_ref().map(|_| ()).map_err(Clone::clone)
-            }
-
-            /// Loads the table once, with the host's GL context current.
-            pub fn load() -> Result<(), Error> {
-                // SAFETY: these queries don't need a context or dereference host data.
-                unsafe {
-                    if wglGetCurrentContext().is_null() {
-                        return Err(Error::NoContext);
-                    }
-                    FUNCTIONS.get_or_init(|| {
-                        let module = GetModuleHandleA(c"opengl32.dll".as_ptr().cast());
-                        let address = |function: Option<unsafe extern "system" fn() -> isize>| {
-                            function.map_or(std::ptr::null(), |f| f as *const c_void)
-                        };
-                        Functions::load_with(|name| {
-                            let from_context = address(wglGetProcAddress(name.as_ptr().cast()));
-                            if valid_address(from_context) {
-                                from_context
-                            } else if !module.is_null() {
-                                address(GetProcAddress(module, name.as_ptr().cast()))
-                            } else {
-                                std::ptr::null()
-                            }
-                        })
-                    }).as_ref().map(|_| ()).map_err(Clone::clone)
-                }
-            }
-
-            $( $(#[$attr])*
-                pub(super) unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
-                    let functions = FUNCTIONS.get().and_then(|f| f.as_ref().ok())
-                        .expect("OpenGL functions loaded before instance creation");
-                    // SAFETY: the caller has the context current and passes GL arguments.
-                    unsafe { (functions.$name)($($arg),*) }
-                }
-            )*
-
-            #[cfg(test)]
-            mod tests {
-                use super::*;
-
-                #[test]
-                fn rejects_wgl_failure_addresses() {
-                    for address in [0, 1, 2, 3, usize::MAX] {
-                        assert!(!valid_address(address as *const c_void));
-                    }
-                    assert!(valid_address(4usize as *const c_void));
-                }
-
-                #[test]
-                fn load_names_missing_function() {
-                    for address in [0, 1, 2, 3, usize::MAX] {
-                        // SAFETY: a failure address is rejected before any function is stored.
-                        let result = unsafe { Functions::load_with(|_| address as *const c_void) };
-                        assert_eq!(result.err(), Some(Error::MissingFunction("glGenTextures")));
-                    }
-                }
-
-                #[test]
-                fn load_without_context_fails_before_caching() {
-                    assert_eq!(load(), Err(Error::NoContext));
-                    assert!(FUNCTIONS.get().is_none());
-                }
-
-                #[test]
-                fn missing_interop_functions_leave_ram_available() {
-                    // SAFETY: only the pointer table is inspected; no function is called.
-                    let functions = unsafe { Functions::load_with(|name| {
-                        if name.to_bytes().ends_with(b"EXT") { std::ptr::null() }
-                        else { 4usize as *const c_void }
-                    }) }.unwrap();
-                    assert_eq!(functions.interop.err(),
-                        Some(Error::MissingFunction("glCreateMemoryObjectsEXT")));
-                }
+        impl Functions {
+            /// # Safety
+            /// `resolve` must return each named GL function's address, or a null or sentinel
+            /// address when it's unavailable.
+            unsafe fn load_with(mut resolve: impl FnMut(&CStr) -> *const c_void) -> Result<Self, Error> {
+                Ok(Self {
+                    $( $(#[$attr])* $name: {
+                        let name = concat!(stringify!($name), "\0");
+                        let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+                        let address = resolve(name);
+                        if !valid_address(address) {
+                            return Err(Error::MissingFunction(stringify!($name)));
+                        }
+                        // SAFETY: the resolver supplies this symbol's declared GL ABI.
+                        unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn($($ty),*) $(-> $ret)?>(address) }
+                    }, )*
+                    #[cfg(target_os = "windows")]
+                    // SAFETY: the same resolver supplies optional extension entry points.
+                    interop: unsafe { InteropFunctions::load_with(&mut resolve) },
+                })
             }
         }
-        #[cfg(target_os = "windows")]
-        use windows::*;
-        #[cfg(target_os = "windows")]
-        pub use windows::load;
+
+        $( $(#[$attr])*
+            #[allow(non_snake_case, clippy::too_many_arguments)]
+            unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+                // SAFETY: the caller has the context current and passes GL arguments.
+                unsafe { (functions().$name)($($arg),*) }
+            }
+        )*
     };
+}
+
+static FUNCTIONS: OnceLock<Result<Functions, Error>> = OnceLock::new();
+
+/// macOS's OpenGL framework.
+#[cfg(target_os = "macos")]
+const GL_LIBRARY: &str = "/System/Library/Frameworks/OpenGL.framework/OpenGL";
+/// The GL library of other Unix systems.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const GL_LIBRARY: &str = "libGL.so.1";
+
+fn valid_address(address: *const c_void) -> bool {
+    !matches!(address as usize, 0 | 1 | 2 | 3 | usize::MAX)
+}
+
+fn functions() -> &'static Functions {
+    #[cfg(not(target_os = "windows"))]
+    if let Err(e) = load() {
+        panic!("{e}");
+    }
+    FUNCTIONS
+        .get()
+        .and_then(|f| f.as_ref().ok())
+        .expect("OpenGL functions loaded before instance creation")
+}
+
+/// Loads the table once, with the host's GL context current.
+#[cfg(target_os = "windows")]
+pub fn load() -> Result<(), Error> {
+    use windows_sys::Win32::Graphics::OpenGL::{wglGetCurrentContext, wglGetProcAddress};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+
+    // SAFETY: these queries don't need a context or dereference host data.
+    unsafe {
+        if wglGetCurrentContext().is_null() {
+            return Err(Error::NoContext);
+        }
+        FUNCTIONS
+            .get_or_init(|| {
+                let module = GetModuleHandleA(c"opengl32.dll".as_ptr().cast());
+                let address = |function: Option<unsafe extern "system" fn() -> isize>| {
+                    function.map_or(std::ptr::null(), |f| f as *const c_void)
+                };
+                Functions::load_with(|name| {
+                    let from_context = address(wglGetProcAddress(name.as_ptr().cast()));
+                    if valid_address(from_context) {
+                        from_context
+                    } else if !module.is_null() {
+                        address(GetProcAddress(module, name.as_ptr().cast()))
+                    } else {
+                        std::ptr::null()
+                    }
+                })
+            })
+            .as_ref()
+            .map(|_| ())
+            .map_err(Clone::clone)
+    }
+}
+
+/// Loads the table once from the system's OpenGL library. The GL calls also load it on first
+/// use.
+#[cfg(not(target_os = "windows"))]
+pub fn load() -> Result<(), Error> {
+    FUNCTIONS
+        .get_or_init(|| {
+            // SAFETY: loading runs the initialisers of the operating system's own GL library.
+            let library = unsafe { libloading::Library::new(GL_LIBRARY) }
+                .map_err(|_| Error::NoLibrary(GL_LIBRARY))?;
+            // SAFETY: the addresses outlive their `Symbol`s because the library is never
+            // unloaded (forgotten below), and the table declares each function's GL ABI.
+            let functions = unsafe {
+                Functions::load_with(|name| {
+                    library
+                        .get::<*mut c_void>(name)
+                        .ok()
+                        .and_then(|symbol| symbol.try_as_raw_ptr())
+                        .map_or(std::ptr::null(), |address| address.cast_const())
+                })
+            }?;
+            // The table points into the library for the rest of the process.
+            std::mem::forget(library);
+            Ok(functions)
+        })
+        .as_ref()
+        .map(|_| ())
+        .map_err(Clone::clone)
+}
+
+#[cfg(target_os = "windows")]
+fn interop_loaded() -> Result<(), Error> {
+    FUNCTIONS
+        .get()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .interop
+        .as_ref()
+        .map(|_| ())
+        .map_err(Clone::clone)
+}
+
+#[cfg(target_os = "windows")]
+interop_functions! {
+    fn glCreateMemoryObjectsEXT(n: GLsizei, objects: *mut GLuint);
+    fn glDeleteMemoryObjectsEXT(n: GLsizei, objects: *const GLuint);
+    fn glMemoryObjectParameterivEXT(memory: GLuint, name: GLenum, value: *const GLint);
+    fn glImportMemoryWin32HandleEXT(memory: GLuint, size: u64, kind: GLenum, handle: *mut c_void);
+    fn glTexStorageMem2DEXT(target: GLenum, levels: GLsizei, format: GLenum, w: GLsizei, h: GLsizei, memory: GLuint, offset: u64);
+    fn glGetUnsignedBytevEXT(name: GLenum, value: *mut u8);
+    fn glGenSemaphoresEXT(n: GLsizei, semaphores: *mut GLuint);
+    fn glDeleteSemaphoresEXT(n: GLsizei, semaphores: *const GLuint);
+    fn glImportSemaphoreWin32HandleEXT(semaphore: GLuint, kind: GLenum, handle: *mut c_void);
+    fn glWaitSemaphoreEXT(semaphore: GLuint, buffers: GLuint, buffer_names: *const GLuint, textures: GLuint, texture_names: *const GLuint, layouts: *const GLenum);
+    fn glSignalSemaphoreEXT(semaphore: GLuint, buffers: GLuint, buffer_names: *const GLuint, textures: GLuint, texture_names: *const GLuint, layouts: *const GLenum);
 }
 
 gl_functions! {
@@ -345,13 +364,6 @@ gl_functions! {
     fn glFinish();
 }
 
-#[cfg(target_os = "windows")]
-pub use windows::{
-    glCreateMemoryObjectsEXT, glDeleteMemoryObjectsEXT, glDeleteSemaphoresEXT, glGenSemaphoresEXT,
-    glGetUnsignedBytevEXT, glImportMemoryWin32HandleEXT, glImportSemaphoreWin32HandleEXT,
-    glMemoryObjectParameterivEXT, glSignalSemaphoreEXT, glTexStorageMem2DEXT, glWaitSemaphoreEXT,
-};
-
 /// Checks the optional sharing functions without making them a requirement for RAM.
 #[cfg(target_os = "windows")]
 /// # Safety
@@ -375,7 +387,7 @@ pub unsafe fn shared_memory_luid() -> Result<[u8; 8], Error> {
                 return Err(Error::MissingExtension(required));
             }
         }
-        windows::interop_loaded()?;
+        interop_loaded()?;
         let mut luid = [0; 8];
         glGetUnsignedBytevEXT(0x9599, luid.as_mut_ptr()); // GL_DEVICE_LUID_EXT
         check_error("OpenGL device LUID")?;
@@ -850,4 +862,60 @@ pub unsafe fn nearest_rectangle(texture: GLuint) {
 pub unsafe fn bind_rectangle(texture: GLuint) {
     // SAFETY: the caller has the context current.
     unsafe { glBindTexture(TEXTURE_RECTANGLE, texture) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_names_missing_function() {
+        for address in [0, 1, 2, 3, usize::MAX] {
+            // SAFETY: a failure address is rejected before any function is stored.
+            let result = unsafe { Functions::load_with(|_| address as *const c_void) };
+            assert_eq!(result.err(), Some(Error::MissingFunction("glGenTextures")));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rejects_wgl_failure_addresses() {
+        for address in [0, 1, 2, 3, usize::MAX] {
+            assert!(!valid_address(address as *const c_void));
+        }
+        assert!(valid_address(4usize as *const c_void));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn load_without_context_fails_before_caching() {
+        assert_eq!(load(), Err(Error::NoContext));
+        assert!(FUNCTIONS.get().is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn missing_interop_functions_leave_ram_available() {
+        // SAFETY: only the pointer table is inspected; no function is called.
+        let functions = unsafe {
+            Functions::load_with(|name| {
+                if name.to_bytes().ends_with(b"EXT") {
+                    std::ptr::null()
+                } else {
+                    4usize as *const c_void
+                }
+            })
+        }
+        .unwrap();
+        assert_eq!(
+            functions.interop.err(),
+            Some(Error::MissingFunction("glCreateMemoryObjectsEXT"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_resolves_framework_functions() {
+        assert_eq!(load(), Ok(()));
+    }
 }

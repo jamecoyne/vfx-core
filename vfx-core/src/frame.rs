@@ -183,8 +183,8 @@ impl Readback {
     }
 
     fn read_into(&mut self, gpu: &Gpu, frame: &Frame, out: &mut [u8], row_stride: u32) {
-        if let Err(why) = self.read_within(gpu, frame, out, row_stride, READBACK_TIMEOUT) {
-            panic!("GPU readback failed: {why}");
+        if let Err(err) = self.read_within(gpu, frame, out, row_stride, READBACK_TIMEOUT) {
+            panic!("GPU readback failed: {err}");
         }
     }
 
@@ -195,7 +195,7 @@ impl Readback {
         out: &mut [u8],
         row_stride: u32,
         timeout: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReadbackError> {
         assert_eq!(self.size, (frame.width, frame.height, frame.format));
         let row_bytes = frame.width * frame.bytes_per_pixel();
         let gpu_pitch = self.gpu_pitch;
@@ -234,13 +234,13 @@ impl Readback {
         };
         // Another thread's poll may be the one that calls back, a moment later.
         let mapped = crate::poll_device(&gpu.device, wait)
-            .map_err(|e| e.to_string())
-            .and_then(|_| rx.recv_timeout(timeout).map_err(|e| e.to_string()))
-            .and_then(|mapped| mapped.map_err(|e| e.to_string()));
-        if let Err(why) = mapped {
+            .map_err(ReadbackError::from)
+            .and_then(|_| rx.recv_timeout(timeout).map_err(ReadbackError::from))
+            .and_then(|mapped| mapped.map_err(ReadbackError::from));
+        if let Err(err) = mapped {
             // The map may still be pending on this buffer, so the next read takes a new one.
             *self = Self::new(gpu, frame);
-            return Err(why);
+            return Err(err);
         }
 
         let data = slice.get_mapped_range().expect("readback range is mapped");
@@ -254,6 +254,16 @@ impl Readback {
         buffer.unmap();
         Ok(())
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReadbackError {
+    #[error(transparent)]
+    Poll(#[from] crate::PollFailure),
+    #[error(transparent)]
+    Recv(#[from] std::sync::mpsc::RecvTimeoutError),
+    #[error(transparent)]
+    Map(#[from] wgpu::BufferAsyncError),
 }
 
 fn extent(width: u32, height: u32) -> wgpu::Extent3d {
@@ -270,10 +280,8 @@ mod tests {
 
     #[test]
     fn readback_recovers_after_timeout() {
-        let Ok(gpu) = pollster::block_on(Gpu::headless()) else {
-            eprintln!("no GPU adapter: skipped");
-            return;
-        };
+        let gpu = pollster::block_on(Gpu::headless())
+            .expect("no GPU adapter available for headless tests");
         let frame = Frame::new(&gpu, 256, 256, wgpu::TextureFormat::Rgba32Float);
         let input: Vec<f32> = (0..256 * 256 * 4).map(|i| i as f32).collect();
         frame.write(&gpu, bytemuck::cast_slice(&input));

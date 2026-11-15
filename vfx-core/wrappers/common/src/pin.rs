@@ -5,14 +5,11 @@
 /// Pins this DLL for the life of the process. Repeat calls do nothing.
 #[cfg(target_os = "windows")]
 pub(crate) fn pin_module() {
-    use std::ffi::c_void;
     use std::sync::Once;
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExW,
+    };
 
-    const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x1;
-    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
-    unsafe extern "system" {
-        fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
-    }
     static PIN: Once = Once::new();
     PIN.call_once(|| {
         let mut module = std::ptr::null_mut();
@@ -58,3 +55,12 @@ pub(crate) fn pin_module() {
 
 #[cfg(not(any(target_os = "windows", unix)))]
 pub(crate) fn pin_module() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pin_module_is_repeatable() {
+        super::pin_module();
+        super::pin_module();
+    }
+}

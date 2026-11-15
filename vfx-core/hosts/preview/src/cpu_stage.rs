@@ -224,7 +224,7 @@ impl CpuStage {
         self.rendered_with = None;
         let before = self.effect.frames_before(values, frame_rate);
         let held = self.effect.frames_held(values, frame_rate);
-        self.history.next(before, held)
+        self.history.push_slot(before, held)
     }
 
     fn push_input(
@@ -733,7 +733,11 @@ mod tests {
     /// In a process of its own: the device has to be shared before segcam opens one, and segcam
     /// opens one once per process.
     #[test]
-    fn output_frame_test_in_own_process() {
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+    )]
+    fn output_frame_matches_ram_path_in_own_process() {
         let test = "cpu_stage::tests::output_frame_matches_ram_path";
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--ignored"])
@@ -742,14 +746,12 @@ mod tests {
         assert!(status.success());
     }
 
-    /// After a switch to a new source of the same size, Record has nothing until a new frame, and
-    /// a first picture equal to the old one still reaches the output frame.
-    #[test]
-    fn source_switch_leaves_no_old_picture() {
-        let (_turn, gpu) = crate::test_gpu();
+    /// A segcam stage that showed one grey frame and was then restarted, with its values and the
+    /// picture it showed.
+    fn restarted_stage(gpu: &Gpu) -> (CpuStage, ParamValues, Vec<Argb<u8>>) {
         let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu(false)));
         let effect = CpuInstance::new(make, true).expect("a CPU effect");
-        let mut stage = CpuStage::new(&gpu, effect, (32, 32));
+        let mut stage = CpuStage::new(gpu, effect, (32, 32));
         let mut values = ParamValues::new(SegcamMotion::with_gpu(false).params());
         for (name, value) in [
             ("detect", ParamValue::Int(0)),
@@ -758,19 +760,31 @@ mod tests {
         ] {
             values.set(name, value).expect(name);
         }
-        let input = Frame::new(&gpu, 32, 32, crate::effects::FRAME_FORMAT);
-        input.write(&gpu, bytemuck::cast_slice(&vec![0.5f32; 32 * 32 * 4]));
-        stage.render(&gpu, Input::Gpu(&input), &values, 0.0, None, false);
+        let input = Frame::new(gpu, 32, 32, crate::effects::FRAME_FORMAT);
+        input.write(gpu, bytemuck::cast_slice(&vec![0.5f32; 32 * 32 * 4]));
+        stage.render(gpu, Input::Gpu(&input), &values, 0.0, None, false);
         let old = stage.shown().to_vec();
         assert_eq!(old.len(), 32 * 32);
-
         stage.restart();
+        (stage, values, old)
+    }
+
+    /// After a switch to a new source of the same size, Record has nothing until a new frame.
+    #[test]
+    fn restart_clears_shown_picture() {
+        let (_turn, gpu) = crate::test_gpu();
+        let (mut stage, values, _) = restarted_stage(&gpu);
         assert!(stage.shown().is_empty());
         assert!(stage.reader.is_none());
         let waiting = stage.render(&gpu, Input::Ram(&[]), &values, 0.0, None, false);
         assert!(!waiting.new_picture);
         assert!(stage.shown().is_empty());
+    }
 
+    #[test]
+    fn restart_accepts_picture_equal_to_old() {
+        let (_turn, gpu) = crate::test_gpu();
+        let (mut stage, values, old) = restarted_stage(&gpu);
         let first = stage.render(&gpu, Input::Ram(&old), &values, 0.0, None, false);
         assert!(first.new_picture);
         let p = old[0];
@@ -783,13 +797,14 @@ mod tests {
     /// A swarm drawn straight into the output frame against the same swarm kept in RAM, then the
     /// switch Record makes, to RAM on the frame already shown.
     #[test]
-    #[ignore = "run by output_frame_test_in_own_process"]
+    #[ignore = "run by output_frame_matches_ram_path_in_own_process"]
     fn output_frame_matches_ram_path() {
         let (_turn, gpu) = crate::test_gpu();
-        if gpu.device.adapter_info().device_type == wgpu::DeviceType::Cpu {
-            eprintln!("no hardware GPU adapter: skipped");
-            return;
-        }
+        assert_ne!(
+            gpu.device.adapter_info().device_type,
+            wgpu::DeviceType::Cpu,
+            "needs a hardware GPU adapter"
+        );
         gpu.share();
         segcam_motion::gpu::status().expect("segcam draws on the shared device");
         let (w, h) = (320usize, 180usize);
@@ -873,7 +888,7 @@ mod tests {
 
     /// A frame read from a lost device is skipped, on the main thread, with no panic.
     #[test]
-    fn lost_device_skips_the_frame() {
+    fn lost_device_read_skips_frame() {
         let (_turn, gpu) = crate::test_gpu();
         let _faults = vfx_core::DeviceFaults::watch(&gpu.device);
         let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu(false)));
@@ -898,7 +913,7 @@ mod tests {
 
     /// Within 1 level of the float readback: the GPU rounds a tie its own way.
     #[test]
-    fn float_frame_reads_at_8_bit() {
+    fn float_frame_matches_rgba8_readback() {
         let (_turn, gpu) = crate::test_gpu();
         let mut controls = crate::controls::Controls::default();
         controls.effect = find("segcam").unwrap();

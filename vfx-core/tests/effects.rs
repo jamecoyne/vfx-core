@@ -1,7 +1,6 @@
-//! Headless render tests. Each one runs an effect on an offscreen frame and
-//! checks pixels against values worked out from the formula, with a small
-//! tolerance for 8-bit quantisation. Tests need a GPU adapter (Metal here;
-//! Vulkan via lavapipe on Linux CI).
+//! Headless render tests: each runs an effect on an offscreen frame and checks pixels
+//! against values worked out from the formula, within 8-bit quantisation. They need a GPU
+//! adapter.
 
 use vfx_core::effects::{ColorAdjust, FeedbackTrail, GaussianBlur};
 use vfx_core::{EffectChain, Frame, Gpu, ParamValue};
@@ -46,11 +45,6 @@ fn assert_close(actual: u8, expected: u8, tolerance: u8, what: &str) {
     );
 }
 
-/// Expected channel value after adding `offset` in normalised space, rounded to 8 bits.
-fn brightened(channel: u8, offset: f32) -> u8 {
-    ((f32::from(channel) / 255.0 + offset).clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
 #[test]
 fn color_adjust_defaults_are_identity() {
     let gpu = gpu();
@@ -73,14 +67,15 @@ fn color_adjust_brightness_offsets_each_channel() {
 
     let out = run(&gpu, &mut chain, &input);
     let px = pixel(&out, 4, 4);
-    for (channel, &source) in [128u8, 64, 200].iter().enumerate() {
-        assert_close(px[channel], brightened(source, 0.25), 1, "brightness");
+    // 0.25 is 63.75 of 255 levels; 200 clamps at white.
+    for (channel, expected) in [192u8, 128, 255].into_iter().enumerate() {
+        assert_close(px[channel], expected, 1, "brightness");
     }
     assert_eq!(px[3], 255, "alpha is untouched");
 }
 
 #[test]
-fn blur_spreads_an_impulse_and_keeps_its_energy() {
+fn blur_impulse_spreads_and_conserves_energy() {
     let gpu = gpu();
     let mut input = solid(OPAQUE_BLACK);
     let centre = ((4 * W + 4) * 4) as usize;
@@ -94,7 +89,8 @@ fn blur_spreads_an_impulse_and_keeps_its_energy() {
         .unwrap();
     let out = run(&gpu, &mut chain, &input);
 
-    // sigma = 1 gives taps 1, 0.6065, 0.1353; the 2-D centre weight is (1 / 2.4836)^2 ≈ 0.162.
+    // sigma = 1 gives taps 1, 0.6065, 0.1353; the 2-D centre weight is
+    // (1 / 2.4836)^2 ≈ 0.162.
     assert_close(pixel(&out, 4, 4)[0], 41, 2, "centre");
     let neighbour = pixel(&out, 3, 4)[0];
     assert!(
@@ -168,7 +164,7 @@ fn feedback_trail_fades_across_frames() {
 }
 
 #[test]
-fn chain_of_three_stages_matches_composed_formula() {
+fn chain_of_three_matches_composed_formula() {
     let gpu = gpu();
     let input = solid([128, 64, 200, 255]);
     // Three stages exercise both scratch frames. A zero-radius blur passes through,
@@ -192,14 +188,9 @@ fn chain_of_three_stages_matches_composed_formula() {
 
     let out = run(&gpu, &mut chain, &input);
     let px = pixel(&out, 4, 4);
-    for (channel, &source) in [128u8, 64, 200].iter().enumerate() {
-        // Each stage quantises to 8 bits, so allow 2 levels of drift.
-        assert_close(
-            px[channel],
-            brightened(source, 0.2),
-            2,
-            "composed brightness",
-        );
+    // 0.2 is 51 of 255 levels. Each stage quantises to 8 bits, so allow 2 levels of drift.
+    for (channel, expected) in [179u8, 115, 251].into_iter().enumerate() {
+        assert_close(px[channel], expected, 2, "composed brightness");
     }
 }
 

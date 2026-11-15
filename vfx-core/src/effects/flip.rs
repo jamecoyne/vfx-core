@@ -1,7 +1,7 @@
 use crate::shader::{self, Uniform};
 use crate::{Context, Effect, Frame, Gpu, ParamSpec, ParamValues};
 
-// Numbers rather than switches, so hosts can animate or drive them: above 0.5 flips.
+// Numbers, so hosts can animate or drive them: above 0.5 flips.
 const PARAMS: &[ParamSpec] = &[
     ParamSpec::float("flip_x", 0.0, 1.0, 0.0),
     ParamSpec::float("flip_y", 0.0, 1.0, 0.0),

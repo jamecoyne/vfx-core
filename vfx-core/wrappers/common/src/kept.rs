@@ -1,12 +1,11 @@
 //! Whether a host keeps a CPU effect between renders: one policy for every host target.
 //!
-//! An effect that says it [keeps state](vfx_core::CpuEffect::keeps_state) is kept for the
-//! instance by a host that can keep one (OpenFX, FFGL, the preview), and made fresh for every
-//! render otherwise, as After Effects must for its cache and Multi-Frame Rendering. Either way
-//! the output must be what a fresh effect renders from the same frames; [`crate::contract`]
-//! checks that for an effect. A host calls [`CpuInstance::clear_history`] when its frames stop
-//! following on (a seek back, a clip loop, a new size), which keeps the effect's GPU resources.
-//! A render that panicked can leave the effect half updated, so the effect is made again.
+//! An effect that [keeps state](vfx_core::CpuEffect::keeps_state) is kept for the instance
+//! by a host that can keep one (OpenFX, FFGL, the preview), and made anew for every
+//! render otherwise, as After Effects must for its cache and Multi-Frame Rendering.
+//! Either way the output must be what a new effect renders from the same frames:
+//! [`crate::contract`] checks that. A render that panicked can leave the effect half
+//! updated, so the effect is made again.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
@@ -21,7 +20,8 @@ pub struct CpuInstance {
 }
 
 /// A render panicked; the instance has started over.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a render panicked")]
 pub struct Panicked;
 
 impl CpuInstance {
@@ -36,24 +36,23 @@ impl CpuInstance {
         Some(Self { make, kept })
     }
 
-    /// Whether the effect is kept between renders.
     pub fn is_kept(&self) -> bool {
         self.kept.is_some()
     }
 
-    /// Runs `f` on the effect: the kept one, or a fresh one.
+    /// Runs `f` on the effect: the kept one, or a new one.
     pub fn with<R>(&self, f: impl FnOnce(&mut dyn CpuEffect) -> R) -> R {
         match &self.kept {
             Some(kept) => {
                 let mut effect = kept.lock().unwrap_or_else(|poisoned| {
                     kept.clear_poison();
                     let mut effect = poisoned.into_inner();
-                    *effect = fresh(self.make);
+                    *effect = cpu_effect(self.make);
                     effect
                 });
                 f(&mut **effect)
             }
-            None => f(&mut *fresh(self.make)),
+            None => f(&mut *cpu_effect(self.make)),
         }
     }
 
@@ -143,7 +142,8 @@ impl CpuInstance {
     }
 
     /// Makes the kept effect forget earlier frames (see [`CpuEffect::clear_history`]), rebuilding
-    /// it only if it can't.
+    /// it only if it can't. A host calls this when its frames stop following on (a seek
+    /// back, a clip loop, a new size); the effect keeps its GPU resources.
     pub fn clear_history(&self) {
         if self.kept.is_some() && !self.with(|e| e.clear_history()) {
             self.rebuild();
@@ -156,15 +156,19 @@ impl CpuInstance {
                 kept.clear_poison();
                 poisoned.into_inner()
             });
-            *effect = fresh(self.make);
+            *effect = cpu_effect(self.make);
         }
     }
 }
 
-fn fresh(make: fn() -> Processor) -> Box<dyn CpuEffect> {
+/// The CPU effect `make` returns.
+///
+/// # Panics
+/// If `make` returns a GPU effect.
+pub(crate) fn cpu_effect(make: fn() -> Processor) -> Box<dyn CpuEffect> {
     match make() {
         Processor::Cpu(effect) => effect,
-        Processor::Gpu(_) => unreachable!("a CPU instance's effect is a CPU effect"),
+        Processor::Gpu(_) => panic!("expected a CPU effect, made a GPU one"),
     }
 }
 
@@ -232,20 +236,34 @@ mod tests {
     }
 
     #[test]
-    fn effect_kept_only_when_host_allows() {
+    fn new_keeps_effect_when_host_keeps() {
         let kept = CpuInstance::new(make, true).expect("a CPU effect");
         assert!(kept.is_kept());
         assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
-        // A panic rebuilds, and so does clearing history for an effect that can't do it in place.
+    }
+
+    #[test]
+    fn render_panic_rebuilds_kept_effect() {
+        let kept = CpuInstance::new(make, true).expect("a CPU effect");
+        assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
         assert_eq!(render(&kept), Err(Panicked));
         assert_eq!(render(&kept), Ok(1));
+    }
+
+    #[test]
+    fn clear_history_rebuilds_effect_that_cannot_clear() {
+        let kept = CpuInstance::new(make, true).expect("a CPU effect");
+        assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
         kept.clear_history();
         assert_eq!(render(&kept), Ok(1));
+    }
 
-        let fresh = CpuInstance::new(make, false).expect("a CPU effect");
-        assert!(!fresh.is_kept());
+    #[test]
+    fn new_makes_effect_per_render_when_host_cannot_keep() {
+        let unkept = CpuInstance::new(make, false).expect("a CPU effect");
+        assert!(!unkept.is_kept());
         let before = MADE.load(Ordering::SeqCst);
-        assert_eq!((render(&fresh), render(&fresh)), (Ok(1), Ok(1)));
+        assert_eq!((render(&unkept), render(&unkept)), (Ok(1), Ok(1)));
         assert!(MADE.load(Ordering::SeqCst) >= before + 2, "made per render");
     }
 
@@ -288,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_history_keeps_effect_that_clears_in_place() {
+    fn clear_history_in_place_skips_rebuild() {
         let kept = CpuInstance::new(make_clears_in_place, true).expect("a CPU effect");
         assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
         let made = MADE_CLEARS_IN_PLACE.load(Ordering::SeqCst);

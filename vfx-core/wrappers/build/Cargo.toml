@@ -9,4 +9,5 @@ description = "Build-script helper for vfx-core effect crates: identity variable
 
 [dependencies]
 pipl = "0.1.1"
+thiserror = "2.0.21"
 toml = { version = "1.2.1", features = ["preserve_order"] }

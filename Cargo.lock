@@ -394,6 +394,7 @@ name = "cargo-vfx"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "thiserror 2.0.21",
  "vfx-build",
 ]
 
@@ -1498,9 +1499,9 @@ dependencies = [
 
 [[package]]
 name = "libloading"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
 dependencies = [
  "cfg-if",
  "windows-link",
@@ -3506,6 +3507,7 @@ dependencies = [
  "objc2 0.6.5",
  "objc2-metal 0.3.2",
  "pollster",
+ "thiserror 2.0.21",
  "vfx-core",
  "vfx-host",
 ]
@@ -3515,6 +3517,7 @@ name = "vfx-build"
 version = "0.1.0"
 dependencies = [
  "pipl",
+ "thiserror 2.0.21",
  "toml 1.2.1+spec-1.1.0",
 ]
 
@@ -3534,9 +3537,10 @@ name = "vfx-core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "libloading 0.9.0",
+ "libloading 0.9.1",
  "pollster",
  "tempfile",
+ "thiserror 2.0.21",
  "wgpu",
  "windows-sys 0.61.2",
 ]
@@ -3553,6 +3557,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-open-gl",
  "pollster",
+ "thiserror 2.0.21",
  "vfx-core",
  "vfx-ffgl-common",
  "vfx-host",
@@ -3562,6 +3567,7 @@ dependencies = [
 name = "vfx-ffgl-common"
 version = "0.1.0"
 dependencies = [
+ "libloading 0.9.1",
  "windows-sys 0.61.2",
 ]
 
@@ -3573,7 +3579,9 @@ dependencies = [
  "libc",
  "pollster",
  "rayon",
+ "thiserror 2.0.21",
  "vfx-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3615,6 +3623,7 @@ dependencies = [
  "segcam-face",
  "segcam-motion",
  "sysinfo",
+ "thiserror 2.0.21",
  "vfx-build",
  "vfx-chain",
  "vfx-core",

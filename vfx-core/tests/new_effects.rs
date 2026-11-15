@@ -103,7 +103,7 @@ fn vignette_leaves_centre_and_tints_corners() {
 }
 
 #[test]
-fn vignette_radius_zero_covers_the_frame() {
+fn vignette_zero_radius_covers_frame() {
     let gpu = gpu();
     let (w, h) = (9u32, 9u32);
     let white = vec![[1.0, 1.0, 1.0, 1.0]; (w * h) as usize];
@@ -160,7 +160,7 @@ fn blend_modes_and_transparent_layer() {
 }
 
 #[test]
-fn blend_without_layer_is_a_copy() {
+fn blend_without_layer_copies_input() {
     let gpu = gpu();
     let base = [[0.1, 0.2, 0.3, 0.4], [0.9, 0.8, 0.7, 1.0]];
     let out = run(&gpu, Blend::default(), (2, 1), &base, None, &[]);

@@ -13,12 +13,10 @@ pub struct Portrait {
     pub height: usize,
 }
 
-/// The portrait `SEGCAM_FACE_PORTRAIT` names, or None with a note when it isn't set.
-pub fn portrait() -> Option<Portrait> {
-    let Ok(path) = std::env::var("SEGCAM_FACE_PORTRAIT") else {
-        eprintln!("skipped: set SEGCAM_FACE_PORTRAIT to a P6 PPM of a face");
-        return None;
-    };
+/// The portrait `SEGCAM_FACE_PORTRAIT` names, a binary PPM (P6).
+pub fn portrait() -> Portrait {
+    let path = std::env::var("SEGCAM_FACE_PORTRAIT")
+        .expect("SEGCAM_FACE_PORTRAIT names a P6 PPM of a face");
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let mut fields = Vec::new();
     let mut at = 0;
@@ -37,7 +35,7 @@ pub fn portrait() -> Option<Portrait> {
     assert!(height <= H as usize, "{path}: taller than {H}");
     let rgb = bytes[at + 1..].to_vec();
     assert_eq!(rgb.len(), width * height * 3, "{path}: size");
-    Some(Portrait { rgb, width, height })
+    Portrait { rgb, width, height }
 }
 
 /// A frame with the portrait centred on (cx, cy) over a gradient, and a bright square at

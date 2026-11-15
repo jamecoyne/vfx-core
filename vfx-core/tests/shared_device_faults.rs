@@ -3,8 +3,8 @@
 
 use vfx_core::{Gpu, wgpu};
 
-fn device() -> Option<Gpu> {
-    pollster::block_on(Gpu::headless()).ok()
+fn device() -> Gpu {
+    pollster::block_on(Gpu::headless()).expect("no GPU adapter available for headless tests")
 }
 
 /// Destroys the device and waits for its loss to be reported.
@@ -15,12 +15,7 @@ fn lose(gpu: &Gpu) {
 
 #[test]
 fn faults_follow_their_own_device() {
-    let (Some(lost_first), Some(replacement), Some(lost_late), Some(last)) =
-        (device(), device(), device(), device())
-    else {
-        eprintln!("no adapter: skipped");
-        return;
-    };
+    let (lost_first, replacement, lost_late, last) = (device(), device(), device(), device());
 
     // A device lost before another replaces it.
     lost_first.share();

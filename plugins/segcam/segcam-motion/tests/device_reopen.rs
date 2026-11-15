@@ -1,7 +1,8 @@
-//! Segcam following a host's device through a loss: on the CPU while the shared device is lost, with
-//! no device of its own, then drawing into frames on the device the host shares next. Its own test
-//! binary, since it shares devices for the whole process. The loss is `destroy()`, which goes
-//! another way through wgpu than a real loss. Skipped where there is no hardware adapter.
+//! Segcam following a host's device through a loss: on the CPU while the shared device is lost,
+//! with no device of its own, then drawing into frames on the device the host shares next. Its
+//! own test binary, since it shares devices for the whole process. The loss is `destroy()`,
+//! which goes another way through wgpu than a real loss. Ignored except on macOS, where CI has
+//! a hardware adapter.
 
 use std::time::{Duration, Instant};
 
@@ -77,11 +78,12 @@ fn render(
 }
 
 #[test]
-fn follows_the_hosts_device_through_a_loss() {
-    let Some(first) = host_gpu() else {
-        eprintln!("no hardware GPU adapter: skipped");
-        return;
-    };
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
+)]
+fn host_device_loss_waits_for_next_shared_device() {
+    let first = host_gpu().expect("a hardware GPU adapter");
     first.share();
     segcam_motion::gpu::status().expect("segcam draws on the shared device");
 

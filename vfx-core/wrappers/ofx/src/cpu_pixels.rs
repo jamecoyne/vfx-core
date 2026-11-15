@@ -214,6 +214,7 @@ mod tests {
             for x in r.x1..r.x2 {
                 // SAFETY: intersection confines the pointer and four channels to the host image.
                 let p = unsafe { pixel_address(image, x, y) };
+                // SAFETY: `p` addresses four channels inside the image, as above.
                 let read = |i| unsafe {
                     match image.depth {
                         Depth::Byte => C::from_unit(f32::from(*p.add(i)) / 255.0),
@@ -291,127 +292,9 @@ mod tests {
         read
     }
 
-    /// Every byte `decode` reads shows up in the bytes handed out, and bytes it doesn't read don't.
-    #[test]
-    fn image_bytes_are_what_decode_reads() {
-        let bounds = Rect {
-            x1: -1,
-            y1: -1,
-            x2: 7,
-            y2: 5,
-        };
-        let canvas = Rect {
-            x1: 0,
-            y1: 0,
-            x2: 4,
-            y2: 4,
-        };
-        let mut host: Vec<u8> = (0..8 * 6 * 4).map(|i| i as u8).collect();
-        let before = image_bytes(&host_image(&mut host, bounds, Depth::Byte), canvas);
-        for at in 0..host.len() {
-            host[at] ^= 0x40;
-            let image = host_image(&mut host, bounds, Depth::Byte);
-            // SAFETY: the image is live.
-            let decoded = unsafe { decode::<u8>(&image, canvas) };
-            host[at] ^= 0x40;
-            let image = host_image(&mut host, bounds, Depth::Byte);
-            // SAFETY: the image is live.
-            let same_canvas = decoded == unsafe { decode::<u8>(&image, canvas) };
-            host[at] ^= 0x40;
-            let image = host_image(&mut host, bounds, Depth::Byte);
-            assert_eq!(
-                image_bytes(&image, canvas) == before,
-                same_canvas,
-                "a change at byte {at}"
-            );
-            host[at] ^= 0x40;
-        }
-    }
-
-    /// The same pixels elsewhere on the canvas, or at another depth, are a different frame.
-    #[test]
-    fn image_bytes_differ_with_placement_and_depth() {
-        let canvas = Rect {
-            x1: 0,
-            y1: 0,
-            x2: 4,
-            y2: 4,
-        };
-        let at = |x1, y1, x2, y2| Rect { x1, y1, x2, y2 };
-        let mut host = vec![7u8; 2 * 2 * 16];
-        let bytes =
-            |host: &mut [u8], bounds, depth| image_bytes(&host_image(host, bounds, depth), canvas);
-        let here = bytes(&mut host, at(0, 0, 2, 2), Depth::Byte);
-        assert_ne!(here, bytes(&mut host, at(1, 0, 3, 2), Depth::Byte));
-        assert_ne!(here, bytes(&mut host, at(0, 1, 2, 3), Depth::Byte));
-        assert_ne!(here, bytes(&mut host, at(0, 0, 2, 2), Depth::Short));
-        assert_eq!(here, bytes(&mut host, at(0, 0, 2, 2), Depth::Byte));
-        let outside = bytes(&mut host, at(9, 9, 11, 11), Depth::Byte);
-        assert_eq!(outside.len(), 1, "only where the rows would lie");
-    }
-
-    /// Hosts may pad each row, or store rows top down with negative row bytes. The bytes handed
-    /// out are the pixels alone, the same for every layout, so neither padding nor layout reads as
-    /// a changed frame, and they're what `decode` reads.
-    #[test]
-    fn image_bytes_are_the_pixels_whatever_the_row_layout() {
-        let canvas = Rect {
-            x1: 0,
-            y1: 0,
-            x2: 3,
-            y2: 2,
-        };
-        for depth in [Depth::Byte, Depth::Float] {
-            let row = 3 * 4 * depth.bytes_per_channel();
-            // Finite channels, so decoded pixels compare equal.
-            let mut packed: Vec<u8> = match depth {
-                Depth::Float => (0..2 * row / 4)
-                    .flat_map(|i| (i as f32 / 7.0).to_ne_bytes())
-                    .collect(),
-                _ => (0..2 * row).map(|i| (i * 37 % 251) as u8).collect(),
-            };
-            let packed_image = host_image(&mut packed, canvas, depth);
-            let expected = image_bytes(&packed_image, canvas);
-            // SAFETY: the image is live.
-            let expected_pixels = unsafe { decode::<f32>(&packed_image, canvas) };
-
-            const PADDING: usize = 12;
-            let mut padded = vec![0u8; 2 * (row + PADDING)];
-            for y in 0..2 {
-                let at = y * (row + PADDING);
-                padded[at..at + row].copy_from_slice(&packed[y * row..(y + 1) * row]);
-            }
-            for fill in [0x00, 0xa5] {
-                for y in 0..2 {
-                    let at = y * (row + PADDING) + row;
-                    padded[at..at + PADDING].fill(fill);
-                }
-                let image = Image {
-                    row_bytes: (row + PADDING) as isize,
-                    ..host_image(&mut padded, canvas, depth)
-                };
-                assert_eq!(image_bytes(&image, canvas), expected, "padding {fill:#x}");
-                // SAFETY: the image is live.
-                assert_eq!(unsafe { decode::<f32>(&image, canvas) }, expected_pixels);
-            }
-
-            // The bottom row, y1, last in memory, and each row up `row` bytes before it.
-            let mut top_down: Vec<u8> = packed.chunks(row).rev().flatten().copied().collect();
-            let image = Image {
-                // SAFETY: the offset is the start of the last row, inside `top_down`.
-                data: unsafe { top_down.as_mut_ptr().add(row) },
-                row_bytes: -(row as isize),
-                ..host_image(&mut top_down, canvas, depth)
-            };
-            assert_eq!(image_bytes(&image, canvas), expected, "negative row bytes");
-            // SAFETY: the image is live.
-            assert_eq!(unsafe { decode::<f32>(&image, canvas) }, expected_pixels);
-        }
-    }
-
     /// A reused buffer holds the last frame: pixels off this image come out clear all the same.
     #[test]
-    fn decode_into_clears_what_the_image_does_not_cover() {
+    fn decode_into_clears_uncovered_canvas() {
         let canvas = Rect {
             x1: 0,
             y1: 0,
@@ -479,7 +362,7 @@ mod tests {
 
     /// Row conversions match the per-pixel ones.
     #[test]
-    fn row_conversions_match_the_per_pixel_ones() {
+    fn row_conversions_match_reference() {
         let (w, h) = (37usize, 5usize);
         for depth in [Depth::Byte, Depth::Short, Depth::Float] {
             let bytes = 4 * depth.bytes_per_channel();
@@ -512,6 +395,7 @@ mod tests {
         }
 
         fn for_both(image: &Image, canvas: Rect) {
+            // SAFETY: the caller's `image` is a buffer the test owns, covering its bounds.
             unsafe {
                 assert_eq!(
                     decode::<u8>(image, canvas),
@@ -536,13 +420,140 @@ mod tests {
             let window = canvas.intersect(&image.bounds);
             let size = image.row_bytes as usize * image.bounds.height();
             let read =
+                // SAFETY: `size` is the byte length of the buffer `image.data` points to.
                 |image: &Image| unsafe { std::slice::from_raw_parts(image.data, size).to_vec() };
             let before = read(image);
+            // SAFETY: `window` lies inside `image` and `canvas`, as built above.
             unsafe { encode_reference(&pixels, canvas, image, window) };
             let expected = read(image);
+            // SAFETY: `before` was read from `image.data` with the same `size`; they don't overlap.
             unsafe { std::ptr::copy_nonoverlapping(before.as_ptr(), image.data, size) };
+            // SAFETY: as for `encode_reference`.
             unsafe { encode(&pixels, canvas, image, window) };
             assert_eq!(read(image), expected);
+        }
+    }
+
+    mod image_bytes {
+        use super::*;
+
+        /// Every byte `decode` reads shows up in the bytes handed out, and bytes it doesn't read don't.
+        #[test]
+        fn match_decode_reads() {
+            let bounds = Rect {
+                x1: -1,
+                y1: -1,
+                x2: 7,
+                y2: 5,
+            };
+            let canvas = Rect {
+                x1: 0,
+                y1: 0,
+                x2: 4,
+                y2: 4,
+            };
+            let mut host: Vec<u8> = (0..8 * 6 * 4).map(|i| i as u8).collect();
+            let before = image_bytes(&host_image(&mut host, bounds, Depth::Byte), canvas);
+            for at in 0..host.len() {
+                host[at] ^= 0x40;
+                let image = host_image(&mut host, bounds, Depth::Byte);
+                // SAFETY: the image is live.
+                let decoded = unsafe { decode::<u8>(&image, canvas) };
+                host[at] ^= 0x40;
+                let image = host_image(&mut host, bounds, Depth::Byte);
+                // SAFETY: the image is live.
+                let same_canvas = decoded == unsafe { decode::<u8>(&image, canvas) };
+                host[at] ^= 0x40;
+                let image = host_image(&mut host, bounds, Depth::Byte);
+                assert_eq!(
+                    image_bytes(&image, canvas) == before,
+                    same_canvas,
+                    "a change at byte {at}"
+                );
+                host[at] ^= 0x40;
+            }
+        }
+
+        /// The same pixels elsewhere on the canvas, or at another depth, are a different frame.
+        #[test]
+        fn vary_with_placement_and_depth() {
+            let canvas = Rect {
+                x1: 0,
+                y1: 0,
+                x2: 4,
+                y2: 4,
+            };
+            let at = |x1, y1, x2, y2| Rect { x1, y1, x2, y2 };
+            let mut host = vec![7u8; 2 * 2 * 16];
+            let bytes = |host: &mut [u8], bounds, depth| {
+                image_bytes(&host_image(host, bounds, depth), canvas)
+            };
+            let here = bytes(&mut host, at(0, 0, 2, 2), Depth::Byte);
+            assert_ne!(here, bytes(&mut host, at(1, 0, 3, 2), Depth::Byte));
+            assert_ne!(here, bytes(&mut host, at(0, 1, 2, 3), Depth::Byte));
+            assert_ne!(here, bytes(&mut host, at(0, 0, 2, 2), Depth::Short));
+            assert_eq!(here, bytes(&mut host, at(0, 0, 2, 2), Depth::Byte));
+            let outside = bytes(&mut host, at(9, 9, 11, 11), Depth::Byte);
+            assert_eq!(outside.len(), 1, "only where the rows would lie");
+        }
+
+        /// Hosts may pad each row, or store rows top down with negative row bytes. The bytes handed
+        /// out are the pixels alone, the same for every layout, so neither padding nor layout reads as
+        /// a changed frame, and they're what `decode` reads.
+        #[test]
+        fn match_pixels_for_any_row_layout() {
+            let canvas = Rect {
+                x1: 0,
+                y1: 0,
+                x2: 3,
+                y2: 2,
+            };
+            for depth in [Depth::Byte, Depth::Float] {
+                let row = 3 * 4 * depth.bytes_per_channel();
+                // Finite channels, so decoded pixels compare equal.
+                let mut packed: Vec<u8> = match depth {
+                    Depth::Float => (0..2 * row / 4)
+                        .flat_map(|i| (i as f32 / 7.0).to_ne_bytes())
+                        .collect(),
+                    _ => (0..2 * row).map(|i| (i * 37 % 251) as u8).collect(),
+                };
+                let packed_image = host_image(&mut packed, canvas, depth);
+                let expected = image_bytes(&packed_image, canvas);
+                // SAFETY: the image is live.
+                let expected_pixels = unsafe { decode::<f32>(&packed_image, canvas) };
+
+                const PADDING: usize = 12;
+                let mut padded = vec![0u8; 2 * (row + PADDING)];
+                for y in 0..2 {
+                    let at = y * (row + PADDING);
+                    padded[at..at + row].copy_from_slice(&packed[y * row..(y + 1) * row]);
+                }
+                for fill in [0x00, 0xa5] {
+                    for y in 0..2 {
+                        let at = y * (row + PADDING) + row;
+                        padded[at..at + PADDING].fill(fill);
+                    }
+                    let image = Image {
+                        row_bytes: (row + PADDING) as isize,
+                        ..host_image(&mut padded, canvas, depth)
+                    };
+                    assert_eq!(image_bytes(&image, canvas), expected, "padding {fill:#x}");
+                    // SAFETY: the image is live.
+                    assert_eq!(unsafe { decode::<f32>(&image, canvas) }, expected_pixels);
+                }
+
+                // The bottom row, y1, last in memory, and each row up `row` bytes before it.
+                let mut top_down: Vec<u8> = packed.chunks(row).rev().flatten().copied().collect();
+                let image = Image {
+                    // SAFETY: the offset is the start of the last row, inside `top_down`.
+                    data: unsafe { top_down.as_mut_ptr().add(row) },
+                    row_bytes: -(row as isize),
+                    ..host_image(&mut top_down, canvas, depth)
+                };
+                assert_eq!(image_bytes(&image, canvas), expected, "negative row bytes");
+                // SAFETY: the image is live.
+                assert_eq!(unsafe { decode::<f32>(&image, canvas) }, expected_pixels);
+            }
         }
     }
 }

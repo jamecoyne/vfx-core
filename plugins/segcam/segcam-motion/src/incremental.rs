@@ -161,7 +161,7 @@ struct RenderPlan<'a> {
     number: i64,
     /// The frame at index 0 of this render's count. A source that holds fewer frames than it
     /// counts ([`FrameSource::held`]) can't hand over the oldest of them.
-    first: i64,
+    window_start: i64,
     canvas: (i32, i32),
     to_analyse: BTreeSet<i64>,
     /// How many frames back a frame's background reaches.
@@ -188,14 +188,14 @@ impl<'a> RenderPlan<'a> {
         number: i64,
         canvas: (i32, i32),
     ) -> Self {
-        let first = number - count as i64 + 1;
+        let window_start = number - count as i64 + 1;
         let background = i64::from(history_frames(s));
         Self {
             s,
             number,
-            first,
+            window_start,
             canvas,
-            to_analyse: frames_to_analyse(s, number, first),
+            to_analyse: frames_to_analyse(s, number, window_start),
             background,
             invalidation_reach: background.max(i64::from(s.faces.any()) * s.analysis_step.every),
             trail_len: trail_frame_count(s),
@@ -214,7 +214,7 @@ impl<'a> RenderPlan<'a> {
             return BTreeSet::new();
         };
         let every = self.s.analysis_step.every;
-        (analysis_key(self.s, frame, self.first).background_start..frame)
+        (analysis_key(self.s, frame, self.window_start).background_start..frame)
             .filter(|f| f.rem_euclid(every) == 0)
             .chain([frame])
             .collect()
@@ -227,7 +227,7 @@ impl<'a> RenderPlan<'a> {
             .to_analyse
             .first()
             .map_or(self.number, |&f| f.min(self.number));
-        let oldest = (oldest_analysed - self.background).max(self.first);
+        let oldest = (oldest_analysed - self.background).max(self.window_start);
         (oldest..=self.number)
             .filter(|f| {
                 f.rem_euclid(self.s.analysis_step.every) == 0
@@ -291,7 +291,7 @@ impl IncrementalRenderer {
     }
 
     /// Whether the GPU drew the last render's output.
-    pub fn drew_on_gpu(&self) -> bool {
+    pub fn last_draw_on_gpu(&self) -> bool {
         self.drew_on_gpu == Some(true)
     }
 
@@ -405,19 +405,22 @@ impl IncrementalRenderer {
         plan.takes_faces_on_held_picture = self.drop_analysis_for_waiting_faces(&plan);
         let swarm = s.mode == OutputMode::Swarm;
         if swarm {
-            self.pin_unreadable_frames(s, plan.first, number, oldest_held_frame);
+            self.pin_unreadable_frames(s, plan.window_start, number, oldest_held_frame);
         }
         let (mut checks, mut deferred) = (BTreeSet::new(), Vec::new());
         let (mut all_verified, mut changed) = (false, false);
         let frames_to_read = match plan.fetch_budget {
-            None if plan.fixed => self.frames_to_read(s, plan.first, number, oldest_held_frame),
+            None if plan.fixed => {
+                self.frames_to_read(s, plan.window_start, number, oldest_held_frame)
+            }
             None => plan.frames_feeding_analysis(),
             Some(budget) => {
                 self.budgeted_render_count += 1;
                 if !plan.fixed {
                     self.last_unfixed_render = self.budgeted_render_count;
                 }
-                let mut rebuild = self.frames_to_read(s, plan.first, number, oldest_held_frame);
+                let mut rebuild =
+                    self.frames_to_read(s, plan.window_start, number, oldest_held_frame);
                 let checked = |f: &i64| self.kept.get(f).map_or(0, |kept| kept.last_checked);
                 // A frame found missing is checked for its return with the
                 // verified ones, or a missing frame that is never analysed would
@@ -496,10 +499,10 @@ impl IncrementalRenderer {
         // time; under one it is checked again with the frames verified longest ago.
         let mut missing = BTreeSet::new();
         for frame in frames_to_read {
-            let index = (frame - plan.first) as usize;
+            let index = (frame - plan.window_start) as usize;
             let before = self.read_before(frame);
-            // Whether this read has to show the frame unchanged, rather than take it as it
-            // was.
+            // A fixed source's frames are verified only when they are in `checks`; the rest reuse a
+            // known hash.
             let verify = !plan.fixed || checks.contains(&frame);
             let read_known = if !verify && before.is_some() {
                 before
@@ -515,17 +518,17 @@ impl IncrementalRenderer {
             // converting them is most of what a check costs a host that converts. A fixed
             // source lists only frames it needs, besides checks. Decided here, after
             // earlier frames' changes have dropped what they invalidate.
-            let unchanged_is_enough = verify
+            let may_skip_unchanged = verify
                 && frame != number
                 && (!plan.to_analyse.contains(&frame)
-                    || self.is_cached(frame, &analysis_key(s, frame, plan.first), s));
+                    || self.is_cached(frame, &analysis_key(s, frame, plan.window_start), s));
             let mut wanted = |rows: &[&[u8]]| {
                 if read_known.is_some() {
                     return true;
                 }
                 let hashed = PixelsRead::Hash(frame_hash(rows));
                 read.set(Some(hashed));
-                !(unchanged_is_enough && before == Some(hashed))
+                !(may_skip_unchanged && before == Some(hashed))
             };
             let mut use_frame = |image: Option<Image<'_>>| {
                 let view = image.and_then(C::view);
@@ -561,7 +564,7 @@ impl IncrementalRenderer {
         // Frames that use a deferred frame without a grid go stale, and so does
         // the current frame if its face source is deferred. A deferred frame can
         // be older than frames this render analysed, which its range covers.
-        if deferred.contains(&face_source_frame(s, number, plan.first)) {
+        if deferred.contains(&face_source_frame(s, number, plan.window_start)) {
             self.mark_stale(number..=number);
         }
         deferred.retain(|&f| kept_grid(&self.kept, f).is_none());
@@ -617,7 +620,7 @@ impl IncrementalRenderer {
             }
         } else if plan.fixed {
             source.with_frame_if_wanted(
-                (plan.number - plan.first) as usize,
+                (plan.number - plan.window_start) as usize,
                 &mut |rows| {
                     current_hash = Some(frame_hash(rows));
                     false
@@ -702,13 +705,13 @@ impl IncrementalRenderer {
     ) {
         let s = plan.s;
         let swarm = s.mode == OutputMode::Swarm;
-        let key = analysis_key(s, frame, plan.first);
+        let key = analysis_key(s, frame, plan.window_start);
         // Outside the swarm a missing analysis frame isn't analysed: the frame displaying it
         // analyses itself instead.
         let wanted = plan.to_analyse.contains(&frame) && (swarm || view.is_some())
             || !swarm
                 && frame == plan.number
-                && self.displayed_analysis_frame(s, plan.number, plan.first) == plan.number;
+                && self.displayed_analysis_frame(s, plan.number, plan.window_start) == plan.number;
         if !wanted || self.is_cached(frame, &key, s) {
             return;
         }
@@ -731,15 +734,15 @@ impl IncrementalRenderer {
     fn pin_unreadable_frames(
         &mut self,
         s: &RenderSettings,
-        first: i64,
+        window_start: i64,
         number: i64,
         oldest_held_frame: i64,
     ) {
-        for frame in frames_to_analyse(s, number, first)
+        for frame in frames_to_analyse(s, number, window_start)
             .into_iter()
             .filter(|&f| f < oldest_held_frame)
         {
-            let key = analysis_key(s, frame, first);
+            let key = analysis_key(s, frame, window_start);
             let kept = self.kept.entry(frame).or_default();
             kept.record
                 .analysis
@@ -810,30 +813,30 @@ impl IncrementalRenderer {
         crate::faces::ready()
     }
 
-    /// The frames from `first` a render of `number` must read: those without cached motion or
-    /// tiles, the analyses before them without grids, and `number`, which it draws and, outside
-    /// the swarm, may analyse. None before `oldest_held_frame`.
+    /// The frames from `window_start` a render of `number` must read: those without cached
+    /// motion or tiles, the analyses before them without grids, and `number`, which it draws
+    /// and, outside the swarm, may analyse. None before `oldest_held_frame`.
     fn frames_to_read(
         &self,
         s: &RenderSettings,
-        first: i64,
+        window_start: i64,
         number: i64,
         oldest_held_frame: i64,
     ) -> BTreeSet<i64> {
         let mut wanted = BTreeSet::from([number]);
         let grids = |frame: i64| {
-            (analysis_key(s, frame, first)
+            (analysis_key(s, frame, window_start)
                 .background_start
                 .max(oldest_held_frame)..frame)
                 .filter(|&k| {
                     k.rem_euclid(s.analysis_step.every) == 0 && kept_grid(&self.kept, k).is_none()
                 })
         };
-        for frame in frames_to_analyse(s, number, first)
+        for frame in frames_to_analyse(s, number, window_start)
             .into_iter()
             .filter(|&f| f >= oldest_held_frame)
         {
-            if !self.is_cached(frame, &analysis_key(s, frame, first), s) {
+            if !self.is_cached(frame, &analysis_key(s, frame, window_start), s) {
                 wanted.insert(frame);
                 wanted.extend(grids(frame));
             }
@@ -863,10 +866,10 @@ impl IncrementalRenderer {
         }
     }
 
-    fn update_face_readings(&mut self, s: &RenderSettings, number: i64, first: i64) {
+    fn update_face_readings(&mut self, s: &RenderSettings, number: i64, window_start: i64) {
         self.faces_wanted = s.faces.any();
         self.readings = if s.faces.face {
-            let (_, motion) = self.displayed_analysis(s, number, first);
+            let (_, motion) = self.displayed_analysis(s, number, window_start);
             let models_loaded = crate::faces::runs_on().is_some();
             crate::faces::readings(models_loaded, &motion.blobs)
         } else {
@@ -943,17 +946,21 @@ impl IncrementalRenderer {
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
     ) {
-        let first = number - count as i64 + 1;
+        let window_start = number - count as i64 + 1;
         let pile = build_pile(&self.kept, s, count, number, out.width, out.height);
-        let (analysis_frame, motion) = self.displayed_analysis(s, number, first);
+        let (analysis_frame, motion) = self.displayed_analysis(s, number, window_start);
         draw_output(out, s, frame, motion, analysis_frame, pile.visible());
     }
 
     /// The frame whose analysis frame `number` displays: the last analysed, or `number` itself
     /// when that analysis is missing.
-    fn displayed_analysis_frame(&self, s: &RenderSettings, number: i64, first: i64) -> i64 {
-        let analysis = s.analysis_step.analysis_frame(number, first);
-        match cached_analysis(&self.kept, analysis, &analysis_key(s, analysis, first)) {
+    fn displayed_analysis_frame(&self, s: &RenderSettings, number: i64, window_start: i64) -> i64 {
+        let analysis = s.analysis_step.analysis_frame(number, window_start);
+        match cached_analysis(
+            &self.kept,
+            analysis,
+            &analysis_key(s, analysis, window_start),
+        ) {
             Some(_) => analysis,
             None => number,
         }
@@ -964,10 +971,10 @@ impl IncrementalRenderer {
         &self,
         s: &RenderSettings,
         number: i64,
-        first: i64,
+        window_start: i64,
     ) -> (i64, &Segmentation) {
-        let frame = self.displayed_analysis_frame(s, number, first);
-        let motion = cached_analysis(&self.kept, frame, &analysis_key(s, frame, first))
+        let frame = self.displayed_analysis_frame(s, number, window_start);
+        let motion = cached_analysis(&self.kept, frame, &analysis_key(s, frame, window_start))
             .unwrap_or(&NO_SEGMENTS);
         (frame, motion)
     }
@@ -981,7 +988,7 @@ impl IncrementalRenderer {
         frame: Option<View<C>>,
         out: &mut ViewMut<C>,
     ) -> Result<(), Fault> {
-        let first = number - count as i64 + 1;
+        let window_start = number - count as i64 + 1;
         if s.mode != OutputMode::Swarm {
             self.draw_cpu(s, count, number, frame, out);
             return Ok(());
@@ -1003,8 +1010,9 @@ impl IncrementalRenderer {
                 .atlas
                 .place(&self.kept, &visible, drawer, (w, h), live)?
         {
-            let motion = cached_analysis(&self.kept, number, &analysis_key(s, number, first))
-                .unwrap_or(&NO_SEGMENTS);
+            let motion =
+                cached_analysis(&self.kept, number, &analysis_key(s, number, window_start))
+                    .unwrap_or(&NO_SEGMENTS);
             let windows = visible.iter().map(|p| p.tile);
             draw_output(out, s, frame, motion, number, windows);
             return Ok(());
@@ -1217,8 +1225,8 @@ impl Analyser {
         // The face source is analysed first, unless it is missing or a live
         // source left it out, which leaves it no grid, or under a fetch budget
         // an empty one, and no faces.
-        let source_frame = face_source_frame(s, frame, plan.first);
-        let source_key = analysis_key(s, source_frame, plan.first);
+        let source_frame = face_source_frame(s, frame, plan.window_start);
+        let source_key = analysis_key(s, source_frame, plan.window_start);
         let source_motion = key
             .face_source
             .filter(|_| !plan.takes_faces_on_held_picture)
@@ -1262,8 +1270,8 @@ impl Analyser {
         view: Option<&View<C>>,
     ) -> CutTiles {
         let s = plan.s;
-        // Reused faces need tiles here if a trail no longer than the step draws
-        // no earlier analysis, or if the windows of held faces would leave it
+        // Reused faces need tiles here if the trail is at most `every` frames
+        // long, so it draws no earlier analysis, or if the windows of held faces would leave it
         // before the next analysis, as a slow detection's do on a short trail.
         let next_analysis = frame + s.analysis_step.every;
         let held_windows_leaving = self
@@ -1406,11 +1414,11 @@ fn build_pile<'a>(
     width: i32,
     height: i32,
 ) -> Pile<'a> {
-    let first = number - count as i64 + 1;
+    let window_start = number - count as i64 + 1;
     let mut pile = Pile::new(width, height, s.max_tiles);
     if s.mode == OutputMode::Swarm {
-        for frame in analysis_frames_used(s, number, first) {
-            let tiles = cached_tiles(kept, frame, &analysis_key(s, frame, first), s.mirror);
+        for frame in analysis_frames_used(s, number, window_start) {
+            let tiles = cached_tiles(kept, frame, &analysis_key(s, frame, window_start), s.mirror);
             for (index, tile) in tiles.into_iter().flatten().enumerate() {
                 pile.push(PileEntry { tile, frame, index });
             }
@@ -1419,14 +1427,14 @@ fn build_pile<'a>(
     pile
 }
 
-/// The cache key of `frame` in a render whose frames start at `first`.
-fn analysis_key(s: &RenderSettings, frame: i64, first: i64) -> AnalysisKey {
+/// The cache key of `frame` in a render whose frames start at `window_start`.
+fn analysis_key(s: &RenderSettings, frame: i64, window_start: i64) -> AnalysisKey {
     // The background's analyses end at the last one before the frame, on it or not.
     let every = s.analysis_step.every;
     let background_start = |frame: i64| {
         let last = frame - 1 - (frame - 1).rem_euclid(every);
         let oldest = last + every - i64::from(history_frames(s));
-        oldest.min(frame).max(first)
+        oldest.min(frame).max(window_start)
     };
     AnalysisKey {
         detection: DetectionSettings {
@@ -1438,7 +1446,7 @@ fn analysis_key(s: &RenderSettings, frame: i64, first: i64) -> AnalysisKey {
             faces: s.faces,
         },
         background_start: background_start(frame),
-        face_source: Some(face_source_frame(s, frame, first))
+        face_source: Some(face_source_frame(s, frame, window_start))
             .filter(|&source| source != frame)
             .map(|source| (source, background_start(source))),
     }
@@ -1446,15 +1454,19 @@ fn analysis_key(s: &RenderSettings, frame: i64, first: i64) -> AnalysisKey {
 
 /// The frames whose motion a render of `number` uses: the analysed frames of the swarm's
 /// trail, or the analysis the frame shows.
-fn analysis_frames_used(s: &RenderSettings, number: i64, first: i64) -> impl Iterator<Item = i64> {
+fn analysis_frames_used(
+    s: &RenderSettings,
+    number: i64,
+    window_start: i64,
+) -> impl Iterator<Item = i64> {
     // The trail's oldest frame is never analysed early, or its windows would come and go with it.
     let (frames, every) = if s.mode == OutputMode::Swarm {
         (
-            (number - trail_frame_count(s) + 1).max(first)..=number,
+            (number - trail_frame_count(s) + 1).max(window_start)..=number,
             s.analysis_step.every,
         )
     } else {
-        let visible = s.analysis_step.analysis_frame(number, first);
+        let visible = s.analysis_step.analysis_frame(number, window_start);
         (visible..=visible, 1)
     };
     frames.filter(move |f| f.rem_euclid(every) == 0)
@@ -1469,12 +1481,12 @@ fn trail_frame_count(s: &RenderSettings) -> i64 {
     }
 }
 
-/// The frame whose faces `frame` shows in a render whose frames start at `first`. As in
+/// The frame whose faces `frame` shows in a render whose frames start at `window_start`. As in
 /// segcam, faces run on every 2nd analysis; the analysis between reuses the one before's.
-fn face_source_frame(s: &RenderSettings, frame: i64, first: i64) -> i64 {
+fn face_source_frame(s: &RenderSettings, frame: i64, window_start: i64) -> i64 {
     let every = s.analysis_step.every;
     let before = frame - every;
-    if s.faces.any() && frame.rem_euclid(2 * every) == every && before >= first {
+    if s.faces.any() && frame.rem_euclid(2 * every) == every && before >= window_start {
         before
     } else {
         frame
@@ -1483,9 +1495,9 @@ fn face_source_frame(s: &RenderSettings, frame: i64, first: i64) -> i64 {
 
 /// The frames whose motion a render of `number` computes: those it uses, and the frames whose
 /// faces they reuse.
-fn frames_to_analyse(s: &RenderSettings, number: i64, first: i64) -> BTreeSet<i64> {
-    analysis_frames_used(s, number, first)
-        .flat_map(|f| [face_source_frame(s, f, first), f])
+fn frames_to_analyse(s: &RenderSettings, number: i64, window_start: i64) -> BTreeSet<i64> {
+    analysis_frames_used(s, number, window_start)
+        .flat_map(|f| [face_source_frame(s, f, window_start), f])
         .collect()
 }
 
@@ -1682,7 +1694,7 @@ mod tests {
             for frame in &frames {
                 let mut shown = None;
                 for _ in 0..=repeats {
-                    history.next(needed, 0).copy_from_slice(frame);
+                    history.push_slot(needed, 0).copy_from_slice(frame);
                     history.drop_repeat();
                     let count = history.len();
                     let number = history.frame_number();
@@ -1809,7 +1821,7 @@ mod tests {
         let before = crate::previous_frames_needed(&with_faces(ALL_PARTS)) as usize;
         for (n, frame) in frames.iter().enumerate() {
             state.simulate_models_loading = n < 7;
-            history.next(before, before).copy_from_slice(frame);
+            history.push_slot(before, before).copy_from_slice(frame);
             let count = history.len();
             let face_detection_calls =
                 face_detection_calls_in(&mut state, &mut history, count, n as i64);
@@ -1835,7 +1847,7 @@ mod tests {
             history.resize(W, H);
             let before = crate::previous_frames_needed(&with_faces(ALL_PARTS)) as usize;
             for (n, frame) in frames.iter().enumerate() {
-                history.next(before, before).copy_from_slice(frame);
+                history.push_slot(before, before).copy_from_slice(frame);
                 let count = history.len();
                 face_detection_calls_in(&mut state, &mut history, count, n as i64);
             }
@@ -1852,7 +1864,7 @@ mod tests {
     /// A picture that holds still takes what detection found in it, on a frame with faces of its
     /// own and on one that reuses the frame before's, and doesn't change again until there's more.
     #[test]
-    fn held_picture_takes_the_faces_found_in_it() {
+    fn held_picture_keeps_found_faces() {
         wait_for_models();
         // The worker waits behind this, so the only answers are the ones left here.
         let models = crate::faces::lock_models();
@@ -1863,7 +1875,7 @@ mod tests {
         let mut history = vfx_core::cpu::History::<u8>::default();
         history.resize(W, H);
         let mut show = |state: &mut IncrementalRenderer, frame: &[Argb<u8>]| {
-            history.next(before, before).copy_from_slice(frame);
+            history.push_slot(before, before).copy_from_slice(frame);
             history.drop_repeat();
             let (count, number) = (history.len(), history.frame_number());
             let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
@@ -1917,7 +1929,9 @@ mod tests {
         history.resize(W, H);
         let started = std::time::Instant::now();
         while started.elapsed() < Duration::from_secs(2) {
-            history.next(before, before).copy_from_slice(&frames[0]);
+            history
+                .push_slot(before, before)
+                .copy_from_slice(&frames[0]);
             history.drop_repeat();
             let (count, number) = (history.len(), history.frame_number());
             let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
@@ -1942,7 +1956,7 @@ mod tests {
         while !state.analyser.live_faces.holds_faces() {
             assert!(started.elapsed() < Duration::from_secs(120), "no detection");
             history
-                .next(before, before)
+                .push_slot(before, before)
                 .copy_from_slice(&frames[n as usize % frames.len()]);
             let count = history.len();
             face_detection_calls_in(&mut state, &mut history, count, n);
@@ -1952,7 +1966,7 @@ mod tests {
         // Two renders in, so the lower number is certain whichever frame the detection landed on.
         for _ in 0..2 {
             history
-                .next(before, before)
+                .push_slot(before, before)
                 .copy_from_slice(&frames[n as usize % frames.len()]);
             let count = history.len();
             face_detection_calls_in(&mut state, &mut history, count, n);
@@ -1961,7 +1975,9 @@ mod tests {
 
         let mut restarted = vfx_core::cpu::History::<u8>::default();
         restarted.resize(W, H);
-        restarted.next(before, before).copy_from_slice(&frames[0]);
+        restarted
+            .push_slot(before, before)
+            .copy_from_slice(&frames[0]);
         let count = restarted.len();
         face_detection_calls_in(&mut state, &mut restarted, count, 0);
         assert!(!state.analyser.live_faces.holds_faces());
@@ -1970,7 +1986,7 @@ mod tests {
     /// Faces stay on screen however long the next detection takes, past the trail and what the
     /// frame cache keeps, in windows showing the frame they were found in.
     #[test]
-    fn held_faces_outlast_the_frame_cache() {
+    fn held_faces_survive_frame_cache_eviction() {
         wait_for_models();
         let models = crate::faces::lock_models();
         let frames = crossing();
@@ -1998,7 +2014,7 @@ mod tests {
         let renders = 200;
         for n in 0..renders {
             history
-                .next(before, before)
+                .push_slot(before, before)
                 .copy_from_slice(&frames[n as usize % frames.len()]);
             let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
@@ -2067,7 +2083,7 @@ mod tests {
         history.resize(W, H);
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         for (n, frame) in frames.iter().enumerate().take(2) {
-            history.next(before, before).copy_from_slice(frame);
+            history.push_slot(before, before).copy_from_slice(frame);
             // Past the first render, which takes in the frame format and clears everything.
             if n == 1 {
                 state
@@ -2248,16 +2264,11 @@ mod tests {
     }
 
     /// A device of the test's own, on the adapter `SEGCAM_GPU_ADAPTER` picks or on a software
-    /// one where there is none; `None` where there is no adapter at all.
-    fn own_device() -> Option<Arc<gpu::GpuContext>> {
+    /// one where there is none.
+    fn own_device() -> Arc<gpu::GpuContext> {
         let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-        match gpu::open(&choice).or_else(|_| gpu::open("fallback")) {
-            Ok(dev) => Some(Arc::new(dev)),
-            Err(e) => {
-                eprintln!("no adapter ({e}): skipped");
-                None
-            }
-        }
+        let dev = gpu::open(&choice).or_else(|_| gpu::open("fallback"));
+        Arc::new(dev.expect("a GPU adapter, hardware or fallback"))
     }
 
     /// An instance drawing every swarm render on `dev`.
@@ -2300,13 +2311,12 @@ mod tests {
     /// still there. This loses it by `destroy()`, which goes another way through wgpu than a real
     /// loss: it shows this code's states, not what a driver does.
     #[test]
-    fn lost_gpu_draws_on_the_cpu_and_reopens() {
+    fn lost_gpu_draws_on_cpu_until_reopen() {
         let _lock = gpu_test_lock();
         let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-        if gpu::open(&choice).is_err() && gpu::open("fallback").is_err() {
-            eprintln!("no adapter: skipped");
-            return;
-        }
+        gpu::open(&choice)
+            .or_else(|_| gpu::open("fallback"))
+            .expect("a GPU adapter, hardware or fallback");
         let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(move |_| {
             gpu::open(&choice).or_else(|_| gpu::open("fallback"))
         })));
@@ -2377,7 +2387,7 @@ mod tests {
     /// A first open that keeps failing leaves the CPU for good once its retries are spent: with no
     /// adapter the CPU is the machine's path. Until then renders draw on the CPU and keep asking.
     #[test]
-    fn failed_first_open_leaves_the_cpu_for_good() {
+    fn failed_first_open_stays_on_cpu() {
         let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(|_| {
             Err(gpu::NoGpu::NoAdapter("none here".into()))
         })));
@@ -2398,105 +2408,6 @@ mod tests {
         }
         render(&mut on_cpu, &crossing(), 0);
         assert!(!on_cpu.gpu_wanted);
-    }
-
-    /// Hashes are compared across renders that may run on different numbers of threads.
-    #[test]
-    fn frame_hash_is_the_rows_hashes_in_order_and_sees_every_pixel() {
-        // An odd width leaves a row's last pixel out of the words of 8-bit frames.
-        let (w, h) = (201, 130);
-        let mut pixels: Vec<Argb<u8>> = (0..w * h)
-            .map(|i| {
-                let v = (i * 7919 % 256) as u8;
-                Argb {
-                    alpha: 255,
-                    red: v,
-                    green: v.wrapping_add(1),
-                    blue: v.wrapping_add(2),
-                }
-            })
-            .collect();
-        let hash = |pixels: &[Argb<u8>]| {
-            let rows = View::from_pixels(pixels, w, h).byte_rows();
-            let hash = frame_hash(&rows);
-            assert_eq!(hash, fold_hash(rows.iter().map(|row| row_hash(row))));
-            hash
-        };
-        let before = hash(&pixels);
-        let last = pixels.len() - 1;
-        for at in [0, w as usize - 1, last / 2, last] {
-            pixels[at].green ^= 1;
-            assert_ne!(hash(&pixels), before, "a change at pixel {at}");
-            pixels[at].green ^= 1;
-        }
-        assert_eq!(hash(&pixels), before);
-        let (top, bottom) = pixels.split_at_mut(w as usize);
-        top.swap_with_slice(&mut bottom[..w as usize]);
-        assert_ne!(hash(&pixels), before, "two rows swapped");
-
-        let floats: Vec<Argb<f32>> = (0..w * h)
-            .map(|i| Argb {
-                alpha: 1.0,
-                red: i as f32 / 7.0,
-                green: 0.25,
-                blue: 0.5,
-            })
-            .collect();
-        let rows = View::from_pixels(&floats, w, h).byte_rows();
-        assert_eq!(
-            frame_hash(&rows),
-            fold_hash(rows.iter().map(|row| row_hash(row)))
-        );
-    }
-
-    /// A Float frame hashes as its bits. Equal bits are the same frame, whatever the values, NaN
-    /// included. Equal values in other bits, 0 and -0 or NaNs with other payloads, are a changed
-    /// frame: that costs the work again, and never keeps work for pixels that changed.
-    #[test]
-    fn frame_hash_of_float_rows_follows_their_bits() {
-        let (w, h) = (5, 3);
-        let mut floats = vec![
-            Argb {
-                alpha: 1.0f32,
-                red: 0.0,
-                green: 0.5,
-                blue: 0.25,
-            };
-            (w * h) as usize
-        ];
-        let hash = |floats: &[Argb<f32>]| frame_hash(&View::from_pixels(floats, w, h).byte_rows());
-        let zero = hash(&floats);
-        floats[7].red = -0.0;
-        assert_ne!(hash(&floats), zero, "-0 in place of 0");
-        floats[7].red = f32::NAN;
-        let nan = hash(&floats);
-        assert_eq!(hash(&floats), nan, "the same NaN");
-        floats[7].red = f32::from_bits(f32::NAN.to_bits() | 1);
-        assert!(floats[7].red.is_nan());
-        assert_ne!(hash(&floats), nan, "a NaN with another payload");
-        floats[7].red = 0.0;
-        assert_eq!(hash(&floats), zero);
-    }
-
-    /// A host's padding after each row is no part of the frame: a view's rows end at its width.
-    #[test]
-    fn frame_hash_leaves_out_row_padding() {
-        let (w, h) = (3, 4);
-        let row = w as usize * size_of::<Argb<u8>>();
-        let stride = row + 8;
-        let packed: Vec<u8> = (0..h as usize * row)
-            .map(|i| (i * 13 % 256) as u8)
-            .collect();
-        let expected = frame_hash(&View::<u8>::new(&packed, w, h, row).byte_rows());
-        let mut padded = vec![0u8; h as usize * stride];
-        for fill in [0x00, 0xff] {
-            for (y, line) in padded.chunks_mut(stride).enumerate() {
-                line[..row].copy_from_slice(&packed[y * row..(y + 1) * row]);
-                line[row..].fill(fill);
-            }
-            let rows = View::<u8>::new(&padded, w, h, stride).byte_rows();
-            assert_eq!(frame_hash(&rows), expected, "padding {fill:#x}");
-        }
     }
 
     /// A source whose [`FrameSource::with_frame`] is costly, and which holds frames in other bytes
@@ -2549,84 +2460,6 @@ mod tests {
         state.render_frame(&s, &mut source, clip.len(), n as i64, out);
         let converted = source.converted.iter().map(|i| i + start).collect();
         (pixels, converted)
-    }
-
-    /// A check with nothing changed converts only the frame it draws; a change anywhere in an
-    /// earlier frame is still seen, and what it invalidates comes out as a fresh render's.
-    #[test]
-    fn check_converts_only_what_changed() {
-        let mut frames = crossing();
-        let n = frames.len() - 1;
-        let mut state = IncrementalRenderer::default();
-        let (first, _) = render_converting(&mut state, &frames, n);
-        let (same, converted) = render_converting(&mut state, &frames, n);
-        assert_eq!(same, first);
-        assert_eq!(converted, [n], "nothing changed");
-
-        for pixel in [0, frames[4].len() - 1, frames[4].len() / 2] {
-            frames[4][pixel].alpha ^= 1;
-            let (_, converted) = render_converting(&mut state, &frames, n);
-            assert!(converted.contains(&4), "a change at pixel {pixel}");
-            assert!(!converted.contains(&3), "frames before it are unchanged");
-            let (again, converted) = render_converting(&mut state, &frames, n);
-            assert_eq!(converted, [n], "the change is taken in");
-            let mut fresh = IncrementalRenderer::default();
-            let (cold, _) = render_converting(&mut fresh, &frames, n);
-            assert_eq!(again, cold);
-        }
-    }
-
-    /// A frame that goes missing from a check counts as empty, as in a cold render, and one that
-    /// comes back gives what it gave before.
-    #[test]
-    fn check_sees_a_frame_go_missing_and_come_back() {
-        let frames = crossing();
-        let n = frames.len() - 1;
-        let mut state = IncrementalRenderer::default();
-        let (first, _) = render_converting(&mut state, &frames, n);
-
-        struct Gap<'a>(ConvertingFrames<'a>, usize);
-        impl FrameSource for Gap<'_> {
-            fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
-                if index == self.1 {
-                    f(None);
-                } else {
-                    self.0.with_frame(index, f);
-                }
-            }
-            fn with_frame_if_wanted(
-                &mut self,
-                index: usize,
-                wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
-                f: &mut dyn FnMut(Option<Image<'_>>),
-            ) {
-                if index == self.1 {
-                    f(None);
-                } else {
-                    self.0.with_frame_if_wanted(index, wanted, f);
-                }
-            }
-        }
-        let s = swarm_settings();
-        let start = n.saturating_sub(crate::previous_frames_needed(&s) as usize);
-        let clip = &frames[start..=n];
-        let with_gap = |state: &mut IncrementalRenderer| {
-            let mut pixels = vec![Argb::<u8>::default(); (W * H) as usize];
-            let converting = ConvertingFrames {
-                frames: clip,
-                converted: Vec::new(),
-            };
-            let mut source = Gap(converting, 4 - start);
-            let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
-            state.render_frame(&s, &mut source, clip.len(), n as i64, out);
-            pixels
-        };
-        let after_gap = with_gap(&mut state);
-        let cold = with_gap(&mut IncrementalRenderer::default());
-        assert_eq!(after_gap, cold, "the missing frame counts as empty");
-
-        let (back, _) = render_converting(&mut state, &frames, n);
-        assert_eq!(back, first);
     }
 
     /// [`ConvertingFrames`] under a fetch budget, recording the earlier
@@ -2716,234 +2549,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn budget_catches_up_from_cold() {
-        let s = swarm_settings();
-        let frames = crossing();
-        let n = frames.len() - 1;
-        let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
-        let mut state = IncrementalRenderer::default();
-        // Only the first render reads past the budget, for its frame's
-        // background of 4; once that is kept every render keeps to 2.
-        let renders = (1..=catch_up_renders(&s, 2)).find(|&r| {
-            let render = render_budgeted(&mut state, &s, &frames, n, 2);
-            let limit = if r == 1 { 4 } else { 2 };
-            assert!(
-                render.earlier.len() <= limit,
-                "render {r} read {} earlier frames",
-                render.earlier.len()
-            );
-            render.pixels == cold
-        });
-        assert!(
-            renders.is_some_and(|r| r > 1),
-            "caught up after {renders:?} renders"
-        );
-        let again = render_budgeted(&mut state, &s, &frames, n, 2);
-        assert!(again.pixels == cold, "stays caught up");
-        assert!(again.earlier.len() <= 2, "read {}", again.earlier.len());
-    }
-
-    /// A budget of 8 under a background of 16, as a 4K seek in Resolve: the first
-    /// render reads the whole background and analyses its frame, since Resolve
-    /// may not render a still frame again.
-    #[test]
-    fn budget_seek_analyses_current_frame() {
-        let s = RenderSettings {
-            background_frames: 16,
-            trail_frames: 12,
-            ..swarm_settings()
-        };
-        let frames: Vec<_> = (0..80).map(|f| crossing()[f % 14].clone()).collect();
-        let n = 60;
-        let start = n - crate::previous_frames_needed(&s) as usize;
-        let mut state = IncrementalRenderer::default();
-        let render = render_budgeted(&mut state, &s, &frames, n, 8);
-        let background: BTreeSet<usize> = (n - 16..n).map(|f| f - start).collect();
-        assert!(
-            render.earlier.is_superset(&background),
-            "read {:?}",
-            render.earlier
-        );
-        assert_eq!(render.earlier.len(), 16, "nothing past the background");
-        assert!(
-            state
-                .kept
-                .get(&(n as i64))
-                .is_some_and(|kept| kept.record.analysis.is_some()),
-            "the seek's own frame is analysed"
-        );
-    }
-
-    /// A background over twice the budget, as Background 64 at 4K: the seek keeps
-    /// a stale analysis from the newest frames and catches up once it reads the rest.
-    #[test]
-    fn budget_seek_redoes_partial_analysis() {
-        let s = RenderSettings {
-            background_frames: 16,
-            trail_frames: 12,
-            ..swarm_settings()
-        };
-        let frames: Vec<_> = (0..80).map(|f| crossing()[f % 14].clone()).collect();
-        let n = 60;
-        let start = n - crate::previous_frames_needed(&s) as usize;
-        let mut state = IncrementalRenderer::default();
-        let seek = render_budgeted(&mut state, &s, &frames, n, 4);
-        let newest: BTreeSet<usize> = (n - 8..n).map(|f| f - start).collect();
-        assert_eq!(seek.earlier, newest, "the newest 8 background frames");
-        let kept = &state.kept[&(n as i64)];
-        assert!(kept.record.analysis.is_some(), "frame {n} analysed");
-        assert!(
-            kept.stale,
-            "frame {n} kept as done from part of its background"
-        );
-        let cold = render_budgeted(
-            &mut IncrementalRenderer::default(),
-            &s,
-            &frames,
-            n,
-            usize::MAX,
-        );
-        let renders = catch_up_renders(&s, 4);
-        let caught_up = (1..=renders).any(|_| {
-            let render = render_budgeted(&mut state, &s, &frames, n, 4);
-            assert!(render.earlier.len() <= 8, "read {}", render.earlier.len());
-            render.pixels == cold.pixels
-        });
-        assert!(caught_up, "not caught up in {renders} renders");
-        assert!(!state.kept[&(n as i64)].stale, "frame {n} still stale");
-    }
-
-    /// With a background several times the budget, an edit to every frame is
-    /// caught up reading each earlier frame once.
-    #[test]
-    fn budget_reads_each_frame_once_after_edit() {
-        let s = RenderSettings {
-            background_frames: 16,
-            trail_frames: 12,
-            ..swarm_settings()
-        };
-        let mut frames: Vec<_> = (0..40).map(|f| crossing()[f % 14].clone()).collect();
-        let n = frames.len() - 1;
-        let earlier = (crate::previous_frames_needed(&s) as usize).min(n);
-        let mut state = IncrementalRenderer::default();
-        let settled = (0..8).any(|_| {
-            render_budgeted(&mut state, &s, &frames, n, usize::MAX).converted == [earlier]
-        });
-        assert!(settled, "renders before the edit never settled");
-        invert_red(&mut frames[..n]);
-        let cold = render_budgeted(
-            &mut IncrementalRenderer::default(),
-            &s,
-            &frames,
-            n,
-            usize::MAX,
-        );
-        let renders = catch_up_renders(&s, 2);
-        let mut converted = vec![0; earlier];
-        let caught_up = (1..=renders).any(|_| {
-            let render = render_budgeted(&mut state, &s, &frames, n, 2);
-            for index in render.converted.into_iter().filter(|&i| i < earlier) {
-                converted[index] += 1;
-            }
-            render.pixels == cold.pixels
-        });
-        assert!(caught_up, "not caught up in {renders} renders");
-        assert!(
-            converted.iter().all(|&c| c <= 1),
-            "converted more than once: {converted:?}"
-        );
-    }
-
-    /// An edit to earlier frames found by a budgeted check leaves the motion
-    /// that used them drawn until it is redone, so the trail doesn't empty.
-    #[test]
-    fn budget_draws_stale_motion_after_edit() {
-        let s = swarm_settings();
-        let mut frames = crossing();
-        let n = frames.len() - 1;
-        let mut state = IncrementalRenderer::default();
-        let (before, _) = render_converting(&mut state, &frames, n);
-        invert_red(&mut frames[..n]);
-        let first = render_budgeted(&mut state, &s, &frames, n, 2);
-        assert_eq!(first.earlier.len(), 2);
-        assert!(
-            first.pixels == before,
-            "the first check after the edit drew what was kept"
-        );
-        let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
-        assert!(cold != before, "the edit changes the picture");
-        let renders = catch_up_renders(&s, 2);
-        let caught_up = (1..=renders).any(|_| {
-            let render = render_budgeted(&mut state, &s, &frames, n, 2);
-            assert!(
-                render.earlier.len() <= 2,
-                "read {} earlier frames",
-                render.earlier.len()
-            );
-            render.pixels == cold
-        });
-        assert!(caught_up, "not caught up in {renders} renders");
-    }
-
-    /// An edit to the frame a settled held frame's checks just read waits for the
-    /// rotation to come back, and the frames checked before then are read again:
-    /// 27 renders here, where a jump takes at most 15.
-    #[test]
-    fn budget_catches_up_after_one_frame_edit() {
-        let s = RenderSettings {
-            background_frames: 16,
-            trail_frames: 12,
-            ..swarm_settings()
-        };
-        let mut frames: Vec<_> = (0..40).map(|f| crossing()[f % 14].clone()).collect();
-        let n = frames.len() - 1;
-        let start = n - (crate::previous_frames_needed(&s) as usize).min(n);
-        let mut state = IncrementalRenderer::default();
-        for _ in 0..2 * catch_up_renders(&s, 2) {
-            render_budgeted(&mut state, &s, &frames, n, 2);
-        }
-        let checked = render_budgeted(&mut state, &s, &frames, n, 2).earlier;
-        let just_checked = start + checked.last().expect("a settled render checks");
-        invert_red(&mut frames[just_checked..=just_checked]);
-        let cold = render_budgeted(
-            &mut IncrementalRenderer::default(),
-            &s,
-            &frames,
-            n,
-            usize::MAX,
-        );
-        let renders =
-            (1..=40).find(|_| render_budgeted(&mut state, &s, &frames, n, 2).pixels == cold.pixels);
-        assert_eq!(renders, Some(27), "frame {just_checked} edited");
-        let again = render_budgeted(&mut state, &s, &frames, n, 2);
-        assert!(again.pixels == cold.pixels, "stays caught up");
-    }
-
-    /// Threshold reads no background, so a frame's change reaches no later frame.
-    /// Held renders under a budget still catch up.
-    #[test]
-    fn budget_threshold_catches_up() {
-        let s = RenderSettings {
-            detection_mode: crate::DetectionMode::Threshold,
-            ..swarm_settings()
-        };
-        let frames = crossing();
-        let n = frames.len() - 1;
-        let cold = render_budgeted(
-            &mut IncrementalRenderer::default(),
-            &s,
-            &frames,
-            n,
-            usize::MAX,
-        );
-        let mut state = IncrementalRenderer::default();
-        let renders = catch_up_renders(&s, 2);
-        let caught_up = (0..renders)
-            .any(|_| render_budgeted(&mut state, &s, &frames, n, 2).pixels == cold.pixels);
-        assert!(caught_up, "not caught up in {renders} renders");
-    }
-
     /// Frames that never change, fixed or not as the host says.
     struct Steps<'a> {
         frames: &'a [Vec<Argb<u8>>],
@@ -2971,7 +2576,7 @@ mod tests {
 
     /// Of single steps through a clip, one of them not taken as a stream, then
     /// a step over a frame, the renders that differ from a fresh render.
-    fn steps_over_a_frame(budget: Option<usize>) -> Vec<usize> {
+    fn differing_renders_after_step_over(budget: Option<usize>) -> Vec<usize> {
         let s = RenderSettings {
             background_frames: 16,
             trail_frames: 12,
@@ -3005,16 +2610,6 @@ mod tests {
             }
         }
         differing
-    }
-
-    /// A frame a stream of single steps went over is read before the frames the
-    /// stream checks again after a step it didn't take as a stream, so the next
-    /// renders match a fresh render as they do without a budget.
-    #[test]
-    fn budget_reads_a_stepped_over_frame_first() {
-        let without = steps_over_a_frame(None);
-        assert_eq!(without, Vec::<usize>::new(), "without a budget");
-        assert_eq!(steps_over_a_frame(Some(4)), without);
     }
 
     /// Renders of a stream, after a settled pause, an edit to earlier frames
@@ -3067,170 +2662,12 @@ mod tests {
         matched_from.expect("the stream matches fresh renders by its end")
     }
 
-    /// A stream after an edit reads its stale and unchecked frames oldest first
-    /// as a held frame does, so frames aren't rebuilt from background frames not
-    /// checked yet: 6 renders after an edit to every earlier frame, 8 after an
-    /// edit to one, with a budget of 4 for 28 earlier frames.
-    #[test]
-    fn budget_stream_after_edit_catches_up() {
-        assert_eq!(
-            stream_renders_after_edit(true),
-            6,
-            "every earlier frame edited"
-        );
-        assert_eq!(
-            stream_renders_after_edit(false),
-            8,
-            "one earlier frame edited"
-        );
-    }
-
-    /// Playback that dropped frames keeps no hashes of earlier frames. A held
-    /// render after it still catches up within the bound.
-    #[test]
-    fn budget_catches_up_after_dropped_frames() {
-        let frames = crossing();
-        let s = swarm_settings();
-        let needed = crate::previous_frames_needed(&s) as usize;
-        let n = frames.len() - 1;
-        let mut state = IncrementalRenderer::default();
-        render_budgeted(&mut state, &s, &frames, n - 4, usize::MAX);
-        for t in n - 3..=n {
-            let clip = &frames[t - needed.min(t)..=t];
-            let mut source = OnlyNewestFrame {
-                frames: clip,
-                reads: 0,
-            };
-            let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
-            let view = &mut ViewMut::from_pixels(&mut out, W, H);
-            state.render_frame(&s, &mut source, clip.len(), t as i64, view);
-        }
-        let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
-        let renders = catch_up_renders(&s, 2);
-        let caught_up = (1..=renders).find(|_| {
-            let render = render_budgeted(&mut state, &s, &frames, n, 2);
-            assert!(
-                render.earlier.len() <= 2,
-                "read {} earlier frames",
-                render.earlier.len()
-            );
-            render.pixels == cold
-        });
-        assert!(caught_up.is_some(), "not caught up in {renders} renders");
-    }
-
-    /// After a detection change on a frame that reuses its face source's faces, a
-    /// render that leaves the source for later leaves the frame stale, so it is
-    /// redone with the source's faces once the source is.
-    #[test]
-    fn budget_redoes_frame_whose_face_source_waits() {
-        wait_for_models();
-        let frames = crossing();
-        let n = frames.len() - 1;
-        let s = with_faces(ALL_PARTS);
-        assert_ne!(
-            face_source_frame(&s, n as i64, 0),
-            n as i64,
-            "frame {n} reuses faces"
-        );
-        let mut state = IncrementalRenderer::default();
-        render_budgeted(&mut state, &s, &frames, n, usize::MAX);
-        let changed = RenderSettings {
-            motion: motion::MotionSettings {
-                sensitivity: s.motion.sensitivity / 2.0,
-                ..s.motion
-            },
-            ..s
-        };
-        render_budgeted(&mut state, &changed, &frames, n, 2);
-        assert!(state.kept[&(n as i64)].stale, "frame {n} kept as done");
-        let cold = render_budgeted(
-            &mut IncrementalRenderer::default(),
-            &changed,
-            &frames,
-            n,
-            usize::MAX,
-        );
-        let renders = catch_up_renders(&changed, 2);
-        let caught_up = (0..renders)
-            .any(|_| render_budgeted(&mut state, &changed, &frames, n, 2).pixels == cold.pixels);
-        assert!(caught_up, "not caught up in {renders} renders");
-        assert!(
-            !state.kept[&(n as i64)].stale,
-            "frame {n} still stale once caught up"
-        );
-    }
-
-    /// A check that skips converting earlier frames can't hide what a lost device took with it:
-    /// the tiles are in RAM, so the new device's empty atlas fills from them and the whole trail
-    /// draws. A change to an earlier frame is still found on the new device.
-    #[test]
-    fn check_after_a_new_device_draws_the_whole_trail_without_converting() {
-        let _lock = gpu_test_lock();
-        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-        if gpu::open(&choice).is_err() && gpu::open("fallback").is_err() {
-            eprintln!("no adapter: skipped");
-            return;
-        }
-        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(move |_| {
-            gpu::open(&choice).or_else(|_| gpu::open("fallback"))
-        })));
-        let device = || loop {
-            match slot.now() {
-                gpu::DeviceNow::Ready(dev) => return dev,
-                gpu::DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
-                gpu::DeviceNow::Never => panic!("the slot gave up"),
-            }
-        };
-        let first_device = device();
-        let mut frames = crossing();
-        let n = frames.len() - 1;
-        let cold = |frames: &[Vec<Argb<u8>>]| {
-            render_converting(&mut IncrementalRenderer::default(), frames, n).0
-        };
-        let mut state = IncrementalRenderer {
-            test_slot: Some(slot),
-            ..Default::default()
-        };
-        state.use_gpu(true);
-        render_converting(&mut state, &frames, n);
-        let (on_first, converted) = render_converting(&mut state, &frames, n);
-        assert_eq!(converted, [n], "nothing changed");
-        assert!(drawn(&state) > 0, "drawing on the GPU before the loss");
-        assert!(within_gpu_bound(&cold(&frames), &on_first));
-
-        first_device.device.destroy();
-        let (on_cpu, converted) = render_converting(&mut state, &frames, n);
-        assert_eq!(converted, [n], "the loss changed no frame");
-        assert_eq!(state.report().draw.as_deref(), Some("CPU"));
-        assert_eq!(on_cpu, cold(&frames), "the render after the loss");
-
-        let second_device = device();
-        assert!(!Arc::ptr_eq(&first_device, &second_device));
-        let (on_second, converted) = render_converting(&mut state, &frames, n);
-        assert_eq!(converted, [n], "the new device needs no earlier frame");
-        assert!(drawn(&state) > 0, "the instance stayed on the CPU");
-        assert_eq!(
-            state.report().draw,
-            Some(format!("GPU ({})", second_device.info.name))
-        );
-        assert!(within_gpu_bound(&cold(&frames), &on_second));
-
-        frames[4][0].alpha ^= 1;
-        let (_, converted) = render_converting(&mut state, &frames, n);
-        assert!(converted.contains(&4), "the change on the new device");
-        assert!(!converted.contains(&3), "frames before it are unchanged");
-        let (edited, converted) = render_converting(&mut state, &frames, n);
-        assert_eq!(converted, [n], "the change is taken in");
-        assert!(within_gpu_bound(&cold(&frames), &edited));
-    }
-
     /// A validation error leaves the device usable: it is counted, not kept as a failure, so
     /// new instances still draw on it and a render that didn't cause it isn't charged with it.
     #[test]
-    fn error_leaves_the_device_usable() {
+    fn device_survives_error() {
         let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+        let dev = own_device();
         let frames = crossing();
         dev.misuse();
         let _ = dev.device.poll(wgpu::PollType::Poll);
@@ -3252,7 +2689,7 @@ mod tests {
     #[test]
     fn disabling_gpu_mid_sequence_matches_cpu() {
         let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+        let dev = own_device();
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
         let mut on_gpu = on_device(&dev);
@@ -3278,52 +2715,13 @@ mod tests {
         assert!(dev.lost().is_none(), "the device was lost");
     }
 
-    /// A render the GPU can't take, here a canvas larger than the device binds, is drawn on
-    /// the CPU byte for byte, and the next render is back on the GPU.
-    #[test]
-    fn fault_falls_back_for_one_render() {
-        let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
-        let frames = crossing();
-        let mut cpu = IncrementalRenderer::default();
-        let mut on_gpu = on_device(&dev);
-        for n in 0..frames.len() {
-            let limit = if n == 7 { 1024 } else { u64::MAX };
-            on_gpu
-                .drawer
-                .as_mut()
-                .expect("on the GPU")
-                .set_max_buffer_bytes(limit);
-            let before = drawn(&on_gpu);
-            let (a, b) = (
-                render(&mut cpu, &frames, n),
-                render(&mut on_gpu, &frames, n),
-            );
-            assert!(within_gpu_bound(&a, &b), "frame {n} is off the CPU's");
-            if n == 7 {
-                assert_eq!(a, b, "the faulted frame isn't the CPU's");
-                assert_eq!(drawn(&on_gpu), before, "the faulted frame counts as drawn");
-            } else {
-                // Frame 0 has no windows yet, so it draws on the CPU.
-                assert_eq!(
-                    drawn(&on_gpu),
-                    before + u64::from(n > 0),
-                    "frame {n} wasn't drawn on the GPU"
-                );
-            }
-        }
-        assert_eq!(faults(&on_gpu), 1);
-        assert!(on_gpu.drawer().is_some(), "the instance left the GPU");
-        assert!(dev.lost().is_none(), "the device was lost");
-    }
-
     /// A draw that isn't back in time is drawn on the CPU, and the next render is back on
     /// the GPU with a fresh readback buffer. Whether the first draw is in time depends on
     /// the GPU, so only what must hold either way is checked.
     #[test]
     fn slow_readback_falls_back_for_one_render() {
         let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+        let dev = own_device();
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
         let mut on_gpu = on_device(&dev);
@@ -3358,28 +2756,37 @@ mod tests {
         assert!(dev.lost().is_none(), "the device was lost");
     }
 
-    /// A GPU failing every other render enters cooldown too: after `MAX_RECENT_FAULTS` faults
-    /// in the history, renders match the CPU byte for byte without touching the GPU, and the GPU
-    /// draws again when the cooldown ends.
-    #[test]
-    fn repeated_gpu_faults_cool_down_then_recover() {
-        let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+    /// The frames [`render_with_gpu_faults`] renders in fault cooldown.
+    const FAULT_COOLDOWN_FRAMES: std::ops::Range<usize> = 6..9;
+
+    /// One render of [`render_with_gpu_faults`].
+    struct FaultedRender {
+        number: usize,
+        failing: bool,
+        /// In fault cooldown before this render, read before the test ends the cooldown.
+        cooldown_before_reset: bool,
+        in_cooldown: bool,
+        matches_cpu: bool,
+        drawn: u64,
+        faulted: u64,
+    }
+
+    /// Renders every frame on `dev` and on the CPU with the GPU failing on renders 1, 3, 5 and
+    /// [`FAULT_COOLDOWN_FRAMES`], ending the cooldown at its last frame.
+    fn render_with_gpu_faults(
+        dev: &Arc<gpu::GpuContext>,
+    ) -> (Vec<FaultedRender>, IncrementalRenderer) {
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
-        let mut on_gpu = on_device(&dev);
-        // Frame 0 has no windows and draws on the CPU. Frames 1, 3 and 5 fault; the
-        // cooldown runs from 6 until the test ends it at 9.
-        let cooldown_frames = 6..9;
+        let mut on_gpu = on_device(dev);
+        let mut renders = Vec::new();
+        // Frame 0 has no windows and draws on the CPU.
         for n in 0..frames.len() {
             let drawer = on_gpu.drawer.as_mut().expect("on the GPU");
-            let failing = n < 9 && n % 2 == 1 || cooldown_frames.contains(&n);
+            let failing = n < 9 && n % 2 == 1 || FAULT_COOLDOWN_FRAMES.contains(&n);
             drawer.set_max_buffer_bytes(if failing { 1024 } else { u64::MAX });
-            if n == cooldown_frames.end {
-                assert!(
-                    drawer.in_fault_cooldown(),
-                    "still trying the GPU at frame {n}"
-                );
+            let cooldown_before_reset = drawer.in_fault_cooldown();
+            if n == FAULT_COOLDOWN_FRAMES.end {
                 drawer.set_cooldown(Duration::ZERO);
             }
             let in_cooldown = drawer.in_fault_cooldown();
@@ -3389,17 +2796,17 @@ mod tests {
                 render(&mut on_gpu, &frames, n),
             );
             assert!(within_gpu_bound(&a, &b), "frame {n} is off the CPU's");
-            assert_eq!(in_cooldown, cooldown_frames.contains(&n), "frame {n}");
-            if in_cooldown {
-                assert_eq!(a, b, "cooldown frame {n} isn't the CPU's");
-                assert_eq!(drawn(&on_gpu), before, "cooldown frame {n} drew on the GPU");
-                assert_eq!(faults(&on_gpu), faulted, "cooldown frame {n} tried the GPU");
-            } else if !failing && n > 0 {
-                assert_eq!(drawn(&on_gpu), before + 1, "frame {n} wasn't on the GPU");
-            }
+            renders.push(FaultedRender {
+                number: n,
+                failing,
+                cooldown_before_reset,
+                in_cooldown,
+                matches_cpu: a == b,
+                drawn: drawn(&on_gpu) - before,
+                faulted: faults(&on_gpu) - faulted,
+            });
         }
-        assert_eq!(faults(&on_gpu), u64::from(gpu::MAX_RECENT_FAULTS));
-        assert!(dev.lost().is_none(), "the device was lost");
+        (renders, on_gpu)
     }
 
     /// A host holding only the current frame: tiles the pile stopped drawing keep no pixels.
@@ -3419,7 +2826,7 @@ mod tests {
         let before = crate::previous_frames_needed(&s) as usize;
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         for (n, frame) in frames.iter().enumerate() {
-            history.next(before, 0).copy_from_slice(frame);
+            history.push_slot(before, 0).copy_from_slice(frame);
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             let count = history.len();
             state.render_frame(&s, &mut history, count, n as i64, view);
@@ -3441,7 +2848,7 @@ mod tests {
     #[test]
     fn clear_history_keeps_drawer_and_frees_atlas() {
         let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+        let dev = own_device();
         let frames = crossing();
         let mut drawer = gpu::Drawer::new(dev.clone()).expect("a drawer on a working device");
         drawer.limit_tile_atlas(64, 64);
@@ -3483,7 +2890,7 @@ mod tests {
     #[test]
     fn live_full_atlas_drops_oldest_windows_on_gpu() {
         let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+        let dev = own_device();
         let frames = crossing();
         let mut drawer = gpu::Drawer::new(dev.clone()).expect("a drawer on a working device");
         // Room for a few frames' tiles, and no more.
@@ -3502,7 +2909,7 @@ mod tests {
         history.resize(W, H);
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         for (n, frame) in frames.iter().enumerate() {
-            history.next(needed, 1).copy_from_slice(frame);
+            history.push_slot(needed, 1).copy_from_slice(frame);
             let count = history.len();
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             state.render_frame(&s, &mut history, count, n as i64, view);
@@ -3524,7 +2931,7 @@ mod tests {
     #[test]
     fn exact_render_after_full_atlas_has_every_window() {
         let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+        let dev = own_device();
         let frames = crossing();
         let mut drawer = gpu::Drawer::new(dev.clone()).expect("a drawer on a working device");
         drawer.limit_tile_atlas(64, 2);
@@ -3536,7 +2943,7 @@ mod tests {
         history.resize(W, H);
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         for (n, frame) in frames.iter().enumerate() {
-            history.next(needed, 1).copy_from_slice(frame);
+            history.push_slot(needed, 1).copy_from_slice(frame);
             let count = history.len();
             let view = &mut ViewMut::from_pixels(&mut out, W, H);
             state.render_frame(&s, &mut history, count, n as i64, view);
@@ -3554,7 +2961,7 @@ mod tests {
     #[test]
     fn full_atlas_falls_back_for_one_render() {
         let _lock = gpu_test_lock();
-        let Some(dev) = own_device() else { return };
+        let dev = own_device();
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
         let mut drawer = gpu::Drawer::new(dev.clone()).expect("a drawer on a working device");
@@ -3578,5 +2985,778 @@ mod tests {
         assert_eq!(faults(&on_gpu), 0, "a full atlas is not a fault");
         assert!(on_gpu.drawer().is_some(), "the instance left the GPU");
         assert!(dev.lost().is_none(), "the device was lost");
+    }
+
+    mod budget {
+        use super::*;
+
+        #[test]
+        fn catches_up_from_cold() {
+            let s = swarm_settings();
+            let frames = crossing();
+            let n = frames.len() - 1;
+            let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
+            let mut state = IncrementalRenderer::default();
+            // Only the first render reads past the budget, for its frame's
+            // background of 4; once that is kept every render keeps to 2.
+            let renders = (1..=catch_up_renders(&s, 2)).find(|&r| {
+                let render = render_budgeted(&mut state, &s, &frames, n, 2);
+                let limit = if r == 1 { 4 } else { 2 };
+                assert!(
+                    render.earlier.len() <= limit,
+                    "render {r} read {} earlier frames",
+                    render.earlier.len()
+                );
+                render.pixels == cold
+            });
+            assert!(
+                renders.is_some_and(|r| r > 1),
+                "caught up after {renders:?} renders"
+            );
+            let again = render_budgeted(&mut state, &s, &frames, n, 2);
+            assert!(again.pixels == cold, "stays caught up");
+            assert!(again.earlier.len() <= 2, "read {}", again.earlier.len());
+        }
+
+        /// A budget of 8 under a background of 16, as a 4K seek in Resolve: the first
+        /// render reads the whole background and analyses its frame, since Resolve
+        /// may not render a still frame again.
+        #[test]
+        fn seek_analyses_current_frame() {
+            let s = RenderSettings {
+                background_frames: 16,
+                trail_frames: 12,
+                ..swarm_settings()
+            };
+            let frames: Vec<_> = (0..80).map(|f| crossing()[f % 14].clone()).collect();
+            let n = 60;
+            let start = n - crate::previous_frames_needed(&s) as usize;
+            let mut state = IncrementalRenderer::default();
+            let render = render_budgeted(&mut state, &s, &frames, n, 8);
+            let background: BTreeSet<usize> = (n - 16..n).map(|f| f - start).collect();
+            assert!(
+                render.earlier.is_superset(&background),
+                "read {:?}",
+                render.earlier
+            );
+            assert_eq!(render.earlier.len(), 16, "nothing past the background");
+            assert!(
+                state
+                    .kept
+                    .get(&(n as i64))
+                    .is_some_and(|kept| kept.record.analysis.is_some()),
+                "the seek's own frame is analysed"
+            );
+        }
+
+        /// A background over twice the budget, as Background 64 at 4K: the seek keeps
+        /// a stale analysis from the newest frames and catches up once it reads the rest.
+        #[test]
+        fn seek_redoes_partial_analysis() {
+            let s = RenderSettings {
+                background_frames: 16,
+                trail_frames: 12,
+                ..swarm_settings()
+            };
+            let frames: Vec<_> = (0..80).map(|f| crossing()[f % 14].clone()).collect();
+            let n = 60;
+            let start = n - crate::previous_frames_needed(&s) as usize;
+            let mut state = IncrementalRenderer::default();
+            let seek = render_budgeted(&mut state, &s, &frames, n, 4);
+            let newest: BTreeSet<usize> = (n - 8..n).map(|f| f - start).collect();
+            assert_eq!(seek.earlier, newest, "the newest 8 background frames");
+            let kept = &state.kept[&(n as i64)];
+            assert!(kept.record.analysis.is_some(), "frame {n} analysed");
+            assert!(
+                kept.stale,
+                "frame {n} kept as done from part of its background"
+            );
+            let cold = render_budgeted(
+                &mut IncrementalRenderer::default(),
+                &s,
+                &frames,
+                n,
+                usize::MAX,
+            );
+            let renders = catch_up_renders(&s, 4);
+            let caught_up = (1..=renders).any(|_| {
+                let render = render_budgeted(&mut state, &s, &frames, n, 4);
+                assert!(render.earlier.len() <= 8, "read {}", render.earlier.len());
+                render.pixels == cold.pixels
+            });
+            assert!(caught_up, "not caught up in {renders} renders");
+            assert!(!state.kept[&(n as i64)].stale, "frame {n} still stale");
+        }
+
+        /// With a background several times the budget, an edit to every frame is
+        /// caught up reading each earlier frame once.
+        #[test]
+        fn reads_each_frame_once_after_edit() {
+            let s = RenderSettings {
+                background_frames: 16,
+                trail_frames: 12,
+                ..swarm_settings()
+            };
+            let mut frames: Vec<_> = (0..40).map(|f| crossing()[f % 14].clone()).collect();
+            let n = frames.len() - 1;
+            let earlier = (crate::previous_frames_needed(&s) as usize).min(n);
+            let mut state = IncrementalRenderer::default();
+            let settled = (0..8).any(|_| {
+                render_budgeted(&mut state, &s, &frames, n, usize::MAX).converted == [earlier]
+            });
+            assert!(settled, "renders before the edit never settled");
+            invert_red(&mut frames[..n]);
+            let cold = render_budgeted(
+                &mut IncrementalRenderer::default(),
+                &s,
+                &frames,
+                n,
+                usize::MAX,
+            );
+            let renders = catch_up_renders(&s, 2);
+            let mut converted = vec![0; earlier];
+            let caught_up = (1..=renders).any(|_| {
+                let render = render_budgeted(&mut state, &s, &frames, n, 2);
+                for index in render.converted.into_iter().filter(|&i| i < earlier) {
+                    converted[index] += 1;
+                }
+                render.pixels == cold.pixels
+            });
+            assert!(caught_up, "not caught up in {renders} renders");
+            assert!(
+                converted.iter().all(|&c| c <= 1),
+                "converted more than once: {converted:?}"
+            );
+        }
+
+        /// An edit to earlier frames found by a budgeted check leaves the motion
+        /// that used them drawn until it is redone, so the trail doesn't empty.
+        #[test]
+        fn draws_stale_motion_after_edit() {
+            let s = swarm_settings();
+            let mut frames = crossing();
+            let n = frames.len() - 1;
+            let mut state = IncrementalRenderer::default();
+            let (before, _) = render_converting(&mut state, &frames, n);
+            invert_red(&mut frames[..n]);
+            let first = render_budgeted(&mut state, &s, &frames, n, 2);
+            assert_eq!(first.earlier.len(), 2);
+            assert!(
+                first.pixels == before,
+                "the first check after the edit drew what was kept"
+            );
+            let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
+            assert!(cold != before, "the edit changes the picture");
+            let renders = catch_up_renders(&s, 2);
+            let caught_up = (1..=renders).any(|_| {
+                let render = render_budgeted(&mut state, &s, &frames, n, 2);
+                assert!(
+                    render.earlier.len() <= 2,
+                    "read {} earlier frames",
+                    render.earlier.len()
+                );
+                render.pixels == cold
+            });
+            assert!(caught_up, "not caught up in {renders} renders");
+        }
+
+        /// An edit to the frame a settled held frame's checks just read waits for the
+        /// rotation to come back, and the frames checked before then are read again:
+        /// 27 renders here, where a jump takes at most 15.
+        #[test]
+        fn catches_up_after_one_frame_edit() {
+            let s = RenderSettings {
+                background_frames: 16,
+                trail_frames: 12,
+                ..swarm_settings()
+            };
+            let mut frames: Vec<_> = (0..40).map(|f| crossing()[f % 14].clone()).collect();
+            let n = frames.len() - 1;
+            let start = n - (crate::previous_frames_needed(&s) as usize).min(n);
+            let mut state = IncrementalRenderer::default();
+            for _ in 0..2 * catch_up_renders(&s, 2) {
+                render_budgeted(&mut state, &s, &frames, n, 2);
+            }
+            let checked = render_budgeted(&mut state, &s, &frames, n, 2).earlier;
+            let just_checked = start + checked.last().expect("a settled render checks");
+            invert_red(&mut frames[just_checked..=just_checked]);
+            let cold = render_budgeted(
+                &mut IncrementalRenderer::default(),
+                &s,
+                &frames,
+                n,
+                usize::MAX,
+            );
+            let renders = (1..=40)
+                .find(|_| render_budgeted(&mut state, &s, &frames, n, 2).pixels == cold.pixels);
+            assert_eq!(renders, Some(27), "frame {just_checked} edited");
+            let again = render_budgeted(&mut state, &s, &frames, n, 2);
+            assert!(again.pixels == cold.pixels, "stays caught up");
+        }
+
+        /// Threshold reads no background, so a frame's change reaches no later frame.
+        /// Held renders under a budget still catch up.
+        #[test]
+        fn threshold_catches_up() {
+            let s = RenderSettings {
+                detection_mode: crate::DetectionMode::Threshold,
+                ..swarm_settings()
+            };
+            let frames = crossing();
+            let n = frames.len() - 1;
+            let cold = render_budgeted(
+                &mut IncrementalRenderer::default(),
+                &s,
+                &frames,
+                n,
+                usize::MAX,
+            );
+            let mut state = IncrementalRenderer::default();
+            let renders = catch_up_renders(&s, 2);
+            let caught_up = (0..renders)
+                .any(|_| render_budgeted(&mut state, &s, &frames, n, 2).pixels == cold.pixels);
+            assert!(caught_up, "not caught up in {renders} renders");
+        }
+
+        /// A frame a stream of single steps went over is read before the frames the
+        /// stream checks again after a step it didn't take as a stream, so the next
+        /// renders match a fresh render as they do without a budget.
+        #[test]
+        fn step_over_matches_unbudgeted_renders() {
+            let without = differing_renders_after_step_over(None);
+            assert_eq!(without, Vec::<usize>::new(), "without a budget");
+            assert_eq!(differing_renders_after_step_over(Some(4)), without);
+        }
+
+        /// A stream after an edit reads its stale and unchecked frames oldest first
+        /// as a held frame does, so frames aren't rebuilt from background frames not
+        /// checked yet: 6 renders after an edit to every earlier frame, 8 after an
+        /// edit to one, with a budget of 4 for 28 earlier frames.
+        #[test]
+        fn stream_after_edit_catches_up() {
+            assert_eq!(
+                stream_renders_after_edit(true),
+                6,
+                "every earlier frame edited"
+            );
+            assert_eq!(
+                stream_renders_after_edit(false),
+                8,
+                "one earlier frame edited"
+            );
+        }
+
+        /// Playback that dropped frames keeps no hashes of earlier frames. A held
+        /// render after it still catches up within the bound.
+        #[test]
+        fn catches_up_after_dropped_frames() {
+            let frames = crossing();
+            let s = swarm_settings();
+            let needed = crate::previous_frames_needed(&s) as usize;
+            let n = frames.len() - 1;
+            let mut state = IncrementalRenderer::default();
+            render_budgeted(&mut state, &s, &frames, n - 4, usize::MAX);
+            for t in n - 3..=n {
+                let clip = &frames[t - needed.min(t)..=t];
+                let mut source = OnlyNewestFrame {
+                    frames: clip,
+                    reads: 0,
+                };
+                let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
+                let view = &mut ViewMut::from_pixels(&mut out, W, H);
+                state.render_frame(&s, &mut source, clip.len(), t as i64, view);
+            }
+            let (cold, _) = render_converting(&mut IncrementalRenderer::default(), &frames, n);
+            let renders = catch_up_renders(&s, 2);
+            let caught_up = (1..=renders).find(|_| {
+                let render = render_budgeted(&mut state, &s, &frames, n, 2);
+                assert!(
+                    render.earlier.len() <= 2,
+                    "read {} earlier frames",
+                    render.earlier.len()
+                );
+                render.pixels == cold
+            });
+            assert!(caught_up.is_some(), "not caught up in {renders} renders");
+        }
+
+        /// After a detection change on a frame that reuses its face source's faces, a
+        /// render that leaves the source for later leaves the frame stale, so it is
+        /// redone with the source's faces once the source is.
+        #[test]
+        fn redoes_frame_with_waiting_face_source() {
+            wait_for_models();
+            let frames = crossing();
+            let n = frames.len() - 1;
+            let s = with_faces(ALL_PARTS);
+            assert_ne!(
+                face_source_frame(&s, n as i64, 0),
+                n as i64,
+                "frame {n} reuses faces"
+            );
+            let mut state = IncrementalRenderer::default();
+            render_budgeted(&mut state, &s, &frames, n, usize::MAX);
+            let changed = RenderSettings {
+                motion: motion::MotionSettings {
+                    sensitivity: s.motion.sensitivity / 2.0,
+                    ..s.motion
+                },
+                ..s
+            };
+            render_budgeted(&mut state, &changed, &frames, n, 2);
+            assert!(state.kept[&(n as i64)].stale, "frame {n} kept as done");
+            let cold = render_budgeted(
+                &mut IncrementalRenderer::default(),
+                &changed,
+                &frames,
+                n,
+                usize::MAX,
+            );
+            let renders = catch_up_renders(&changed, 2);
+            let caught_up = (0..renders).any(|_| {
+                render_budgeted(&mut state, &changed, &frames, n, 2).pixels == cold.pixels
+            });
+            assert!(caught_up, "not caught up in {renders} renders");
+            assert!(
+                !state.kept[&(n as i64)].stale,
+                "frame {n} still stale once caught up"
+            );
+        }
+    }
+
+    mod frame_hash {
+        use super::*;
+
+        /// An odd width, so rows of 8-bit pixels don't end on a whole word of the hash.
+        const SIZE: (i32, i32) = (201, 130);
+
+        fn u8_pixels() -> Vec<Argb<u8>> {
+            (0..SIZE.0 * SIZE.1)
+                .map(|i| {
+                    let v = (i * 7919 % 256) as u8;
+                    Argb {
+                        alpha: 255,
+                        red: v,
+                        green: v.wrapping_add(1),
+                        blue: v.wrapping_add(2),
+                    }
+                })
+                .collect()
+        }
+
+        /// Hashes are compared across renders that may run on different numbers of threads.
+        #[test]
+        fn equals_folded_row_hashes() {
+            let (w, h) = SIZE;
+            let pixels = u8_pixels();
+            let rows = View::from_pixels(&pixels, w, h).byte_rows();
+            assert_eq!(
+                frame_hash(&rows),
+                fold_hash(rows.iter().map(|row| row_hash(row)))
+            );
+
+            let floats: Vec<Argb<f32>> = (0..w * h)
+                .map(|i| Argb {
+                    alpha: 1.0,
+                    red: i as f32 / 7.0,
+                    green: 0.25,
+                    blue: 0.5,
+                })
+                .collect();
+            let rows = View::from_pixels(&floats, w, h).byte_rows();
+            assert_eq!(
+                frame_hash(&rows),
+                fold_hash(rows.iter().map(|row| row_hash(row)))
+            );
+        }
+
+        #[test]
+        fn changes_with_any_pixel_or_row_order() {
+            let (w, h) = SIZE;
+            let mut pixels = u8_pixels();
+            let hash = |pixels: &[Argb<u8>]| {
+                let rows = View::from_pixels(pixels, w, h).byte_rows();
+                let hash = frame_hash(&rows);
+                assert_eq!(hash, fold_hash(rows.iter().map(|row| row_hash(row))));
+                hash
+            };
+            let before = hash(&pixels);
+            let last = pixels.len() - 1;
+            for at in [0, w as usize - 1, last / 2, last] {
+                pixels[at].green ^= 1;
+                assert_ne!(hash(&pixels), before, "a change at pixel {at}");
+                pixels[at].green ^= 1;
+            }
+            assert_eq!(hash(&pixels), before);
+            let (top, bottom) = pixels.split_at_mut(w as usize);
+            top.swap_with_slice(&mut bottom[..w as usize]);
+            assert_ne!(hash(&pixels), before, "two rows swapped");
+        }
+
+        /// A Float frame hashes as its bits. Equal bits are the same frame, whatever the values, NaN
+        /// included. Equal values in other bits, 0 and -0 or NaNs with other payloads, are a changed
+        /// frame: that costs the work again, and never keeps work for pixels that changed.
+        #[test]
+        fn float_rows_hash_by_bits() {
+            let (w, h) = (5, 3);
+            let mut floats = vec![
+                Argb {
+                    alpha: 1.0f32,
+                    red: 0.0,
+                    green: 0.5,
+                    blue: 0.25,
+                };
+                (w * h) as usize
+            ];
+            let hash =
+                |floats: &[Argb<f32>]| frame_hash(&View::from_pixels(floats, w, h).byte_rows());
+            let zero = hash(&floats);
+            floats[7].red = -0.0;
+            assert_ne!(hash(&floats), zero, "-0 in place of 0");
+            floats[7].red = f32::NAN;
+            let nan = hash(&floats);
+            assert_eq!(hash(&floats), nan, "the same NaN");
+            floats[7].red = f32::from_bits(f32::NAN.to_bits() | 1);
+            assert!(floats[7].red.is_nan());
+            assert_ne!(hash(&floats), nan, "a NaN with another payload");
+            floats[7].red = 0.0;
+            assert_eq!(hash(&floats), zero);
+        }
+
+        /// A host's padding after each row is no part of the frame: a view's rows end at its width.
+        #[test]
+        fn skips_row_padding() {
+            let (w, h) = (3, 4);
+            let row = w as usize * size_of::<Argb<u8>>();
+            let stride = row + 8;
+            let packed: Vec<u8> = (0..h as usize * row)
+                .map(|i| (i * 13 % 256) as u8)
+                .collect();
+            let expected = frame_hash(&View::<u8>::new(&packed, w, h, row).byte_rows());
+            let mut padded = vec![0u8; h as usize * stride];
+            for fill in [0x00, 0xff] {
+                for (y, line) in padded.chunks_mut(stride).enumerate() {
+                    line[..row].copy_from_slice(&packed[y * row..(y + 1) * row]);
+                    line[row..].fill(fill);
+                }
+                let rows = View::<u8>::new(&padded, w, h, stride).byte_rows();
+                assert_eq!(frame_hash(&rows), expected, "padding {fill:#x}");
+            }
+        }
+    }
+
+    mod fault {
+        use super::*;
+
+        /// A render the GPU can't take, here a canvas larger than the device binds, is drawn on
+        /// the CPU byte for byte, and the next render is back on the GPU.
+        #[test]
+        fn falls_back_for_one_render() {
+            let _lock = gpu_test_lock();
+            let dev = own_device();
+            let frames = crossing();
+            let mut cpu = IncrementalRenderer::default();
+            let mut on_gpu = on_device(&dev);
+            for n in 0..frames.len() {
+                let limit = if n == 7 { 1024 } else { u64::MAX };
+                on_gpu
+                    .drawer
+                    .as_mut()
+                    .expect("on the GPU")
+                    .set_max_buffer_bytes(limit);
+                let before = drawn(&on_gpu);
+                let (a, b) = (
+                    render(&mut cpu, &frames, n),
+                    render(&mut on_gpu, &frames, n),
+                );
+                assert!(within_gpu_bound(&a, &b), "frame {n} is off the CPU's");
+                if n == 7 {
+                    assert_eq!(a, b, "the faulted frame isn't the CPU's");
+                    assert_eq!(drawn(&on_gpu), before, "the faulted frame counts as drawn");
+                } else {
+                    // Frame 0 has no windows yet, so it draws on the CPU.
+                    assert_eq!(
+                        drawn(&on_gpu),
+                        before + u64::from(n > 0),
+                        "frame {n} wasn't drawn on the GPU"
+                    );
+                }
+            }
+            assert_eq!(faults(&on_gpu), 1);
+            assert!(on_gpu.drawer().is_some(), "the instance left the GPU");
+            assert!(dev.lost().is_none(), "the device was lost");
+        }
+
+        /// After `MAX_RECENT_FAULTS` faults in the history, renders match the CPU byte for byte
+        /// without touching the GPU until the cooldown ends.
+        #[test]
+        fn cooldown_draws_on_cpu() {
+            let _lock = gpu_test_lock();
+            let (renders, on_gpu) = render_with_gpu_faults(&own_device());
+            for r in &renders {
+                let n = r.number;
+                assert_eq!(
+                    r.in_cooldown,
+                    FAULT_COOLDOWN_FRAMES.contains(&n),
+                    "frame {n}"
+                );
+                if n == FAULT_COOLDOWN_FRAMES.end {
+                    assert!(r.cooldown_before_reset, "still trying the GPU at frame {n}");
+                }
+                if r.in_cooldown {
+                    assert!(r.matches_cpu, "cooldown frame {n} isn't the CPU's");
+                    assert_eq!(r.drawn, 0, "cooldown frame {n} drew on the GPU");
+                    assert_eq!(r.faulted, 0, "cooldown frame {n} tried the GPU");
+                }
+            }
+            assert_eq!(faults(&on_gpu), u64::from(gpu::MAX_RECENT_FAULTS));
+        }
+
+        #[test]
+        fn cooldown_end_returns_to_gpu() {
+            let _lock = gpu_test_lock();
+            let dev = own_device();
+            let (renders, _) = render_with_gpu_faults(&dev);
+            for r in &renders {
+                let n = r.number;
+                if !r.in_cooldown && !r.failing && n > 0 {
+                    assert_eq!(r.drawn, 1, "frame {n} wasn't on the GPU");
+                }
+            }
+            assert!(dev.lost().is_none(), "the device was lost");
+        }
+    }
+
+    mod check {
+        use super::*;
+
+        #[test]
+        fn unchanged_converts_only_drawn_frame() {
+            let frames = crossing();
+            let n = frames.len() - 1;
+            let mut state = IncrementalRenderer::default();
+            let (first, _) = render_converting(&mut state, &frames, n);
+            let (same, converted) = render_converting(&mut state, &frames, n);
+            assert_eq!(same, first);
+            assert_eq!(converted, [n], "nothing changed");
+        }
+
+        /// A change anywhere in an earlier frame converts that frame again and none before it.
+        #[test]
+        fn earlier_edit_matches_cold_render() {
+            let mut frames = crossing();
+            let n = frames.len() - 1;
+            let mut state = IncrementalRenderer::default();
+            for _ in 0..2 {
+                render_converting(&mut state, &frames, n);
+            }
+
+            for pixel in [0, frames[4].len() - 1, frames[4].len() / 2] {
+                frames[4][pixel].alpha ^= 1;
+                let (_, converted) = render_converting(&mut state, &frames, n);
+                assert!(converted.contains(&4), "a change at pixel {pixel}");
+                assert!(!converted.contains(&3), "frames before it are unchanged");
+                let (again, converted) = render_converting(&mut state, &frames, n);
+                assert_eq!(converted, [n], "the change is taken in");
+                let mut fresh = IncrementalRenderer::default();
+                let (cold, _) = render_converting(&mut fresh, &frames, n);
+                assert_eq!(again, cold);
+            }
+        }
+
+        /// [`ConvertingFrames`] with the frame at index `.1` missing.
+        struct Gap<'a>(ConvertingFrames<'a>, usize);
+
+        impl FrameSource for Gap<'_> {
+            fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>)) {
+                if index == self.1 {
+                    f(None);
+                } else {
+                    self.0.with_frame(index, f);
+                }
+            }
+            fn with_frame_if_wanted(
+                &mut self,
+                index: usize,
+                wanted: &mut dyn FnMut(&[&[u8]]) -> bool,
+                f: &mut dyn FnMut(Option<Image<'_>>),
+            ) {
+                if index == self.1 {
+                    f(None);
+                } else {
+                    self.0.with_frame_if_wanted(index, wanted, f);
+                }
+            }
+        }
+
+        /// Renders frame `n` of `frames` with frame 4 missing.
+        fn render_without_frame_4(
+            state: &mut IncrementalRenderer,
+            frames: &[Vec<Argb<u8>>],
+            n: usize,
+        ) -> Vec<Argb<u8>> {
+            let s = swarm_settings();
+            let start = n.saturating_sub(crate::previous_frames_needed(&s) as usize);
+            let clip = &frames[start..=n];
+            let mut pixels = vec![Argb::<u8>::default(); (W * H) as usize];
+            let converting = ConvertingFrames {
+                frames: clip,
+                converted: Vec::new(),
+            };
+            let mut source = Gap(converting, 4 - start);
+            let out = &mut ViewMut::from_pixels(&mut pixels, W, H);
+            state.render_frame(&s, &mut source, clip.len(), n as i64, out);
+            pixels
+        }
+
+        #[test]
+        fn missing_frame_renders_like_cold_render() {
+            let frames = crossing();
+            let n = frames.len() - 1;
+            let mut state = IncrementalRenderer::default();
+            render_converting(&mut state, &frames, n);
+            let after_gap = render_without_frame_4(&mut state, &frames, n);
+            let cold = render_without_frame_4(&mut IncrementalRenderer::default(), &frames, n);
+            assert_eq!(after_gap, cold, "the missing frame counts as empty");
+        }
+
+        #[test]
+        fn returned_frame_renders_as_before() {
+            let frames = crossing();
+            let n = frames.len() - 1;
+            let mut state = IncrementalRenderer::default();
+            let (first, _) = render_converting(&mut state, &frames, n);
+            render_without_frame_4(&mut state, &frames, n);
+            let (back, _) = render_converting(&mut state, &frames, n);
+            assert_eq!(back, first);
+        }
+
+        fn cold_render(frames: &[Vec<Argb<u8>>], n: usize) -> Vec<Argb<u8>> {
+            render_converting(&mut IncrementalRenderer::default(), frames, n).0
+        }
+
+        /// A render of [`render_across_device_loss`]: its pixels, the frames it converted, the
+        /// GPU draws so far and the drawer it reports.
+        struct Step {
+            pixels: Vec<Argb<u8>>,
+            converted: Vec<usize>,
+            drawn: u64,
+            draw: Option<String>,
+        }
+
+        fn step(state: &mut IncrementalRenderer, frames: &[Vec<Argb<u8>>], n: usize) -> Step {
+            let (pixels, converted) = render_converting(state, frames, n);
+            Step {
+                pixels,
+                converted,
+                drawn: drawn(state),
+                draw: state.report().draw,
+            }
+        }
+
+        /// The renders of the last frame of `crossing()` on a first device, after its loss, and
+        /// on the slot's next device.
+        struct DeviceLoss {
+            state: IncrementalRenderer,
+            frames: Vec<Vec<Argb<u8>>>,
+            n: usize,
+            on_first: Step,
+            on_cpu: Step,
+            on_second: Step,
+            second_name: String,
+            devices_differ: bool,
+        }
+
+        fn render_across_device_loss() -> DeviceLoss {
+            let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
+            gpu::open(&choice)
+                .or_else(|_| gpu::open("fallback"))
+                .expect("a GPU adapter, hardware or fallback");
+            let slot: &'static gpu::DeviceSlot =
+                Box::leak(Box::new(gpu::DeviceSlot::new(move |_| {
+                    gpu::open(&choice).or_else(|_| gpu::open("fallback"))
+                })));
+            let device = || loop {
+                match slot.now() {
+                    gpu::DeviceNow::Ready(dev) => return dev,
+                    gpu::DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
+                    gpu::DeviceNow::Never => panic!("the slot gave up"),
+                }
+            };
+            let first_device = device();
+            let frames = crossing();
+            let n = frames.len() - 1;
+            let mut state = IncrementalRenderer {
+                test_slot: Some(slot),
+                ..Default::default()
+            };
+            state.use_gpu(true);
+            render_converting(&mut state, &frames, n);
+            let on_first = step(&mut state, &frames, n);
+            first_device.device.destroy();
+            let on_cpu = step(&mut state, &frames, n);
+            let second_device = device();
+            let on_second = step(&mut state, &frames, n);
+            DeviceLoss {
+                state,
+                frames,
+                n,
+                on_first,
+                on_cpu,
+                on_second,
+                second_name: second_device.info.name.clone(),
+                devices_differ: !Arc::ptr_eq(&first_device, &second_device),
+            }
+        }
+
+        /// A check that skips converting earlier frames can't hide what a lost device took with it:
+        /// the tiles are in RAM, so the new device's empty atlas fills from them and the whole trail
+        /// draws.
+        #[test]
+        fn new_device_fills_atlas_without_converting() {
+            let _lock = gpu_test_lock();
+            let loss = render_across_device_loss();
+            let cold = cold_render(&loss.frames, loss.n);
+            let n = loss.n;
+
+            let on_first = &loss.on_first;
+            assert_eq!(on_first.converted, [n], "nothing changed");
+            assert!(on_first.drawn > 0, "drawing on the GPU before the loss");
+            assert!(within_gpu_bound(&cold, &on_first.pixels));
+
+            let on_cpu = &loss.on_cpu;
+            assert_eq!(on_cpu.converted, [n], "the loss changed no frame");
+            assert_eq!(on_cpu.draw.as_deref(), Some("CPU"));
+            assert_eq!(on_cpu.pixels, cold, "the render after the loss");
+
+            assert!(loss.devices_differ);
+            let on_second = &loss.on_second;
+            assert_eq!(
+                on_second.converted,
+                [n],
+                "the new device needs no earlier frame"
+            );
+            assert!(on_second.drawn > 0, "the instance stayed on the CPU");
+            assert_eq!(on_second.draw, Some(format!("GPU ({})", loss.second_name)));
+            assert!(within_gpu_bound(&cold, &on_second.pixels));
+        }
+
+        #[test]
+        fn new_device_finds_earlier_edit() {
+            let _lock = gpu_test_lock();
+            let DeviceLoss {
+                mut state,
+                mut frames,
+                n,
+                ..
+            } = render_across_device_loss();
+            frames[4][0].alpha ^= 1;
+            let (_, converted) = render_converting(&mut state, &frames, n);
+            assert!(converted.contains(&4), "the change on the new device");
+            assert!(!converted.contains(&3), "frames before it are unchanged");
+            let (edited, converted) = render_converting(&mut state, &frames, n);
+            assert_eq!(converted, [n], "the change is taken in");
+            assert!(within_gpu_bound(&cold_render(&frames, n), &edited));
+        }
     }
 }
