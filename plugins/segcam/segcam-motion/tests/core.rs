@@ -817,7 +817,8 @@ fn earlier_frame_edit_invalidates_cache() {
     }
 }
 
-/// A frame the host couldn't hand over is read again next time, not kept as empty.
+/// A gap renders as a cold render of the same frames does, and the missing frame is read again
+/// once the host hands it over.
 #[test]
 fn gap_renders_like_cold_render() {
     for s in [RenderSettings::default(), swarm_settings()] {

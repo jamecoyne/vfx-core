@@ -272,14 +272,14 @@ mod tests {
         }
 
         #[test]
-        fn argb8_channel_order() {
+        fn argb8_uses_ae_channel_order() {
             // alpha 255, red 10, green 20, blue 30
             let rgba = decode(&[255, 10, 20, 30], 4, 1, 1, Depth::Bpc8);
             assert_eq!(rgba, vec![10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
         }
 
         #[test]
-        fn argb16_full_scale() {
+        fn argb16_scales_to_unit() {
             let mut src = Vec::new();
             for v in [32768u16, 0, 16384, 32768] {
                 src.extend_from_slice(&v.to_ne_bytes());

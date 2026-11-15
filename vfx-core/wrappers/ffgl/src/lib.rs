@@ -364,7 +364,6 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
             if viewport.is_none() {
                 return FFMixed::fail();
             }
-            #[cfg(target_os = "windows")]
             if let Err(e) = gl::load() {
                 LOG.note(&format!("warning: {e}"));
                 return FFMixed::fail();

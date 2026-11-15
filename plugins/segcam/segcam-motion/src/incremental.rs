@@ -2310,7 +2310,7 @@ mod tests {
     /// still there. This loses it by `destroy()`, which goes another way through wgpu than a real
     /// loss: it shows this code's states, not what a driver does.
     #[test]
-    fn lost_gpu_falls_back_to_cpu_and_reopens() {
+    fn lost_gpu_draws_on_cpu_until_reopen() {
         let _lock = gpu_test_lock();
         let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
         gpu::open(&choice)
@@ -3505,7 +3505,7 @@ mod tests {
         /// A frame that goes missing from a check counts as empty, as in a cold render, and one that
         /// comes back gives what it gave before.
         #[test]
-        fn tracks_missing_frame() {
+        fn missing_frame_counts_as_empty() {
             let frames = crossing();
             let n = frames.len() - 1;
             let mut state = IncrementalRenderer::default();

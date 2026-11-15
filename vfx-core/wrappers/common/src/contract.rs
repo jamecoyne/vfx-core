@@ -120,7 +120,8 @@ pub fn stream_catch_up_renders(frames: usize, budget: usize) -> usize {
 /// How often a frame is rendered again while the effect says it is unfinished.
 const MAX_UNFINISHED_RERENDERS: usize = 8;
 
-/// How a kept effect broke the contract. `what` names the step of the check that saw it.
+/// The first way a kept effect broke the contract. `what`, where a variant has it, names the step
+/// of the check that saw it.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Mismatch {
     #[error(

@@ -424,18 +424,6 @@ mod tests {
     }
 
     #[test]
-    fn now_never_waits_for_first_open() {
-        let (slot, fake) = fake_slot();
-        fake.set_blocked(true);
-        let start = Instant::now();
-        assert!(slot.now(start, log()).is_none(), "the open is blocked");
-        assert!(slot.now(start, log()).is_none());
-        fake.set_blocked(false);
-        slot.settle();
-        assert_eq!(slot.now(start, log()).expect("opened").number, 1);
-    }
-
-    #[test]
     fn failed_first_open_retries_after_backoff() {
         let (slot, fake) = fake_slot();
         fake.set_fail(true);
@@ -447,23 +435,6 @@ mod tests {
         assert!(slot.now(start + LATER, log()).is_none(), "the try starts");
         slot.settle();
         assert!(slot.now(start + LATER, log()).is_some());
-    }
-
-    #[test]
-    fn now_replaces_lost_device_after_backoff() {
-        let (slot, fake) = fake_slot();
-        let start = Instant::now();
-        let first = slot.wait(start, log()).expect("first device");
-        fake.lose(0);
-        assert!(slot.now(start, log()).is_none(), "the loss is seen");
-        assert!(slot.now(start, log()).is_none());
-        assert!(is_waiting(slot), "no new try before the backoff");
-        assert!(slot.now(start + LATER, log()).is_none(), "the try starts");
-        slot.settle();
-        let second = slot.now(start + LATER, log()).expect("the replacement");
-        assert_ne!(first.pool_key, second.pool_key);
-        assert_eq!(second.number, 2);
-        assert!(second.lost().is_none());
     }
 
     #[test]
@@ -541,14 +512,14 @@ mod tests {
         use super::*;
 
         #[test]
-        fn waits_for_first_open() {
+        fn blocks_until_first_open() {
             let (slot, _) = fake_slot();
             let device = slot.wait(Instant::now(), log()).expect("waited for");
             assert_eq!(device.pool_key, OWN_DEVICE_KEYS | 1);
         }
 
         #[test]
-        fn skips_retry_after_failed_open() {
+        fn does_not_block_on_retry() {
             let (slot, fake) = fake_slot();
             fake.set_fail(true);
             let start = Instant::now();
@@ -575,6 +546,39 @@ mod tests {
                 .wait(start, log())
                 .expect("the replacement, waited for");
             assert_ne!(first.pool_key, second.pool_key);
+        }
+    }
+
+    mod now {
+        use super::*;
+
+        #[test]
+        fn never_waits_for_first_open() {
+            let (slot, fake) = fake_slot();
+            fake.set_blocked(true);
+            let start = Instant::now();
+            assert!(slot.now(start, log()).is_none(), "the open is blocked");
+            assert!(slot.now(start, log()).is_none());
+            fake.set_blocked(false);
+            slot.settle();
+            assert_eq!(slot.now(start, log()).expect("opened").number, 1);
+        }
+
+        #[test]
+        fn replaces_lost_device_after_backoff() {
+            let (slot, fake) = fake_slot();
+            let start = Instant::now();
+            let first = slot.wait(start, log()).expect("first device");
+            fake.lose(0);
+            assert!(slot.now(start, log()).is_none(), "the loss is seen");
+            assert!(slot.now(start, log()).is_none());
+            assert!(is_waiting(slot), "no new try before the backoff");
+            assert!(slot.now(start + LATER, log()).is_none(), "the try starts");
+            slot.settle();
+            let second = slot.now(start + LATER, log()).expect("the replacement");
+            assert_ne!(first.pool_key, second.pool_key);
+            assert_eq!(second.number, 2);
+            assert!(second.lost().is_none());
         }
     }
 }
