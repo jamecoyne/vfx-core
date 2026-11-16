@@ -60,4 +60,6 @@ segcam-face = { path = "../segcam-face" }
 wgpu = { version = "=30.0.2", features = ["noop"] }
 
 [dev-dependencies]
+png = "0.18.1"
+flate2 = "1.1.11"
 vfx-host = { path = "../../../vfx-core/wrappers/common" }

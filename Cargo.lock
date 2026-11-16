@@ -2849,7 +2849,9 @@ name = "segcam-motion"
 version = "1.0.0"
 dependencies = [
  "bytemuck",
+ "flate2",
  "libm",
+ "png",
  "pollster",
  "segcam-face",
  "vfx-build",
