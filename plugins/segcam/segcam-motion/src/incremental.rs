@@ -130,8 +130,6 @@ pub struct IncrementalRenderer {
     gpu_wanted: bool,
     /// Suppresses repeat logs of the same message.
     last_reported_fault: Option<String>,
-    /// The last render's draw hasn't been read back from the GPU yet (browsers).
-    unfinished: bool,
     /// `None` before the first render.
     drew_on_gpu: Option<bool>,
     faces_wanted: bool,
@@ -140,16 +138,17 @@ pub struct IncrementalRenderer {
     /// Live renders act as if the face models were still loading.
     #[cfg(test)]
     simulate_models_loading: bool,
-    /// A host's GPU frame the render may draw into instead of its output.
-    target: Option<TargetOffer>,
-    /// The slot context this instance draws with, where it isn't the process's.
+    /// A host's texture the render may draw into instead of its output.
+    texture: Option<TextureOffer>,
+    /// The slot context this instance draws with when it isn't the process's.
     #[cfg(test)]
     test_slot_context: Option<&'static gpu::SlotContext>,
 }
 
-/// A host's frame, offered to one render ([`vfx_core::CpuEffect::render_to`]), the record of
-/// the device it's on, and whether the render drew into it.
-struct TargetOffer {
+/// Holds a host's texture output ([`vfx_core::FrameOut::Texture`]) offered to one
+/// render, the record of the device the texture is on, and whether the render drew into
+/// it.
+struct TextureOffer {
     faults: vfx_core::DeviceFaults,
     frame: vfx_core::Frame,
     drawn_into: bool,
@@ -284,12 +283,6 @@ impl IncrementalRenderer {
         self.drawer.as_deref()
     }
 
-    /// Whether the last render is still waiting on the GPU (see
-    /// [`vfx_core::CpuEffect::unfinished`]).
-    pub fn unfinished(&self) -> bool {
-        self.unfinished
-    }
-
     /// Whether the GPU drew the last render's output.
     pub fn last_draw_on_gpu(&self) -> bool {
         self.drew_on_gpu == Some(true)
@@ -307,13 +300,13 @@ impl IncrementalRenderer {
         self.atlas.frames.clear();
     }
 
-    /// Offers the next render `target` to draw into instead of its output, which a swarm drawn
-    /// on the GPU of the same device takes; [`IncrementalRenderer::took_target`] says whether it
+    /// Offers the next render `texture` to draw into instead of its output, which a swarm drawn
+    /// on the GPU of the same device takes; [`IncrementalRenderer::took_texture`] says whether it
     /// did.
-    pub fn offer_target(&mut self, target: vfx_core::Target<'_>) {
-        let f = target.frame;
-        self.target = Some(TargetOffer {
-            faults: target.gpu.faults(),
+    pub fn offer_texture(&mut self, texture: vfx_core::GpuFrame<'_>) {
+        let f = texture.frame;
+        self.texture = Some(TextureOffer {
+            faults: texture.gpu.faults(),
             frame: vfx_core::Frame {
                 texture: f.texture.clone(),
                 view: f.view.clone(),
@@ -325,15 +318,15 @@ impl IncrementalRenderer {
         });
     }
 
-    /// Whether the last render drew into the target offered for it. The offer ends.
-    pub fn took_target(&mut self) -> bool {
-        self.target.take().is_some_and(|offer| offer.drawn_into)
+    /// Returns whether the last render drew into the texture offered for it, and ends the offer.
+    pub fn took_texture(&mut self) -> bool {
+        self.texture.take().is_some_and(|offer| offer.drawn_into)
     }
 
-    /// Whether this render can draw a swarm of `(w, h)` at `C` into the offered target: one
-    /// on `drawer`'s device, of the canvas's size, for an 8-bit canvas.
-    fn can_draw_into_target<C: Channel>(&self, drawer: &Drawer, (w, h): (i32, i32)) -> bool {
-        let fits = self.target.as_ref().is_some_and(|offer| {
+    /// Whether this render can draw a swarm of `(w, h)` at `C` into the offered texture. That
+    /// needs a texture on `drawer`'s device, of the canvas's size, and an 8-bit canvas.
+    fn can_draw_into_texture<C: Channel>(&self, drawer: &Drawer, (w, h): (i32, i32)) -> bool {
+        let fits = self.texture.as_ref().is_some_and(|offer| {
             (offer.frame.width, offer.frame.height) == (w as u32, h as u32)
                 && drawer.draws_on(&offer.faults)
         });
@@ -351,7 +344,6 @@ impl IncrementalRenderer {
         number: i64,
         out: &mut ViewMut<C>,
     ) {
-        self.unfinished = false;
         self.drew_on_gpu = Some(false);
         self.source_is_live = source.live();
         if out.is_empty() {
@@ -925,7 +917,6 @@ impl IncrementalRenderer {
         };
         drawer.begin_render();
         let drawn = self.draw_gpu(&mut drawer, s, count, number, frame, out);
-        self.unfinished = drawn.is_ok() && drawer.unfinished;
         self.drawer = Some(drawer);
         drawn
     }
@@ -1004,7 +995,7 @@ impl IncrementalRenderer {
             return Ok(());
         }
         let (w, h) = (out.width, out.height);
-        let into_target = self.can_draw_into_target::<C>(drawer, (w, h));
+        let into_texture = self.can_draw_into_texture::<C>(drawer, (w, h));
         let m = SwarmMetrics::new(h);
         let shadow = swarm::shadow_kernel(m.scale);
         let pile = build_pile(&self.kept, s, count, number, w, h);
@@ -1014,7 +1005,7 @@ impl IncrementalRenderer {
         let live = self.source_is_live;
         // With no windows both paths draw the same picture, and the CPU's
         // costs nothing next to a readback.
-        let no_windows = visible.is_empty() && !into_target;
+        let no_windows = visible.is_empty() && !into_texture;
         if no_windows
             || !self
                 .atlas
@@ -1031,14 +1022,34 @@ impl IncrementalRenderer {
             let allocation = self.atlas.frames.get(&p.frame)?;
             Some((p.tile, allocation.slots[p.index]))
         });
-        if into_target && let Some(offer) = self.target.as_mut() {
+        if into_texture && let Some(offer) = self.texture.as_mut() {
             drawer.draw_swarm_into(&offer.frame, windows, frame.as_ref(), s, &shadow)?;
             offer.drawn_into = true;
             self.drew_on_gpu = Some(true);
             return Ok(());
         }
-        drawer.draw_swarm(out, windows, frame.as_ref(), number, s, &shadow)?;
-        self.drew_on_gpu = Some(true);
+        // Browsers can't wait for a readback, so a swarm draws on the CPU there
+        // when it can't draw into the host's texture. That happens with a pixels output,
+        // or with a texture of another size or on another device.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let motion =
+                cached_analysis(&self.kept, number, &analysis_key(s, number, window_start))
+                    .unwrap_or(&NO_SEGMENTS);
+            draw_output(
+                out,
+                s,
+                frame,
+                motion,
+                number,
+                visible.iter().map(|p| p.tile),
+            );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            drawer.draw_swarm(out, windows, frame.as_ref(), s, &shadow)?;
+            self.drew_on_gpu = Some(true);
+        }
         Ok(())
     }
 
@@ -1048,10 +1059,6 @@ impl IncrementalRenderer {
         self.kept.clear();
         self.atlas = AtlasPlacements::default();
         self.analyser.live_faces.forget();
-        self.unfinished = false;
-        if let Some(drawer) = &mut self.drawer {
-            drawer.drop_unfinished_draw();
-        }
     }
 
     /// Whether `frame` has cached motion and, for the swarm, tiles, none of it

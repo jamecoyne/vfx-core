@@ -10,8 +10,8 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 
-use vfx_core::cpu::{FrameSource, ImageMut};
-use vfx_core::{Context, CpuEffect, ParamValues, Processor, Report, Target};
+use vfx_core::cpu::FrameSource;
+use vfx_core::{Context, CpuEffect, FrameOut, ParamValues, Processor, RenderError, Report};
 
 /// A CPU effect as a host instance holds it.
 pub struct CpuInstance {
@@ -19,10 +19,15 @@ pub struct CpuInstance {
     kept: Option<Mutex<Box<dyn CpuEffect>>>,
 }
 
-/// A render panicked; the instance has started over.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("a render panicked")]
-pub struct Panicked;
+/// Why [`CpuInstance::render`] drew nothing.
+#[derive(Debug, thiserror::Error)]
+pub enum CpuRenderError {
+    /// The render panicked, and the instance has started over.
+    #[error("a render panicked")]
+    Panicked,
+    #[error(transparent)]
+    Render(#[from] RenderError),
+}
 
 impl CpuInstance {
     /// `None` when `make` makes a GPU effect. `host_keeps` says whether this host can keep an
@@ -80,49 +85,20 @@ impl CpuInstance {
         &self,
         frames: &mut dyn FrameSource,
         count: usize,
-        output: ImageMut<'_>,
+        out: FrameOut<'_>,
         values: &ParamValues,
         ctx: &Context,
-    ) -> Result<(), Panicked> {
+    ) -> Result<(), CpuRenderError> {
         let rendered = catch_unwind(AssertUnwindSafe(|| {
-            self.with(|e| e.render(frames, count, output, values, ctx))
+            self.with(|e| e.render(frames, count, out, values, ctx))
         }));
-        rendered.map_err(|_| {
-            self.rebuild();
-            Panicked
-        })
-    }
-
-    /// Whether a render with `values` can draw into a target (see
-    /// [`CpuEffect::can_draw_to_target`]). An effect that isn't kept has nothing to keep one for.
-    pub fn can_draw_to_target(&self, values: &ParamValues) -> bool {
-        self.kept.is_some() && self.with(|e| e.can_draw_to_target(values))
-    }
-
-    /// Renders, into `target` where the effect can (see [`CpuEffect::render_to`]), starting over
-    /// if the render panics. `Ok(true)` when the frame is in `target`, `Ok(false)` when it is in
-    /// `output`.
-    pub fn render_to(
-        &self,
-        frames: &mut dyn FrameSource,
-        count: usize,
-        output: ImageMut<'_>,
-        target: Target<'_>,
-        values: &ParamValues,
-        ctx: &Context,
-    ) -> Result<bool, Panicked> {
-        let rendered = catch_unwind(AssertUnwindSafe(|| {
-            self.with(|e| e.render_to(frames, count, output, target, values, ctx))
-        }));
-        rendered.map_err(|_| {
-            self.rebuild();
-            Panicked
-        })
-    }
-
-    /// Whether the last render is still waiting on the GPU (see [`CpuEffect::unfinished`]).
-    pub fn unfinished(&self) -> bool {
-        self.kept.is_some() && self.with(|e| e.unfinished())
+        match rendered {
+            Ok(rendered) => Ok(rendered?),
+            Err(_) => {
+                self.rebuild();
+                Err(CpuRenderError::Panicked)
+            }
+        }
     }
 
     /// The kept effect's [`CpuEffect::report`]; an effect that isn't kept has none.
@@ -177,7 +153,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use vfx_core::ParamSpec;
-    use vfx_core::cpu::{Argb, ViewMut};
+    use vfx_core::cpu::{Argb, ImageMut, ViewMut};
 
     /// Counts its renders, and panics on the third.
     #[derive(Default)]
@@ -198,15 +174,16 @@ mod tests {
             &mut self,
             _frames: &mut dyn FrameSource,
             _count: usize,
-            output: ImageMut<'_>,
+            out: FrameOut<'_>,
             _values: &ParamValues,
             _ctx: &Context,
-        ) {
+        ) -> Result<(), RenderError> {
             self.renders += 1;
             assert!(self.renders != 3, "third render");
-            if let ImageMut::U8(mut out) = output {
+            if let FrameOut::Pixels(ImageMut::U8(mut out)) = out {
                 out.row_mut(0)[0].alpha = self.renders as u8;
             }
+            Ok(())
         }
     }
 
@@ -222,40 +199,46 @@ mod tests {
         }
     }
 
-    fn render(instance: &CpuInstance) -> Result<u8, Panicked> {
+    /// Renders once on `instance` and returns the alpha it wrote, or `None` if the render
+    /// panicked.
+    fn render(instance: &CpuInstance) -> Option<u8> {
         let mut px = [Argb::<u8>::default()];
-        let out = ImageMut::U8(ViewMut::from_pixels(&mut px, 1, 1));
-        instance.render(
+        let out = FrameOut::Pixels(ImageMut::U8(ViewMut::from_pixels(&mut px, 1, 1)));
+        let rendered = instance.render(
             &mut NoFrames,
             1,
             out,
             &ParamValues::new(&[]),
             &Context::at(0.0),
-        )?;
-        Ok(px[0].alpha)
+        );
+        match rendered {
+            Ok(()) => Some(px[0].alpha),
+            Err(CpuRenderError::Panicked) => None,
+            Err(err) => panic!("{err}"),
+        }
     }
 
     #[test]
     fn new_keeps_effect_when_host_keeps() {
         let kept = CpuInstance::new(make, true).expect("a CPU effect");
         assert!(kept.is_kept());
-        assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
+        assert_eq!((render(&kept), render(&kept)), (Some(1), Some(2)));
     }
 
     #[test]
     fn render_panic_rebuilds_kept_effect() {
         let kept = CpuInstance::new(make, true).expect("a CPU effect");
-        assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
-        assert_eq!(render(&kept), Err(Panicked));
-        assert_eq!(render(&kept), Ok(1));
+        assert_eq!((render(&kept), render(&kept)), (Some(1), Some(2)));
+        assert_eq!(render(&kept), None);
+        assert_eq!(render(&kept), Some(1));
     }
 
     #[test]
     fn clear_history_rebuilds_effect_that_cannot_clear() {
         let kept = CpuInstance::new(make, true).expect("a CPU effect");
-        assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
+        assert_eq!((render(&kept), render(&kept)), (Some(1), Some(2)));
         kept.clear_history();
-        assert_eq!(render(&kept), Ok(1));
+        assert_eq!(render(&kept), Some(1));
     }
 
     #[test]
@@ -263,7 +246,7 @@ mod tests {
         let unkept = CpuInstance::new(make, false).expect("a CPU effect");
         assert!(!unkept.is_kept());
         let before = MADE.load(Ordering::SeqCst);
-        assert_eq!((render(&unkept), render(&unkept)), (Ok(1), Ok(1)));
+        assert_eq!((render(&unkept), render(&unkept)), (Some(1), Some(1)));
         assert!(MADE.load(Ordering::SeqCst) >= before + 2, "made per render");
     }
 
@@ -289,14 +272,15 @@ mod tests {
             &mut self,
             _frames: &mut dyn FrameSource,
             _count: usize,
-            output: ImageMut<'_>,
+            out: FrameOut<'_>,
             _values: &ParamValues,
             _ctx: &Context,
-        ) {
+        ) -> Result<(), RenderError> {
             self.renders += 1;
-            if let ImageMut::U8(mut out) = output {
+            if let FrameOut::Pixels(ImageMut::U8(mut out)) = out {
                 out.row_mut(0)[0].alpha = self.renders;
             }
+            Ok(())
         }
     }
 
@@ -308,10 +292,10 @@ mod tests {
     #[test]
     fn clear_history_in_place_skips_rebuild() {
         let kept = CpuInstance::new(make_clears_in_place, true).expect("a CPU effect");
-        assert_eq!((render(&kept), render(&kept)), (Ok(1), Ok(2)));
+        assert_eq!((render(&kept), render(&kept)), (Some(1), Some(2)));
         let made = MADE_CLEARS_IN_PLACE.load(Ordering::SeqCst);
         kept.clear_history();
-        assert_eq!(render(&kept), Ok(1));
+        assert_eq!(render(&kept), Some(1));
         assert_eq!(MADE_CLEARS_IN_PLACE.load(Ordering::SeqCst), made);
     }
 }

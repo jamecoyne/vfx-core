@@ -959,9 +959,9 @@ impl Effects {
                 };
                 #[cfg(target_arch = "wasm32")]
                 let input = cpu_stage::Input::Gpu(source);
-                let offer_target = !self.keep_output_in_ram;
+                let texture_output = !self.keep_output_in_ram;
                 self.last_outcome =
-                    stage.render(gpu, input, values, time, self.frame_rate, offer_target);
+                    stage.render(gpu, input, values, time, self.frame_rate, texture_output);
             }
         }
 

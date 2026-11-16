@@ -162,7 +162,7 @@ impl Gpu {
     }
 
     /// Lets CPU effects draw on this device: in browsers, where they can't open their own, and
-    /// in hosts that offer their output a GPU frame on it ([`crate::CpuEffect::render_to`]).
+    /// in hosts that offer their output a GPU frame on it ([`crate::FrameOut::Texture`]).
     /// Effects pick their device on first use, so a host shares it before they render.
     ///
     /// This takes over the device's error and loss callbacks; read them with [`Gpu::faults`].

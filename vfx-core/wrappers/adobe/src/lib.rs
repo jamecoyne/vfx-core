@@ -20,7 +20,7 @@ use std::sync::Once;
 use after_effects as ae;
 use pixel::{Depth, Placement};
 use vfx_core::cpu::{Depth as CpuDepth, FrameSource, Image, View, ViewMut};
-use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Processor, Region};
+use vfx_core::{Context, CpuEffect, FrameOut, ParamSpec, ParamValues, Processor, Region};
 use vfx_host::{Kind, diag, pipeline};
 
 pub use params::Key;
@@ -877,14 +877,17 @@ fn render_at_depth<C: CpuDepth>(
     let stride = stride(output)?;
     let (width, height) = (output.width() as i32, output.height() as i32);
     let out = ViewMut::<C>::new(output.buffer_mut(), width, height, stride);
-    effect.render(
+    let rendered = effect.render(
         &mut frames,
         plan.frame_count,
-        C::image_mut(out),
+        FrameOut::Pixels(C::image_mut(out)),
         &plan.values,
         &plan.ctx,
     );
-    frames.error.map_or(Ok(()), Err)
+    if let Some(error) = frames.error {
+        return Err(error);
+    }
+    rendered.map_err(|_| ae::Error::BadCallbackParameter)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -925,14 +928,26 @@ pub fn render_legacy(
                     let out = ViewMut::<u8>::new(out_layer.buffer_mut(), w, h, stride);
                     let mut one = SingleFrame::<u8>(in_layer, std::marker::PhantomData);
                     instance
-                        .render(&mut one, 1, u8::image_mut(out), &values, &ctx)
+                        .render(
+                            &mut one,
+                            1,
+                            FrameOut::Pixels(u8::image_mut(out)),
+                            &values,
+                            &ctx,
+                        )
                         .map_err(|_| ae::Error::BadCallbackParameter)?;
                 }
                 16 => {
                     let out = ViewMut::<u16>::new(out_layer.buffer_mut(), w, h, stride);
                     let mut one = SingleFrame::<u16>(in_layer, std::marker::PhantomData);
                     instance
-                        .render(&mut one, 1, u16::image_mut(out), &values, &ctx)
+                        .render(
+                            &mut one,
+                            1,
+                            FrameOut::Pixels(u16::image_mut(out)),
+                            &values,
+                            &ctx,
+                        )
                         .map_err(|_| ae::Error::BadCallbackParameter)?;
                 }
                 _ => return Err(ae::Error::BadCallbackParameter),

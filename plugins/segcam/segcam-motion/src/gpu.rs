@@ -21,11 +21,13 @@ use web_time::Instant;
 use vfx_core::device::{Device, DeviceSlot, NoDevice};
 use vfx_core::{DeviceFaults, wgpu};
 
-use crate::pixel::{Argb, Channel, View, ViewMut};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::pixel::{Argb, ViewMut};
+use crate::pixel::{Channel, View};
 use crate::render::RenderSettings;
 use crate::swarm::{ShadowKernel, Tile};
 pub use crate::swarm_pass::{AtlasAllocation, Slot};
-use crate::swarm_pass::{Occlusion, Readback, SwarmPass, SwarmPipelines};
+use crate::swarm_pass::{Occlusion, SwarmPass, SwarmPipelines};
 
 /// segcam's pipelines on one device, and that device's loss and error record.
 pub struct GpuContext {
@@ -461,6 +463,7 @@ pub struct Drawer {
     pass: SwarmPass,
     dev: Arc<GpuContext>,
     /// The largest buffer the device makes, which a readback has to fit.
+    #[cfg(not(target_arch = "wasm32"))]
     max_buffer_bytes: u64,
     /// The device's error count when this render began.
     errors_at_render_start: u64,
@@ -474,31 +477,7 @@ pub struct Drawer {
     /// When [`MAX_RECENT_FAULTS`] faults in the history started the cooldown.
     cooldown_started: Option<Instant>,
     cooldown: Duration,
-    /// This render's draw isn't read back yet; the next render of the same draw reads it (browsers).
-    pub unfinished: bool,
-    /// A draw submitted by [`Drawer::draw_swarm_deferred`] and not read back yet.
-    in_flight: Option<InFlightDraw>,
-    /// In-flight draws replaced in a row, as when a parameter moves every frame.
-    superseded_draws: u32,
 }
-
-/// A submitted draw awaiting readback: what it drew, its readback and map
-/// state.
-#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
-struct InFlightDraw {
-    key: u64,
-    readback: Readback,
-    state: Arc<std::sync::atomic::AtomicU8>,
-}
-
-#[cfg(any(test, target_arch = "wasm32"))]
-const PENDING: u8 = 0;
-#[cfg(any(test, target_arch = "wasm32"))]
-const MAPPED: u8 = 1;
-
-/// After this many in-flight draws replaced in a row, one render draws on the CPU.
-#[cfg(any(test, target_arch = "wasm32"))]
-const MAX_SUPERSEDED_DRAWS: u32 = 3;
 
 impl Drawer {
     /// A drawer on `dev`; `None` if the device is lost.
@@ -512,6 +491,7 @@ impl Drawer {
         });
         Some(Self {
             pass,
+            #[cfg(not(target_arch = "wasm32"))]
             max_buffer_bytes: dev.device.limits().max_buffer_size,
             errors_at_render_start: dev.errors().0,
             drawn: 0,
@@ -519,9 +499,6 @@ impl Drawer {
             recent_faults: 0,
             cooldown_started: None,
             cooldown: FAULT_COOLDOWN,
-            unfinished: false,
-            in_flight: None,
-            superseded_draws: 0,
             dev,
         })
     }
@@ -568,21 +545,12 @@ impl Drawer {
 
     /// Called as a render starts: errors reported before it aren't its own.
     pub fn begin_render(&mut self) {
-        self.unfinished = false;
         // A browser reports errors in a later task, after this render has finished, so there the
         // count carries over and the next render falls back.
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.errors_at_render_start = self.dev.errors().0;
         }
-    }
-
-    /// Abandons an in-flight draw: its frames were just cleared, and a later render of a reused
-    /// frame number could otherwise match its key.
-    pub(crate) fn drop_unfinished_draw(&mut self) {
-        self.unfinished = false;
-        self.in_flight = None;
-        self.superseded_draws = 0;
     }
 
     /// Whether the atlas is waiting for the GPU to answer a request to grow (browsers).
@@ -648,38 +616,32 @@ impl Drawer {
     }
 
     /// Draws the swarm of `windows` (visible tiles, oldest first) into `out`. `frame` is frame
-    /// `number`, for the source backdrop and live windows; `shadow` the kernel at the canvas's
-    /// scale. A browser can't wait for the GPU, so there the render may be left
-    /// [`unfinished`](Self::unfinished).
+    /// `number`, used for the source backdrop and live windows. `shadow` is the kernel at the
+    /// canvas's scale.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn draw_swarm<'t, C: Channel>(
         &mut self,
         out: &mut ViewMut<C>,
         windows: impl IntoIterator<Item = (&'t Tile, Slot)>,
         frame: Option<&View<C>>,
-        number: i64,
         s: &RenderSettings,
         shadow: &ShadowKernel,
     ) -> Result<(), Fault> {
-        #[cfg(target_arch = "wasm32")]
-        return self.draw_swarm_deferred(out, windows, frame, number, s, shadow);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = number;
-            self.check_device_faults()?;
-            self.check_readback_fits(out)?;
-            let drawn = self
-                .pass
-                .draw(out, windows, frame, s, shadow, Occlusion::Depth);
-            drawn.map_err(|e| Fault(e.to_string()))?;
-            self.check_device_faults()?;
-            self.drawn += 1;
-            self.record_outcome(false);
-            Ok(())
-        }
+        self.check_device_faults()?;
+        self.check_readback_fits(out)?;
+        let drawn = self
+            .pass
+            .draw(out, windows, frame, s, shadow, Occlusion::Depth);
+        drawn.map_err(|e| Fault(e.to_string()))?;
+        self.check_device_faults()?;
+        self.drawn += 1;
+        self.record_outcome(false);
+        Ok(())
     }
 
     /// A fault where a readback of `out` is a larger buffer than the device
     /// makes.
+    #[cfg(not(target_arch = "wasm32"))]
     fn check_readback_fits<C: Channel>(&self, out: &ViewMut<C>) -> Result<(), Fault> {
         let row = out.width as u64 * size_of::<Argb<C>>() as u64;
         let padded_row = row.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
@@ -689,94 +651,6 @@ impl Drawer {
                 "the readback needs {bytes} bytes, more than the GPU's largest buffer"
             )));
         }
-        Ok(())
-    }
-
-    /// [`Drawer::draw_swarm`] without waiting: the draw is submitted and mapped,
-    /// and this render is left [`unfinished`](Self::unfinished). The next render
-    /// that asks for the same draw reads it back into `out`; one that asks for
-    /// another drops it.
-    #[cfg(any(test, target_arch = "wasm32"))]
-    pub(crate) fn draw_swarm_deferred<'t, C: Channel>(
-        &mut self,
-        out: &mut ViewMut<C>,
-        windows: impl IntoIterator<Item = (&'t Tile, Slot)>,
-        frame: Option<&View<C>>,
-        number: i64,
-        s: &RenderSettings,
-        shadow: &ShadowKernel,
-    ) -> Result<(), Fault> {
-        use std::hash::{Hash, Hasher};
-        use std::sync::atomic::{AtomicU8, Ordering};
-
-        self.check_device_faults()?;
-        self.check_readback_fits(out)?;
-        let windows: Vec<(&Tile, Slot)> = windows.into_iter().collect();
-        let mut key = std::hash::DefaultHasher::new();
-        (out.width, out.height, depth::<C>(), number).hash(&mut key);
-        (s.straight_alpha, s.mirror, s.live_windows).hash(&mut key);
-        (s.swarm_background as u8, frame.is_some()).hash(&mut key);
-        for (tile, slot) in &windows {
-            let (content, clipped) = (tile.content_rect, tile.clipped_rect);
-            [content.x, content.y, content.w, content.h].hash(&mut key);
-            [clipped.x, clipped.y, clipped.w, clipped.h].hash(&mut key);
-            slot.hash(&mut key);
-        }
-        let key = key.finish();
-        if let Some(in_flight) = self.in_flight.take() {
-            let state = in_flight.state.load(Ordering::Acquire);
-            match (in_flight.key == key, state) {
-                (true, MAPPED) => {
-                    let copied = in_flight.readback.copy_into(out);
-                    self.pass.restore_readback(in_flight.readback);
-                    copied.map_err(|e| Fault(e.to_string()))?;
-                    self.superseded_draws = 0;
-                    self.check_device_faults()?;
-                    self.drawn += 1;
-                    self.record_outcome(false);
-                    return Ok(());
-                }
-                (true, PENDING) => {
-                    self.in_flight = Some(in_flight);
-                    self.unfinished = true;
-                    return Ok(());
-                }
-                (true, _) => return Err(Fault("the readback failed to map".into())),
-                (false, PENDING) => self.superseded_draws += 1,
-                (false, MAPPED) => {
-                    in_flight.readback.buffer().unmap();
-                    self.pass.restore_readback(in_flight.readback);
-                }
-                (false, _) => {}
-            }
-        }
-        if self.superseded_draws >= MAX_SUPERSEDED_DRAWS {
-            self.superseded_draws = 0;
-            return Err(Fault("the draw changed before the GPU was done".into()));
-        }
-        let size = (out.width, out.height);
-        let submitted = self
-            .pass
-            .submit(size, windows, frame, s, shadow, Occlusion::Depth);
-        submitted.map_err(|e| Fault(e.to_string()))?;
-        // The next draw takes another readback while this one is mapped.
-        let Some(readback) = self.pass.take_readback() else {
-            return Err(Fault("the draw left no readback".into()));
-        };
-        let state = Arc::new(AtomicU8::new(PENDING));
-        let done = state.clone();
-        readback
-            .buffer()
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |r| {
-                done.store(if r.is_ok() { MAPPED } else { u8::MAX }, Ordering::Release);
-            });
-        self.in_flight = Some(InFlightDraw {
-            key,
-            readback,
-            state,
-        });
-        self.unfinished = true;
         Ok(())
     }
 
@@ -820,90 +694,6 @@ fn depth<C: Channel>() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A drawer and a 30 window scene to draw with it: the tiles, their slots and
-    /// the kernel.
-    fn drawer_with_scene() -> (Drawer, Vec<Tile>, AtlasAllocation, Arc<ShadowKernel>) {
-        use crate::swarm_pass::scene::{trail_tiles, visible};
-        let mut drawer =
-            Drawer::new(Arc::new(test_context())).expect("a drawer on a working device");
-        let tiles = trail_tiles::<u8>(CANVAS, 12, 3, false);
-        let shown: Vec<Tile> = visible(&tiles, CANVAS, 30)
-            .into_iter()
-            .map(|(_, tile)| tile.clone())
-            .collect();
-        let shadow = crate::swarm::shadow_kernel(crate::swarm::SwarmMetrics::new(CANVAS.1).scale);
-        let uploaded = drawer.upload_tiles(&shown, CANVAS);
-        let allocation = uploaded
-            .expect("the upload is accepted")
-            .expect("the atlas has room");
-        (drawer, shown, allocation, shadow)
-    }
-
-    const CANVAS: (i32, i32) = (320, 180);
-
-    fn swarm_settings() -> RenderSettings {
-        RenderSettings {
-            mode: crate::render::OutputMode::Swarm,
-            ..RenderSettings::default()
-        }
-    }
-
-    /// The draw a browser makes, with the polls its event loop would run in
-    /// between.
-    #[test]
-    fn deferred_swarm_draw_matches_waiting_draw() {
-        let _lock = gpu_test_lock();
-        let (mut drawer, shown, allocation, shadow) = drawer_with_scene();
-        let s = swarm_settings();
-        let (w, h) = CANVAS;
-        let mut waited = vec![Argb::<u8>::default(); (w * h) as usize];
-        let windows = || shown.iter().zip(allocation.slots.iter().copied());
-        let view = &mut ViewMut::from_pixels(&mut waited, w, h);
-        let drawn = drawer.draw_swarm(view, windows(), None, 0, &s, &shadow);
-        drawn.expect("the waiting draw comes back");
-
-        let mut deferred = vec![Argb::<u8>::default(); (w * h) as usize];
-        let mut renders = 0;
-        loop {
-            drawer.begin_render();
-            let view = &mut ViewMut::from_pixels(&mut deferred, w, h);
-            let drawn = drawer.draw_swarm_deferred(view, windows(), None, 0, &s, &shadow);
-            drawn.expect("the deferred draw is accepted");
-            renders += 1;
-            if !drawer.unfinished {
-                break;
-            }
-            assert!(renders < 1000, "the draw never came back");
-            vfx_core::poll_device(&drawer.dev.device, wgpu::PollType::Poll).expect("a poll");
-        }
-        assert!(renders >= 2, "the first render can't have the pixels yet");
-        assert!(waited == deferred, "the deferred draw differs");
-        assert_eq!(drawer.drawn, 2);
-    }
-
-    /// A deferred draw replaced [`MAX_SUPERSEDED_DRAWS`] times in a row faults,
-    /// and the caller draws that render on the CPU.
-    #[test]
-    fn deferred_swarm_draw_faults_after_max_superseded() {
-        let _lock = gpu_test_lock();
-        let (mut drawer, shown, allocation, shadow) = drawer_with_scene();
-        let s = swarm_settings();
-        let (w, h) = CANVAS;
-        let mut out = vec![Argb::<u8>::default(); (w * h) as usize];
-        let mut faults = Vec::new();
-        for number in 0..8 {
-            drawer.begin_render();
-            let view = &mut ViewMut::from_pixels(&mut out, w, h);
-            let windows = shown.iter().zip(allocation.slots.iter().copied());
-            // Another frame number is another draw, as when a clip plays.
-            let drawn = drawer.draw_swarm_deferred(view, windows, None, number, &s, &shadow);
-            faults.push(drawn.is_err());
-        }
-        let expected = [false, false, false, true, false, false, false, true];
-        assert_eq!(faults, expected, "which renders gave up");
-        assert_eq!(drawer.drawn, 0, "an unread draw counted as drawn");
-    }
 
     /// Opens a device and shares it as a host does, until dropped.
     struct HostShare {

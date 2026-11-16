@@ -43,10 +43,10 @@ wgpu also finish their work before the other API starts. No pixels pass through 
 
 CPU effects read the frame back through RAM for their work on the CPU. On Windows the
 plugin shares that same Vulkan device with them when the instance is made, so one that
-draws on the GPU (segcam's swarm) can draw its output into a frame there instead
-(`CpuEffect::render_to`). That frame is copied into the output image and drawn into the
-host's framebuffer like a GPU effect's, with no readback and no upload. A render the
-effect draws on the CPU goes up through RAM as before.
+draws on the GPU (segcam's swarm) draws its output into a texture there
+(`FrameOut::Texture`). That texture is copied into the output image and drawn into the
+host's framebuffer like a GPU effect's, with no readback. A render the effect draws on the
+CPU is uploaded into the texture.
 
 If sharing can't be set up (missing extensions, a device mismatch, unsupported export
 formats or a setup error), the plugin reads the texture back through RAM instead.
@@ -64,8 +64,8 @@ frames come back.
 A frame waits at most 1 s for the GPU (`VFX_FFGL_GPU_WAIT_MS` changes it, for tests). After that
 the instance goes through RAM and tries the shared path again 60 s later, once the GPU has
 finished with the old images; if it never does, they are leaked rather than waited on.
-A CPU effect's shared images are allocated when the effect can draw its settings on the GPU
-(`CpuEffect::can_draw_to_target`), and kept while the frame size holds.
+A CPU effect's shared images are allocated once a device is shared with OpenGL. They are kept
+until the frame size changes.
 Headless GPU setup uses Vulkan, Metal or DX12 so wgpu leaves the host's
 OpenGL context alone. On Windows, GL draws convert the row order and alpha before
 readback and after upload; the RAM buffers already match the pipeline's canvas.

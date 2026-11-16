@@ -829,11 +829,6 @@ pub struct Readback {
 }
 
 impl Readback {
-    /// The buffer a draw's output is copied into, for the caller to map.
-    pub fn buffer(&self) -> &wgpu::Buffer {
-        &self.buffer
-    }
-
     /// Copies the mapped buffer into `out` and unmaps it. An error where
     /// `out` isn't the canvas it was made for.
     pub fn copy_into<C: Channel>(&self, out: &mut ViewMut<C>) -> Result<(), DrawError> {
@@ -1161,23 +1156,6 @@ impl SwarmPass {
         let targets = self.targets.as_ref().ok_or(DrawError::NoReadback)?;
         let readback = targets.readback.as_ref().ok_or(DrawError::NoReadback)?;
         readback.copy_into(out)
-    }
-
-    /// Takes the readback of the last [`Self::submit`] out, for a caller
-    /// that maps it across renders; the next submit makes another.
-    pub fn take_readback(&mut self) -> Option<Readback> {
-        self.targets.as_mut()?.readback.take()
-    }
-
-    /// Gives back an unmapped readback from [`Self::take_readback`], if the
-    /// canvas is still the one it was made for and has none.
-    pub fn restore_readback(&mut self, readback: Readback) {
-        if let Some(targets) = &mut self.targets
-            && targets.size == readback.size
-            && targets.readback.is_none()
-        {
-            targets.readback = Some(readback);
-        }
     }
 
     /// Submits the draw of `windows` over a canvas of `(w, h)` at depth `C`,

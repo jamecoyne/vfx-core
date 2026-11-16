@@ -22,7 +22,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use vfx_core::cpu::{Argb, Depth as CpuDepth, FrameSource, View, ViewMut};
-use vfx_core::{Context, ParamSpec, ParamValues, Processor, Region};
+use vfx_core::{Context, FrameOut, ParamSpec, ParamValues, Processor, Region};
 use vfx_host::{Kind, diag, pipeline};
 
 use host::{Props, check_status, required, suites};
@@ -1131,9 +1131,13 @@ impl CpuRender<'_> {
             output_pixels.clear();
             output_pixels.resize(canvas.width() * canvas.height(), Argb::default());
             let view = C::image_mut(ViewMut::from_pixels(output_pixels, w, h));
-            let rendered =
-                self.effect
-                    .render(&mut frames, self.frame_count, view, self.values, self.ctx);
+            let rendered = self.effect.render(
+                &mut frames,
+                self.frame_count,
+                FrameOut::Pixels(view),
+                self.values,
+                self.ctx,
+            );
             // The host can free what it holds for this render before the output is written.
             frames.release();
             if rendered.is_err() {

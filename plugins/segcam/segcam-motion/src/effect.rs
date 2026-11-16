@@ -2,9 +2,8 @@
 //! the host works in. Hosts fetch (or keep) the frames before the current one that
 //! [`CpuEffect::frames_before`] asks for.
 
-use vfx_core::Target;
-use vfx_core::cpu::{FrameSource, ImageMut};
-use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Report, Unit};
+use vfx_core::cpu::{Argb, FrameSource, Image, ImageMut, View, ViewMut};
+use vfx_core::{Context, CpuEffect, FrameOut, ParamSpec, ParamValues, RenderError, Report, Unit};
 
 use crate::{
     AnalysisStep, Color, DetectionMode, FaceParts, IncrementalRenderer, MotionSettings, OutputMode,
@@ -151,6 +150,10 @@ pub fn settings_from_params(p: &ParamValues, premultiplied: bool) -> RenderSetti
 /// recomputes only what changed.
 pub struct SegcamMotion {
     renderer: IncrementalRenderer,
+    /// What a render into a texture draws in RAM, uploaded unless the swarm
+    /// drew into the texture itself.
+    canvas: Vec<Argb<u8>>,
+    drew_into_texture: bool,
     _slot_user: crate::gpu::ContextUser,
 }
 
@@ -176,11 +179,19 @@ impl SegcamMotion {
         renderer.use_gpu(gpu);
         Self {
             renderer,
+            canvas: Vec::new(),
+            drew_into_texture: false,
             _slot_user: crate::gpu::ContextUser::new(
                 &crate::gpu::SLOT_CONTEXT,
                 release_shared_faces,
             ),
         }
+    }
+
+    /// Whether the swarm drew the last render straight into its texture
+    /// output, with no upload from RAM.
+    pub fn drew_into_texture(&self) -> bool {
+        self.drew_into_texture
     }
 }
 
@@ -221,47 +232,39 @@ impl CpuEffect for SegcamMotion {
         &mut self,
         frames: &mut dyn FrameSource,
         count: usize,
-        output: ImageMut<'_>,
+        out: FrameOut<'_>,
         params: &ParamValues,
         ctx: &Context,
-    ) {
+    ) -> Result<(), RenderError> {
         let s = RenderSettings {
             analysis_step: AnalysisStep::for_frame_rate(ctx.frame_rate),
             ..settings_from_params(params, ctx.premultiplied)
         };
         let (renderer, n) = (&mut self.renderer, ctx.frame);
-        match output {
-            ImageMut::U8(mut out) => renderer.render_frame(&s, frames, count, n, &mut out),
-            ImageMut::U16(mut out) => renderer.render_frame(&s, frames, count, n, &mut out),
-            ImageMut::F32(mut out) => renderer.render_frame(&s, frames, count, n, &mut out),
+        self.drew_into_texture = false;
+        match out {
+            FrameOut::Pixels(ImageMut::U8(mut out)) => {
+                renderer.render_frame(&s, frames, count, n, &mut out)
+            }
+            FrameOut::Pixels(ImageMut::U16(mut out)) => {
+                renderer.render_frame(&s, frames, count, n, &mut out)
+            }
+            FrameOut::Pixels(ImageMut::F32(mut out)) => {
+                renderer.render_frame(&s, frames, count, n, &mut out)
+            }
+            FrameOut::Texture(texture) => {
+                let (w, h) = (texture.frame.width as i32, texture.frame.height as i32);
+                self.canvas.resize(w as usize * h as usize, Argb::default());
+                renderer.offer_texture(texture);
+                let mut canvas = ViewMut::from_pixels(&mut self.canvas, w, h);
+                renderer.render_frame(&s, frames, count, n, &mut canvas);
+                self.drew_into_texture = renderer.took_texture();
+                if !self.drew_into_texture {
+                    texture.write(Image::U8(View::from_pixels(&self.canvas, w, h)))?;
+                }
+            }
         }
-    }
-
-    /// Only the swarm draws on the GPU in a form a target can take, and only on the device a host
-    /// shares, which `SEGCAM_GPU=0` leaves.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn can_draw_to_target(&self, params: &ParamValues) -> bool {
-        settings_from_params(params, false).mode == OutputMode::Swarm && self.renderer.gpu_wanted()
-    }
-
-    /// A swarm drawn on the GPU goes into `target` when it is on the device the swarm draws
-    /// on, which it is where the host shared it before the first render (FFGL).
-    fn render_to(
-        &mut self,
-        frames: &mut dyn FrameSource,
-        count: usize,
-        output: ImageMut<'_>,
-        target: Target<'_>,
-        params: &ParamValues,
-        ctx: &Context,
-    ) -> bool {
-        self.renderer.offer_target(target);
-        self.render(frames, count, output, params, ctx);
-        self.renderer.took_target()
-    }
-
-    fn unfinished(&self) -> bool {
-        self.renderer.unfinished()
+        Ok(())
     }
 
     fn report(&self) -> Report {
@@ -403,7 +406,15 @@ mod tests {
                 };
                 let count = history.len();
                 let view = ViewMut::from_pixels(&mut out, w, h);
-                effect.render(history, count, ImageMut::U8(view), &params, &ctx);
+                effect
+                    .render(
+                        history,
+                        count,
+                        FrameOut::Pixels(ImageMut::U8(view)),
+                        &params,
+                        &ctx,
+                    )
+                    .unwrap();
             }
             out
         };
@@ -462,7 +473,15 @@ mod tests {
             };
             let count = history.len();
             let view = ViewMut::from_pixels(&mut out, w, h);
-            effect.render(&mut history, count, ImageMut::U8(view), &params, &ctx);
+            effect
+                .render(
+                    &mut history,
+                    count,
+                    FrameOut::Pixels(ImageMut::U8(view)),
+                    &params,
+                    &ctx,
+                )
+                .unwrap();
         }
         let at = |x: i32, y: i32| out[(y * w + x) as usize].alpha;
         assert_eq!(at(2, 2), 0, "still background is cut out");

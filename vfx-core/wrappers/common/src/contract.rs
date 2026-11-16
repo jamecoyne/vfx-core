@@ -2,14 +2,14 @@
 //! render of the same frames, or under a
 //! [fetch budget](FrameSource::fetch_budget) catches up to it. Hosts rely on it
 //! (see [`crate::kept`]); an effect crate checks itself with [`check`] in its
-//! tests, on a clip that moves. A render left
-//! [unfinished](CpuEffect::unfinished) counts only once the same frame renders
-//! again and finishes, as a host must show it.
+//! tests, on a clip that moves.
 
 use std::collections::BTreeSet;
 
 use vfx_core::cpu::{Argb, FrameSource, Image, ImageMut, View, ViewMut};
-use vfx_core::{Context, CpuEffect, Frame, Gpu, ParamValues, Processor, Target};
+use vfx_core::{
+    Context, CpuEffect, Frame, FrameOut, Gpu, GpuFrame, ParamValues, Processor, RenderError,
+};
 
 use crate::kept::cpu_effect;
 
@@ -117,12 +117,15 @@ pub fn stream_catch_up_renders(frames: usize, budget: usize) -> usize {
     frames.saturating_sub(budget).div_ceil(budget.max(2) - 1) + 1
 }
 
-/// How often a frame is rendered again while the effect says it is unfinished.
-const MAX_UNFINISHED_RERENDERS: usize = 8;
-
 /// The first difference [`check`] found between a kept effect and a fresh one.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum Mismatch {
+    #[error("frame {frame} failed to render: {source}")]
+    Failed {
+        frame: i64,
+        #[source]
+        source: RenderError,
+    },
     #[error(
         "frame {frame}: a render under a fetch budget of {FETCH_BUDGET} read {read} earlier \
          frames, more than {limit}"
@@ -132,8 +135,6 @@ pub enum Mismatch {
         read: usize,
         limit: usize,
     },
-    #[error("frame {frame} is still unfinished after {MAX_UNFINISHED_RERENDERS} renders")]
-    Unfinished { frame: i64 },
     #[error("{what}: frame {frame} differs from a fresh render, first at pixel {pixel}")]
     Differs {
         /// The step of the check that saw it.
@@ -164,13 +165,11 @@ pub enum Mismatch {
          {render}, differs from a fresh render"
     )]
     Stream { frame: i64, render: usize },
-    #[error("{what}: frame {frame} differs from a fresh render (drawn {drawn}, fresh {fresh})")]
-    Target {
+    #[error("{what}: frame {frame} in a texture differs from a fresh render")]
+    Texture {
         /// The step of the check that saw it.
         what: &'static str,
         frame: i64,
-        drawn: bool,
-        fresh: bool,
     },
 }
 
@@ -189,40 +188,38 @@ fn render(
         frame_rate: clip.frame_rate,
         ..Context::at(number as f64 / clip.frame_rate.unwrap_or(30.0))
     };
-    for _ in 0..MAX_UNFINISHED_RERENDERS {
-        let mut source = Source {
-            clip,
-            first: number - count + 1,
-            missing,
-            fetch_budget: read_limit.map(|_| FETCH_BUDGET),
-            fixed,
-            earlier: BTreeSet::new(),
-            current: count as usize - 1,
-        };
-        // A new buffer each time, so a finished render can't lean on an unfinished one.
-        let mut out = vec![Argb::default(); clip.frames[0].len()];
-        let view = ViewMut::from_pixels(&mut out, clip.width, clip.height);
-        effect.render(
-            &mut source,
-            count as usize,
-            ImageMut::U8(view),
-            values,
-            &ctx,
-        );
-        if let Some(limit) = read_limit
-            && source.earlier.len() > limit
-        {
-            return Err(Mismatch::OverBudget {
-                frame: number,
-                read: source.earlier.len(),
-                limit,
-            });
-        }
-        if !effect.unfinished() {
-            return Ok(out);
-        }
+    let mut source = Source {
+        clip,
+        first: number - count + 1,
+        missing,
+        fetch_budget: read_limit.map(|_| FETCH_BUDGET),
+        fixed,
+        earlier: BTreeSet::new(),
+        current: count as usize - 1,
+    };
+    let mut out = vec![Argb::default(); clip.frames[0].len()];
+    let view = ViewMut::from_pixels(&mut out, clip.width, clip.height);
+    let rendered = effect.render(
+        &mut source,
+        count as usize,
+        FrameOut::Pixels(ImageMut::U8(view)),
+        values,
+        &ctx,
+    );
+    rendered.map_err(|source| Mismatch::Failed {
+        frame: number,
+        source,
+    })?;
+    if let Some(limit) = read_limit
+        && source.earlier.len() > limit
+    {
+        return Err(Mismatch::OverBudget {
+            frame: number,
+            read: source.earlier.len(),
+            limit,
+        });
     }
-    Err(Mismatch::Unfinished { frame: number })
+    Ok(out)
 }
 
 /// Compares a kept effect's renders of `clip` with a fresh effect's and
@@ -479,15 +476,15 @@ pub fn check(make: fn() -> Processor, clip: &Clip, values: &[ParamValues]) -> Re
     Ok(())
 }
 
-/// What a render offered `target` gave: the frame's bytes when it drew there, the output's when not.
-fn render_offering(
+/// Renders frame `number` into `texture` and returns its bytes. The texture is cleared first,
+/// so a render that doesn't write to it shows up.
+fn render_into(
     effect: &mut dyn CpuEffect,
     clip: &Clip,
     number: i64,
     values: &ParamValues,
-    gpu: &Gpu,
-    target: &Frame,
-) -> (bool, Vec<u8>) {
+    texture: GpuFrame<'_>,
+) -> Result<Vec<u8>, Mismatch> {
     let count = (effect.frames_before(values, clip.frame_rate) as i64 + 1).min(number + 1);
     let ctx = Context {
         frame: number,
@@ -503,63 +500,62 @@ fn render_offering(
         earlier: BTreeSet::new(),
         current: count as usize - 1,
     };
-    let mut out = vec![Argb::<u8>::default(); clip.frames[0].len()];
-    let view = ViewMut::from_pixels(&mut out, clip.width, clip.height);
-    let drawn = effect.render_to(
+    let frame = texture.frame;
+    let cleared = vec![0; (frame.width * frame.height * frame.bytes_per_pixel()) as usize];
+    frame.write(texture.gpu, &cleared);
+    let rendered = effect.render(
         &mut source,
         count as usize,
-        ImageMut::U8(view),
-        Target::new(gpu, target),
+        FrameOut::Texture(texture),
         values,
         &ctx,
     );
-    match drawn {
-        true => (true, target.read(gpu)),
-        false => (false, bytemuck::cast_slice(&out).to_vec()),
-    }
+    rendered.map_err(|source| Mismatch::Failed {
+        frame: number,
+        source,
+    })?;
+    Ok(texture.frame.read(texture.gpu))
 }
 
-/// [`check`] for a host offering a GPU frame on `gpu`, the device it shared: through one kept
-/// effect forwards, backwards, and after clearing history for other pixels under the same frame
-/// numbers, every render matches a fresh effect's, whether or not it drew into the frame. Returns
-/// how many kept renders drew into it, so a caller can tell the check wasn't empty.
-pub fn check_target(
+/// [`check`] for a host whose output is a texture on `gpu`, the device it shared. Every render
+/// into the texture must match a fresh effect's. One kept effect renders the clip forwards and
+/// backwards. Then its history is cleared and it renders an edited clip, which has different
+/// pixels under the same frame numbers.
+pub fn check_texture(
     make: fn() -> Processor,
     clip: &Clip,
     values: &ParamValues,
     gpu: &Gpu,
     format: vfx_core::wgpu::TextureFormat,
-) -> Result<usize, Mismatch> {
-    let target = Frame::new(gpu, clip.width as u32, clip.height as u32, format);
+) -> Result<(), Mismatch> {
+    let frame = Frame::new(gpu, clip.width as u32, clip.height as u32, format);
+    let texture = GpuFrame { gpu, frame: &frame };
     let n = clip.len();
     let edited = clip.edited_before(n - 1);
     let mut kept = cpu_effect(make);
     let compare = |kept: &mut dyn CpuEffect, clip: &Clip, number: i64, what: &'static str| {
-        let got = render_offering(kept, clip, number, values, gpu, &target);
-        let want = render_offering(&mut *cpu_effect(make), clip, number, values, gpu, &target);
+        let got = render_into(kept, clip, number, values, texture)?;
+        let want = render_into(&mut *cpu_effect(make), clip, number, values, texture)?;
         match got == want {
-            true => Ok(usize::from(got.0)),
-            false => Err(Mismatch::Target {
+            true => Ok(()),
+            false => Err(Mismatch::Texture {
                 what,
                 frame: number,
-                drawn: got.0,
-                fresh: want.0,
             }),
         }
     };
-    let mut drawn = 0;
     for number in 0..n {
-        drawn += compare(&mut *kept, clip, number, "forwards")?;
+        compare(&mut *kept, clip, number, "forwards")?;
     }
     for number in (0..n).rev() {
-        drawn += compare(&mut *kept, clip, number, "backwards")?;
+        compare(&mut *kept, clip, number, "backwards")?;
     }
     if kept.clear_history() {
         for number in 0..n {
-            drawn += compare(&mut *kept, &edited, number, "after clearing history")?;
+            compare(&mut *kept, &edited, number, "after clearing history")?;
         }
     }
-    Ok(drawn)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -589,10 +585,10 @@ mod tests {
             &mut self,
             frames: &mut dyn FrameSource,
             count: usize,
-            output: ImageMut<'_>,
+            out: FrameOut<'_>,
             _: &ParamValues,
             ctx: &Context,
-        ) {
+        ) -> Result<(), RenderError> {
             let mut total = 0u8;
             for index in 0..count {
                 let frame = ctx.frame - (count - 1 - index) as i64;
@@ -611,9 +607,10 @@ mod tests {
                     total = total.wrapping_add(sum);
                 });
             }
-            if let ImageMut::U8(mut out) = output {
+            if let FrameOut::Pixels(ImageMut::U8(mut out)) = out {
                 out.row_mut(0)[0].red = total;
             }
+            Ok(())
         }
     }
 
@@ -657,56 +654,14 @@ mod tests {
             &mut self,
             _: &mut dyn FrameSource,
             _: usize,
-            output: ImageMut<'_>,
+            out: FrameOut<'_>,
             _: &ParamValues,
             _: &Context,
-        ) {
-            if let ImageMut::U8(mut out) = output {
+        ) -> Result<(), RenderError> {
+            if let FrameOut::Pixels(ImageMut::U8(mut out)) = out {
                 out.row_mut(0)[0].red = u8::from(self.cleared);
             }
-        }
-    }
-
-    /// Reports each frame's first render unfinished, with a wrong pixel, and draws the frame on
-    /// its next render, like a browser's GPU draw. With `stuck` set, it never finishes.
-    #[derive(Default)]
-    struct Deferred {
-        waiting: Option<i64>,
-        stuck: bool,
-    }
-
-    impl CpuEffect for Deferred {
-        fn params(&self) -> &[ParamSpec] {
-            &[]
-        }
-        fn keeps_state(&self) -> bool {
-            true
-        }
-        fn render(
-            &mut self,
-            frames: &mut dyn FrameSource,
-            count: usize,
-            output: ImageMut<'_>,
-            _: &ParamValues,
-            ctx: &Context,
-        ) {
-            let ImageMut::U8(mut out) = output else {
-                return;
-            };
-            if self.stuck || self.waiting != Some(ctx.frame) {
-                self.waiting = Some(ctx.frame);
-                out.row_mut(0)[0].red = 1;
-                return;
-            }
-            self.waiting = None;
-            frames.with_frame(count - 1, &mut |image| {
-                if let Some(Image::U8(v)) = image {
-                    out.row_mut(0)[0].red = v.row(0)[0].red;
-                }
-            });
-        }
-        fn unfinished(&self) -> bool {
-            self.waiting.is_some()
+            Ok(())
         }
     }
 
@@ -716,7 +671,7 @@ mod tests {
         #[test]
         fn accepts_rereading_effect() {
             let make = || Processor::Cpu(Box::new(Sums::default()));
-            assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
+            check(make, &clip(), &[ParamValues::new(&[])]).unwrap();
         }
 
         #[test]
@@ -742,24 +697,6 @@ mod tests {
                 matches!(&err, Mismatch::Differs { what, .. } if *what == "after clearing history"),
                 "{err}"
             );
-        }
-
-        #[test]
-        fn waits_for_unfinished_render() {
-            let make = || Processor::Cpu(Box::new(Deferred::default()));
-            assert_eq!(check(make, &clip(), &[ParamValues::new(&[])]), Ok(()));
-        }
-
-        #[test]
-        fn rejects_stuck_render() {
-            let make = || {
-                Processor::Cpu(Box::new(Deferred {
-                    stuck: true,
-                    ..Deferred::default()
-                }))
-            };
-            let err = check(make, &clip(), &[ParamValues::new(&[])]).expect_err("unfinished");
-            assert!(matches!(err, Mismatch::Unfinished { .. }), "{err}");
         }
     }
 }

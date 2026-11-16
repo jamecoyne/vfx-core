@@ -108,15 +108,13 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | Item | Where |
 |---|---|
 | `Effect` (GPU): `params`, `prepare`, `render`, `layer_inputs`, `layer_name`, `render_layers`, `region` | vfx-core |
-| `CpuEffect`: `params`, `frames_before` (the frame rate), `render` | vfx-core |
+| `CpuEffect`: `params`, `frames_before` (the frame rate), `render` (`FrameOut` and `GpuFrame`: an output that is a texture or pixels; returns `RenderError`) | vfx-core |
 | `CpuEffect::keeps_state` | vfx-core |
 | `DeviceFaults`, `Gpu::faults`, `Gpu::shared_faults`, `Gpu::watch_faults` (the error and loss callbacks of a device, which `Gpu::share` takes over; each device has its own record), `poll_device` (a poll that returns device loss as an error) | vfx-core |
 | `CpuEffect::clear_history` (forget earlier frames, keeping GPU resources; default `false`, and the host rebuilds the effect) | vfx-core |
-| `CpuEffect::unfinished` (browsers: the last render waits on the GPU, the host renders the frame again) | vfx-core |
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core |
 | `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core |
-| `CpuEffect::render_to` and `Target` (a host's GPU frame the effect may draw its output into instead) | vfx-core |
-| `CpuEffect::can_draw_to_target` (whether a render can use a `Target`, so a host allocates one only then; default `false`) | vfx-core |
+| `FrameOut::with_pixels`, `GpuFrame::write` (an effect that draws in RAM uploads into a texture output) | vfx-core |
 | `CpuEffect::report`, `Report`, `Reading` (where the last render's work ran and what it found; default empty) | vfx-core |
 | `CpuEffect::device_lost`, `CpuInstance::device_lost` (the host's shared device was lost: the effect lets go of everything on it, so the host can open a new one; default does nothing) | vfx-core |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core |
@@ -139,20 +137,18 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | Pixels: `Channel`, `Depth`, `View`, `ViewMut`, `Image`, `ImageMut`, `Argb` | vfx-core |
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core |
 | `contract::check` and `Clip` (a kept render equals a fresh one; under a fetch budget, in order, and after a jump within `held_catch_up_renders` for a held frame and `stream_catch_up_renders` for a stream) | vfx-host |
-| `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host |
+| `CpuInstance` and `CpuRenderError` (one kept effect per host instance) | vfx-host |
 | `device` (exports, waits) and `try_device` (live, never waits): the core slot's device for GPU effects through RAM; `pool_key`; `release_own_device`, which a target calls after it shares a device; `pipeline::run` returns `Result` and fails on a validation error in its own calls (`pipeline::checked`); `pipeline::evict_lost` | vfx-host |
 | `CpuInstance::frames_held` | vfx-host |
 | `CpuInstance::values_known` | vfx-host |
-| `CpuInstance::render_to` | vfx-host |
 | `CpuInstance::report` | vfx-host |
-| `CpuInstance::can_draw_to_target` | vfx-host |
 | `plugin::register`, `plugin`, `gpu` | vfx-host |
 | `controls::layout` | vfx-host |
 | `by_rows` (a frame in row bands over a work queue) | vfx-host |
 
 A target implements `FrameSource` for its frames. It fills a `Context` for each render. It keeps a
 `CpuInstance` if it keeps effects, and it lays out parameters with `controls::layout`. The browser
-items (`unfinished`, `share`, `shared`) are the only parts that depend on the platform.
+items (`share`, `shared`) are the only parts that depend on the platform.
 
 ## Layout
 
@@ -382,10 +378,10 @@ conversions. Each host also has a harness that runs the effects:
   images shared with OpenGL. Everything else, and any setup failure, goes through RAM. If the GPU
   fails, the frame passes through unchanged instead of failing the host's render.
 - A CPU effect that draws on the GPU can leave its output there. On Windows, the FFGL target shares
-  the device of its Vulkan images (`Gpu::share`) before the effect's first render. It offers each
-  render a frame on that device (`CpuEffect::render_to`). An effect that draws there says so. The
-  frame is then shown with no trip through RAM. Otherwise its output goes up through RAM as before.
-  The input still comes through RAM, for the effect's work on the CPU.
+  the device of its Vulkan images (`Gpu::share`) before the effect's first render. It hands each
+  render a texture on that device as its output (`FrameOut::Texture`), which is shown with no trip
+  through RAM. An effect that draws in RAM uploads into it. The input still comes through RAM, for
+  the effect's work on the CPU.
 - The OpenFX and FFGL bindings are bindgen's output, committed so a build needs neither
   bindgen nor libclang: `vfx-core/wrappers/ofx/src/sys.rs` from the OpenFX 1.5.1 headers, and
   `vfx-core/wrappers/ffgl-common/src/sys.rs` from `FFGL.h` in Resolume's SDK, with its licence.

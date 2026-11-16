@@ -146,7 +146,7 @@ vfx-build = {{ path = "../../vfx-core/wrappers/build" }}
 //! amount, on the CPU, at whatever depth the host works in.
 
 use vfx_core::cpu::{{Argb, Depth, FrameSource, ImageMut, ViewMut}};
-use vfx_core::{{Context, CpuEffect, ParamSpec, ParamValues}};
+use vfx_core::{{Context, CpuEffect, FrameOut, ParamSpec, ParamValues, RenderError}};
 
 vfx_plugin::export!(cpu: {file});
 
@@ -164,16 +164,16 @@ impl CpuEffect for {file} {{
         &mut self,
         frames: &mut dyn FrameSource,
         count: usize,
-        output: ImageMut<'_>,
+        out: FrameOut<'_>,
         params: &ParamValues,
         _ctx: &Context,
-    ) {{
+    ) -> Result<(), RenderError> {{
         let amount = params.float("amount");
-        match output {{
+        out.with_pixels(|pixels| match pixels {{
             ImageMut::U8(out) => invert(frames, count, out, amount),
             ImageMut::U16(out) => invert(frames, count, out, amount),
             ImageMut::F32(out) => invert(frames, count, out, amount),
-        }}
+        }})
     }}
 }}
 

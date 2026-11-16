@@ -2,6 +2,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use crate::Gpu;
+use crate::cpu::{Argb, Channel, Image, ImageMut, View, ViewMut};
 use crate::readback::{ReadbackError, map_read};
 
 /// A GPU texture that effects read from or render into.
@@ -137,6 +138,156 @@ impl Frame {
             },
             extent(self.width, self.height),
         );
+    }
+}
+
+/// A frame on the GPU device a host and its effect share.
+#[derive(Clone, Copy)]
+pub struct GpuFrame<'a> {
+    pub gpu: &'a Gpu,
+    pub frame: &'a Frame,
+}
+
+/// How many rows [`GpuFrame::write`] converts per upload. This limits its buffer to that many
+/// rows of the frame.
+const ROWS_PER_UPLOAD: usize = 32;
+
+impl GpuFrame<'_> {
+    /// Uploads `image`, in the frame's format. `image` is straight colour with the top row first.
+    /// Fails with [`RenderError::DeviceLost`] if the device is already known to be lost. A loss
+    /// during the call isn't reported, because wgpu drops that error.
+    ///
+    /// # Panics
+    /// If `image` isn't the frame's size, or the frame is neither RGBA8 nor
+    /// RGBA32F.
+    pub fn write(&self, image: Image<'_>) -> Result<(), RenderError> {
+        match image {
+            Image::U8(view) => self.write_view(view),
+            Image::U16(view) => self.write_view(view),
+            Image::F32(view) => self.write_view(view),
+        }
+    }
+
+    fn write_view<C: Channel>(&self, view: View<'_, C>) -> Result<(), RenderError> {
+        if self.gpu.faults().lost().is_some() {
+            return Err(RenderError::DeviceLost);
+        }
+        let frame = self.frame;
+        assert_eq!(
+            (view.width as u32, view.height as u32),
+            (frame.width, frame.height),
+            "image and frame sizes differ"
+        );
+        let row_bytes = frame.width as usize * frame.bytes_per_pixel() as usize;
+        // The buffer holds `u32` words, so a row can be cast to `f32`s as well as to bytes.
+        let mut words = vec![0u32; row_bytes / 4 * ROWS_PER_UPLOAD.min(frame.height as usize)];
+        let rows = bytemuck::cast_slice_mut::<u32, u8>(&mut words);
+        for top in (0..frame.height as usize).step_by(ROWS_PER_UPLOAD) {
+            let count = ROWS_PER_UPLOAD.min(frame.height as usize - top);
+            for (y, dst) in rows.chunks_exact_mut(row_bytes).take(count).enumerate() {
+                let src = view.row((top + y) as i32);
+                match frame.format {
+                    wgpu::TextureFormat::Rgba8Unorm => {
+                        for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                            *dst = [p.red, p.green, p.blue, p.alpha].map(to_u8);
+                        }
+                    }
+                    wgpu::TextureFormat::Rgba32Float => {
+                        let dst = bytemuck::cast_slice_mut::<u8, [f32; 4]>(dst);
+                        for (dst, p) in dst.iter_mut().zip(src) {
+                            *dst = [p.red, p.green, p.blue, p.alpha].map(C::to_unit);
+                        }
+                    }
+                    format => panic!("no upload into {format:?}"),
+                }
+            }
+            self.gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: top as u32,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rows[..row_bytes * count],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes as u32),
+                    rows_per_image: None,
+                },
+                extent(frame.width, count as u32),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Converts `c` to 8 bits. A `u8` converts exactly. Other types go through the unit range.
+fn to_u8<C: Channel>(c: C) -> u8 {
+    match bytemuck::try_cast::<C, u8>(c) {
+        Ok(byte) => byte,
+        Err(_) => u8::from_unit(c.to_unit()),
+    }
+}
+
+/// Where a CPU render draws its frame: straight colour, top row first.
+pub enum FrameOut<'a> {
+    /// A frame the size of the render on the device the host shares. An effect
+    /// that draws in RAM uploads into it.
+    Texture(GpuFrame<'a>),
+    Pixels(ImageMut<'a>),
+}
+
+impl FrameOut<'_> {
+    /// Calls `draw` with pixels for the frame. For a CPU output these are the output's own pixels.
+    /// For a texture they're 8-bit pixels, uploaded into the texture after `draw` returns. For a
+    /// texture the pixels are allocated on every call, so an effect that renders often keeps its
+    /// own pixels and calls [`GpuFrame::write`].
+    pub fn with_pixels(self, draw: impl FnOnce(ImageMut<'_>)) -> Result<(), RenderError> {
+        match self {
+            FrameOut::Pixels(pixels) => {
+                draw(pixels);
+                Ok(())
+            }
+            FrameOut::Texture(texture) => {
+                let (w, h) = (texture.frame.width as i32, texture.frame.height as i32);
+                let mut pixels = vec![Argb::<u8>::default(); w as usize * h as usize];
+                draw(ImageMut::U8(ViewMut::from_pixels(&mut pixels, w, h)));
+                texture.write(Image::U8(View::from_pixels(&pixels, w, h)))
+            }
+        }
+    }
+}
+
+/// Why a render drew nothing. The host shows its input or fails the frame.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RenderError {
+    /// The device was lost; everything on it has to be made again on a new one.
+    #[error("the GPU device was lost")]
+    DeviceLost,
+    #[error("the GPU device is still opening")]
+    DeviceOpening,
+    /// An allocation failed; the device is still alive.
+    #[error("the GPU is out of memory")]
+    OutOfMemory,
+    /// A readback or wait ran out of time on a device that is still alive.
+    #[error("the GPU didn't finish in time")]
+    Timeout,
+    /// Any other error wgpu reported for the render's work.
+    #[error("GPU error: {0}")]
+    Gpu(#[source] wgpu::Error),
+}
+
+impl From<wgpu::Error> for RenderError {
+    fn from(error: wgpu::Error) -> Self {
+        match error {
+            wgpu::Error::OutOfMemory { .. } => RenderError::OutOfMemory,
+            error => RenderError::Gpu(error),
+        }
     }
 }
 
