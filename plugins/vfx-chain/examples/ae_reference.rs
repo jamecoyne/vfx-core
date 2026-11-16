@@ -170,7 +170,7 @@ fn run(frame: &Frame) -> Result<(), Box<dyn Error>> {
     let layer = frame.layer.as_deref().map(read).transpose()?;
     vfx_host::register(&vfx_chain::VFX_PLUGIN);
     static LOG: vfx_host::diag::Log = vfx_host::diag::Log::new("-reference.log");
-    let device = vfx_host::gpu(&LOG).ok_or("no GPU adapter")?;
+    let device = vfx_host::device(&LOG).ok_or("no GPU adapter")?;
     for _ in 0..frame.repeat {
         let job = pipeline::Job {
             spec: pipeline::Spec {
@@ -183,7 +183,8 @@ fn run(frame: &Frame) -> Result<(), Box<dyn Error>> {
             input: &pixels,
             layer: layer.as_deref(),
         };
-        pixels = pipeline::run(device.gpu(), device.pool_key, &job);
+        pixels = pipeline::run(device.gpu(), vfx_host::pool_key(&device), &job)
+            .map_err(|e| e.to_string())?;
     }
     // Unclamped f32, so the harness can quantise the way each bit depth does: integer
     // depths clip before premultiplying, 32 bpc keeps values above 1.0 until output.

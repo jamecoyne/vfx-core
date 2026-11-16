@@ -80,5 +80,8 @@ fn dx12_instance() -> wgpu::Instance {
 fn test_gpu() -> (std::sync::MutexGuard<'static, ()>, vfx_core::Gpu) {
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-    (turn, pollster::block_on(vfx_core::Gpu::headless()).unwrap())
+    (
+        turn,
+        vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).unwrap(),
+    )
 }

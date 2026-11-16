@@ -11,7 +11,8 @@ const H: u32 = 9;
 const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
 
 fn gpu() -> Gpu {
-    pollster::block_on(Gpu::headless()).expect("no GPU adapter available for headless tests")
+    vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+        .expect("no GPU adapter available for headless tests")
 }
 
 fn solid(color: [u8; 4]) -> Vec<u8> {

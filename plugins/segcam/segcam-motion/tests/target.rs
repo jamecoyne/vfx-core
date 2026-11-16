@@ -22,7 +22,7 @@ type Pixels = Vec<Argb<u8>>;
 fn shared() -> Option<&'static Gpu> {
     static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
     GPU.get_or_init(|| {
-        let gpu = pollster::block_on(Gpu::headless()).ok()?;
+        let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).ok()?;
         let hardware = gpu.device.adapter_info().device_type != wgpu::DeviceType::Cpu;
         hardware.then(|| {
             gpu.share();

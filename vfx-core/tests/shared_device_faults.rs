@@ -4,7 +4,8 @@
 use vfx_core::{Gpu, wgpu};
 
 fn device() -> Gpu {
-    pollster::block_on(Gpu::headless()).expect("no GPU adapter available for headless tests")
+    vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+        .expect("no GPU adapter available for headless tests")
 }
 
 /// Destroys the device and waits for its loss to be reported.

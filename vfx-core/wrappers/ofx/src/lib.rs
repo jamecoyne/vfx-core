@@ -574,14 +574,22 @@ fn render_gpu(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxSta
     LOG.note(&format!(
         "render path: GPU effect, frames through RAM, {depth:?}"
     ));
-    let result = match vfx_host::gpu(&LOG) {
-        Some(device) => catch_unwind(AssertUnwindSafe(|| {
-            pipeline::run(device.gpu(), device.pool_key, &job)
-        }))
-        .unwrap_or_else(|_| {
-            LOG.note("warning: GPU render failed, passing frames through");
-            input.clone()
-        }),
+    let result = match vfx_host::device(&LOG) {
+        Some(device) => match catch_unwind(AssertUnwindSafe(|| {
+            pipeline::run(device.gpu(), vfx_host::pool_key(&device), &job)
+        })) {
+            Ok(Ok(pixels)) => pixels,
+            Ok(Err(error)) => {
+                LOG.note(&format!(
+                    "warning: GPU render failed, passing frames through: {error}"
+                ));
+                input.clone()
+            }
+            Err(_) => {
+                LOG.note("warning: GPU render failed, passing frames through: it panicked");
+                input.clone()
+            }
+        },
         None => input.clone(),
     };
     // SAFETY: the window lies inside the output image's bounds and the canvas.

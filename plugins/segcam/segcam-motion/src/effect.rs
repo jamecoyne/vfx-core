@@ -151,7 +151,7 @@ pub fn settings_from_params(p: &ParamValues, premultiplied: bool) -> RenderSetti
 /// recomputes only what changed.
 pub struct SegcamMotion {
     renderer: IncrementalRenderer,
-    _slot_user: crate::gpu::SlotUser,
+    _slot_user: crate::gpu::ContextUser,
 }
 
 /// Sets aside face models with DirectML on the host's shared device, for the last
@@ -176,7 +176,10 @@ impl SegcamMotion {
         renderer.use_gpu(gpu);
         Self {
             renderer,
-            _slot_user: crate::gpu::SlotUser::new(&crate::gpu::SHARED_SLOT, release_shared_faces),
+            _slot_user: crate::gpu::ContextUser::new(
+                &crate::gpu::SLOT_CONTEXT,
+                release_shared_faces,
+            ),
         }
     }
 }
@@ -235,12 +238,10 @@ impl CpuEffect for SegcamMotion {
     }
 
     /// Only the swarm draws on the GPU in a form a target can take, and only on the device a host
-    /// shares, which `SEGCAM_GPU=0` and an adapter asked for by name both leave.
+    /// shares, which `SEGCAM_GPU=0` leaves.
     #[cfg(not(target_arch = "wasm32"))]
     fn can_draw_to_target(&self, params: &ParamValues) -> bool {
-        settings_from_params(params, false).mode == OutputMode::Swarm
-            && self.renderer.gpu_wanted()
-            && crate::gpu::adapter_choice().is_empty()
+        settings_from_params(params, false).mode == OutputMode::Swarm && self.renderer.gpu_wanted()
     }
 
     /// A swarm drawn on the GPU goes into `target` when it is on the device the swarm draws
@@ -274,7 +275,7 @@ impl CpuEffect for SegcamMotion {
         if let Some(gpu) = vfx_core::Gpu::shared() {
             crate::faces::release_on_d3d12_adapter(&gpu.device.adapter_info());
         }
-        crate::gpu::SHARED_SLOT.host_device_lost();
+        crate::gpu::SLOT_CONTEXT.release_host_context();
     }
 }
 

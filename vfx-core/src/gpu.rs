@@ -127,34 +127,6 @@ impl Gpu {
         }
     }
 
-    /// Requests a GPU with no window surface. Async, so the caller picks the executor.
-    pub async fn headless() -> Result<Self, GpuError> {
-        // Plugins run inside hosts that own OpenGL contexts, and wgpu's GL backend would
-        // take over the host's current one.
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            backend_options: Self::backend_options(),
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
-            .await?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                // Effects blend in 32-bit float targets where the adapter can.
-                required_features: adapter.features() & wgpu::Features::FLOAT32_BLENDABLE,
-                memory_hints: Self::memory_hints(),
-                ..wgpu::DeviceDescriptor::default()
-            })
-            .await?;
-        Ok(Self::from_parts(device, queue))
-    }
-
     /// Backend options for every wgpu instance a host or effect makes. On Windows
     /// they select the DXC the Setup shares, else the one beside this module (the
     /// zips), else the slower FXC; `WGPU_DX12_COMPILER` overrides.
@@ -197,6 +169,7 @@ impl Gpu {
         #[cfg(not(target_arch = "wasm32"))]
         {
             *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = parts;
+            crate::device::slot().wake();
         }
     }
 
@@ -482,15 +455,6 @@ thread_local! {
 
 #[cfg(not(target_arch = "wasm32"))]
 static SHARED: std::sync::Mutex<Option<GpuParts>> = std::sync::Mutex::new(None);
-
-/// Why [`Gpu::headless`] has no device.
-#[derive(Debug, thiserror::Error)]
-pub enum GpuError {
-    #[error("GPU setup failed: {0}")]
-    Adapter(#[from] wgpu::RequestAdapterError),
-    #[error("GPU setup failed: {0}")]
-    Device(#[from] wgpu::RequestDeviceError),
-}
 
 #[cfg(test)]
 mod tests {

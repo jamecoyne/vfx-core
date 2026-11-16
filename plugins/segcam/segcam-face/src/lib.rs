@@ -15,20 +15,15 @@ pub mod runtime;
 pub mod vision;
 pub mod yunet;
 
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub use picodet::Body;
 pub use yunet::Face;
 
-/// Held while making or releasing a D3D12 device, including through a DirectML session, a
-/// [`runtime::fastest`] trial's losers or a [`Segmenter`]. Making a device on one thread while
-/// another releases one can deadlock inside the driver and D3D12. Nothing in this crate takes
-/// it, so every caller does, for as long as it makes or drops them.
-pub fn d3d12_device_lock() -> MutexGuard<'static, ()> {
-    static D3D12_DEVICE_LOCK: Mutex<()> = Mutex::new(());
-    D3D12_DEVICE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// Every caller that makes or drops a D3D12 device takes this lock. That covers a DirectML
+/// session, the losers of a [`runtime::fastest`] trial and a [`Segmenter`]. Nothing in this
+/// crate takes it.
+pub use vfx_core::d3d12_device_lock;
 
 /// The bundled YuNet model, `face_detection_yunet_2023mar.onnx`.
 #[cfg(feature = "onnx")]

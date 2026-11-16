@@ -128,7 +128,9 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `FrameSource::fetch_budget` (the distinct earlier frames one render may ask for, at least 2, plus up to as many again that one analysis of the current frame needs and nothing was kept from, for a host that holds every frame it hands out until the render returns; default `None`, as many as it needs) | vfx-core |
 | `DeviceFaults::same_device` (whether two records are one device, across wgpu instances), `ReopenBackoff` (when to try for a new device after a loss) | vfx-core |
 | `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core |
-| `Gpu`: `from_parts`, `headless`; `GpuError` | vfx-core |
+| `Gpu::from_parts` | vfx-core |
+| Native only: `device::slot`, `DeviceSlot` (`try_wait` for live callers, never waits; `wait` for exports; the host's shared device while a host shares one), `Device`, `NoDevice`, `device::open` and `AdapterChoice` (a blocking open; `WGPU_ADAPTER_NAME` names the adapter), `adapter_name_from_env` | vfx-core |
+| `d3d12_device_lock` (held while making or dropping a D3D12 device; segcam-face re-exports it) | vfx-core |
 | `Gpu::share`, `Gpu::shared` | vfx-core |
 | `Gpu::unshare` (a host whose device was lost stops sharing it before dropping it, which D3D12 needs to offer the adapter again) | vfx-core |
 | `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core |
@@ -137,6 +139,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core |
 | `contract::check` and `Clip` (a kept render equals a fresh one; under a fetch budget, in order, and after a jump within `held_catch_up_renders` for a held frame and `stream_catch_up_renders` for a stream) | vfx-host |
 | `CpuInstance` and `Panicked` (one kept effect per host instance) | vfx-host |
+| `device` (exports, waits) and `try_device` (live, never waits): the core slot's device for GPU effects through RAM; `pool_key`; `release_own_device`, which a target calls after it shares a device; `pipeline::run` returns `Result` and fails on a validation error in its own calls (`pipeline::checked`); `pipeline::evict_lost` | vfx-host |
 | `CpuInstance::frames_held` | vfx-host |
 | `CpuInstance::values_known` | vfx-host |
 | `CpuInstance::render_to` | vfx-host |

@@ -1,5 +1,5 @@
 //! The swarm's GPU path against the CPU path, within [`Bound::of`] its depth.
-//! `SEGCAM_GPU_ADAPTER=fallback` runs it on a software adapter (WARP).
+//! `WGPU_ADAPTER_NAME="Microsoft Basic Render Driver"` runs it on WARP, as CI does.
 
 use segcam_motion::pixel::Depth;
 use segcam_motion::{
@@ -255,7 +255,7 @@ fn each_case<C: Depth>() {
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
-    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
+    ignore = "needs a GPU adapter segcam draws on: hardware, or the software one WGPU_ADAPTER_NAME names"
 )]
 fn gpu_matches_cpu_u8() {
     each_case::<u8>();
@@ -264,7 +264,7 @@ fn gpu_matches_cpu_u8() {
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
-    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
+    ignore = "needs a GPU adapter segcam draws on: hardware, or the software one WGPU_ADAPTER_NAME names"
 )]
 fn gpu_matches_cpu_u16() {
     each_case::<u16>();
@@ -273,7 +273,7 @@ fn gpu_matches_cpu_u16() {
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
-    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
+    ignore = "needs a GPU adapter segcam draws on: hardware, or the software one WGPU_ADAPTER_NAME names"
 )]
 fn gpu_matches_cpu_f32() {
     each_case::<f32>();

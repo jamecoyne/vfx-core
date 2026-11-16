@@ -7,6 +7,8 @@
 
 mod chain;
 pub mod cpu;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod device;
 mod effect;
 pub mod effects;
 mod frame;
@@ -15,9 +17,11 @@ mod param;
 mod shader;
 
 pub use chain::EffectChain;
+#[cfg(not(target_arch = "wasm32"))]
+pub use device::d3d12_device_lock;
 pub use effect::{Context, CpuEffect, Effect, Processor, Reading, Region, Report, Target};
 pub use frame::{Frame, Readback};
-pub use gpu::{DeviceFaults, Gpu, GpuError, PollFailure, ReopenBackoff, poll_device};
+pub use gpu::{DeviceFaults, Gpu, PollFailure, ReopenBackoff, poll_device};
 pub use param::{ParamError, ParamKind, ParamSpec, ParamValue, ParamValues, Requires, Unit};
 
 /// Re-exported so hosts can match the exact wgpu version the core was built against.

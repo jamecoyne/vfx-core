@@ -2,14 +2,14 @@
 //! browsers, which have no allocator report.
 #![cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
 
-use vfx_core::{Gpu, poll_device, wgpu};
+use vfx_core::{poll_device, wgpu};
 
 /// Memory of a buffer larger than the largest block, 128 MiB, goes back when the buffer does,
 /// even with a small buffer made after it.
 #[test]
 fn large_buffer_memory_returns_beside_small_buffer() {
-    let gpu =
-        pollster::block_on(Gpu::headless()).expect("no GPU adapter available for headless tests");
+    let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+        .expect("no GPU adapter available for headless tests");
     let reserved = || {
         gpu.device
             .generate_allocator_report()

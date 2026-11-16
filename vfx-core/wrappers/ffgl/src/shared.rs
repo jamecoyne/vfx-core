@@ -161,6 +161,7 @@ impl SharedDevice {
         // A CPU effect that was on the lost device is waiting for its replacement.
         if replaces_lost && Gpu::shared_faults().lost().is_some() {
             device.gpu.share();
+            vfx_host::release_own_device();
         }
         let lost: Vec<_> = {
             let mut devices = OPEN_DEVICES.lock().unwrap_or_else(|e| e.into_inner());
@@ -340,8 +341,9 @@ pub unsafe fn share_device_with_cpu_effects() -> Result<(), SetupError> {
         DeviceState::Working(device) => device.gpu.share(),
         DeviceState::NeverOpened => SharedDevice::open(luid)?.gpu.share(),
         // Its replacement shares itself, and a new instance mustn't wait for a driver to come back.
-        DeviceState::Lost => {}
+        DeviceState::Lost => return Ok(()),
     }
+    vfx_host::release_own_device();
     Ok(())
 }
 
@@ -1616,7 +1618,10 @@ mod tests {
     }
 
     fn two_devices() -> (Gpu, Gpu) {
-        let open = || pollster::block_on(Gpu::headless()).expect("a GPU adapter");
+        let open = || {
+            vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+                .expect("a GPU adapter")
+        };
         (open(), open())
     }
 
