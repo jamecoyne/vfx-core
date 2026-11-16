@@ -6,8 +6,15 @@ use std::time::Duration;
 /// and its default error handler panics, so one place installs them and everyone reads this.
 #[derive(Clone, Default)]
 pub struct DeviceFaults {
-    errors: Arc<Mutex<(u64, String)>>,
+    errors: Arc<Mutex<Errors>>,
     lost: Arc<Mutex<Option<String>>>,
+}
+
+/// The errors a device reported: how many, and the last.
+#[derive(Default)]
+struct Errors {
+    count: u64,
+    last: Option<Arc<wgpu::Error>>,
 }
 
 impl DeviceFaults {
@@ -26,10 +33,17 @@ impl DeviceFaults {
         device.on_uncaptured_error(Arc::new(move |e| {
             if let Ok(mut errors) = errors.lock() {
                 let message = e.to_string();
-                if errors.1 != message {
+                if errors
+                    .last
+                    .as_ref()
+                    .is_none_or(|last| last.to_string() != message)
+                {
                     eprintln!("GPU error: {message}");
                 }
-                *errors = (errors.0 + 1, message);
+                *errors = Errors {
+                    count: errors.count + 1,
+                    last: Some(Arc::new(e)),
+                };
             }
         }));
         let lost = self.lost.clone();
@@ -44,9 +58,14 @@ impl DeviceFaults {
         });
     }
 
-    /// How many errors the device has reported, and the last one.
-    pub fn errors(&self) -> (u64, String) {
-        self.errors.lock().map_or((0, String::new()), |e| e.clone())
+    /// How many errors the device has reported.
+    pub fn error_count(&self) -> u64 {
+        self.errors.lock().map_or(0, |e| e.count)
+    }
+
+    /// The last error the device reported.
+    pub fn last_error(&self) -> Option<Arc<wgpu::Error>> {
+        self.errors.lock().ok().and_then(|e| e.last.clone())
     }
 
     /// Why the device was lost, once it is.

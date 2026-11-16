@@ -920,6 +920,9 @@ pub struct SwarmPass {
     /// How long a draw waits for the GPU before it fails.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     readback_timeout: Duration,
+    /// Makes the next readback time out, for tests.
+    #[cfg(test)]
+    time_out_next_readback: bool,
 }
 
 impl SwarmPass {
@@ -984,12 +987,20 @@ impl SwarmPass {
             targets: None,
             instances: None,
             readback_timeout: Duration::from_secs(1),
+            #[cfg(test)]
+            time_out_next_readback: false,
             shared,
         }
     }
 
     pub fn set_readback_timeout(&mut self, timeout: Duration) {
         self.readback_timeout = timeout;
+    }
+
+    /// Makes the next readback time out, as a hung GPU's would.
+    #[cfg(test)]
+    pub fn time_out_next_readback(&mut self) {
+        self.time_out_next_readback = true;
     }
 
     /// Replaces the tile atlas with one of `side` texels square that grows to
@@ -1110,6 +1121,11 @@ impl SwarmPass {
         let submit = started.elapsed();
 
         let mapped = self.wait_for_readback(submitted);
+        #[cfg(test)]
+        let mapped = match std::mem::take(&mut self.time_out_next_readback) {
+            true => mapped.and(Err(DrawError::MapTimeout)),
+            false => mapped,
+        };
         if mapped.is_err() {
             // The map may still be pending on the buffer: the next draw
             // takes a new one.

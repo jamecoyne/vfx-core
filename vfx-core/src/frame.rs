@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
@@ -279,15 +280,33 @@ pub enum RenderError {
     Timeout,
     /// Any other error wgpu reported for the render's work.
     #[error("GPU error: {0}")]
-    Gpu(#[source] wgpu::Error),
+    Gpu(#[source] Arc<wgpu::Error>),
+    /// The effect's GPU work failed, but wgpu reported no error.
+    #[error("the effect's GPU work failed: {0}")]
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl RenderError {
+    /// Whether the effect had no device to draw on, because it was lost or the next one is still
+    /// opening. An editor renders such a frame once more. In a render whose source isn't live, the
+    /// effect waits for the next device.
+    pub fn needs_device(&self) -> bool {
+        matches!(self, Self::DeviceLost | Self::DeviceOpening)
+    }
+}
+
+impl From<Arc<wgpu::Error>> for RenderError {
+    fn from(error: Arc<wgpu::Error>) -> Self {
+        match *error {
+            wgpu::Error::OutOfMemory { .. } => RenderError::OutOfMemory,
+            _ => RenderError::Gpu(error),
+        }
+    }
 }
 
 impl From<wgpu::Error> for RenderError {
     fn from(error: wgpu::Error) -> Self {
-        match error {
-            wgpu::Error::OutOfMemory { .. } => RenderError::OutOfMemory,
-            error => RenderError::Gpu(error),
-        }
+        Arc::new(error).into()
     }
 }
 

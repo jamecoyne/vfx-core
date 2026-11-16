@@ -202,11 +202,13 @@ fn render<C: Depth>(
     };
     let count = n - window_start + 1;
     let out = &mut ViewMut::from_pixels(out, w, h);
-    renderer.render_frame(s, &mut source, count, n as i64, out);
+    renderer
+        .render_frame(s, &mut source, count, n as i64, out)
+        .unwrap();
 }
 
-/// How far apart two frames were: the most levels a channel was off by, and the pixels off
-/// by over half a level and over one.
+/// How far apart two frames were. It holds the most levels a channel was off by, and how
+/// many pixels were off by over half a level and by over one.
 struct Difference {
     levels: f32,
     over_half: usize,
@@ -285,8 +287,6 @@ fn compare<C: Depth>(name: &str, s: &RenderSettings, w: i32, h: i32) {
     if let Err(e) = segcam_motion::gpu::status() {
         panic!("{name}: {e}");
     }
-    let faults = gpu.drawer().map_or(0, |d| d.faults);
-    assert_eq!(faults, 0, "{name}: renders fell back to the CPU");
     // Frames with no windows draw on the CPU: only those before the first windows.
     let first_on_gpu = on_gpu.iter().position(|&g| g);
     let first_on_gpu = first_on_gpu.unwrap_or_else(|| panic!("{name}: no render drawn on the GPU"));
@@ -459,8 +459,6 @@ mod references {
         }
         if on_gpu {
             assert!(renderer.last_draw_on_gpu(), "the last frame left the GPU");
-            let faults = renderer.drawer().map_or(0, |d| d.faults);
-            assert_eq!(faults, 0, "renders fell back to the CPU");
         }
         (out, renderer.drawer().map(|d| d.adapter().clone()))
     }

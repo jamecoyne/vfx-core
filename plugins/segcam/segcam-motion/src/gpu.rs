@@ -1,8 +1,7 @@
 //! The device segcam Motion draws its swarm on with [`crate::swarm_pass`], and
 //! what a render does when the device isn't there: the core's device slot opens
-//! it in the background, a failed draw falls back to the CPU and is retried or
-//! cooled down, a lost device is dropped and replaced, and a browser reads a
-//! draw back a render later.
+//! it in the background, a failed draw returns its `RenderError`, and a lost
+//! device is dropped and replaced.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -11,15 +10,10 @@ use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
-
-#[cfg(target_arch = "wasm32")]
-use web_time::Instant;
 
 #[cfg(not(target_arch = "wasm32"))]
 use vfx_core::device::{Device, DeviceSlot, NoDevice};
-use vfx_core::{DeviceFaults, wgpu};
+use vfx_core::{DeviceFaults, PollFailure, RenderError, wgpu};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::pixel::{Argb, ViewMut};
@@ -27,27 +21,27 @@ use crate::pixel::{Channel, View};
 use crate::render::RenderSettings;
 use crate::swarm::{ShadowKernel, Tile};
 pub use crate::swarm_pass::{AtlasAllocation, Slot};
-use crate::swarm_pass::{Occlusion, SwarmPass, SwarmPipelines};
+use crate::swarm_pass::{DrawError, Occlusion, SwarmPass, SwarmPipelines};
 
-/// segcam's pipelines on one device, and that device's loss and error record.
+/// Holds segcam's pipelines on one device, along with that device's loss and error record.
 pub struct GpuContext {
     pub(crate) device: wgpu::Device,
     pub info: wgpu::AdapterInfo,
     swarm: Arc<SwarmPipelines>,
-    /// A render that sees the device's error count move falls back and the device stays; once the
-    /// device is lost, nothing draws on it.
+    /// A render that sees the device's error count change fails, but the device stays in
+    /// use. Once the device is lost, nothing draws on it.
     faults: DeviceFaults,
     /// Whether a host shared this device. Only then can a host's frame be on it, and only the host
     /// can replace it.
     host_shared: bool,
-    /// The slot's device, which goes after everything made on it.
+    /// The slot's device. It's dropped after everything made on it.
     #[cfg(not(target_arch = "wasm32"))]
     slot_device: Arc<Device>,
 }
 
 impl Drop for GpuContext {
-    /// Face models with DirectML on a lost device's adapter hold the same
-    /// removed D3D12 device, so they go with it.
+    /// Face models running DirectML on a lost device's adapter hold the same removed D3D12
+    /// device, so they are released along with it.
     fn drop(&mut self) {
         if self.lost().is_some() {
             crate::faces::release_on_d3d12_adapter(&self.info);
@@ -62,7 +56,7 @@ impl GpuContext {
     fn build(device: Arc<Device>) -> Result<Self, NoDevice> {
         let gpu = device.gpu();
         // The host may have reported errors of its own before this.
-        let errors_before = gpu.faults().errors().0;
+        let errors_before = gpu.faults().error_count();
         let context = Self {
             swarm: Self::pipelines(gpu, device.host_shared()),
             device: gpu.device.clone(),
@@ -71,14 +65,17 @@ impl GpuContext {
             host_shared: device.host_shared(),
             slot_device: device,
         };
-        match (context.lost(), context.errors()) {
-            (Some(why), _) => Err(NoDevice::Lost(why)),
-            (None, (count, why)) if count != errors_before => Err(NoDevice::Unusable(why)),
-            _ => Ok(context),
+        if let Some(why) = context.lost() {
+            return Err(NoDevice::Lost(why));
         }
+        if context.faults.error_count() != errors_before {
+            let why = context.faults.last_error().map(|e| e.to_string());
+            return Err(NoDevice::Unusable(why.unwrap_or_default()));
+        }
+        Ok(context)
     }
 
-    /// A context on the device a browser host shared.
+    /// Makes a context on the device a browser host shared.
     #[cfg(target_arch = "wasm32")]
     fn on_shared(gpu: vfx_core::Gpu) -> Self {
         Self {
@@ -108,8 +105,18 @@ impl GpuContext {
         self.faults.lost()
     }
 
-    pub(crate) fn errors(&self) -> (u64, String) {
-        self.faults.errors()
+    pub(crate) fn error_count(&self) -> u64 {
+        self.faults.error_count()
+    }
+
+    /// Says why this render failed, using the device's record. That is its loss, or the
+    /// last error it reported.
+    fn failure(&self) -> RenderError {
+        match (self.lost(), self.faults.last_error()) {
+            (Some(_), _) => RenderError::DeviceLost,
+            (None, Some(error)) => error.into(),
+            (None, None) => RenderError::Internal(Box::new(UnkeptError)),
+        }
     }
 
     /// Makes the device report a validation error: a buffer mapped for reading and
@@ -126,25 +133,26 @@ impl GpuContext {
     }
 }
 
-/// Why a render couldn't be drawn on the GPU.
-#[derive(Clone, Debug)]
-pub struct Fault(pub String);
+/// Stands for an error the device counted but didn't keep.
+#[derive(Debug)]
+struct UnkeptError;
 
-/// How long a render waits for its draw before drawing on the CPU instead.
-const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
+impl std::fmt::Display for UnkeptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the device reported an error it didn't keep")
+    }
+}
 
-/// The timeout on a software adapter, which shares the CPU's cores with the host's work and can
-/// be slow without hanging.
-const SOFTWARE_READBACK_TIMEOUT: Duration = Duration::from_secs(10);
+impl std::error::Error for UnkeptError {}
 
-/// Faults within the last [`FAULT_HISTORY_RENDERS`] renders tried on the GPU that start a cooldown
-/// of [`FAULT_COOLDOWN`].
-pub(crate) const MAX_RECENT_FAULTS: u32 = 3;
-const FAULT_HISTORY_RENDERS: u32 = 10;
+/// How long a live render waits for its draw before it fails with
+/// [`RenderError::Timeout`].
+const LIVE_READBACK_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Long relative to the readback timeout, so a hung but not lost GPU degrades to CPU speed rather
-/// than stalling every render, with a periodic retry.
-const FAULT_COOLDOWN: Duration = Duration::from_secs(30);
+/// How long a render that may be exported waits for its draw, and also any render on a
+/// software adapter. A software adapter shares the CPU's cores with the host's work, so
+/// it can be slow without hanging.
+const READBACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether to draw on the GPU where there is one: yes, unless `SEGCAM_GPU=0`.
 pub fn enabled_by_env() -> bool {
@@ -201,7 +209,7 @@ enum ContextState {
     },
     Ready(Arc<GpuContext>),
     /// Holds the device, so a host's keeps its id and isn't built again
-    /// every render.
+    /// every render. A build that failed on a device stays failed for it.
     #[cfg(not(target_arch = "wasm32"))]
     Failed {
         device: Arc<Device>,
@@ -345,7 +353,7 @@ impl SlotContext {
                     ContextState::Ready(Arc::new(context))
                 }
                 Err(why) => {
-                    eprintln!("segcam Motion: drawing on the CPU ({why})");
+                    eprintln!("segcam Motion: no GPU pipelines ({why})");
                     ContextState::Failed {
                         device: failed_on,
                         why,
@@ -455,10 +463,9 @@ pub(crate) fn test_context() -> GpuContext {
     GpuContext::build(device).expect("pipelines on a working device")
 }
 
-/// Per effect instance GPU state: the swarm's atlases and targets, and the
-/// fault history.
+/// Per effect instance GPU state: the swarm's atlases and targets.
 pub struct Drawer {
-    // Drops before `dev`, which holds the slot's device: that goes last, on
+    // Drops before `dev`, which holds the slot's device. The device is dropped last, on
     // the core's retire thread.
     pass: SwarmPass,
     dev: Arc<GpuContext>,
@@ -469,36 +476,22 @@ pub struct Drawer {
     errors_at_render_start: u64,
     /// Renders drawn on the GPU.
     pub drawn: u64,
-    /// Renders the GPU failed, drawn on the CPU instead.
-    pub faults: u64,
-    /// The last [`FAULT_HISTORY_RENDERS`] renders tried on the GPU, newest in the lowest bit, set
-    /// for a fault.
-    recent_faults: u16,
-    /// When [`MAX_RECENT_FAULTS`] faults in the history started the cooldown.
-    cooldown_started: Option<Instant>,
-    cooldown: Duration,
+    /// Whether the device is a software adapter. It always waits [`READBACK_TIMEOUT`].
+    software: bool,
 }
 
 impl Drawer {
     /// A drawer on `dev`; `None` if the device is lost.
     pub fn new(dev: Arc<GpuContext>) -> Option<Self> {
         dev.lost().is_none().then_some(())?;
-        let mut pass = SwarmPass::new(dev.swarm.clone());
-        pass.set_readback_timeout(if dev.info.device_type == wgpu::DeviceType::Cpu {
-            SOFTWARE_READBACK_TIMEOUT
-        } else {
-            READBACK_TIMEOUT
-        });
+        let pass = SwarmPass::new(dev.swarm.clone());
         Some(Self {
             pass,
             #[cfg(not(target_arch = "wasm32"))]
             max_buffer_bytes: dev.device.limits().max_buffer_size,
-            errors_at_render_start: dev.errors().0,
+            errors_at_render_start: dev.error_count(),
             drawn: 0,
-            faults: 0,
-            recent_faults: 0,
-            cooldown_started: None,
-            cooldown: FAULT_COOLDOWN,
+            software: dev.info.device_type == wgpu::DeviceType::Cpu,
             dev,
         })
     }
@@ -523,33 +516,20 @@ impl Drawer {
         self.dev.lost().is_some()
     }
 
-    /// Counts a render the GPU failed. [`MAX_RECENT_FAULTS`] within the history start a cooldown.
-    pub(crate) fn record_fault(&mut self) {
-        self.faults += 1;
-        self.record_outcome(true);
-        if self.recent_faults.count_ones() >= MAX_RECENT_FAULTS {
-            self.cooldown_started = Some(Instant::now());
-        }
-    }
-
-    fn record_outcome(&mut self, fault: bool) {
-        self.recent_faults =
-            (self.recent_faults << 1 | u16::from(fault)) & ((1 << FAULT_HISTORY_RENDERS) - 1);
-    }
-
-    /// Whether renders stay off the GPU after too many recent faults.
-    pub fn in_fault_cooldown(&self) -> bool {
-        self.cooldown_started
-            .is_some_and(|since| since.elapsed() < self.cooldown)
-    }
-
-    /// Called as a render starts: errors reported before it aren't its own.
-    pub fn begin_render(&mut self) {
+    /// Call this as a render starts. Errors the device reported before then don't count
+    /// against this render. A `live` render waits [`LIVE_READBACK_TIMEOUT`] for its draw.
+    pub fn begin_render(&mut self, live: bool) {
+        let timeout = if live && !self.software {
+            LIVE_READBACK_TIMEOUT
+        } else {
+            READBACK_TIMEOUT
+        };
+        self.pass.set_readback_timeout(timeout);
         // A browser reports errors in a later task, after this render has finished, so there the
-        // count carries over and the next render falls back.
+        // count carries over and the next render fails.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.errors_at_render_start = self.dev.errors().0;
+            self.errors_at_render_start = self.dev.error_count();
         }
     }
 
@@ -578,27 +558,42 @@ impl Drawer {
         self.max_buffer_bytes = bytes;
     }
 
+    /// Makes the next draw's readback time out.
     #[cfg(test)]
-    pub(crate) fn set_readback_timeout(&mut self, timeout: Duration) {
-        self.pass.set_readback_timeout(timeout);
+    pub(crate) fn time_out_next_readback(&mut self) {
+        self.pass.time_out_next_readback();
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_cooldown(&mut self, cooldown: Duration) {
-        self.cooldown = cooldown;
-    }
-
-    /// A fault where the device is lost or reported an error since this render began.
-    fn check_device_faults(&mut self) -> Result<(), Fault> {
-        if let Some(e) = self.dev.lost() {
-            return Err(Fault(e));
+    /// Fails with the device's loss, or with the last error it reported since
+    /// [`Self::begin_render`].
+    fn check_device_faults(&mut self) -> Result<(), RenderError> {
+        if self.dev.lost().is_some() {
+            return Err(RenderError::DeviceLost);
         }
-        let (count, last) = self.dev.errors();
+        let count = self.dev.error_count();
         if count != self.errors_at_render_start {
             self.errors_at_render_start = count;
-            return Err(Fault(last));
+            // A device reports that it's lost only when it's polled.
+            let _ = self.lost();
+            return Err(self.dev.failure());
         }
         Ok(())
+    }
+
+    /// Turns a failed draw into the error the host sees. That's a lost device, a timed-out
+    /// wait on a live render, or an internal failure of the effect. A device reports that
+    /// it's lost only when it's polled.
+    fn draw_failure(&self, error: DrawError) -> RenderError {
+        if self.lost() {
+            return RenderError::DeviceLost;
+        }
+        match error {
+            DrawError::MapTimeout
+            | DrawError::Poll(PollFailure::Other(wgpu::PollError::Timeout)) => RenderError::Timeout,
+            DrawError::Poll(PollFailure::DeviceLost) => RenderError::DeviceLost,
+            DrawError::NoStagingMemory => RenderError::OutOfMemory,
+            error => RenderError::Internal(Box::new(error)),
+        }
     }
 
     /// Puts a frame's tiles in the atlases: their pixels as the CPU cut them and
@@ -608,7 +603,7 @@ impl Drawer {
         &mut self,
         tiles: &[Tile],
         canvas: (i32, i32),
-    ) -> Result<Option<AtlasAllocation>, Fault> {
+    ) -> Result<Option<AtlasAllocation>, RenderError> {
         // Made before the check, so a fault gives the room back.
         let allocation = self.pass.upload_tiles(tiles, canvas.1);
         self.check_device_faults()?;
@@ -626,32 +621,30 @@ impl Drawer {
         frame: Option<&View<C>>,
         s: &RenderSettings,
         shadow: &ShadowKernel,
-    ) -> Result<(), Fault> {
+    ) -> Result<(), RenderError> {
         self.check_device_faults()?;
-        self.check_readback_fits(out)?;
         let drawn = self
             .pass
             .draw(out, windows, frame, s, shadow, Occlusion::Depth);
-        drawn.map_err(|e| Fault(e.to_string()))?;
+        drawn.map_err(|e| self.draw_failure(e))?;
         self.check_device_faults()?;
         self.drawn += 1;
-        self.record_outcome(false);
         Ok(())
     }
 
-    /// A fault where a readback of `out` is a larger buffer than the device
-    /// makes.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn check_readback_fits<C: Channel>(&self, out: &ViewMut<C>) -> Result<(), Fault> {
-        let row = out.width as u64 * size_of::<Argb<C>>() as u64;
-        let padded_row = row.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        let bytes = padded_row * out.height as u64;
-        if bytes > self.max_buffer_bytes {
-            return Err(Fault(format!(
-                "the readback needs {bytes} bytes, more than the GPU's largest buffer"
-            )));
+    /// Whether this device can draw a canvas of `(w, h)` at `C`. The canvas must fit in the
+    /// device's textures and, on the desktop, be readable in one buffer.
+    pub fn fits<C: Channel>(&self, (w, h): (i32, i32)) -> bool {
+        let side = self.dev.device.limits().max_texture_dimension_2d;
+        let fits_texture = w as u32 <= side && h as u32 <= side;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let row = w as u64 * size_of::<Argb<C>>() as u64;
+            let padded_row = row.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+            fits_texture && padded_row * h as u64 <= self.max_buffer_bytes
         }
-        Ok(())
+        #[cfg(target_arch = "wasm32")]
+        fits_texture
     }
 
     /// Draws the swarm as [`Drawer::draw_swarm`] does, into `target`, a host's
@@ -665,20 +658,19 @@ impl Drawer {
         frame: Option<&View<C>>,
         s: &RenderSettings,
         shadow: &ShadowKernel,
-    ) -> Result<(), Fault> {
-        if depth::<C>() != 0 {
-            return Err(Fault(
-                "only an 8-bit canvas draws into a host's frame".into(),
-            ));
-        }
+    ) -> Result<(), RenderError> {
+        assert_eq!(
+            depth::<C>(),
+            0,
+            "only an 8-bit canvas draws into a host's frame"
+        );
         self.check_device_faults()?;
         let submitted = self
             .pass
             .submit_into(target, windows, frame, s, shadow, Occlusion::Depth);
-        submitted.map_err(|e| Fault(e.to_string()))?;
+        submitted.map_err(|e| self.draw_failure(e))?;
         self.check_device_faults()?;
         self.drawn += 1;
-        self.record_outcome(false);
         Ok(())
     }
 }

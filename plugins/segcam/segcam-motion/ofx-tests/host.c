@@ -1,6 +1,12 @@
 /* Use the Preview host's suites, against the official OpenFX headers. */
+#ifndef _WIN32
+/* nanosleep, which -std=c11 hides on glibc without it. */
+#define _POSIX_C_SOURCE 200809L
+#endif
 #define main preview_main
 #include "../../../../vfx-core/wrappers/ofx/minihost/minihost.c"
+#include <time.h>
+#include "ofxMessage.h"
 #undef main
 
 static Img history[32], output;
@@ -216,8 +222,41 @@ static int export_after_edit(void) {
     printf("export after edit: %d failures\n",failures);
     return failures?1:0;
 }
+/* The message suite: how many errors failed renders showed, and the last. */
+static char last_error[512];
+static int errors_shown;
+static OfxStatus record_error(const char *type, const char *format, va_list args) {
+    CHECK(!strcmp(type, kOfxMessageError), "message type %s", type);
+    vsnprintf(last_error, sizeof last_error, format, args);
+    errors_shown++;
+    return kOfxStatOK;
+}
+static OfxStatus message(void *handle, const char *type, const char *id, const char *format, ...) {
+    (void)handle; (void)id;
+    va_list args; va_start(args, format);
+    OfxStatus status = record_error(type, format, args);
+    va_end(args);
+    return status;
+}
+static OfxMessageSuiteV1 message_suite = { message };
+static const void *fetch_suite(OfxPropertySetHandle host_props, const char *name, int version) {
+    if (!strcmp(name, kOfxMessageSuite) && version == 1) return &message_suite;
+    return fetchSuite(host_props, name, version);
+}
+/* Waits `ms` milliseconds between a failed render and its retry. */
+static void wait_ms(int ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec wait={ms/1000,(long)(ms%1000)*1000000L};
+    nanosleep(&wait,NULL);
+#endif
+}
 /* argv: plugin input output mode depth top premult order, where order is 0 forwards, 1 backwards,
-   2 shuffled, 3 every frame cold on a fresh instance. Frames are written in frame order.
+   2 shuffled, 3 every frame cold on a fresh instance, and 4 forwards rendering a failed frame
+   again for up to 10 s, as an editor does. With VFX_OFX_REMOVE_DEVICE_AFTER set, order 4 checks
+   that no render failed and no error was shown, since the plugin waits for the next device.
+   Frames are written in frame order.
    Or argv: plugin export, for export_after_edit. */
 int main(int argc, char **argv) {
     if (argc != 9 && argc != 3) return 2;
@@ -226,7 +265,7 @@ int main(int argc, char **argv) {
     OfxPlugin *(*getp)(int) = plugin_symbol(lib,"OfxGetPlugin");
     plugin = getp(0);
     CHECK(!strcmp(plugin->pluginIdentifier,"com.lofiscifi.segcam"),"wrong identity");
-    host.host=props_new(); host.fetchSuite=fetchSuite; plugin->setHost(&host);
+    host.host=props_new(); host.fetchSuite=fetch_suite; plugin->setHost(&host);
     CHECK(action(kOfxActionLoad,NULL,NULL,NULL)==kOfxStatOK,"load failed");
     if (argc == 3) return export_after_edit();
     int mode=atoi(argv[4]), top=atoi(argv[6]), premult=atoi(argv[7]), order=atoi(argv[8]);
@@ -255,6 +294,9 @@ int main(int argc, char **argv) {
         for(int i=31;i>0;i--) { seed=seed*1103515245u+12345u; int j=(int)((seed>>16)%(unsigned)(i+1)); int s=frames[i]; frames[i]=frames[j]; frames[j]=s; }
     }
     static unsigned char rendered[32][320*180*4];
+    int retries=0;
+    const char *removal=getenv("VFX_OFX_REMOVE_DEVICE_AFTER");
+    int removal_at=removal?atoi(removal):-1;
     OfxImageEffectHandle e=instance(mode,premult);
     for(int i=0;i<32;i++) {
         int t=frames[i];
@@ -267,8 +309,20 @@ int main(int argc, char **argv) {
         int back=mode==3?123:64;
         CHECK(range && range->dbl[0]==t-back && range->dbl[1]==t,"wrong frame range");
         reads=0;
-        CHECK(action(kOfxImageEffectActionRender,e,args,NULL)==kOfxStatOK,"render failed at %d",t);
-        CHECK(images_out==0,"image leak"); CHECK(reads<=(t<back?t:back)+1,"read %d frames at %d",reads,t);
+        /* Frames drawn while the face models load can differ by a level or two from run to
+           run, so the removal runs start once they're up. */
+        if(order>=4 && i==0) wait_ms(3000);
+        /* Paced as playback is, so segcam's device opens before the removal. */
+        if(order>=4) wait_ms(100);
+        OfxStatus status=action(kOfxImageEffectActionRender,e,args,NULL);
+        for(int tries=0;status!=kOfxStatOK && order==4 && tries<200;tries++) {
+            retries++; wait_ms(50); reads=0;
+            status=action(kOfxImageEffectActionRender,e,args,NULL);
+        }
+        CHECK(status==kOfxStatOK,"render failed at %d",t);
+        /* The plugin renders the frame that meets a removal twice, reading its frames again. */
+        int most=((t<back?t:back)+1)*(removal_at==t?2:1);
+        CHECK(images_out==0,"image leak"); CHECK(reads<=most,"read %d frames at %d",reads,t);
         output.premultiplied=0; load(&output); output.premultiplied=premult;
         unsigned char *frame=rendered[t];
         for(int y=179;y>=0;y--) for(int x=0;x<320;x++) {
@@ -276,6 +330,11 @@ int main(int argc, char **argv) {
             for(int c=0;c<4;c++) *frame++=(unsigned char)(fminf(1,fmaxf(0,p[order4[c]]))*255+0.5f);
         }
     }
+    if(order==4 && getenv("VFX_OFX_REMOVE_DEVICE_AFTER")) {
+        CHECK(retries==0,"%d renders failed after the device was removed",retries);
+        CHECK(errors_shown==0,"the removal showed an error: %s",last_error);
+    }
+    if(order==4) printf("renders tried again: %d\n",retries);
     fwrite(rendered,1,sizeof rendered,out);
     fclose(out); action(kOfxActionUnload,NULL,NULL,NULL);
     printf("mode %d depth %s top %d premult %d order %d: %d failures\n",mode,depth,top,premult,order,failures);

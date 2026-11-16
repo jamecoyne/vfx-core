@@ -108,19 +108,22 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | Item | Where |
 |---|---|
 | `Effect` (GPU): `params`, `prepare`, `render`, `layer_inputs`, `layer_name`, `render_layers`, `region` | vfx-core |
-| `CpuEffect`: `params`, `frames_before` (the frame rate), `render` (`FrameOut` and `GpuFrame`: an output that is a texture or pixels; returns `RenderError`) | vfx-core |
+| `CpuEffect`: `params`, `frames_before` (the frame rate) and `render`. `render` gets its output as a `FrameOut`, which is a texture (`GpuFrame`) or pixels | vfx-core |
+| `RenderError`, what `render` returns when it fails: `DeviceLost`, `DeviceOpening`, `OutOfMemory`, `Timeout` (the GPU didn't answer in time; the device is kept), `Gpu` with wgpu's error, and `Internal` for the effect's own errors | vfx-core |
 | `CpuEffect::keeps_state` | vfx-core |
+| `DeviceFaults::error_count` and `DeviceFaults::last_error` replace `errors`. They give how many errors a device has reported and the most recent one, which `RenderError::Gpu` carries | vfx-core |
 | `DeviceFaults`, `Gpu::faults`, `Gpu::shared_faults`, `Gpu::watch_faults` (the error and loss callbacks of a device, which `Gpu::share` takes over; each device has its own record), `poll_device` (a poll that returns device loss as an error) | vfx-core |
 | `CpuEffect::clear_history` (forget earlier frames, keeping GPU resources; default `false`, and the host rebuilds the effect) | vfx-core |
 | `CpuEffect::frames_held` (how many of the frames before a render a live host holds in full) | vfx-core |
 | `CpuEffect::values_known` (the values a host holds, ahead of a render) | vfx-core |
-| `FrameOut::with_pixels`, `GpuFrame::write` (an effect that draws in RAM uploads into a texture output) | vfx-core |
+| `RenderError::needs_device`: true when the device was lost or the next one is still opening. Editors use it to wait and render the frame again | vfx-core |
+| `FrameOut::with_pixels` and `GpuFrame::write`: an effect that draws in RAM uses them to upload its pixels into a texture output | vfx-core |
 | `CpuEffect::report`, `Report`, `Reading` (where the last render's work ran and what it found; default empty) | vfx-core |
 | `CpuEffect::device_lost`, `CpuInstance::device_lost` (the host's shared device was lost: the effect lets go of everything on it, so the host can open a new one; default does nothing) | vfx-core |
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core |
 | `Context::frame_rate` | vfx-core |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core |
-| `ReadbackRing` (small GPU results read back through three mapped buffers: `newest_finished` for live callers, never waits; `wait` for exports, native only; a result at most two submissions old, never older than one returned), `ReadbackError`, `readback::Finished` | vfx-core |
+| `ReadbackRing` reads small GPU results back through three mapped buffers. `newest_finished` is for live callers and never blocks. `wait` is for exports, native only. A result is at most two submissions old, and never older than one already returned. `ReadbackError`, `readback::Finished` | vfx-core |
 | `FrameSource`: `with_frame`; `History` | vfx-core |
 | `FrameSource::held`; `History::push_slot(before, held)` | vfx-core |
 | `FrameSource::live` (true for `History`) | vfx-core |
@@ -138,7 +141,10 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | Parameters: `ParamSpec`, `ParamKind`, `ParamValue`, `ParamValues`, `ParamError`, `Requires`, `Unit` | vfx-core |
 | `contract::check` and `Clip` (a kept render equals a fresh one; under a fetch budget, in order, and after a jump within `held_catch_up_renders` for a held frame and `stream_catch_up_renders` for a stream) | vfx-host |
 | `CpuInstance` and `CpuRenderError` (one kept effect per host instance) | vfx-host |
-| `device` (exports, waits) and `try_device` (live, never waits): the core slot's device for GPU effects through RAM; `pool_key`; `release_own_device`, which a target calls after it shares a device; `pipeline::run` returns `Result` and fails on a validation error in its own calls (`pipeline::checked`); `pipeline::evict_lost` | vfx-host |
+| `device` (for exports, waits) and `try_device` (for live renders, never blocks): the core slot's device, for GPU effects that go through RAM. `pool_key`. `release_own_device`, which a target calls after it shares a device | vfx-host |
+| `pipeline::run` returns a `Result` and fails on a validation error in its own calls (`pipeline::checked`). `pipeline::evict_lost` | vfx-host |
+| `remove_d3d12_device` and `RemoveDeviceError`: removes a D3D12 device through D3D12's own call, for device loss tests | vfx-host |
+| `wait_for_next_device` and `NextDevice`: an editor waits for the slot's next device after a render failed because there was none. Once a wait has timed out, later renders don't wait again until a device is back | vfx-host |
 | `CpuInstance::frames_held` | vfx-host |
 | `CpuInstance::values_known` | vfx-host |
 | `CpuInstance::report` | vfx-host |
@@ -376,7 +382,18 @@ conversions. Each host also has a harness that runs the effects:
   `MTLBuffer`s. The plugin opens wgpu on After Effects' own device and wraps them. Resolume's GL
   textures are drawn into IOSurfaces that wgpu's Metal device shares. On Windows they go into Vulkan
   images shared with OpenGL. Everything else, and any setup failure, goes through RAM. If the GPU
-  fails, the frame passes through unchanged instead of failing the host's render.
+  fails, a GPU effect's frame passes through unchanged instead of failing the host's render.
+- When a CPU effect's render returns a `RenderError`, what happens depends on the host:
+  - Live hosts (the preview, FFGL) show the input for that frame.
+  - Editors (OpenFX, After Effects) check `RenderError::needs_device`. If the render failed
+    because there was no device, they wait for the slot's next one, for as long as
+    `DeviceSlot::wait` does, and render the frame again. The second render runs as an export
+    render, so the effect also waits for its own pipelines.
+  - If the frame fails again, the render fails. OpenFX returns `kOfxStatFailed` and shows one
+    error through the message suite. After Effects returns an error code.
+  - Once a wait has timed out, later renders that find no device fail right away, and OpenFX
+    doesn't show another message. That lasts until the slot has a device again, so one outage shows
+    one message.
 - A CPU effect that draws on the GPU can leave its output there. On Windows, the FFGL target shares
   the device of its Vulkan images (`Gpu::share`) before the effect's first render. It hands each
   render a texture on that device as its output (`FrameOut::Texture`), which is shown with no trip

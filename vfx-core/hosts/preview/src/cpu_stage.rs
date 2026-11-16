@@ -12,11 +12,11 @@ use std::time::Duration;
 use web_time::Instant;
 
 use crate::effects::{FullscreenPass, RenderOutcome};
-use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
+use vfx_core::cpu::{Argb, FrameSource, History, Image, ImageMut, ViewMut};
 use vfx_core::{Context, Frame, FrameOut, Gpu, GpuFrame, ParamValues};
 use vfx_host::{CpuInstance, by_rows};
 
-/// How long a frame read back may take once the poll has returned.
+/// How long reading a frame back may take. The limit applies to the poll and again to the map.
 #[cfg(not(target_arch = "wasm32"))]
 const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -301,10 +301,16 @@ impl CpuStage {
         let started = Instant::now();
         let rendered = (self.effect).render(&mut self.history, count, out, values, &ctx);
         let render_time = Some(started.elapsed());
-        // A render that panicked starts the effect over and shows what it drew. One that failed
-        // leaves the last picture up, and the next render tries this frame again.
+        // If the render panicked, the effect starts over and the stage shows what the render
+        // drew. If it failed, the stage shows the input, and the next render tries this frame
+        // again.
         if let Err(vfx_host::CpuRenderError::Render(_)) = rendered {
-            return RenderOutcome::default();
+            self.show_newest_frame();
+            return RenderOutcome {
+                finished: false,
+                new_picture: true,
+                render_time,
+            };
         }
         self.rendered_with = Some(values.clone());
         self.output_drawn_on_gpu = texture_output;
@@ -339,6 +345,27 @@ impl CpuStage {
             new_picture,
             render_time,
         }
+    }
+
+    /// Shows the newest frame of the history as it came in, after a render failed.
+    fn show_newest_frame(&mut self) {
+        let width = self.size.0 as usize;
+        let upload = &mut self.upload_rgba;
+        let newest = self.history.len().saturating_sub(1);
+        self.history.with_frame(newest, &mut |image| {
+            let Some(Image::U8(frame)) = image else {
+                return;
+            };
+            by_rows(upload, width * 4, |y, dst| {
+                let src = frame.row(y as i32);
+                for (dst, p) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                    *dst = [p.red, p.green, p.blue, p.alpha];
+                }
+            });
+        });
+        self.output_drawn_on_gpu = false;
+        self.shown.clear();
+        self.upload_pending = true;
     }
 
     pub fn report(&self) -> vfx_core::Report {
@@ -524,13 +551,18 @@ impl GpuFrameReader {
             .map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.send(r);
             });
-        // A device lost now skips the frame; the app reports it on its next draw.
-        if vfx_core::poll_device(&gpu.device, wgpu::PollType::wait_indefinitely()).is_err() {
+        // A frame that isn't back in time, or that comes from a device lost just now, is skipped.
+        // The app reports a loss on its next draw. D3D12 finishes a poll on a removed device
+        // without noticing the loss, so the map may never answer. A buffer that is still being
+        // mapped can't be mapped again, so the next read needs a new buffer.
+        let wait = wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(READBACK_TIMEOUT),
+        };
+        if vfx_core::poll_device(&gpu.device, wait).is_err() {
+            self.buffer = new_readback_buffer(gpu, self.pitch, input.height);
             return;
         }
-        // D3D12 finishes a poll on a removed device without having found the loss, so the map may
-        // never answer. A frame that doesn't arrive is skipped; a buffer still being mapped can't
-        // be mapped again, so the next read needs a new one.
         match rx.recv_timeout(READBACK_TIMEOUT) {
             Ok(Ok(())) => self.with_mapped_rows(&self.buffer, time, f),
             _ => self.buffer = new_readback_buffer(gpu, self.pitch, input.height),
@@ -666,13 +698,181 @@ mod tests {
         let effect = CpuInstance::new(texture_holder, true).expect("a kept CPU effect");
         let stage = CpuStage::new(&gpu, effect, (16, 16));
 
-        crate::app::remove_d3d12_device(&gpu.device).expect("removed");
+        vfx_host::remove_d3d12_device(&gpu.device).expect("removed");
         Gpu::unshare();
         let (released, on_device) = stage.release();
         drop((on_device, gpu));
         assert!(!crate::warp_offered(), "the effect doesn't hold the device");
         released.effect.device_lost();
         assert!(crate::wait_for_warp(), "the effect kept the removed device");
+    }
+
+    /// Runs segcam's swarm on WARP through a device removed by `RemoveDevice`, with the host's
+    /// recovery: release the stage, share the next device, restore. The tests run in a child
+    /// process, because segcam draws on a software adapter only where `WGPU_ADAPTER_NAME` names
+    /// one.
+    #[cfg(windows)]
+    mod removal {
+        use super::*;
+
+        const SIZE: (usize, usize) = (160, 90);
+        /// How many frames render before the removal, and again after it on the next device.
+        const BEFORE: usize = 10;
+        const AFTER: usize = 3;
+
+        fn frame(f: usize) -> Vec<Argb<u8>> {
+            let (w, h) = SIZE;
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    let inside = (8 + f * 5..28 + f * 5).contains(&x) && (30..60).contains(&y);
+                    let v = if inside { 230 } else { 40 + (x % 30) as u8 };
+                    Argb {
+                        alpha: 255,
+                        red: v,
+                        green: 90,
+                        blue: 255 - v,
+                    }
+                })
+                .collect()
+        }
+
+        fn swarm() -> ParamValues {
+            let mut values = ParamValues::new(SegcamMotion::with_gpu(true).params());
+            for (name, value) in [
+                ("output", ParamValue::Int(3)),
+                ("detect", ParamValue::Int(0)),
+                ("background", ParamValue::Int(4)),
+                ("trail", ParamValue::Int(8)),
+            ] {
+                values.set(name, value).expect(name);
+            }
+            values
+        }
+
+        fn stage(gpu: &Gpu) -> CpuStage {
+            let make = || Processor::Cpu(Box::new(SegcamMotion::with_gpu(true)));
+            let effect = CpuInstance::new(make, true).expect("a CPU effect");
+            CpuStage::new(gpu, effect, (SIZE.0 as u32, SIZE.1 as u32))
+        }
+
+        fn render(stage: &mut CpuStage, gpu: &Gpu, f: usize) -> RenderOutcome {
+            let time = f as f64 / 60.0;
+            let pixels = frame(f);
+            stage.render(gpu, Input::Ram(&pixels), &swarm(), time, Some(60.0), true)
+        }
+
+        /// What the stage showed across the removal: the outcome of the render right after it,
+        /// the picture that render put up, and the last picture on the next device.
+        struct Removal {
+            failed: RenderOutcome,
+            shown: Vec<u8>,
+            recovered: Vec<u8>,
+        }
+
+        fn remove_and_recover() -> Removal {
+            let gpu = crate::warp_gpu();
+            gpu.share();
+            segcam_motion::gpu::status().expect("segcam draws on the shared device");
+            let mut stage = stage(&gpu);
+            for f in 0..BEFORE {
+                render(&mut stage, &gpu, f);
+            }
+            let draw = stage.report().draw.unwrap_or_default();
+            assert!(
+                draw.starts_with("GPU"),
+                "segcam drew on the {draw}, not on WARP"
+            );
+            vfx_host::remove_d3d12_device(&gpu.device).expect("removed");
+            let failed = render(&mut stage, &gpu, BEFORE);
+            let shown = stage.upload_rgba.clone();
+            stage.device_lost();
+            Gpu::unshare();
+            let (released, on_device) = stage.release();
+            drop((on_device, gpu));
+            let gpu = crate::warp_gpu();
+            gpu.share();
+            segcam_motion::gpu::status().expect("segcam draws on the next device");
+            let mut stage = CpuStage::restore(&gpu, released);
+            for f in BEFORE + 1..=BEFORE + AFTER {
+                render(&mut stage, &gpu, f);
+            }
+            let draw = stage.report().draw.unwrap_or_default();
+            assert!(
+                draw.starts_with("GPU"),
+                "segcam drew on the {draw} on the next device"
+            );
+            let recovered = stage.output().read_rgba8(&gpu);
+            drop(stage);
+            Gpu::unshare();
+            Removal {
+                failed,
+                shown,
+                recovered,
+            }
+        }
+
+        /// Renders every frame on one device and returns the last picture.
+        fn uninterrupted() -> Vec<u8> {
+            let gpu = crate::warp_gpu();
+            gpu.share();
+            segcam_motion::gpu::status().expect("segcam draws on the shared device");
+            let mut stage = stage(&gpu);
+            for f in 0..=BEFORE + AFTER {
+                render(&mut stage, &gpu, f);
+            }
+            let picture = stage.output().read_rgba8(&gpu);
+            drop(stage);
+            Gpu::unshare();
+            picture
+        }
+
+        #[test]
+        #[ignore = "run by removal::removal_tests_pass_in_child"]
+        fn failed_render_shows_input() {
+            let _turn = crate::test_gpu().0;
+            let removal = remove_and_recover();
+            let input: Vec<u8> = (frame(BEFORE).iter())
+                .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
+                .collect();
+            assert!(
+                !removal.failed.finished,
+                "the render on the removed device drew"
+            );
+            assert!(removal.failed.new_picture);
+            assert!(removal.shown == input, "the input isn't up");
+        }
+
+        #[test]
+        #[ignore = "run by removal::removal_tests_pass_in_child"]
+        fn next_device_draws_whole_trail() {
+            let _turn = crate::test_gpu().0;
+            let recovered = remove_and_recover().recovered;
+            assert!(
+                recovered == uninterrupted(),
+                "the picture after the removal"
+            );
+        }
+
+        #[test]
+        fn removal_tests_pass_in_child() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--test-threads=1",
+                    "cpu_stage::tests::removal::",
+                ])
+                .env("WGPU_ADAPTER_NAME", "Microsoft Basic Render Driver")
+                .env("WGPU_BACKEND", "dx12")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}");
+            for test in ["failed_render_shows_input", "next_device_draws_whole_trail"] {
+                let passed = format!("removal::{test} ... ok");
+                assert!(stdout.contains(&passed), "{test} didn't run: {stdout}");
+            }
+        }
     }
 
     /// Every value of every channel, so a rounding on the way would show.
@@ -781,8 +981,8 @@ mod tests {
         );
     }
 
-    /// Overlay, drawn on the CPU, uploaded into the output frame by the effect against the same
-    /// render kept in RAM.
+    /// An overlay drawn on the CPU and uploaded into the output frame by the effect gives the
+    /// same picture as the same render kept in RAM.
     #[test]
     fn overlay_upload_matches_ram_path() {
         let (_turn, gpu) = crate::test_gpu();

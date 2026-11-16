@@ -3586,6 +3586,7 @@ dependencies = [
  "rayon",
  "thiserror 2.0.21",
  "vfx-core",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

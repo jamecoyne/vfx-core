@@ -2319,43 +2319,6 @@ struct OpenedDevice {
     gpu: Gpu,
 }
 
-/// Why `--lose-gpu removed` could not remove the device.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum RemoveDeviceError {
-    #[cfg(windows)]
-    #[error("--lose-gpu removed: not on D3D12; WGPU_BACKEND=dx12 asks for it")]
-    NotD3d12,
-    #[cfg(windows)]
-    #[error("--lose-gpu removed: no ID3D12Device5: {0}")]
-    NoDevice5(#[source] windows::core::Error),
-    #[cfg(not(windows))]
-    #[error("--lose-gpu removed: D3D12 only")]
-    Unsupported,
-}
-/// Removes this device, and every other D3D12 user's of the adapter in this process, as a driver
-/// reset would. It touches nothing outside the process.
-#[cfg(windows)]
-pub(crate) fn remove_d3d12_device(device: &wgpu::Device) -> Result<(), RemoveDeviceError> {
-    use windows::Win32::Graphics::Direct3D12::ID3D12Device5;
-    use windows::core::Interface;
-    // SAFETY: the raw device is only used here, to ask for its removal, which every later call on
-    // it has to cope with anyway.
-    unsafe {
-        let hal = device
-            .as_hal::<wgpu::hal::api::Dx12>()
-            .ok_or(RemoveDeviceError::NotD3d12)?;
-        let device = hal.raw_device().cast::<ID3D12Device5>();
-        device.map_err(RemoveDeviceError::NoDevice5)?.RemoveDevice();
-    }
-    Ok(())
-}
-
-#[cfg(not(any(windows, target_arch = "wasm32")))]
-pub(crate) fn remove_d3d12_device(_device: &wgpu::Device) -> Result<(), RemoveDeviceError> {
-    Err(RemoveDeviceError::Unsupported)
-}
-
 /// Reopening the device in place. Native only: a browser's device takes async calls and its canvas
 /// has rules of its own, so the web build says to reload.
 #[cfg(not(target_arch = "wasm32"))]
@@ -2393,9 +2356,9 @@ impl Preview {
         match loss.kind {
             script::LossKind::Destroy => self.gpu.device.destroy(),
             script::LossKind::Removed => {
-                if let Err(e) = remove_d3d12_device(&self.gpu.device) {
+                if let Err(e) = vfx_host::remove_d3d12_device(&self.gpu.device) {
                     self.reopening.forced_losses_fired -= 1;
-                    eprintln!("preview: {e}");
+                    eprintln!("preview: --lose-gpu removed: {e}");
                 }
             }
         }

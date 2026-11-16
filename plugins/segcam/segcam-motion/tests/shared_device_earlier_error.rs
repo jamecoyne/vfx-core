@@ -23,7 +23,7 @@ fn host_error_before_open_leaves_gpu_usable() {
     // An odd offset is a validation error.
     gpu.queue.write_buffer(&buffer, 1, &[0; 4]);
     assert!(
-        Gpu::shared_faults().errors().0 > 0,
+        Gpu::shared_faults().error_count() > 0,
         "the misuse wasn't seen"
     );
     segcam_motion::gpu::status().expect("segcam draws on the shared device");
