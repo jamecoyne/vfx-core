@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
-use crate::cpu::{FrameSource, ImageMut};
-use crate::{Frame, Gpu, ParamSpec, ParamValues};
+use crate::cpu::FrameSource;
+use crate::{Frame, FrameOut, Gpu, ParamSpec, ParamValues, RenderError};
 
 /// What a render knows besides its pixels and parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -145,45 +145,18 @@ pub trait CpuEffect: Send {
     /// the render thread.
     fn values_known(&self, _params: &ParamValues) {}
 
-    /// Renders the last of `count` frames into `output`. `frames` hands out the frames it
-    /// asks for; frames a host doesn't have come as `None`.
+    /// Renders the last of `count` frames into `out`. `frames` hands out the frames the effect asks
+    /// for. The current frame is at `count - 1`, and a frame the host doesn't have comes back as
+    /// `None`.
     /// `ctx.frame` is the current frame's number; the one `k` before it is `frame - k`.
     fn render(
         &mut self,
         frames: &mut dyn FrameSource,
         count: usize,
-        output: ImageMut<'_>,
+        out: FrameOut<'_>,
         params: &ParamValues,
         ctx: &Context,
-    );
-
-    /// Whether a render with `params` can draw into a [`Target`] if offered one, so a host
-    /// allocates its GPU output only for those. [`CpuEffect::render_to`] may still decline a frame.
-    fn can_draw_to_target(&self, _params: &ParamValues) -> bool {
-        false
-    }
-
-    /// Like [`CpuEffect::render`], for a host that shows its frames from the GPU (FFGL): the
-    /// effect may draw the frame into `target` instead of `output`, and says whether it did.
-    /// When it didn't, `output` holds the frame. The default renders into `output`.
-    fn render_to(
-        &mut self,
-        frames: &mut dyn FrameSource,
-        count: usize,
-        output: ImageMut<'_>,
-        _target: Target<'_>,
-        params: &ParamValues,
-        ctx: &Context,
-    ) -> bool {
-        self.render(frames, count, output, params, ctx);
-        false
-    }
-
-    /// Whether the last render is unfinished, waiting on the GPU (browsers only). Hosts don't show
-    /// it and render the same frame with the same parameters again until this is false.
-    fn unfinished(&self) -> bool {
-        false
-    }
+    ) -> Result<(), RenderError>;
 
     /// Where the last render's work ran and what it found. Hosts may ask every frame.
     fn report(&self) -> Report {
@@ -229,23 +202,6 @@ impl Reading {
             name: name.into(),
             value,
         }
-    }
-}
-
-/// A GPU frame a host offers a CPU effect's output ([`CpuEffect::render_to`]): `frame`, the
-/// size of the render, on `gpu`, the device the host [shared](Gpu::share). The effect draws
-/// straight colour into it, top row first, as it would into an 8-bit output.
-#[derive(Clone, Copy)]
-#[non_exhaustive]
-pub struct Target<'a> {
-    pub gpu: &'a Gpu,
-    pub frame: &'a Frame,
-}
-
-impl<'a> Target<'a> {
-    /// `frame` on `gpu`, the device the host shared, for the effect's output.
-    pub fn new(gpu: &'a Gpu, frame: &'a Frame) -> Self {
-        Self { gpu, frame }
     }
 }
 

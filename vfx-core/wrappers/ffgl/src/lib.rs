@@ -27,7 +27,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
 use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
-use vfx_core::{Context, ParamValues};
+use vfx_core::{Context, FrameOut, ParamValues};
 use vfx_host::{Kind, diag, pipeline};
 
 #[cfg(target_os = "windows")]
@@ -541,7 +541,7 @@ unsafe fn process_cpu(
     let (w, h) = (input_texture.Width, input_texture.Height);
     // SAFETY: the host's context is current.
     #[cfg(target_os = "windows")]
-    let gpu_output_ready = unsafe { prepare_gpu_output(instance, &values, (w, h)) };
+    let gpu_output_ready = unsafe { prepare_gpu_output(instance, (w, h)) };
     let Some(cpu) = instance.cpu_effect.as_mut() else {
         return false;
     };
@@ -605,23 +605,40 @@ unsafe fn process_cpu(
         h as i32,
     ));
     #[cfg(target_os = "windows")]
-    let target = (instance.interop.current())
+    let texture = (instance.interop.current())
         .zip(instance.gpu_output_frame.as_ref())
         .filter(|_| gpu_output_ready)
-        .map(|(interop, output)| vfx_core::Target::new(interop.gpu(), output.frame()));
+        .map(|(interop, output)| vfx_core::GpuFrame {
+            gpu: interop.gpu(),
+            frame: output.frame(),
+        });
     #[cfg(not(target_os = "windows"))]
-    let target = None;
-    let effect = &cpu.effect;
-    let rendered = match target {
-        Some(target) => effect.render_to(&mut cpu.history, frame_count, out, target, &values, &ctx),
-        None => effect
-            .render(&mut cpu.history, frame_count, out, &values, &ctx)
-            .map(|()| false),
+    let texture: Option<vfx_core::GpuFrame<'_>> = None;
+    let on_gpu = texture.is_some();
+    let out = match texture {
+        Some(texture) => FrameOut::Texture(texture),
+        None => FrameOut::Pixels(out),
     };
-    let Ok(on_gpu) = rendered else {
-        LOG.note("warning: CPU render failed");
+    let rendered = (cpu.effect).render(&mut cpu.history, frame_count, out, &values, &ctx);
+    if let Err(e) = rendered {
+        LOG.note(&format!("warning: CPU render failed: {e}"));
+        #[cfg(target_os = "windows")]
+        if on_gpu {
+            // The frame never reached the texture, so the input stands in for it, and the
+            // instance leaves a lost device. The next frames go through RAM.
+            let error = match e {
+                vfx_host::CpuRenderError::Render(vfx_core::RenderError::DeviceLost) => {
+                    shared::InteropError::Lost(e.to_string())
+                }
+                e => shared::InteropError::Failed(e.to_string()),
+            };
+            instance.interop.record_render_error(error);
+            // SAFETY: the context is current with the host's framebuffer bound.
+            unsafe { draw_input(instance, input_texture) };
+            return true;
+        }
         return false;
-    };
+    }
     let render_time = started.elapsed() - read_time;
     #[cfg(target_os = "windows")]
     if on_gpu {
@@ -630,24 +647,18 @@ unsafe fn process_cpu(
             .zip(instance.gpu_output_frame.as_ref())
             .map(|(interop, output)| {
                 // SAFETY: the context is current with the host's framebuffer bound, and the effect
-                // drew the frame on the interop's device.
+                // wrote the frame into a texture on the interop's device.
                 catch_unwind(AssertUnwindSafe(|| unsafe {
                     interop.present(output.frame())
                 }))
                 .unwrap_or_else(|_| Err(shared::InteropError::Failed("the render panicked".into())))
             });
         if let Some(Err(e)) = presented {
-            // This frame exists only on the GPU, so the input stands in for it. The next ones go
-            // through RAM.
+            // This frame exists only in the texture, so the input is shown instead. The next
+            // frames go through RAM.
             instance.interop.record_render_error(e);
-            if let Some(blit) = &instance.pass_through_blit {
-                let max_uv = [
-                    w as f32 / input_texture.HardwareWidth.max(1) as f32,
-                    h as f32 / input_texture.HardwareHeight.max(1) as f32,
-                ];
-                // SAFETY: the context is current with the host's framebuffer bound.
-                unsafe { blit.draw(input_texture.Handle, gl::TEXTURE_2D, max_uv) };
-            }
+            // SAFETY: the context is current with the host's framebuffer bound.
+            unsafe { draw_input(instance, input_texture) };
             return true;
         }
     }
@@ -692,31 +703,30 @@ unsafe fn process_cpu(
     true
 }
 
+/// Draws the host's input into its framebuffer, in place of a frame the effect couldn't show.
+///
+/// # Safety
+/// The host's context must be current with its framebuffer bound.
+#[cfg(target_os = "windows")]
+unsafe fn draw_input(instance: &Instance, input_texture: &FFGLTextureStruct) {
+    if let Some(blit) = &instance.pass_through_blit {
+        let max_uv = [
+            input_texture.Width as f32 / input_texture.HardwareWidth.max(1) as f32,
+            input_texture.Height as f32 / input_texture.HardwareHeight.max(1) as f32,
+        ];
+        // SAFETY: the caller has the context current with the framebuffer bound.
+        unsafe { blit.draw(input_texture.Handle, gl::TEXTURE_2D, max_uv) };
+    }
+}
+
 /// Readies a CPU effect's GPU output at `size`, and says whether this render can offer it. The
-/// images and the frame the effect draws into are about 100 MB at 1080p, so an instance allocates
-/// them when the effect can use them, and keeps them while the size holds so that switching modes
-/// in a show doesn't allocate on the render thread.
+/// images and the frame are kept while the size holds, so the render thread allocates them only
+/// for a new size.
 ///
 /// # Safety
 /// The host's context must be current.
 #[cfg(target_os = "windows")]
-unsafe fn prepare_gpu_output(
-    instance: &mut Instance,
-    values: &ParamValues,
-    size: (u32, u32),
-) -> bool {
-    let can_draw =
-        (instance.cpu_effect.as_ref()).is_some_and(|cpu| cpu.effect.can_draw_to_target(values));
-    let same_size = instance.interop.current().is_some_and(|i| i.size() == size);
-    if !can_draw {
-        if !same_size {
-            instance.gpu_output_frame = None;
-            // SAFETY: the context is current; the interop belongs to it.
-            unsafe { instance.interop.release() };
-        }
-        LOG.note("GPU output not set up: the effect draws these settings on the CPU");
-        return false;
-    }
+unsafe fn prepare_gpu_output(instance: &mut Instance, size: (u32, u32)) -> bool {
     if vfx_core::Gpu::shared().is_none() {
         LOG.note("GPU output not set up: no device is shared with OpenGL");
         return false;

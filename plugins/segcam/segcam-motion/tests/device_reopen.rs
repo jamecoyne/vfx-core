@@ -7,9 +7,9 @@
 use std::time::{Duration, Instant};
 
 use segcam_motion::{Argb, SegcamMotion, View};
-use vfx_core::cpu::{FrameSource, Image, ImageMut, ViewMut};
+use vfx_core::cpu::{FrameSource, Image};
 use vfx_core::wgpu;
-use vfx_core::{Context, CpuEffect, Frame, Gpu, ParamValue, ParamValues, Target};
+use vfx_core::{Context, CpuEffect, Frame, FrameOut, Gpu, GpuFrame, ParamValue, ParamValues};
 
 const W: i32 = 160;
 const H: i32 = 90;
@@ -53,35 +53,35 @@ fn host_gpu() -> Option<Gpu> {
     (gpu.device.adapter_info().device_type != wgpu::DeviceType::Cpu).then_some(gpu)
 }
 
-/// Renders frame `number`, offering `target`, and returns whether the render drew into it.
+/// Renders frame `number` into `texture` and returns whether the swarm drew
+/// straight into it.
 fn render(
     effect: &mut SegcamMotion,
     gpu: &Gpu,
-    target: &Frame,
+    texture: &Frame,
     params: &ParamValues,
     number: i64,
 ) -> bool {
-    let mut out = vec![Argb::default(); (W * H) as usize];
     let first = (number - effect.frames_before(params, None) as i64).max(0);
     let ctx = Context {
         frame: number,
         ..Context::at(number as f64 / 30.0)
     };
-    effect.render_to(
+    let rendered = effect.render(
         &mut Moving { first },
         (number - first + 1) as usize,
-        ImageMut::U8(ViewMut::from_pixels(&mut out, W, H)),
-        Target::new(gpu, target),
+        FrameOut::Texture(GpuFrame {
+            gpu,
+            frame: texture,
+        }),
         params,
         &ctx,
-    )
+    );
+    rendered.is_ok() && effect.drew_into_texture()
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
-)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs a hardware GPU adapter")]
 fn host_device_loss_waits_for_next_shared_device() {
     let first = host_gpu().expect("a hardware GPU adapter");
     first.share();

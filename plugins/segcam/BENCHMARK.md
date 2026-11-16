@@ -101,7 +101,7 @@ Linux the GPUs `lspci` lists.
 | same | CLI | show faces | 8 bit | CPU, fresh, 600 of 600 frames, faces on Vision | 128.7 ms | 148.7 ms | 247.9 ms | 6.7 fps | no reference |
 | same | CLI | show faces | float | CPU, fresh, 600 of 600 frames, faces on Vision | 164.9 ms | 227.3 ms | 386.9 ms | 4.4 fps | no reference |
 | Ryzen 5 3600, RX 5700 XT 50th Anniversary (display), AMD 26.10.1, Windows 10 22H2 | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output through RAM | not split out | 32.7 ms | 45.6 ms | 26.7 fps | |
-| same | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output kept on the GPU | not split out | 28.9 ms | 41.4 ms | 30.0 fps | the swarm read back, byte for byte (`tests/target.rs`) |
+| same | Resolume Avenue 7.28.1 | show faces at Trail 60 | 8 bit | GPU, output kept on the GPU | not split out | 28.9 ms | 41.4 ms | 30.0 fps | the swarm read back, byte for byte (`tests/texture_output.rs`) |
 
 CLI rows: the benchmark clip (H.264, 1080p, 59.94 fps), frames 0 to 299, two runs pooled, printed by
 `cargo vfx bench`. The first two rows are `--cpu`. Faces run on DirectML on the RTX 4070. A GPU row's

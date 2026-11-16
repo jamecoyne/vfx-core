@@ -12,7 +12,7 @@ use portrait::{H, W, drifting, portrait};
 use segcam_motion::{Argb, SegcamMotion, ViewMut};
 use segcam_motion::{faces, gpu};
 use vfx_core::cpu::{History, ImageMut};
-use vfx_core::{Context, CpuEffect, ParamValue, ParamValues};
+use vfx_core::{Context, CpuEffect, FrameOut, ParamValue, ParamValues};
 
 const TRAIL: i64 = 4;
 const LIMIT: Duration = Duration::from_secs(180);
@@ -40,7 +40,15 @@ fn render(
     let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
     let view = ViewMut::from_pixels(&mut out, W, H);
     let count = history.len();
-    effect.render(history, count, ImageMut::U8(view), params, &ctx);
+    effect
+        .render(
+            history,
+            count,
+            FrameOut::Pixels(ImageMut::U8(view)),
+            params,
+            &ctx,
+        )
+        .unwrap();
     out
 }
 

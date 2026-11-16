@@ -11,7 +11,7 @@ use segcam_motion::{
     View, ViewMut, previous_frames_needed, render,
 };
 use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
-use vfx_core::{Context, CpuEffect, ParamValue, ParamValues};
+use vfx_core::{Context, CpuEffect, FrameOut, ParamValue, ParamValues};
 
 const W: i32 = 320;
 const H: i32 = 180;
@@ -278,7 +278,15 @@ fn stream(effect: &mut SegcamMotion, history: &mut History<u8>, frames: &[Frame]
             let mut out = vec![Argb::default(); (W * H) as usize];
             let view = ViewMut::from_pixels(&mut out, W, H);
             let count = history.len();
-            effect.render(history, count, ImageMut::U8(view), &values, &ctx);
+            effect
+                .render(
+                    history,
+                    count,
+                    FrameOut::Pixels(ImageMut::U8(view)),
+                    &values,
+                    &ctx,
+                )
+                .unwrap();
             out
         })
         .collect()
@@ -334,7 +342,15 @@ fn live(
             let mut out = vec![Argb::default(); (W * H) as usize];
             let view = ViewMut::from_pixels(&mut out, W, H);
             let count = history.len();
-            effect.render(&mut history, count, ImageMut::U8(view), values, &ctx);
+            effect
+                .render(
+                    &mut history,
+                    count,
+                    FrameOut::Pixels(ImageMut::U8(view)),
+                    values,
+                    &ctx,
+                )
+                .unwrap();
             out
         })
         .collect()
@@ -401,7 +417,15 @@ fn live_setting_change_keeps_windows() {
         let mut out = vec![Argb::default(); (W * H) as usize];
         let view = ViewMut::from_pixels(&mut out, W, H);
         let count = history.len();
-        effect.render(&mut history, count, ImageMut::U8(view), &values, &ctx);
+        effect
+            .render(
+                &mut history,
+                count,
+                FrameOut::Pixels(ImageMut::U8(view)),
+                &values,
+                &ctx,
+            )
+            .unwrap();
         if n >= 20 {
             assert!(out == last, "frame {n}");
         }

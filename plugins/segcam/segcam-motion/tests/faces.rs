@@ -14,7 +14,7 @@ use segcam_motion::{
     ViewMut,
 };
 use vfx_core::cpu::{FrameSource, History, Image, ImageMut};
-use vfx_core::{Context, CpuEffect, ParamValue, ParamValues, Processor};
+use vfx_core::{Context, CpuEffect, FrameOut, ParamValue, ParamValues, Processor};
 use vfx_host::contract::{Clip, check};
 
 /// On the CPU: while the shared GPU device opens, a kept and a fresh effect can draw the
@@ -121,7 +121,15 @@ fn live_faces_arrive_and_stay() {
         let mut out = vec![Argb::<u8>::default(); (W * H) as usize];
         let view = ViewMut::from_pixels(&mut out, W, H);
         let count = history.len();
-        effect.render(&mut history, count, ImageMut::U8(view), &params, &ctx);
+        effect
+            .render(
+                &mut history,
+                count,
+                FrameOut::Pixels(ImageMut::U8(view)),
+                &params,
+                &ctx,
+            )
+            .unwrap();
         if seen > 0 {
             assert_eq!(face_read(&effect), Some(1.0), "render {f}, faces went away");
             seen += 1;
@@ -181,7 +189,15 @@ fn kept_history_faces_match_fresh_render() {
                 let view = ViewMut::from_pixels(&mut out, W, H);
                 let count = history.len();
                 let mut exact = ExactHistory(&mut history);
-                effect.render(&mut exact, count, ImageMut::U8(view), params, &ctx);
+                effect
+                    .render(
+                        &mut exact,
+                        count,
+                        FrameOut::Pixels(ImageMut::U8(view)),
+                        params,
+                        &ctx,
+                    )
+                    .unwrap();
                 out
             };
             let got = render(&mut kept);
@@ -193,7 +209,14 @@ fn kept_history_faces_match_fresh_render() {
             let view = ViewMut::from_pixels(&mut out, W, H);
             let count = lean_history.len();
             let mut exact = ExactHistory(&mut lean_history);
-            lean.render(&mut exact, count, ImageMut::U8(view), params, &ctx);
+            lean.render(
+                &mut exact,
+                count,
+                FrameOut::Pixels(ImageMut::U8(view)),
+                params,
+                &ctx,
+            )
+            .unwrap();
             assert!(got == out, "lean, frame {f} at {frame_rate:?}");
         }
     }
@@ -231,7 +254,15 @@ fn readings_match_model_output() {
     let count = history.len();
     let ctx = Context::at(0.0);
     let mut exact = ExactHistory(&mut history);
-    effect.render(&mut exact, count, ImageMut::U8(view), &params, &ctx);
+    effect
+        .render(
+            &mut exact,
+            count,
+            FrameOut::Pixels(ImageMut::U8(view)),
+            &params,
+            &ctx,
+        )
+        .unwrap();
 
     let report = effect.report();
     assert_eq!(report.draw.as_deref(), Some("CPU"));

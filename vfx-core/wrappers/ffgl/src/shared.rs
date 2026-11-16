@@ -863,10 +863,6 @@ impl Interop {
         }
     }
 
-    pub fn size(&self) -> (u32, u32) {
-        self.size
-    }
-
     /// The device both images are on.
     pub fn gpu(&self) -> &Gpu {
         &self.device.gpu

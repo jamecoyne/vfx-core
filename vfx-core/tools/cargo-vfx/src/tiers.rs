@@ -38,8 +38,8 @@ const HARDWARE_GPU_TESTS: [&str; 6] = [
     "device_reopen",
     "gpu",
     "shared_device_earlier_error",
-    "target",
-    "target_on_other_device",
+    "texture_on_other_device",
+    "texture_output",
 ];
 const HOST_FEATURES: &str = "vfx-chain/ae,vfx-chain/ofx,vfx-chain/ffgl,colour-adjust/ae,colour-adjust/ofx,colour-adjust/ffgl,gaussian-blur/ae,gaussian-blur/ofx,gaussian-blur/ffgl,vignette/ae,vignette/ofx,vignette/ffgl,blend/ae,blend/ofx,blend/ffgl,segcam-motion/ae,segcam-motion/ofx,segcam-motion/ffgl";
 const WASM: &str = "wasm32-unknown-unknown";

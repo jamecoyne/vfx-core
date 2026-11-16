@@ -81,10 +81,10 @@ Resolume and the preview hand frames over one at a time and hold only the curren
 tiles the pile still draws, so a setting changed live reaches new windows only. A picture that holds
 exactly still counts as one frame (`History::drop_repeat`), and its windows stay until it changes.
 
-In Resolume on Windows the swarm draws straight into the frame Resolume shows
-(`CpuEffect::render_to`) on the device the plugin shares with Resolume, with no readback. The
-output is byte identical to the swarm read back. A frame drawn on the
-CPU, while the device opens or after a fault, goes through RAM.
+In Resolume on Windows the swarm draws straight into the texture Resolume shows
+(`FrameOut::Texture`) on the device the plugin shares with Resolume, with no readback. The
+output is byte identical to the swarm read back. A frame drawn on the CPU, as every output but
+the swarm is, and the swarm while the device opens or after a fault, is uploaded into it.
 
 ### Device loss
 

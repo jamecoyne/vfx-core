@@ -1,7 +1,7 @@
-//! A swarm drawn into a host's GPU frame (`CpuEffect::render_to`, as FFGL offers on Windows)
-//! against the same swarm drawn on the GPU and read back: every pixel the same. Its own test
-//! binary, since the host's device has to be shared before segcam opens one. Ignored except on
-//! macOS, where CI has a hardware adapter.
+//! Compares a swarm drawn into a host's texture (`FrameOut::Texture`, as FFGL offers on
+//! Windows) with the same swarm drawn on the GPU and read back. Every pixel must be the
+//! same. This test lives in its own binary, because the host's device has to be shared
+//! before segcam opens one. It's ignored except on macOS, where CI has a hardware adapter.
 
 mod motion_only;
 
@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use segcam_motion::{Argb, SegcamMotion, View};
 use vfx_core::cpu::{FrameSource, Image, ImageMut, ViewMut};
 use vfx_core::wgpu;
-use vfx_core::{Context, CpuEffect, Frame, Gpu, ParamValue, ParamValues, Target};
+use vfx_core::{Context, CpuEffect, Frame, FrameOut, Gpu, GpuFrame, ParamValue, ParamValues};
 
 const W: i32 = 320;
 const H: i32 = 180;
@@ -98,11 +98,8 @@ fn argb(bytes: &[u8]) -> Pixels {
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
-)]
-fn kept_target_render_matches_fresh() {
+#[cfg_attr(not(target_os = "macos"), ignore = "needs a hardware GPU adapter")]
+fn kept_texture_render_matches_fresh() {
     let gpu = shared().expect("a hardware GPU adapter");
     // segcam keeps its context on a host's device while an instance lives; this one
     // spans the test, as a host's layer would.
@@ -122,15 +119,11 @@ fn kept_target_render_matches_fresh() {
     };
     let make = || vfx_core::Processor::Cpu(Box::new(SegcamMotion::with_gpu(true)));
     let format = wgpu::TextureFormat::Rgba8Unorm;
-    let drawn = vfx_host::contract::check_target(make, &clip, &params, gpu, format).unwrap();
-    assert!(drawn > 0, "no render drew into the target");
+    vfx_host::contract::check_texture(make, &clip, &params, gpu, format).unwrap();
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
-)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs a hardware GPU adapter")]
 fn swarm_in_host_frame_matches_readback() {
     let gpu = shared().expect("a hardware GPU adapter");
     // segcam keeps its context on a host's device while an instance lives; this one
@@ -166,7 +159,6 @@ fn swarm_in_host_frame_matches_readback() {
         let mut drawn_into = SegcamMotion::with_gpu(true);
         let needed = read_back.frames_before(params, None);
         let mut want = vec![Argb::default(); (W * H) as usize];
-        let mut out = want.clone();
         for n in 0..frames.len() {
             let first = n.saturating_sub(needed);
             let count = n - first + 1;
@@ -176,12 +168,24 @@ fn swarm_in_host_frame_matches_readback() {
             };
             let view = ViewMut::from_pixels(&mut want, W, H);
             let source = &mut Frames(&frames[first..=n]);
-            read_back.render(source, count, ImageMut::U8(view), params, &ctx);
-            let view = ViewMut::from_pixels(&mut out, W, H);
+            read_back
+                .render(
+                    source,
+                    count,
+                    FrameOut::Pixels(ImageMut::U8(view)),
+                    params,
+                    &ctx,
+                )
+                .unwrap();
             let source = &mut Frames(&frames[first..=n]);
-            let to = Target::new(gpu, &target);
-            let took = drawn_into.render_to(source, count, ImageMut::U8(view), to, params, &ctx);
-            assert!(took, "{name}: frame {n} wasn't drawn into the target");
+            let out = FrameOut::Texture(GpuFrame {
+                gpu,
+                frame: &target,
+            });
+            let rendered = drawn_into.render(source, count, out, params, &ctx);
+            rendered.expect("a render into the host's texture");
+            let drew = drawn_into.drew_into_texture();
+            assert!(drew, "{name}: frame {n} wasn't drawn into the texture");
             assert!(argb(&target.read(gpu)) == want, "{name}: frame {n}");
         }
         // Over the transparent backdrop the windows are what's opaque.
