@@ -1,6 +1,8 @@
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use crate::Gpu;
+use crate::readback::{ReadbackError, map_read};
 
 /// A GPU texture that effects read from or render into.
 ///
@@ -223,11 +225,7 @@ impl Readback {
         );
         let submission_index = gpu.queue.submit(Some(encoder.finish()));
 
-        let slice = buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
+        let mapped = map_read(buffer);
         let wait = wgpu::PollType::Wait {
             submission_index: Some(submission_index),
             timeout: Some(timeout),
@@ -235,15 +233,21 @@ impl Readback {
         // Another thread's poll may be the one that calls back, a moment later.
         let mapped = crate::poll_device(&gpu.device, wait)
             .map_err(ReadbackError::from)
-            .and_then(|_| rx.recv_timeout(timeout).map_err(ReadbackError::from))
-            .and_then(|mapped| mapped.map_err(ReadbackError::from));
+            .and_then(|_| match mapped.recv_timeout(timeout) {
+                Ok(Ok(())) => Ok(()),
+                Err(RecvTimeoutError::Timeout) => Err(ReadbackError::Timeout),
+                Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => Err(ReadbackError::DeviceLost),
+            });
         if let Err(err) = mapped {
             // The map may still be pending on this buffer, so the next read takes a new one.
             *self = Self::new(gpu, frame);
             return Err(err);
         }
 
-        let data = slice.get_mapped_range().expect("readback range is mapped");
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("readback range is mapped");
         for (src, dst) in data
             .chunks_exact(gpu_pitch as usize)
             .zip(out.chunks_exact_mut(row_stride as usize))
@@ -254,16 +258,6 @@ impl Readback {
         buffer.unmap();
         Ok(())
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ReadbackError {
-    #[error(transparent)]
-    Poll(#[from] crate::PollFailure),
-    #[error(transparent)]
-    Recv(#[from] std::sync::mpsc::RecvTimeoutError),
-    #[error(transparent)]
-    Map(#[from] wgpu::BufferAsyncError),
 }
 
 fn extent(width: u32, height: u32) -> wgpu::Extent3d {

@@ -14,6 +14,7 @@ pub mod effects;
 mod frame;
 mod gpu;
 mod param;
+pub mod readback;
 mod shader;
 
 pub use chain::EffectChain;
@@ -23,6 +24,7 @@ pub use effect::{Context, CpuEffect, Effect, Processor, Reading, Region, Report,
 pub use frame::{Frame, Readback};
 pub use gpu::{DeviceFaults, Gpu, PollFailure, ReopenBackoff, poll_device};
 pub use param::{ParamError, ParamKind, ParamSpec, ParamValue, ParamValues, Requires, Unit};
+pub use readback::{ReadbackError, ReadbackRing};
 
 /// Re-exported so hosts can match the exact wgpu version the core was built against.
 pub use wgpu;
