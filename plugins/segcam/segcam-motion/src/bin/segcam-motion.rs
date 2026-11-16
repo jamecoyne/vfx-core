@@ -207,9 +207,16 @@ fn run<C: Depth>(
         // unless the work is kept, which renders the same.
         let count = ring.frames.len();
         let mut view = ViewMut::from_pixels(&mut out, width, height);
-        match &mut kept {
+        let rendered = match &mut kept {
             Some(state) => state.render_frame(&settings, &mut ring, count, frame, &mut view),
-            None => segcam_motion::render(&settings, &mut ring, count, frame, &mut view),
+            None => {
+                segcam_motion::render(&settings, &mut ring, count, frame, &mut view);
+                Ok(())
+            }
+        };
+        if let Err(e) = rendered {
+            eprintln!("segcam-motion: frame {frame}: {e}");
+            return ExitCode::FAILURE;
         }
 
         if let Some(state) = &kept

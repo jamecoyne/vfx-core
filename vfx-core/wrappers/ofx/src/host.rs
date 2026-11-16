@@ -11,6 +11,8 @@ pub struct Suites {
     pub prop: &'static OfxPropertySuiteV1,
     pub effect: &'static OfxImageEffectSuiteV1,
     pub param: &'static OfxParameterSuiteV1,
+    /// The message suite, or `None` if the host doesn't have one.
+    pub message: Option<&'static OfxMessageSuiteV1>,
 }
 
 static HOST: AtomicPtr<OfxHost> = AtomicPtr::new(ptr::null_mut());
@@ -79,15 +81,42 @@ pub fn fetch_suites() -> bool {
     if prop.is_null() || effect.is_null() || param.is_null() {
         return false;
     }
+    let message = fetch(kOfxMessageSuite);
+    // SAFETY: the host returns a suite of the requested version, valid while loaded.
+    let message = unsafe { message.cast::<OfxMessageSuiteV1>().as_ref() };
     // SAFETY: the host returns suites of the requested version, valid while loaded.
     let _ = SUITES.set(unsafe {
         Suites {
             prop: &*prop.cast(),
             effect: &*effect.cast(),
             param: &*param.cast(),
+            message,
         }
     });
     true
+}
+
+/// Shows `text` once on `effect` as an error through the host's message suite. Returns false
+/// if the host has no message suite or refused the message.
+pub fn show_error(effect: OfxImageEffectHandle, text: &str) -> bool {
+    let Some(message) = suites().message.and_then(|suite| suite.message) else {
+        return false;
+    };
+    let Ok(text) = CString::new(text.replace('\0', " ")) else {
+        return false;
+    };
+    // SAFETY: `effect` is an instance handle, the strings are NUL-terminated, and the format
+    // reads one string argument, which is the one passed after it.
+    let status = unsafe {
+        message(
+            effect.cast::<c_void>(),
+            kOfxMessageError.as_ptr(),
+            ptr::null(),
+            c"%s".as_ptr(),
+            text.as_ptr(),
+        )
+    };
+    status == kOfxStatOK
 }
 
 pub fn suites() -> &'static Suites {

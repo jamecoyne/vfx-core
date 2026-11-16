@@ -876,18 +876,43 @@ fn render_at_depth<C: CpuDepth>(
     };
     let stride = stride(output)?;
     let (width, height) = (output.width() as i32, output.height() as i32);
-    let out = ViewMut::<C>::new(output.buffer_mut(), width, height, stride);
-    let rendered = effect.render(
-        &mut frames,
-        plan.frame_count,
-        FrameOut::Pixels(C::image_mut(out)),
-        &plan.values,
-        &plan.ctx,
-    );
+    let mut render = |frames: &mut LayerFrames<'_, C>| {
+        let out = ViewMut::<C>::new(output.buffer_mut(), width, height, stride);
+        let out = FrameOut::Pixels(C::image_mut(out));
+        effect.render(frames, plan.frame_count, out, &plan.values, &plan.ctx)
+    };
+    let mut rendered = render(&mut frames);
+    // If a render failed because there was no device, it waits for the slot's next device
+    // and runs once more. After Effects' frames aren't live, so the effect also waits for
+    // whatever it builds on that device.
+    if rendered
+        .as_ref()
+        .is_err_and(vfx_core::RenderError::needs_device)
+        && vfx_host::wait_for_next_device() == vfx_host::NextDevice::Ready
+    {
+        rendered = render(&mut frames);
+    }
     if let Some(error) = frames.error {
         return Err(error);
     }
-    rendered.map_err(|_| ae::Error::BadCallbackParameter)
+    rendered.map_err(|e| render_failure(&e))
+}
+
+/// The error After Effects gets for a frame a CPU effect couldn't render. A failed allocation
+/// gives out of memory, and any other failure gives the generic error.
+fn render_failure(error: &vfx_core::RenderError) -> ae::Error {
+    match error {
+        vfx_core::RenderError::OutOfMemory => ae::Error::OutOfMemory,
+        _ => ae::Error::Generic,
+    }
+}
+
+/// Like [`render_failure`], but for a kept instance's render, which can also have panicked.
+fn cpu_render_failure(error: vfx_host::CpuRenderError) -> ae::Error {
+    match error {
+        vfx_host::CpuRenderError::Render(e) => render_failure(&e),
+        vfx_host::CpuRenderError::Panicked => ae::Error::BadCallbackParameter,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -935,7 +960,7 @@ pub fn render_legacy(
                             &values,
                             &ctx,
                         )
-                        .map_err(|_| ae::Error::BadCallbackParameter)?;
+                        .map_err(cpu_render_failure)?;
                 }
                 16 => {
                     let out = ViewMut::<u16>::new(out_layer.buffer_mut(), w, h, stride);
@@ -948,7 +973,7 @@ pub fn render_legacy(
                             &values,
                             &ctx,
                         )
-                        .map_err(|_| ae::Error::BadCallbackParameter)?;
+                        .map_err(cpu_render_failure)?;
                 }
                 _ => return Err(ae::Error::BadCallbackParameter),
             }

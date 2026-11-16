@@ -747,6 +747,32 @@ impl<C: CpuDepth> FrameSource for ClipFrames<'_, C> {
     }
 }
 
+/// Removes the core slot's device when the render after `VFX_OFX_REMOVE_DEVICE_AFTER` CPU
+/// renders starts, the way a driver reset would. It's for the mini host's device loss test.
+/// The variable is read at the first render.
+fn remove_device_when_due() {
+    static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let after = AFTER.get_or_init(|| {
+        let after = std::env::var("VFX_OFX_REMOVE_DEVICE_AFTER").ok()?;
+        after.trim().parse().ok()
+    });
+    let Some(after) = *after else {
+        return;
+    };
+    if RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != after {
+        return;
+    }
+    let note = match vfx_core::device::slot().try_wait() {
+        Err(e) => format!("warning: VFX_OFX_REMOVE_DEVICE_AFTER: no device: {e}"),
+        Ok(device) => match vfx_host::remove_d3d12_device(&device.gpu().device) {
+            Ok(()) => format!("removed the GPU device after {after} renders"),
+            Err(e) => format!("warning: VFX_OFX_REMOVE_DEVICE_AFTER: {e}"),
+        },
+    };
+    LOG.note(&note);
+}
+
 /// The bytes of earlier frames one render in Resolve fetches, counted as unpadded
 /// RGBA at the output depth, up to twice this for the analysis of its own frame.
 /// Resolve holds every image a render fetches until the render returns.
@@ -793,6 +819,59 @@ fn effect_keeps_state() -> bool {
 struct KeptEffect {
     effect: vfx_host::CpuInstance,
     last_render: std::sync::Mutex<Option<LastRender>>,
+    /// Whether the error for this run of failed renders has been shown ([`host::show_error`]).
+    error_shown: std::sync::atomic::AtomicBool,
+}
+
+/// Why a render action failed.
+enum RenderFailure {
+    /// A host call failed with this status.
+    Host(OfxStatus),
+    /// The effect's render failed.
+    Effect(vfx_host::CpuRenderError),
+    /// The render found no device, and an earlier render in this outage already waited and
+    /// timed out. It fails right away without showing a message, because the outage already
+    /// showed one.
+    StillNoDevice(vfx_host::CpuRenderError),
+}
+
+impl From<OfxStatus> for RenderFailure {
+    fn from(status: OfxStatus) -> Self {
+        Self::Host(status)
+    }
+}
+
+impl RenderFailure {
+    fn status(&self) -> OfxStatus {
+        match self {
+            Self::Host(status) => *status,
+            Self::Effect(_) | Self::StillNoDevice(_) => kOfxStatFailed,
+        }
+    }
+}
+
+/// Fails the render action and shows an effect's failure on the instance. A host that gets
+/// `kOfxStatFailed` may show the plain clip for the frame without any message. Returns whether
+/// a message was shown.
+fn fail_render(effect: OfxImageEffectHandle, frame: f64, failure: &RenderFailure) -> bool {
+    let name = vfx_host::plugin().info.name;
+    let error = match failure {
+        RenderFailure::Host(_) => return false,
+        RenderFailure::StillNoDevice(error) => {
+            LOG.note(&format!(
+                "warning: {name} couldn't render frame {frame}: {error}, shown once per outage"
+            ));
+            return false;
+        }
+        RenderFailure::Effect(error) => error,
+    };
+    let text = format!("{name} couldn't render frame {frame}: {error}");
+    LOG.note(&format!("warning: {text}"));
+    let shown = host::show_error(effect, &text);
+    if !shown {
+        LOG.note("warning: the host showed no message for the failed render");
+    }
+    shown
 }
 
 /// A frame rendered, when it finished, and where it stood in its stream.
@@ -898,6 +977,7 @@ fn create_instance(effect: OfxImageEffectHandle) -> Result<(), OfxStatus> {
     let kept: *mut KeptEffect = Box::into_raw(Box::new(KeptEffect {
         effect: instance,
         last_render: std::sync::Mutex::new(None),
+        error_shown: std::sync::atomic::AtomicBool::new(false),
     }));
     // SAFETY: an instance handle; the pointer is freed in destroy-instance.
     check_status(unsafe {
@@ -969,6 +1049,22 @@ fn render_cpu(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxSta
             StreamPosition::default()
         };
         let rendered = render_cpu_effect(&kept.effect, effect, in_args, host_stream);
+        let shown = &kept.error_shown;
+        let rendered = match rendered {
+            Ok(()) => {
+                shown.store(false, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+            Err(failure) => {
+                // Show a message once per run of failures, not for every failed frame.
+                if !shown.load(std::sync::atomic::Ordering::Acquire)
+                    && fail_render(effect, frame as f64, &failure)
+                {
+                    shown.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err(failure.status())
+            }
+        };
         // A report clones what the effect found, so it isn't asked for every frame.
         if last.is_none() || frame.rem_euclid(FRAMES_PER_REPORT) == 0 {
             let report = kept.effect.report();
@@ -979,7 +1075,7 @@ fn render_cpu(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxSta
                 LOG.note(&format!("face models on: {faces}"));
             }
             if let Some(fault) = report.gpu_fault {
-                LOG.note(&format!("warning: GPU fault, drawn another way: {fault}"));
+                LOG.note(&format!("warning: the GPU didn't draw: {fault}"));
             }
         }
         *kept.last_render.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastRender {
@@ -990,7 +1086,17 @@ fn render_cpu(effect: OfxImageEffectHandle, in_args: Props) -> Result<(), OfxSta
         return rendered;
     }
     let fresh = vfx_host::CpuInstance::new(vfx_host::plugin().make, false).ok_or(kOfxStatFailed)?;
-    render_cpu_effect(&fresh, effect, in_args, StreamPosition::default())
+    let rendered = render_cpu_effect(&fresh, effect, in_args, StreamPosition::default());
+    // A fresh instance can't remember whether this run of failures already showed a message.
+    // Showing one for every failed frame would stop the host each time, so it only logs the
+    // failure.
+    rendered.map_err(|failure| {
+        if let RenderFailure::Effect(error) = &failure {
+            let name = vfx_host::plugin().info.name;
+            LOG.note(&format!("warning: {name} couldn't render a frame: {error}"));
+        }
+        failure.status()
+    })
 }
 
 fn render_cpu_effect(
@@ -998,7 +1104,7 @@ fn render_cpu_effect(
     effect: OfxImageEffectHandle,
     in_args: Props,
     stream: StreamPosition,
-) -> Result<(), OfxStatus> {
+) -> Result<(), RenderFailure> {
     let time = in_args.get_double(kOfxPropTime, 0)?;
     let output = fetch_image(
         clip_handle(effect, kOfxImageEffectOutputClipName).ok_or(kOfxStatFailed)?,
@@ -1033,6 +1139,7 @@ fn render_cpu_effect(
         "render path: CPU effect, {:?} frames, {frame_count} read",
         output.image.depth
     ));
+    remove_device_when_due();
     let render = CpuRender {
         effect: cpu_effect,
         source,
@@ -1046,12 +1153,11 @@ fn render_cpu_effect(
         window,
         stream,
     };
-    let error = if output.image.depth == Depth::Byte {
+    if output.image.depth == Depth::Byte {
         render.at_depth::<u8>()
     } else {
         render.at_depth::<f32>()
-    };
-    error.map_or(Ok(()), Err)
+    }
 }
 
 /// Buffers kept on each rendering thread, so a render allocates no frame-sized memory. A render
@@ -1104,8 +1210,11 @@ struct CpuRender<'a> {
 
 impl CpuRender<'_> {
     /// Renders at `C` and writes the window to the host's output. The error is the render's or
-    /// the first failed frame fetch's.
-    fn at_depth<C: ScratchBuffers>(&self) -> Option<OfxStatus> {
+    /// the first failed frame fetch's. If a render failed because there was no device, it waits
+    /// for the slot's next device ([`vfx_host::wait_for_next_device`]), whether or not the
+    /// render is live, and runs once more as a render that isn't live. That way the effect also
+    /// waits for whatever it builds on the device.
+    fn at_depth<C: ScratchBuffers>(&self) -> Result<(), RenderFailure> {
         let canvas = self.canvas;
         C::with_scratch(|decoded_pixels, output_pixels| {
             let mut frames = ClipFrames::<C> {
@@ -1128,21 +1237,35 @@ impl CpuRender<'_> {
             };
             let started = timing::start(&frames.times);
             let (w, h) = (canvas.width() as i32, canvas.height() as i32);
-            output_pixels.clear();
-            output_pixels.resize(canvas.width() * canvas.height(), Argb::default());
-            let view = C::image_mut(ViewMut::from_pixels(output_pixels, w, h));
-            let rendered = self.effect.render(
-                &mut frames,
-                self.frame_count,
-                FrameOut::Pixels(view),
-                self.values,
-                self.ctx,
-            );
+            let mut render = |frames: &mut ClipFrames<'_, C>| {
+                output_pixels.clear();
+                output_pixels.resize(canvas.width() * canvas.height(), Argb::default());
+                let view = C::image_mut(ViewMut::from_pixels(output_pixels, w, h));
+                let out = FrameOut::Pixels(view);
+                (self.effect).render(frames, self.frame_count, out, self.values, self.ctx)
+            };
+            let mut rendered = render(&mut frames);
+            let mut next_device = None;
+            if let Err(vfx_host::CpuRenderError::Render(error)) = &rendered
+                && error.needs_device()
+            {
+                let found = vfx_host::wait_for_next_device();
+                if found == vfx_host::NextDevice::Ready {
+                    LOG.note(&format!(
+                        "{error}: rendering frame {} again",
+                        self.ctx.frame
+                    ));
+                    frames.frames_dropped = false;
+                    rendered = render(&mut frames);
+                }
+                next_device = Some(found);
+            }
             // The host can free what it holds for this render before the output is written.
             frames.release();
-            if rendered.is_err() {
-                return Some(kOfxStatFailed);
-            }
+            rendered.map_err(|error| match next_device {
+                Some(vfx_host::NextDevice::StillOut) => RenderFailure::StillNoDevice(error),
+                _ => RenderFailure::Effect(error),
+            })?;
             let render = started.map(|s| s.elapsed());
             let started = timing::start(&frames.times);
             // SAFETY: the render window is clipped to the output and canvas bounds.
@@ -1158,7 +1281,9 @@ impl CpuRender<'_> {
                 };
                 timing::log(&line, times);
             }
-            frames.error
+            frames
+                .error
+                .map_or(Ok(()), |status| Err(RenderFailure::Host(status)))
         })
     }
 }

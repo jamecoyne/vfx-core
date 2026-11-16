@@ -46,6 +46,11 @@ impl FrameSource for Moving {
         let pixels = frame(self.first + index as i64);
         f(Some(Image::U8(View::from_pixels(&pixels, W, H))));
     }
+
+    /// The source is live, as Resolume's frames are, so renders never wait for a device.
+    fn live(&self) -> bool {
+        true
+    }
 }
 
 fn host_gpu() -> Option<Gpu> {

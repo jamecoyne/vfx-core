@@ -703,5 +703,7 @@ pub fn render<C: Depth>(
     frame_number: i64,
     out: &mut ViewMut<C>,
 ) {
-    IncrementalRenderer::default().render_frame(s, frames, frame_count, frame_number, out);
+    let rendered =
+        IncrementalRenderer::default().render_frame(s, frames, frame_count, frame_number, out);
+    rendered.expect("a renderer that wants no GPU draws on the CPU, which can't fail");
 }

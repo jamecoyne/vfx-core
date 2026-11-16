@@ -365,13 +365,15 @@ fn live_windows_show_current_frame() {
     for n in [20, 3, 29, 28, 4, 12, 29] {
         let mut out = Image::new(W, H);
         let mut source = MemoryFrames::new(&frames[..=n]);
-        state.render_frame(
-            &live_settings,
-            &mut source,
-            n + 1,
-            n as i64,
-            &mut out.view_mut(),
-        );
+        state
+            .render_frame(
+                &live_settings,
+                &mut source,
+                n + 1,
+                n as i64,
+                &mut out.view_mut(),
+            )
+            .unwrap();
         assert!(out.pixels == cold(n), "frame {n}");
     }
 }
@@ -669,7 +671,9 @@ fn threshold_swarm_matches_cold_render_in_any_order() {
     for n in [20, 3, 29, 28, 4, 12, 29] {
         let mut out = Image::new(W, H);
         let mut source = MemoryFrames::new(&frames[..=n]);
-        state.render_frame(&s, &mut source, n + 1, n as i64, &mut out.view_mut());
+        state
+            .render_frame(&s, &mut source, n + 1, n as i64, &mut out.view_mut())
+            .unwrap();
         assert!(out.pixels == cold(n), "frame {n}");
     }
 }
@@ -769,13 +773,15 @@ fn render_kept(
         missing,
     };
     let last = frames.len() - 1;
-    state.render_frame(
-        s,
-        &mut source,
-        frames.len(),
-        last as i64,
-        &mut out.view_mut(),
-    );
+    state
+        .render_frame(
+            s,
+            &mut source,
+            frames.len(),
+            last as i64,
+            &mut out.view_mut(),
+        )
+        .unwrap();
     out
 }
 
@@ -906,7 +912,9 @@ fn render_fixed(
         images: &frames[..=n],
         reads: 0,
     };
-    state.render_frame(s, &mut source, n + 1, n as i64, &mut out.view_mut());
+    state
+        .render_frame(s, &mut source, n + 1, n as i64, &mut out.view_mut())
+        .unwrap();
     (out, source.reads)
 }
 
@@ -956,7 +964,9 @@ fn clip_start_frames_are_analysed_once() {
                 images: clip,
                 reads: 0,
             };
-            state.render_frame(&s, &mut source, clip.len(), n as i64, &mut out.view_mut());
+            state
+                .render_frame(&s, &mut source, clip.len(), n as i64, &mut out.view_mut())
+                .unwrap();
             let reads = source.reads;
             let cold = render_frames(&s, clip, n as i64).0;
             assert!(out.pixels == cold.pixels, "{:?}: frame {n}", s.mode);

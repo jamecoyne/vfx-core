@@ -299,7 +299,11 @@ fn device_fault_text(faults: &DeviceFaults) -> Option<String> {
     if let Some(why) = faults.lost() {
         return Some(format!("GPU lost: {why}"));
     }
-    let (count, last) = faults.errors();
+    let count = faults.error_count();
+    let last = faults
+        .last_error()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     (count > 0).then(|| {
         format!(
             "GPU errors {count}: {}",

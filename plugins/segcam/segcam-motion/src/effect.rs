@@ -189,7 +189,8 @@ impl SegcamMotion {
     }
 
     /// Whether the swarm drew the last render straight into its texture
-    /// output, with no upload from RAM.
+    /// output, without uploading from RAM. The integration tests use it.
+    #[doc(hidden)]
     pub fn drew_into_texture(&self) -> bool {
         self.drew_into_texture
     }
@@ -244,21 +245,22 @@ impl CpuEffect for SegcamMotion {
         self.drew_into_texture = false;
         match out {
             FrameOut::Pixels(ImageMut::U8(mut out)) => {
-                renderer.render_frame(&s, frames, count, n, &mut out)
+                renderer.render_frame(&s, frames, count, n, &mut out)?
             }
             FrameOut::Pixels(ImageMut::U16(mut out)) => {
-                renderer.render_frame(&s, frames, count, n, &mut out)
+                renderer.render_frame(&s, frames, count, n, &mut out)?
             }
             FrameOut::Pixels(ImageMut::F32(mut out)) => {
-                renderer.render_frame(&s, frames, count, n, &mut out)
+                renderer.render_frame(&s, frames, count, n, &mut out)?
             }
             FrameOut::Texture(texture) => {
                 let (w, h) = (texture.frame.width as i32, texture.frame.height as i32);
                 self.canvas.resize(w as usize * h as usize, Argb::default());
                 renderer.offer_texture(texture);
                 let mut canvas = ViewMut::from_pixels(&mut self.canvas, w, h);
-                renderer.render_frame(&s, frames, count, n, &mut canvas);
+                let drawn = renderer.render_frame(&s, frames, count, n, &mut canvas);
                 self.drew_into_texture = renderer.took_texture();
+                drawn?;
                 if !self.drew_into_texture {
                     texture.write(Image::U8(View::from_pixels(&self.canvas, w, h)))?;
                 }

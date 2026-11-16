@@ -1116,7 +1116,7 @@ static void segcam_device_reopen(void) {
      * process (`segcam-device-reopen` in main). */
     CHECK(logged_message("a CPU effect's frame drawn on a new device reached the host"),
           "the effect didn't draw on the new device");
-    CHECK(!logged_message("CPU render failed"), "a render panicked after the new device");
+    CHECK(!logged_message("CPU render panicked"), "a render panicked after the new device");
     CHECK(call(DEINSTANTIATE_GL, u(0), inst).u == 0, "delete after the new device");
     glDeleteTextures(2, textures);
     f.input = original;

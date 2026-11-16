@@ -61,10 +61,10 @@ fn faults_follow_their_own_device() {
     });
     // An odd offset is a validation error.
     last.queue.write_buffer(&buffer, 1, &[0; 4]);
-    let errors = Gpu::shared_faults().errors().0;
+    let errors = Gpu::shared_faults().error_count();
     assert!(errors > 0, "the misuse went unseen");
     last.share();
-    assert_eq!(Gpu::shared_faults().errors().0, errors);
+    assert_eq!(Gpu::shared_faults().error_count(), errors);
     lose(&last);
     last.share();
     assert!(

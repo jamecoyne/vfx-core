@@ -84,26 +84,35 @@ exactly still counts as one frame (`History::drop_repeat`), and its windows stay
 In Resolume on Windows the swarm draws straight into the texture Resolume shows
 (`FrameOut::Texture`) on the device the plugin shares with Resolume, with no readback. The
 output is byte identical to the swarm read back. A frame drawn on the CPU, as every output but
-the swarm is, and the swarm while the device opens or after a fault, is uploaded into it.
+the swarm is, and the swarm before the first device is ready, is uploaded into it.
 
 ### Device loss
 
 segcam draws on the core's device slot (`vfx_core::device`), which every effect in the plugin file
-shares. A lost device is dropped and opened again while renders draw on the CPU: the next open
-starts once nothing holds the lost device, or after a backoff of 1, 2, 4, 8 and 16 s, then every
-30 s, on the same adapter for about 30 s and then on any. A failed open, the first included, is
-retried on the same backoff for as long as the process runs. A software adapter's device is
-declined (drawn on the CPU) unless `WGPU_ADAPTER_NAME` asked for it. Opens hold the D3D12 device
-lock, so face models loading during a reset wait behind them, and face models that keep failing
-reload on the same backoff. segcam builds its pipelines for a new device on a thread of its own and
-draws on the CPU until they are ready.
+shares. A lost device is dropped and opened again. Until the next one is there, a Swarm render
+returns `RenderError` instead of a frame, and live hosts show their input. A render that isn't
+live waits for the next device first, up to 30 s. Editors (OpenFX, After Effects) wait for the
+slot's next device after a frame failed for want of one, also in Resolve's playback once it has
+dropped frames, and render it once more as a render that isn't live, so an export and playback
+draw every frame; once a wait runs out with no device, renders fail without waiting until one
+comes back. A
+wait for the GPU that runs out (1 s live, 10 s otherwise and on a software adapter) is
+`RenderError::Timeout` and keeps the device. The analysis records stay in RAM, so the next device
+draws the whole trail. The next open starts once nothing holds the lost device, or after a backoff
+of 1, 2, 4, 8 and 16 s, then every 30 s, on the same adapter for about 30 s and then on any. A
+failed open, the first included, is retried on the same backoff for as long as the process runs. A
+software adapter's device is declined (drawn on the CPU) unless `WGPU_ADAPTER_NAME` asked for it.
+Opens hold the D3D12 device lock, so face models loading during a reset wait behind them, and face
+models that keep failing reload on the same backoff. segcam builds its pipelines for a new device on
+a thread of its own; a build that fails on a device stays failed for it. Before the first device
+is ready, where none opens, and for a canvas larger than the device takes, it draws on the CPU.
 
 ### Detection and drawing
 
 Detection runs on the CPU: a connected component labeller over a grid, 192 columns by default, fed
 one frame at a time. Swarm draws on the GPU when there is one, every render
-([Swarm draw](../BENCHMARK.md#swarm-draw)), and on the CPU without one, after a fault or while the
-device is lost.
+([Swarm draw](../BENCHMARK.md#swarm-draw)), and on the CPU without one. After a lost device it
+fails until the next one draws ([Device loss](#device-loss)).
 
 ## Building
 

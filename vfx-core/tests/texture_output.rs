@@ -1,6 +1,6 @@
-//! What a host that shows frames from the GPU gives CPU effects: a device it shares with them,
-//! and a frame on it for their output (`FrameOut::Texture`). Like the render tests, these
-//! need a GPU adapter.
+//! Tests what a host that shows frames from the GPU gives CPU effects: a device it shares
+//! with them, and a frame on that device for their output (`FrameOut::Texture`). Like the
+//! render tests, these need a GPU adapter.
 
 use vfx_core::cpu::{Argb, FrameSource, Image, ImageMut};
 use vfx_core::{

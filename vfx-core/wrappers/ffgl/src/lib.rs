@@ -621,23 +621,34 @@ unsafe fn process_cpu(
     };
     let rendered = (cpu.effect).render(&mut cpu.history, frame_count, out, &values, &ctx);
     if let Err(e) = rendered {
-        LOG.note(&format!("warning: CPU render failed: {e}"));
+        // The host's input is shown in place of the frame the effect couldn't draw, so a live
+        // show never waits on the GPU. A failure inside the effect leaves the texture path in
+        // use. A lost device or a panic ends the texture path, and the next frames go through
+        // RAM.
+        LOG.note(&match &e {
+            vfx_host::CpuRenderError::Panicked => {
+                "warning: CPU render panicked, passing the frame through".to_owned()
+            }
+            e => format!("warning: CPU render failed, passing the frame through: {e}"),
+        });
         #[cfg(target_os = "windows")]
         if on_gpu {
-            // The frame never reached the texture, so the input stands in for it, and the
-            // instance leaves a lost device. The next frames go through RAM.
-            let error = match e {
+            let interop_error = match &e {
                 vfx_host::CpuRenderError::Render(vfx_core::RenderError::DeviceLost) => {
-                    shared::InteropError::Lost(e.to_string())
+                    Some(shared::InteropError::Lost(e.to_string()))
                 }
-                e => shared::InteropError::Failed(e.to_string()),
+                vfx_host::CpuRenderError::Panicked => {
+                    Some(shared::InteropError::Failed(e.to_string()))
+                }
+                vfx_host::CpuRenderError::Render(_) => None,
             };
-            instance.interop.record_render_error(error);
-            // SAFETY: the context is current with the host's framebuffer bound.
-            unsafe { draw_input(instance, input_texture) };
-            return true;
+            if let Some(error) = interop_error {
+                instance.interop.record_render_error(error);
+            }
         }
-        return false;
+        // SAFETY: the context is current with the host's framebuffer bound.
+        unsafe { draw_input(instance, input_texture) };
+        return true;
     }
     let render_time = started.elapsed() - read_time;
     #[cfg(target_os = "windows")]
@@ -693,7 +704,7 @@ unsafe fn process_cpu(
             LOG.note(&format!("face models on: {faces}"));
         }
         if let Some(fault) = report.gpu_fault {
-            LOG.note(&format!("warning: GPU fault, drawn another way: {fault}"));
+            LOG.note(&format!("warning: the GPU didn't draw: {fault}"));
         }
     }
     LOG.note(match on_gpu {
@@ -707,7 +718,6 @@ unsafe fn process_cpu(
 ///
 /// # Safety
 /// The host's context must be current with its framebuffer bound.
-#[cfg(target_os = "windows")]
 unsafe fn draw_input(instance: &Instance, input_texture: &FFGLTextureStruct) {
     if let Some(blit) = &instance.pass_through_blit {
         let max_uv = [
@@ -719,9 +729,9 @@ unsafe fn draw_input(instance: &Instance, input_texture: &FFGLTextureStruct) {
     }
 }
 
-/// Readies a CPU effect's GPU output at `size`, and says whether this render can offer it. The
-/// images and the frame are kept while the size holds, so the render thread allocates them only
-/// for a new size.
+/// Sets up a CPU effect's GPU output at `size` and returns whether this render can offer it.
+/// The images and the frame are kept as long as the size stays the same, so the render thread
+/// allocates them only when the size changes.
 ///
 /// # Safety
 /// The host's context must be current.

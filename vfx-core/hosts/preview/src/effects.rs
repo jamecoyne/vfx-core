@@ -1181,7 +1181,7 @@ mod tests {
         controls.pattern = 1;
         render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
 
-        crate::app::remove_d3d12_device(&gpu.device).expect("removed");
+        vfx_host::remove_d3d12_device(&gpu.device).expect("removed");
         let (_released, on_device) = effects.release();
         drop(gpu);
         assert!(
