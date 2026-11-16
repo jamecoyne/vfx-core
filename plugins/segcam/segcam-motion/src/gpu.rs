@@ -1,20 +1,24 @@
-//! The device segcam Motion draws its swarm on with [`crate::swarm_pass`], and
-//! what a render does when the device isn't there: the core's device slot opens
-//! it in the background, a failed draw returns its `RenderError`, and a lost
-//! device is dropped and replaced.
+//! The device segcam Motion draws its swarm on with [`crate::swarm_pass`], and what a
+//! render does when the device isn't there. The core's device slot opens the device in
+//! the background, and the core's [`DeviceBuild`] builds the pipelines on it. A failed
+//! draw returns its `RenderError`.
 
 #[cfg(not(target_arch = "wasm32"))]
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::convert::Infallible;
+#[cfg(any(test, target_arch = "wasm32"))]
+use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::MutexGuard;
+#[cfg(target_arch = "wasm32")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
-use vfx_core::device::{Device, DeviceSlot, NoDevice};
+use vfx_core::device::{BuildUser, Device, DeviceBuild, DeviceSlot, NoDevice};
 use vfx_core::{DeviceFaults, PollFailure, RenderError, wgpu};
 
+use crate::incremental::IncrementalRenderer;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::pixel::{Argb, ViewMut};
 use crate::pixel::{Channel, View};
@@ -50,28 +54,30 @@ impl Drop for GpuContext {
 }
 
 impl GpuContext {
-    /// A context on `device` with the 8 bit swarm pipelines built, and on a
-    /// host's device the ones that draw into its RGBA8 and RGBA32F frames.
+    /// Makes a context on `device` with the 8 bit swarm pipelines built. On a host's device
+    /// it also builds the pipelines that draw into the host's RGBA8 and RGBA32F frames.
     #[cfg(not(target_arch = "wasm32"))]
-    fn build(device: Arc<Device>) -> Result<Self, NoDevice> {
+    fn new(device: &Arc<Device>) -> Self {
         let gpu = device.gpu();
-        // The host may have reported errors of its own before this.
-        let errors_before = gpu.faults().error_count();
-        let context = Self {
+        Self {
             swarm: Self::pipelines(gpu, device.host_shared()),
             device: gpu.device.clone(),
             info: device.adapter_info(),
             faults: gpu.faults(),
             host_shared: device.host_shared(),
-            slot_device: device,
-        };
-        if let Some(why) = context.lost() {
-            return Err(NoDevice::Lost(why));
+            slot_device: device.clone(),
         }
-        if context.faults.error_count() != errors_before {
-            let why = context.faults.last_error().map(|e| e.to_string());
-            return Err(NoDevice::Unusable(why.unwrap_or_default()));
-        }
+    }
+
+    /// Like [`Self::new`], in the form a [`DeviceBuild`] takes. The [`DeviceBuild`] checks
+    /// the device's errors and loss.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn build(device: &Arc<Device>) -> Result<Self, Infallible> {
+        let context = Self::new(device);
+        eprintln!(
+            "segcam Motion: drawing on the GPU ({}, {})",
+            context.info.name, context.info.backend
+        );
         Ok(context)
     }
 
@@ -176,250 +182,112 @@ pub fn opening() -> bool {
 /// The context every instance draws with.
 pub(crate) static SLOT_CONTEXT: LazyLock<SlotContext> = LazyLock::new(|| {
     #[cfg(not(target_arch = "wasm32"))]
-    return SlotContext::new(vfx_core::device::slot());
+    return slot_context(vfx_core::device::slot());
     #[cfg(target_arch = "wasm32")]
     SlotContext::new()
 });
 
-/// segcam's [`GpuContext`] on the slot's current device. Its pipelines are
-/// built on a thread of their own once a call sees a new device, so no render
-/// waits for them; a call that finds the slot without a device drops it.
+/// segcam's [`GpuContext`] on the slot's current device.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type SlotContext = DeviceBuild<GpuContext>;
+
+/// One live instance's renderer. The last instance dropped releases the context on a
+/// host's device.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type ContextUser = BuildUser<GpuContext, IncrementalRenderer>;
+
+/// Builds segcam's contexts on the devices `slot` opens. It refuses a software
+/// adapter's device unless `WGPU_ADAPTER_NAME` names an adapter.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn slot_context(slot: &'static DeviceSlot) -> SlotContext {
+    let declines_software = vfx_core::device::adapter_name_from_env().is_none();
+    DeviceBuild::new(slot, GpuContext::build).declining_software(declines_software)
+}
+
+/// segcam's [`GpuContext`] on the device a browser host shared. It's built in place,
+/// because browsers can't wait for a device inside a render and the core's device slot
+/// is native only.
+#[cfg(target_arch = "wasm32")]
 pub(crate) struct SlotContext {
-    #[cfg(not(target_arch = "wasm32"))]
-    slot: &'static DeviceSlot,
-    state: Mutex<ContextState>,
-    #[cfg(not(target_arch = "wasm32"))]
-    build_done: std::sync::Condvar,
-    /// Whether a software adapter's device is declined.
-    #[cfg(not(target_arch = "wasm32"))]
-    declines_software: bool,
-    /// The live instances ([`ContextUser`]). When the last goes, a context on a
-    /// host's device goes too, so nothing holds the host's device without an
-    /// instance.
+    context: Mutex<Option<Arc<GpuContext>>>,
+    /// Counts the live instances ([`ContextUser`]).
     users: AtomicUsize,
 }
 
-enum ContextState {
-    Empty,
-    /// For the slot's device with this id.
-    #[cfg(not(target_arch = "wasm32"))]
-    Building {
-        id: u64,
-        host_shared: bool,
-    },
-    Ready(Arc<GpuContext>),
-    /// Holds the device, so a host's keeps its id and isn't built again
-    /// every render. A build that failed on a device stays failed for it.
-    #[cfg(not(target_arch = "wasm32"))]
-    Failed {
-        device: Arc<Device>,
-        why: NoDevice,
-    },
+#[cfg(target_arch = "wasm32")]
+impl SlotContext {
+    fn new() -> Self {
+        Self {
+            context: Mutex::new(None),
+            users: AtomicUsize::new(0),
+        }
+    }
+
+    fn context(&self) -> std::sync::MutexGuard<'_, Option<Arc<GpuContext>>> {
+        self.context.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Returns the context on the host's device. The error type is `()` because `NoDevice`
+    /// is native only.
+    pub(crate) fn try_wait(&self) -> Result<Arc<GpuContext>, ()> {
+        let gpu = vfx_core::Gpu::shared().ok_or(())?;
+        let mut context = self.context();
+        if let Some(built) = &*context
+            && built.faults.same_device(&gpu.faults())
+        {
+            return Ok(built.clone());
+        }
+        let built = Arc::new(GpuContext::on_shared(gpu));
+        *context = Some(built.clone());
+        Ok(built)
+    }
+
+    /// Drops the context. It's always on the host's device.
+    pub(crate) fn release_host_shared(&self) {
+        let gone = self.context().take();
+        drop(gone);
+    }
+
+    /// Makes a live instance from `renderer`. A browser never reports a loss, so nothing
+    /// releases the renderer on one.
+    pub(crate) fn user_with(
+        &'static self,
+        renderer: IncrementalRenderer,
+        _release: fn(&mut IncrementalRenderer, u64),
+        on_last: fn(),
+    ) -> ContextUser {
+        self.users.fetch_add(1, Ordering::AcqRel);
+        ContextUser {
+            slot_context: self,
+            on_last,
+            renderer: Mutex::new(renderer),
+        }
+    }
 }
 
-/// Counts one live instance. The last to drop releases a context on a host's
-/// device and runs `on_last`.
+/// One live instance's renderer. The last to drop releases the context and runs
+/// `on_last`.
+#[cfg(target_arch = "wasm32")]
 pub(crate) struct ContextUser {
     slot_context: &'static SlotContext,
     on_last: fn(),
+    renderer: Mutex<IncrementalRenderer>,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl ContextUser {
-    pub(crate) fn new(slot_context: &'static SlotContext, on_last: fn()) -> Self {
-        slot_context.users.fetch_add(1, Ordering::AcqRel);
-        Self {
-            slot_context,
-            on_last,
-        }
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, IncrementalRenderer> {
+        self.renderer.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 impl Drop for ContextUser {
     fn drop(&mut self) {
         if self.slot_context.users.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.slot_context.release_host_context();
+            self.slot_context.release_host_shared();
             (self.on_last)();
         }
-    }
-}
-
-impl SlotContext {
-    /// Contexts on `slot`'s devices, declining a software adapter's unless
-    /// `WGPU_ADAPTER_NAME` asked for an adapter.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn new(slot: &'static DeviceSlot) -> Self {
-        Self {
-            slot,
-            declines_software: vfx_core::device::adapter_name_from_env().is_none(),
-            state: Mutex::new(ContextState::Empty),
-            build_done: std::sync::Condvar::new(),
-            users: AtomicUsize::new(0),
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(ContextState::Empty),
-            users: AtomicUsize::new(0),
-        }
-    }
-
-    fn state(&self) -> std::sync::MutexGuard<'_, ContextState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Replaces the state with `next`, dropping the old after the lock.
-    fn replace(&self, next: ContextState) {
-        let gone = std::mem::replace(&mut *self.state(), next);
-        #[cfg(not(target_arch = "wasm32"))]
-        self.build_done.notify_all();
-        drop(gone);
-    }
-
-    /// Drops a context on a host's device on the caller's thread, so the host
-    /// can open its next device. A build on one under way discards its context
-    /// when it ends.
-    pub(crate) fn release_host_context(&self) {
-        let host_shared = match &*self.state() {
-            ContextState::Ready(context) => context.host_shared,
-            ContextState::Empty => false,
-            #[cfg(not(target_arch = "wasm32"))]
-            ContextState::Building { host_shared, .. } => *host_shared,
-            #[cfg(not(target_arch = "wasm32"))]
-            ContextState::Failed { device, .. } => device.host_shared(),
-        };
-        if host_shared {
-            self.replace(ContextState::Empty);
-        }
-    }
-
-    /// The context on the slot's device, or why there is none; never waits.
-    /// `Opening` also covers pipelines still building.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn try_wait(&'static self) -> Result<Arc<GpuContext>, NoDevice> {
-        let device = match self.slot.try_wait() {
-            Ok(device) => device,
-            Err(why) => {
-                self.replace(ContextState::Empty);
-                return Err(why);
-            }
-        };
-        let adapter = device.adapter_info();
-        if adapter.device_type == wgpu::DeviceType::Cpu && self.declines_software {
-            return Err(NoDevice::SoftwareOnly(adapter.name));
-        }
-        let (id, host_shared) = (device.id(), device.host_shared());
-        let mut built = self.state();
-        match &*built {
-            ContextState::Ready(context) if context.slot_device.id() == id => {
-                return Ok(context.clone());
-            }
-            ContextState::Building { id: n, .. } if *n == id => return Err(NoDevice::Opening),
-            ContextState::Failed { device, why } if device.id() == id => {
-                return Err(why.clone());
-            }
-            _ => {}
-        }
-        let building = ContextState::Building { id, host_shared };
-        let gone = std::mem::replace(&mut *built, building);
-        drop(built);
-        drop(gone);
-        let failed_on = device.clone();
-        let build = move || {
-            let context = catch_unwind(AssertUnwindSafe(|| GpuContext::build(device)))
-                .unwrap_or_else(|panic| {
-                    let message = (panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_default();
-                    Err(NoDevice::Panicked(format!(
-                        "building the pipelines: {message}"
-                    )))
-                });
-            let mut built = self.state();
-            if !matches!(*built, ContextState::Building { id: n, .. } if n == id) {
-                // Replaced during the build: discard it.
-                drop(built);
-                drop(context);
-                self.build_done.notify_all();
-                return;
-            }
-            *built = match context {
-                Ok(context) => {
-                    eprintln!(
-                        "segcam Motion: drawing on the GPU ({}, {})",
-                        context.info.name, context.info.backend
-                    );
-                    ContextState::Ready(Arc::new(context))
-                }
-                Err(why) => {
-                    eprintln!("segcam Motion: no GPU pipelines ({why})");
-                    ContextState::Failed {
-                        device: failed_on,
-                        why,
-                    }
-                }
-            };
-            drop(built);
-            self.build_done.notify_all();
-        };
-        let spawned = std::thread::Builder::new()
-            .name("segcam GPU".into())
-            .spawn(build);
-        if let Err(e) = spawned {
-            let why = NoDevice::NoThread(Arc::new(e));
-            // The next render tries again.
-            self.replace(ContextState::Empty);
-            return Err(why);
-        }
-        Err(NoDevice::Opening)
-    }
-
-    /// [`Self::try_wait`] after waiting for the slot's first open or replacement
-    /// and for its pipelines.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn wait(&'static self) -> Result<Arc<GpuContext>, NoDevice> {
-        // A lost context holds the lost device, whose drop the slot's reopen
-        // waits for.
-        let lost =
-            matches!(&*self.state(), ContextState::Ready(context) if context.lost().is_some());
-        if lost {
-            self.replace(ContextState::Empty);
-        }
-        self.slot.wait()?;
-        loop {
-            let answer = self.try_wait();
-            if !matches!(answer, Err(NoDevice::Opening)) {
-                return answer;
-            }
-            let built = self.state();
-            if matches!(*built, ContextState::Building { .. }) {
-                let building =
-                    |built: &mut ContextState| matches!(built, ContextState::Building { .. });
-                drop(self.build_done.wait_while(built, building));
-            } else {
-                // The slot itself is opening again.
-                drop(built);
-                self.slot.wait()?;
-            }
-        }
-    }
-
-    /// The context on the device a browser host shared: browsers can't wait
-    /// for a device inside a render. The error is `()` there: the core's
-    /// device slot, and with it `NoDevice`, is native only.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn try_wait(&self) -> Result<Arc<GpuContext>, ()> {
-        let gpu = vfx_core::Gpu::shared().ok_or(())?;
-        let mut built = self.state();
-        if let ContextState::Ready(context) = &*built
-            && context.faults.same_device(&gpu.faults())
-        {
-            return Ok(context.clone());
-        }
-        let context = Arc::new(GpuContext::on_shared(gpu));
-        *built = ContextState::Ready(context.clone());
-        Ok(context)
     }
 }
 
@@ -431,22 +299,26 @@ pub(crate) fn gpu_test_lock() -> MutexGuard<'static, ()> {
     GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A slot of the test's own.
+/// Makes a device slot for one test.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn test_slot() -> &'static DeviceSlot {
     Box::leak(Box::new(DeviceSlot::new(vfx_core::device::open)))
 }
 
-/// A [`SlotContext`] on [`test_slot`]'s devices, software ones included.
+/// Makes a [`SlotContext`] on the devices of [`test_slot`], including software ones.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn test_slot_context() -> &'static SlotContext {
-    Box::leak(Box::new(SlotContext {
-        declines_software: false,
-        ..SlotContext::new(test_slot())
-    }))
+    test_slot_context_on(test_slot())
 }
 
-/// The context `slot_context` hands out, once it has one.
+/// Makes a [`SlotContext`] on `slot`'s devices, including software ones, because CI's
+/// runners have no other adapter.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn test_slot_context_on(slot: &'static DeviceSlot) -> &'static SlotContext {
+    Box::leak(Box::new(DeviceBuild::new(slot, GpuContext::build)))
+}
+
+/// Waits until `slot_context` has a context, and returns it.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn wait_for_context(slot_context: &'static SlotContext) -> Arc<GpuContext> {
     slot_context
@@ -460,7 +332,7 @@ pub(crate) fn test_context() -> GpuContext {
     let device = test_slot()
         .wait()
         .expect("an adapter: CI has lavapipe, WARP or Metal");
-    GpuContext::build(device).expect("pipelines on a working device")
+    GpuContext::new(&device)
 }
 
 /// Per effect instance GPU state: the swarm's atlases and targets.
@@ -494,6 +366,17 @@ impl Drawer {
             software: dev.info.device_type == wgpu::DeviceType::Cpu,
             dev,
         })
+    }
+
+    /// Whether this draws on the slot's device with id `id`.
+    pub(crate) fn on_device(&self, id: u64) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.dev.slot_device.id() == id;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = id;
+            false
+        }
     }
 
     pub fn adapter(&self) -> &wgpu::AdapterInfo {
@@ -680,101 +563,5 @@ fn depth<C: Channel>() -> u32 {
         1 => 0,
         2 => 1,
         _ => 2,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Opens a device and shares it as a host does, until dropped.
-    struct HostShare {
-        _gpu: vfx_core::Gpu,
-    }
-
-    impl HostShare {
-        fn new() -> Self {
-            use vfx_core::device::{DeviceRequest, open};
-            let gpu = open(&DeviceRequest::from_env())
-                .expect("an adapter: CI has lavapipe, WARP or Metal");
-            gpu.share();
-            Self { _gpu: gpu }
-        }
-    }
-
-    impl Drop for HostShare {
-        fn drop(&mut self) {
-            vfx_core::Gpu::unshare();
-        }
-    }
-
-    mod release {
-        use super::*;
-
-        #[test]
-        fn host_context_drops() {
-            let _lock = gpu_test_lock();
-            let _host = HostShare::new();
-            let slot_context = test_slot_context();
-            let held = Arc::downgrade(&wait_for_context(slot_context));
-            assert!(held.upgrade().is_some(), "the slot context holds it");
-            slot_context.release_host_context();
-            assert!(held.upgrade().is_none(), "kept the host's device");
-        }
-
-        /// A context on the slot's own device outlives its last user; only a
-        /// host's goes with it.
-        #[test]
-        fn last_user_keeps_own_device_context() {
-            let _lock = gpu_test_lock();
-            let slot_context = test_slot_context();
-            let user = ContextUser::new(slot_context, || {});
-            slot_context.slot.wait().expect("an adapter");
-            assert!(matches!(slot_context.try_wait(), Err(NoDevice::Opening)));
-            drop(user);
-            assert!(
-                matches!(
-                    *slot_context.state(),
-                    ContextState::Building { .. } | ContextState::Ready(_)
-                ),
-                "the last user dropped a build on the slot's own device"
-            );
-        }
-
-        #[test]
-        fn last_user_drops_host_context() {
-            let _lock = gpu_test_lock();
-            let _host = HostShare::new();
-            let slot_context = test_slot_context();
-            let first = ContextUser::new(slot_context, || {});
-            let second = ContextUser::new(slot_context, || {});
-            let held = Arc::downgrade(&wait_for_context(slot_context));
-            drop(first);
-            assert!(held.upgrade().is_some(), "went with an instance still live");
-            drop(second);
-            assert!(held.upgrade().is_none(), "kept the host's device");
-        }
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn software_adapter_is_declined() {
-        use vfx_core::device::{AdapterChoice, DeviceRequest, open};
-        let _lock = gpu_test_lock();
-        let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(|_| {
-            open(&DeviceRequest {
-                adapter: AdapterChoice::Name("Microsoft Basic Render Driver".into()),
-                ..DeviceRequest::default()
-            })
-        })));
-        let slot_context: &'static SlotContext = Box::leak(Box::new(SlotContext {
-            declines_software: true,
-            ..SlotContext::new(slot)
-        }));
-        slot.wait().expect("WARP");
-        assert!(matches!(
-            slot_context.try_wait(),
-            Err(NoDevice::SoftwareOnly(_))
-        ));
     }
 }

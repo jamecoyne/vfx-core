@@ -82,30 +82,49 @@ tiles the pile still draws, so a setting changed live reaches new windows only. 
 exactly still counts as one frame (`History::drop_repeat`), and its windows stay until it changes.
 
 In Resolume on Windows the swarm draws straight into the texture Resolume shows
-(`FrameOut::Texture`) on the device the plugin shares with Resolume, with no readback. The
-output is byte identical to the swarm read back. A frame drawn on the CPU, as every output but
-the swarm is, and the swarm before the first device is ready, is uploaded into it.
+(`FrameOut::Texture`), on the device the plugin shares with Resolume. Nothing is read back. The
+output is byte identical to the swarm read back. Every other output is drawn on the CPU and
+uploaded into that texture. So is the swarm until the first device is ready.
 
 ### Device loss
 
 segcam draws on the core's device slot (`vfx_core::device`), which every effect in the plugin file
-shares. A lost device is dropped and opened again. Until the next one is there, a Swarm render
-returns `RenderError` instead of a frame, and live hosts show their input. A render that isn't
-live waits for the next device first, up to 30 s. Editors (OpenFX, After Effects) wait for the
-slot's next device after a frame failed for want of one, also in Resolve's playback once it has
-dropped frames, and render it once more as a render that isn't live, so an export and playback
-draw every frame; once a wait runs out with no device, renders fail without waiting until one
-comes back. A
-wait for the GPU that runs out (1 s live, 10 s otherwise and on a software adapter) is
-`RenderError::Timeout` and keeps the device. The analysis records stay in RAM, so the next device
-draws the whole trail. The next open starts once nothing holds the lost device, or after a backoff
-of 1, 2, 4, 8 and 16 s, then every 30 s, on the same adapter for about 30 s and then on any. A
-failed open, the first included, is retried on the same backoff for as long as the process runs. A
-software adapter's device is declined (drawn on the CPU) unless `WGPU_ADAPTER_NAME` asked for it.
-Opens hold the D3D12 device lock, so face models loading during a reset wait behind them, and face
-models that keep failing reload on the same backoff. segcam builds its pipelines for a new device on
-a thread of its own; a build that fails on a device stays failed for it. Before the first device
-is ready, where none opens, and for a canvas larger than the device takes, it draws on the CPU.
+shares. When the device is lost, the slot drops it and opens a new one.
+
+While there is no device:
+
+- A Swarm render returns a `RenderError` instead of a frame.
+- Live hosts show their input.
+- Editors (OpenFX, After Effects) wait for the next device, up to 30 s, and render the frame
+  again. Resolve's playback does this too once it has dropped frames. So an export and playback
+  draw every frame.
+- If that wait times out, later renders fail right away. They don't wait again until a device is
+  back.
+
+On the next device:
+
+- The analysis records are kept in RAM, so the first frame draws the whole trail.
+- segcam builds its pipelines with the core's `DeviceBuild`, on a thread of its own. A build that
+  fails is not retried on that device.
+
+When the slot reopens:
+
+- It starts as soon as nothing holds the lost device any more.
+- If something still holds it, the slot retries after 1, 2, 4, 8 and 16 s, then every 30 s.
+- It always asks for the adapter it lost.
+- A failed open is retried on the same delays for as long as the process runs. That includes the
+  first open.
+
+Other cases:
+
+- A wait for the GPU that times out returns `RenderError::Timeout` and keeps the device. The wait
+  is 1 s for a live render, and 10 s for an export or on a software adapter.
+- segcam refuses a software adapter's device and draws on the CPU, unless `WGPU_ADAPTER_NAME`
+  names an adapter.
+- An open holds the D3D12 device lock, so face models that load during a reset wait for it. Face
+  models that keep failing to load are retried on the same delays.
+- segcam also draws on the CPU before the first device is ready, when no device opens at all, and
+  for a canvas larger than the device supports.
 
 ### Detection and drawing
 

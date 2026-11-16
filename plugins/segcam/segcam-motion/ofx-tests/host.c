@@ -24,12 +24,16 @@ static OfxPropertySetHandle temporal(OfxImageClipHandle c, OfxTime t) {
     reads++;
     return t >= 0 && t < 32 ? history_props[(int)t] : NULL;
 }
-static OfxImageEffectHandle instance(int mode, int premult) {
-    OfxImageEffectHandle e = make_instance(kOfxImageEffectContextFilter);
-    set_param(e, "output", mode, 0);
+/* Motion detection with the face parts off from the start, so the face models never load: their
+   load holds the D3D12 device lock, and the device would open late by however long it takes. */
+static void motion_only(OfxImageEffectHandle e) {
     set_param(e, "detect", 0, 0);
     set_param(e, "eyes", 0, 0);
     set_param(e, "mouth", 0, 0);
+}
+static OfxImageEffectHandle instance(int mode, int premult) {
+    OfxImageEffectHandle e = make_instance_with(kOfxImageEffectContextFilter, motion_only);
+    set_param(e, "output", mode, 0);
     ClipRec *src = clip_find(e, "Source");
     setDouble(src->props, kOfxImageEffectPropFrameRange, 0, 0);
     setDouble(src->props, kOfxImageEffectPropFrameRange, 1, 31);
@@ -253,9 +257,10 @@ static void wait_ms(int ms) {
 #endif
 }
 /* argv: plugin input output mode depth top premult order, where order is 0 forwards, 1 backwards,
-   2 shuffled, 3 every frame cold on a fresh instance, and 4 forwards rendering a failed frame
-   again for up to 10 s, as an editor does. With VFX_OFX_REMOVE_DEVICE_AFTER set, order 4 checks
-   that no render failed and no error was shown, since the plugin waits for the next device.
+   2 shuffled, 3 every frame cold on a fresh instance, 4 forwards rendering a failed frame again
+   for up to 10 s, as an editor does, and 6 forwards as Resolve's playback that has dropped a
+   frame. With VFX_OFX_REMOVE_DEVICE_AFTER set, orders 4 and 6 check that no render failed and no
+   error was shown, since the plugin waits for the next device.
    Frames are written in frame order.
    Or argv: plugin export, for export_after_edit. */
 int main(int argc, char **argv) {
@@ -287,8 +292,16 @@ int main(int argc, char **argv) {
     fclose(in);
     output=img_new(0,0,320,180,depth); output.top_down=top; output.premultiplied=premult; output_props=image_props(&output);
     temporal_image=temporal;
-    int frames[32];
+    int frames[32], count=32;
     for(int t=0;t<32;t++) frames[t]=order==1?31-t:t;
+    /* Resolve's playback falling behind: in order, skipping frame 12 after a run of single
+       steps, so the renders from there on are live. */
+    if(order==6) {
+        as_resolve=1;
+        setString(host.host,kOfxPropName,0,"DaVinci Resolve");
+        count=31;
+        for(int i=12;i<31;i++) frames[i]=i+1;
+    }
     if(order==2) {
         unsigned seed=12345;
         for(int i=31;i>0;i--) { seed=seed*1103515245u+12345u; int j=(int)((seed>>16)%(unsigned)(i+1)); int s=frames[i]; frames[i]=frames[j]; frames[j]=s; }
@@ -296,10 +309,21 @@ int main(int argc, char **argv) {
     static unsigned char rendered[32][320*180*4];
     int retries=0;
     const char *removal=getenv("VFX_OFX_REMOVE_DEVICE_AFTER");
-    int removal_at=removal?atoi(removal):-1;
+    /* The idle instance's render counts first, so renders count one ahead of frames. */
+    int removal_at=removal?frames[atoi(removal)-1]:-1;
     OfxImageEffectHandle e=instance(mode,premult);
-    for(int i=0;i<32;i++) {
+    /* A second instance renders frame 10 once, on the device, and then idles, as Resolve keeps
+       instances it doesn't render with: what it holds on a lost device has to go without a
+       render. */
+    OfxImageEffectHandle idle=order>=4?instance(mode,premult):NULL;
+    for(int i=0;i<count;i++) {
         int t=frames[i];
+        if(idle && i==10) {
+            OfxPropertySetHandle args=props_new();
+            setDouble(args,kOfxPropTime,0,t);
+            int window[4]={0,0,320,180}; setIntN(args,kOfxImageEffectPropRenderWindow,4,window);
+            CHECK(action(kOfxImageEffectActionRender,idle,args,NULL)==kOfxStatOK,"the idle instance's render failed");
+        }
         if(order==3) e=instance(mode,premult);
         OfxPropertySetHandle args=props_new(), needed=props_new();
         setDouble(args,kOfxPropTime,0,t);
@@ -309,9 +333,6 @@ int main(int argc, char **argv) {
         int back=mode==3?123:64;
         CHECK(range && range->dbl[0]==t-back && range->dbl[1]==t,"wrong frame range");
         reads=0;
-        /* Frames drawn while the face models load can differ by a level or two from run to
-           run, so the removal runs start once they're up. */
-        if(order>=4 && i==0) wait_ms(3000);
         /* Paced as playback is, so segcam's device opens before the removal. */
         if(order>=4) wait_ms(100);
         OfxStatus status=action(kOfxImageEffectActionRender,e,args,NULL);
@@ -335,6 +356,10 @@ int main(int argc, char **argv) {
         CHECK(errors_shown==0,"the removal showed an error: %s",last_error);
     }
     if(order==4) printf("renders tried again: %d\n",retries);
+    if(order==6) {
+        CHECK(errors_shown==0,"playback showed an error: %s",last_error);
+        if(!failures) printf("playback removal: no render failed, no error shown\n");
+    }
     fwrite(rendered,1,sizeof rendered,out);
     fclose(out); action(kOfxActionUnload,NULL,NULL,NULL);
     printf("mode %d depth %s top %d premult %d order %d: %d failures\n",mode,depth,top,premult,order,failures);

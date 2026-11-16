@@ -1,15 +1,21 @@
-//! The device every effect in a plugin file draws on: one [`DeviceSlot`] per
-//! process, which hands out the device a host shares ([`Gpu::share`]) or opens
-//! its own in the background.
+//! The device every effect in a plugin file draws on. There is one [`DeviceSlot`] per
+//! process. It hands out the device a host shares ([`Gpu::share`]), or opens one in the
+//! background if the host doesn't share one.
 //!
-//! After a loss the slot reopens by itself once the lost [`Device`] is
-//! dropped, since D3D12 makes no new device on an adapter while its removed one
-//! lives, or at [`ReopenBackoff`]'s delay: a holder that never drops delays a
-//! reopen but can't block it. [`DeviceSlot::on_loss`] tells holders to let go.
+//! After a loss the slot reopens by itself, without waiting for a caller. D3D12 won't
+//! make a new device on an adapter while the removed one is still alive, so the slot
+//! reopens once the lost [`Device`] is dropped, or when [`ReopenBackoff`]'s delay runs
+//! out. A holder that never drops the device delays the reopen but can't block it.
+//! [`DeviceSlot::on_loss`] tells holders to let go.
 //!
-//! Not handled: a D3D12 open or release that never returns in the driver, and
-//! a lost adapter that never comes back. The slot keeps waiting for them, and
-//! the user restarts the app.
+//! The slot doesn't handle two cases: a D3D12 open or release that never returns from the
+//! driver, and a lost adapter that never comes back. The slot keeps waiting, and the user
+//! has to restart the app.
+//!
+//! An effect uses [`DeviceBuild`] to build what it keeps for each device, such as its
+//! pipelines.
+
+mod build;
 
 use std::fmt;
 use std::io;
@@ -19,16 +25,18 @@ use std::time::{Duration, Instant};
 
 use crate::{Gpu, ReopenBackoff};
 
-/// The least time between a loss of the slot's own device and its next open,
-/// so face models releasing the lost device take the D3D12 lock first.
+pub use build::{BuildUser, DeviceBuild};
+
+/// The shortest wait between the slot losing a device it opened and its next open. It
+/// gives face models time to release the lost device and take the D3D12 lock first.
 const REOPEN_AFTER_LOSS: Duration = Duration::from_secs(1);
 
-/// How long [`DeviceSlot::wait`] waits for an open: far above a healthy one.
+/// How long [`DeviceSlot::wait`] waits for an open. A healthy open takes far less.
 const OPEN_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Hold it while making or dropping a D3D12 device, a DirectML session's
-/// included: one made on one thread while another is dropped can deadlock
-/// inside the driver.
+/// Hold it while making or dropping a D3D12 device, including a DirectML session's.
+/// Making a device on one thread while another thread drops one can deadlock inside the
+/// driver.
 pub fn d3d12_device_lock() -> MutexGuard<'static, ()> {
     static D3D12_DEVICE_LOCK: Mutex<()> = Mutex::new(());
     D3D12_DEVICE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -212,9 +220,9 @@ pub enum NoDevice {
     Panicked(String),
     #[error("no thread to open a device on: {0}")]
     NoThread(#[source] Arc<io::Error>),
-    /// The device reported this error while a caller set it up.
+    /// Setting the device up failed with this error, or the device reported it meanwhile.
     #[error("the device failed while being set up: {0}")]
-    Unusable(String),
+    Unusable(#[source] Arc<dyn std::error::Error + Send + Sync>),
     /// The device was lost, for this reason, and no replacement is open yet.
     #[error("the device was lost: {0}")]
     Lost(String),
@@ -1085,14 +1093,14 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 mod tests {
     use super::*;
 
-    /// Tests open devices one at a time: concurrent WARP opens can crash in
+    /// Tests open devices one at a time, because concurrent WARP opens can crash in
     /// d3d10warp.dll.
-    fn gpu_test_lock() -> MutexGuard<'static, ()> {
+    pub(super) fn gpu_test_lock() -> MutexGuard<'static, ()> {
         static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
         GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn test_gpu() -> Gpu {
+    pub(super) fn test_gpu() -> Gpu {
         open(&DeviceRequest::from_env()).expect("a GPU adapter, WARP on Windows")
     }
 
@@ -1151,7 +1159,7 @@ mod tests {
     }
 
     /// Loses `device` as a driver reset would, as far as the slot can tell.
-    fn lose(device: &Device) {
+    pub(super) fn lose(device: &Device) {
         let device = &device.gpu().device;
         device.destroy();
         let _ = crate::poll_device(device, wgpu::PollType::wait_indefinitely());
@@ -1172,12 +1180,12 @@ mod tests {
     }
 
     /// Shares a device as a host does, until dropped.
-    struct HostShare {
+    pub(super) struct HostShare {
         _gpu: Gpu,
     }
 
     impl HostShare {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let gpu = test_gpu();
             gpu.share();
             Self { _gpu: gpu }
@@ -1361,7 +1369,7 @@ mod tests {
         fn falls_back_to_second_backend() {
             let ranked = rank(&adapters_on_two_backends(), &AdapterChoice::HighPerformance);
             let opened = first_opened(ranked, |i| match i {
-                0 => Err(NoDevice::Unusable("Vulkan refused".into())),
+                0 => Err(NoDevice::Unusable(Arc::from(Box::from("Vulkan refused")))),
                 i => Ok(i),
             });
             assert!(matches!(opened, Some(Ok(3))), "{opened:?}");
@@ -1427,7 +1435,7 @@ mod tests {
         fn retry_leaves_wait_unblocked() {
             let _lock = gpu_test_lock();
             let (slot, fake) = fake_slot();
-            fake.set_fail(Some(NoDevice::Unusable("driver".into())));
+            fake.set_fail(Some(NoDevice::Unusable(Arc::from(Box::from("driver")))));
             assert!(slot.wait().is_err());
             fake.set_blocked(true);
             next_try_now(slot);

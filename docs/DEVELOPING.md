@@ -99,6 +99,36 @@ readings. Implement it when the work runs somewhere a host can't see, or when th
 things a host could use. The preview's bar shows the first two. Its expressions match
 readings by name.
 
+### Pipelines per device
+
+A CPU effect that draws on the GPU builds its pipelines and shaders once per device, with
+`vfx_core::device::DeviceBuild`. The build runs on its own thread, so a render never waits for it.
+
+```rust
+static PIPELINES: LazyLock<DeviceBuild<Pipelines>> =
+    LazyLock::new(|| DeviceBuild::new(device::slot(), Pipelines::build));
+```
+
+In a render:
+
+- A live render calls `try_wait`. It never blocks. It returns `NoDevice::Opening` while the build
+  runs, and the `Arc<Pipelines>` once it is done.
+- An export calls `wait`, which blocks until the build is done.
+- A build that fails returns `NoDevice::Unusable` with its error. It is not retried on that device.
+
+What an instance keeps on the device, such as textures and buffers, goes in
+`PIPELINES.user_with(state, release, on_last)`. `lock` gives access to it.
+
+When the slot loses a device it opened, `DeviceBuild` drops what it built on that device. It also
+calls `release` on the state of every instance that isn't rendering right then, and doesn't wait
+for those instances to render. D3D12 needs this: it won't open a new device on an adapter until
+the removed device is fully released.
+
+On a device the app shares, what was built is dropped when the last instance is.
+
+State that belongs to one render or one frame size goes in vfx-host's `pipeline` pool instead,
+which GPU effects already use for theirs. segcam Motion's `gpu.rs` shows `DeviceBuild` in use.
+
 ## What a host implements
 
 This is the core API for 1.0. A PR that adds a trait method, a `Context` field or a `Gpu` function
@@ -131,8 +161,13 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `DeviceFaults::same_device` (whether two records are one device, across wgpu instances), `ReopenBackoff` (when to try for a new device after a loss) | vfx-core |
 | `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core |
 | `Gpu::from_parts` | vfx-core |
-| Native only: `device::slot`, `DeviceSlot` (`try_wait` for live callers, never waits; `wait` for exports; the host's shared device while a host shares one; `on_loss` tells holders of a lost device of the slot's own to let go; the slot reopens by itself once they have), `LossSubscription`, `Device`, `NoDevice`, `device::open` (blocking) for a `DeviceRequest` (`Backend` order and `AdapterChoice`: high performance, low power, LUID or name; `with_env` takes `WGPU_BACKEND`, `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF`), `device::adapters` (the ranked adapters, for a host with its own instance; D3D12's are the kept ones of `device::d3d12_instance`, kept for the process so no open releases a D3D12 device), `device::luid`, `adapter_name_from_env` | vfx-core |
-| `d3d12_device_lock` (held while making or dropping a D3D12 device; segcam-face re-exports it) | vfx-core |
+| Native only: `device::slot` and `DeviceSlot`, the one device every effect in a plugin file draws on. `try_wait` is for live callers and never blocks. `wait` is for exports. While a host shares a device, the slot hands out that one | vfx-core |
+| Native only: `DeviceSlot::on_loss` and `LossSubscription`. The slot calls each listener when it loses a device it opened, so whatever holds that device can release it. Once everything has, the slot reopens by itself | vfx-core |
+| Native only: `Device`, `NoDevice`, and `device::open`, which opens a device for a `DeviceRequest` and blocks. A request names backends in order (`Backend`) and an adapter (`AdapterChoice`: high performance, low power, LUID or name). `with_env` applies `WGPU_BACKEND`, `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF` | vfx-core |
+| Native only: `device::adapters`, the adapters in the order `open` tries them, for a host with its own instance. `device::d3d12_instance` keeps the D3D12 adapters for the life of the process, so opening a device never releases one. `device::luid`, `adapter_name_from_env` | vfx-core |
+| Native only: `device::DeviceBuild`, what an effect builds once per device (its pipelines and shaders), on a thread of its own. `try_wait` never blocks and returns `NoDevice::Opening` while it builds. `wait` is for exports. `declining_software` refuses software adapters. `NoDevice::Unusable` holds a failed build's error | vfx-core |
+| Native only: `device::BuildUser`, one instance's handle on a `DeviceBuild`. `DeviceBuild::user` makes one; when the last one drops, a value built on a host's device is released. `DeviceBuild::user_with` also stores the instance's state, reached with `BuildUser::lock`, and releases it when the slot loses the device, without waiting for a render | vfx-core |
+| `d3d12_device_lock`: hold it while making or dropping a D3D12 device. segcam-face re-exports it | vfx-core |
 | `Gpu::share`, `Gpu::shared` | vfx-core |
 | `Gpu::unshare` (a host whose device was lost stops sharing it before dropping it, which D3D12 needs to offer the adapter again) | vfx-core |
 | `Gpu::memory_hints` (allocator block sizes for a device a host or effect opens) | vfx-core |

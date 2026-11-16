@@ -312,7 +312,12 @@ static OfxStatus action(const char *name, void *handle, OfxPropertySetHandle in,
 }
 
 /* Builds an instance: describes in `context`, then copies defaults into values. */
-static OfxImageEffectHandle make_instance(const char *context) {
+static void set_param(OfxImageEffectHandle e, const char *name, double a, double b);
+
+/* If `set_up` is given, it sets values before the create instance action, the way a host does
+   with a saved project's values. */
+static OfxImageEffectHandle make_instance_with(const char *context,
+                                               void (*set_up)(OfxImageEffectHandle)) {
     OfxImageEffectHandle e = calloc(1, sizeof *e);
     e->props = props_new();
     e->params.props = props_new();
@@ -335,9 +340,14 @@ static OfxImageEffectHandle make_instance(const char *context) {
     }
     setString(e->props, kOfxImageEffectPropContext, 0, context);
     setDouble(e->props, kOfxImageEffectPropFrameRate, 0, 24.0);
+    if (set_up) set_up(e);
     s = action(kOfxActionCreateInstance, e, NULL, NULL);
     CHECK(s == kOfxStatOK, "create instance returned %d", s);
     return e;
+}
+
+static OfxImageEffectHandle make_instance(const char *context) {
+    return make_instance_with(context, NULL);
 }
 
 static void set_param(OfxImageEffectHandle e, const char *name, double a, double b) {
