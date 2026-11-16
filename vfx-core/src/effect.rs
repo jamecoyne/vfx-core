@@ -201,13 +201,14 @@ pub trait CpuEffect: Send {
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Report {
-    /// Where it drew: "CPU", "GPU (NVIDIA GeForce RTX 4070)".
+    /// Where it drew: "CPU", "GPU (NVIDIA GeForce RTX 4070, vulkan)".
     pub draw: Option<String>,
     /// Where its face models run: "DirectML 0", "CPU", "Vision".
     pub faces: Option<String>,
     /// What it found. A host uses the names it knows and ignores the rest.
     pub readings: Vec<Reading>,
-    /// The last time the GPU failed a render, why; the render was drawn another way.
+    /// Why the last render the GPU failed, or the effect got no GPU to draw
+    /// on, was drawn another way.
     pub gpu_fault: Option<String>,
     /// Whether its tile atlas is full, so it leaves out its oldest windows.
     pub atlas_full: bool,

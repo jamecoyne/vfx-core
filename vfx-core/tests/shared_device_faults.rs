@@ -4,7 +4,7 @@
 use vfx_core::{Gpu, wgpu};
 
 fn device() -> Gpu {
-    vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+    vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
         .expect("no GPU adapter available for headless tests")
 }
 

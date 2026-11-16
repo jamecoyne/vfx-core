@@ -480,6 +480,9 @@ fn stats_line(elapsed: f64, span: f64, worst: Duration, s: &Snapshot, delta: Cou
     if let Some(fault) = &s.device_fault {
         text += &format!(" fault={fault:?}");
     }
+    if let Some(fault) = &s.report.gpu_fault {
+        text += &format!(" gpu_fault={fault:?}");
+    }
     text
 }
 

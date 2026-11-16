@@ -256,10 +256,10 @@ mod tests {
 
     #[test]
     fn checked_returns_validation_error() {
-        use vfx_core::device::{AdapterChoice, open};
-        let gpu = open(&AdapterChoice::from_env()).expect("a GPU adapter, WARP on Windows");
+        use vfx_core::device::{DeviceRequest, open};
+        let gpu = open(&DeviceRequest::from_env()).expect("a GPU adapter, WARP on Windows");
         let result = checked(&gpu, || {
-            // A buffer mapped for reading and writing at once is invalid.
+            // Mapping a buffer for reading and writing at once is invalid.
             let usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE;
             gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -273,8 +273,8 @@ mod tests {
 
     #[test]
     fn checked_returns_value() {
-        use vfx_core::device::{AdapterChoice, open};
-        let gpu = open(&AdapterChoice::from_env()).expect("a GPU adapter, WARP on Windows");
+        use vfx_core::device::{DeviceRequest, open};
+        let gpu = open(&DeviceRequest::from_env()).expect("a GPU adapter, WARP on Windows");
         assert!(matches!(checked(&gpu, || 7), Ok(7)));
     }
 }

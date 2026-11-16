@@ -5,7 +5,7 @@ use vfx_core::effects::ColorAdjust;
 use vfx_core::{EffectChain, Frame, Gpu, ParamValue, Readback};
 
 fn gpu() -> Gpu {
-    vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+    vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
         .expect("no GPU adapter available for headless tests")
 }
 

@@ -41,7 +41,7 @@ impl FrameSource for MovingSquare {
     ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
 )]
 fn unshared_device_target_is_declined() {
-    let host = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+    let host = vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
         .ok()
         .filter(|gpu| gpu.device.adapter_info().device_type != wgpu::DeviceType::Cpu)
         .expect("a hardware GPU adapter");

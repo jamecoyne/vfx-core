@@ -8,7 +8,7 @@ use vfx_core::{poll_device, wgpu};
 /// even with a small buffer made after it.
 #[test]
 fn large_buffer_memory_returns_beside_small_buffer() {
-    let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+    let gpu = vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
         .expect("no GPU adapter available for headless tests");
     let reserved = || {
         gpu.device

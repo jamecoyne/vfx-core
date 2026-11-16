@@ -148,13 +148,15 @@ fn main() -> ExitCode {
     // The GPU's state is kept between frames, which renders the same frames as a cold render.
     // Waiting for the device here puts every frame on it. A first open that fails leaves this run
     // on the CPU, without waiting for its retries.
-    let gpu =
-        (!cpu && segcam_motion::gpu::enabled_by_env() && segcam_motion::gpu::status().is_ok())
-            .then(|| {
-                let mut state = IncrementalRenderer::default();
-                state.use_gpu(true);
-                state
-            });
+    let opened = (!cpu && segcam_motion::gpu::enabled_by_env()).then(segcam_motion::gpu::status);
+    if let Some(Err(why)) = &opened {
+        eprintln!("segcam-motion: drawing on the CPU: {why}");
+    }
+    let gpu = matches!(opened, Some(Ok(()))).then(|| {
+        let mut state = IncrementalRenderer::default();
+        state.use_gpu(true);
+        state
+    });
     let state = gpu.or_else(|| kept.then(IncrementalRenderer::default));
     if float {
         run::<f32>(width, height, settings, state)
@@ -215,7 +217,8 @@ fn run<C: Depth>(
         {
             on_gpu += 1;
             if let Some(drawer) = state.drawer() {
-                adapter.clone_from(&drawer.adapter().name);
+                let info = drawer.adapter();
+                adapter = format!("{}, {}", info.name, info.backend);
             }
         }
 

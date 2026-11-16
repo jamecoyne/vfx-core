@@ -588,13 +588,24 @@ impl IncrementalRenderer {
         if let Some(why) = self.drawer.as_ref().and_then(|drawer| drawer.loss()) {
             self.fall_back(&Fault(why));
         }
-        if self.gpu_wanted
-            && self.drawer.is_none()
-            && mode_uses_gpu
-            && let Some(drawer) = self.slot_context().try_wait().ok().and_then(Drawer::new)
-        {
-            self.last_reported_fault = None;
-            self.set_drawer(Some(Box::new(drawer)));
+        if !(self.gpu_wanted && self.drawer.is_none() && mode_uses_gpu) {
+            return;
+        }
+        match self.slot_context().try_wait() {
+            Ok(context) => {
+                if let Some(drawer) = Drawer::new(context) {
+                    self.last_reported_fault = None;
+                    self.set_drawer(Some(Box::new(drawer)));
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Err(vfx_core::device::NoDevice::Opening | vfx_core::device::NoDevice::Lost(_)) => {}
+            // The report says why the slot gives no device, as an override that
+            // found none: the user who set it sees why it didn't take.
+            #[cfg(not(target_arch = "wasm32"))]
+            Err(why) => self.last_reported_fault = Some(why.to_string()),
+            #[cfg(target_arch = "wasm32")]
+            Err(()) => {}
         }
     }
 
@@ -885,7 +896,10 @@ impl IncrementalRenderer {
         report.draw = self.drew_on_gpu.map(|on_gpu| match &self.drawer {
             // Browsers don't name their adapter.
             Some(drawer) if on_gpu && drawer.adapter().name.is_empty() => "GPU".to_owned(),
-            Some(drawer) if on_gpu => format!("GPU ({})", drawer.adapter().name),
+            Some(drawer) if on_gpu => {
+                let adapter = drawer.adapter();
+                format!("GPU ({}, {})", adapter.name, adapter.backend)
+            }
             _ => "CPU".to_owned(),
         });
         report.faces = crate::faces::runs_on()
@@ -2322,7 +2336,7 @@ mod tests {
         assert!(drawn(&on_gpu) > 0, "drawing on the GPU before the loss");
         assert_eq!(
             on_gpu.report().draw,
-            Some(format!("GPU ({})", first.info.name))
+            Some(format!("GPU ({}, {})", first.info.name, first.info.backend))
         );
         first.device.destroy();
 
@@ -2355,7 +2369,10 @@ mod tests {
         assert!(drawn(&on_gpu) > 0, "the instance stayed on the CPU");
         assert_eq!(
             on_gpu.report().draw,
-            Some(format!("GPU ({})", second.info.name))
+            Some(format!(
+                "GPU ({}, {})",
+                second.info.name, second.info.backend
+            ))
         );
         assert!(
             on_gpu.report().gpu_fault.is_none(),
@@ -2368,8 +2385,8 @@ mod tests {
     fn render_without_adapter() -> (IncrementalRenderer, Vec<Argb<u8>>) {
         let slot: &'static vfx_core::device::DeviceSlot =
             Box::leak(Box::new(vfx_core::device::DeviceSlot::new(|_| {
-                Err(vfx_core::device::NoDevice::NoAdapterNamed(
-                    "none here".into(),
+                Err(vfx_core::device::NoDevice::NoAdapter(
+                    vfx_core::device::DeviceRequest::default(),
                 ))
             })));
         let mut failed = IncrementalRenderer {
@@ -2403,6 +2420,14 @@ mod tests {
         let _lock = gpu_test_lock();
         let (failed, _) = render_without_adapter();
         assert!(failed.gpu_wanted, "the failure was final");
+    }
+
+    #[test]
+    fn failed_open_reports_why() {
+        let _lock = gpu_test_lock();
+        let (failed, _) = render_without_adapter();
+        let fault = failed.report().gpu_fault.unwrap_or_default();
+        assert!(fault.contains("no GPU adapter"), "{fault:?}");
     }
 
     /// A source whose [`FrameSource::with_frame`] is costly, and which holds frames in other bytes
@@ -3658,7 +3683,8 @@ mod tests {
             on_first: Step,
             on_cpu: Step,
             on_second: Step,
-            second_name: String,
+            /// The second device's adapter and backend, as the report names them.
+            second_adapter: String,
             devices_differ: bool,
         }
 
@@ -3685,7 +3711,10 @@ mod tests {
                 on_first,
                 on_cpu,
                 on_second,
-                second_name: second_device.info.name.clone(),
+                second_adapter: format!(
+                    "{}, {}",
+                    second_device.info.name, second_device.info.backend
+                ),
                 devices_differ: !Arc::ptr_eq(&first_device, &second_device),
             }
         }
@@ -3718,7 +3747,10 @@ mod tests {
                 "the new device needs no earlier frame"
             );
             assert!(on_second.drawn > 0, "the instance stayed on the CPU");
-            assert_eq!(on_second.draw, Some(format!("GPU ({})", loss.second_name)));
+            assert_eq!(
+                on_second.draw,
+                Some(format!("GPU ({})", loss.second_adapter))
+            );
             assert!(within_gpu_bound(&cold, &on_second.pixels));
         }
 

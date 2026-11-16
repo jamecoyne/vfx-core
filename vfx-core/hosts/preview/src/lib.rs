@@ -39,39 +39,51 @@ mod web_record;
 
 pub use app::run;
 
-/// A D3D12 device on WARP, which every Windows machine has, for device removal
-/// tests: it keeps D3D12's rule that a removed device's adapter comes back only
-/// once nothing holds the device.
+/// Opens a D3D12 device on WARP, which every Windows machine has, for device removal tests.
+/// WARP follows D3D12's rule that a removed device's adapter comes back only once nothing holds
+/// the device. The open is retried for up to 10 s, because a removed WARP device's adapter is
+/// offered again only once it is released.
 #[cfg(all(test, windows))]
 fn warp_gpu() -> vfx_core::Gpu {
-    let adapter = pollster::block_on(dx12_instance().request_adapter(
-        &wgpu::RequestAdapterOptions {
-            force_fallback_adapter: true,
-            ..Default::default()
-        },
-    ))
-    .expect("WARP");
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-            .expect("a device on WARP");
-    vfx_core::Gpu::from_parts(device, queue)
+    let warp = vfx_core::device::DeviceRequest {
+        order: vec![vfx_core::device::Backend::Dx12],
+        adapter: vfx_core::device::AdapterChoice::Name("Microsoft Basic Render Driver".into()),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match vfx_core::device::open(&warp) {
+            Ok(gpu) => return gpu,
+            Err(e) if std::time::Instant::now() >= deadline => panic!("a device on WARP: {e}"),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
-/// Whether D3D12 offers WARP, which it doesn't while anything holds a removed
-/// WARP device.
+/// Whether D3D12 offers WARP. It doesn't while anything holds a removed WARP device. The
+/// core's kept adapters let a removed one go when asked.
 #[cfg(all(test, windows))]
 fn warp_offered() -> bool {
-    pollster::block_on(dx12_instance().enumerate_adapters(wgpu::Backends::DX12))
-        .iter()
-        .any(|a| a.get_info().device_type == wgpu::DeviceType::Cpu)
+    let dx12 = vfx_core::device::DeviceRequest {
+        order: vec![vfx_core::device::Backend::Dx12],
+        adapter: vfx_core::device::AdapterChoice::HighPerformance,
+    };
+    let instance = vfx_core::device::d3d12_instance();
+    let warp = |a: &wgpu::Adapter| a.get_info().device_type == wgpu::DeviceType::Cpu;
+    !pollster::block_on(vfx_core::device::adapters(instance, &dx12, warp)).is_empty()
 }
 
+/// Whether WARP is offered within 10 s. It can take that long, because the kept adapter of a
+/// removed WARP device is released on a separate thread.
 #[cfg(all(test, windows))]
-fn dx12_instance() -> wgpu::Instance {
-    wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::DX12,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    })
+fn wait_for_warp() -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !warp_offered() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    true
 }
 
 /// A device for a test, and the turn to hold while using it. Drivers can deadlock when one test
@@ -82,6 +94,6 @@ fn test_gpu() -> (std::sync::MutexGuard<'static, ()>, vfx_core::Gpu) {
     let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     (
         turn,
-        vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).unwrap(),
+        vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env()).unwrap(),
     )
 }

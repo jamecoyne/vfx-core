@@ -75,11 +75,11 @@ fn log_answer(answer: Result<Arc<Device>, NoDevice>, log: &Log) -> Option<Arc<De
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vfx_core::device::AdapterChoice;
+    use vfx_core::device::DeviceRequest;
 
     #[test]
     fn forget_spares_host_keys() {
-        let gpu = device::open(&AdapterChoice::from_env()).expect("a GPU adapter, WARP on Windows");
+        let gpu = device::open(&DeviceRequest::from_env()).expect("a GPU adapter, WARP on Windows");
         let host_key = 7;
         pipeline::keep_for_test(&gpu, SLOT_DEVICE_KEYS | 1);
         pipeline::keep_for_test(&gpu, host_key);

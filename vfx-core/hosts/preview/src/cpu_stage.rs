@@ -685,7 +685,7 @@ mod tests {
         drop((on_device, gpu));
         assert!(!crate::warp_offered(), "the effect doesn't hold the device");
         released.effect.device_lost();
-        assert!(crate::warp_offered(), "the effect kept the removed device");
+        assert!(crate::wait_for_warp(), "the effect kept the removed device");
     }
 
     /// Every value of every channel, so a rounding on the way would show.

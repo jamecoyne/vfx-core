@@ -6,7 +6,7 @@ use vfx_core::cpu::{Argb, FrameSource, Image, ImageMut, ViewMut};
 use vfx_core::{Context, CpuEffect, Frame, Gpu, ParamSpec, ParamValues, Target};
 
 fn gpu() -> Gpu {
-    vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+    vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
         .expect("no GPU adapter available for headless tests")
 }
 

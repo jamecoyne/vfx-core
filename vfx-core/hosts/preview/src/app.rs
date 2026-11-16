@@ -18,6 +18,8 @@ use crate::{audio, face, script, video};
 #[cfg(target_arch = "wasm32")]
 use crate::{web_media, web_record};
 use vfx_core::Gpu;
+#[cfg(not(target_arch = "wasm32"))]
+use vfx_core::device::{AdapterChoice, Backend, DeviceRequest};
 use winit::application::ApplicationHandler;
 use winit::event::ElementState;
 use winit::event::WindowEvent;
@@ -168,8 +170,13 @@ const SENDER_LIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 pub(crate) enum DeviceError {
     #[error("couldn't create a surface: {0}")]
     Surface(#[source] wgpu::CreateSurfaceError),
-    #[error("--gpu {name}: none found; there are {available}")]
-    NoNamedAdapter { name: String, available: String },
+    #[cfg(not(target_arch = "wasm32"))]
+    #[error("no GPU adapter {choice}; there are {available}")]
+    NoMatchingAdapter {
+        choice: AdapterChoice,
+        available: String,
+    },
+    #[cfg(target_arch = "wasm32")]
     #[error("no GPU adapter: {0}")]
     NoAdapter(#[source] wgpu::RequestAdapterError),
     #[error("couldn't open the GPU: {0}")]
@@ -182,52 +189,183 @@ pub(crate) enum DeviceError {
     #[cfg(not(target_arch = "wasm32"))]
     #[error("opening the device panicked")]
     Panicked,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[error("no thread to open the device on: {0}")]
+    NoThread(#[source] std::io::Error),
+    /// An open ran past the deadline without an answer. The preview doesn't try to open
+    /// anything else after this.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[error("opening the device took over {0:?}")]
+    OpenTimedOut(std::time::Duration),
 }
 
-/// The adapter `--gpu` names: `high` or nothing for the high performance one, `low` for the low
-/// power one, anything else the first that can show the window and has that in its name.
-async fn pick_adapter(
+/// How long the preview waits for its first open. An export host waits the same way for the
+/// device slot's first open.
+#[cfg(not(target_arch = "wasm32"))]
+const OPEN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The preview's device request. On Windows it tries D3D12 first, then Vulkan, then GL.
+/// NVIDIA's Vulkan driver keeps a block that grows for as long as the preview renders (#58),
+/// and D3D12's stays level. Elsewhere Vulkan, Metal and GL are ordered the way wgpu orders
+/// them. `--gpu` (`high`, `low` or part of an adapter's name) takes priority over the machine's
+/// overrides.
+#[cfg(not(target_arch = "wasm32"))]
+fn device_request(gpu: Option<&str>) -> DeviceRequest {
+    let order = if cfg!(windows) {
+        vec![Backend::Dx12, Backend::Vulkan, Backend::Gl]
+    } else {
+        vec![Backend::Vulkan, Backend::Metal, Backend::Gl]
+    };
+    let request = DeviceRequest {
+        order,
+        adapter: AdapterChoice::HighPerformance,
+    }
+    .with_env();
+    let adapter = match gpu {
+        None => request.adapter,
+        Some("high") => AdapterChoice::HighPerformance,
+        Some("low") => AdapterChoice::LowPower,
+        Some(name) => AdapterChoice::Name(name.to_owned()),
+    };
+    DeviceRequest { adapter, ..request }
+}
+
+/// Splits `request` into the parts the preview opens one after another, each from its own
+/// instance. On Windows each backend is a part, so a show process loads the next backend's
+/// drivers and layers only if the one before gave no device. D3D12's part uses the core's kept
+/// instance. Elsewhere one instance takes the whole order.
+#[cfg(not(target_arch = "wasm32"))]
+fn request_parts(request: &DeviceRequest) -> Vec<DeviceRequest> {
+    let part = |order: &[vfx_core::device::Backend]| DeviceRequest {
+        order: order.to_vec(),
+        adapter: request.adapter.clone(),
+    };
+    if !cfg!(windows) {
+        return vec![part(&request.order)];
+    }
+    request.order.chunks(1).map(part).collect()
+}
+
+/// Runs [`open_on_surface`] on a separate thread and waits up to [`OPEN_DEADLINE`] for its
+/// answer. A driver that never returns leaves that thread running.
+#[cfg(not(target_arch = "wasm32"))]
+fn open_on_surface_within(
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    request: DeviceRequest,
+) -> Result<OpenedDevice, DeviceError> {
+    let (answer, opened) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("preview GPU open".into())
+        .spawn(move || {
+            let _ = answer.send(open_on_surface(&instance, surface, &request));
+        })
+        .map_err(DeviceError::NoThread)?;
+    use std::sync::mpsc::RecvTimeoutError;
+    match opened.recv_timeout(OPEN_DEADLINE) {
+        Ok(opened) => opened,
+        Err(RecvTimeoutError::Timeout) => Err(DeviceError::OpenTimedOut(OPEN_DEADLINE)),
+        Err(RecvTimeoutError::Disconnected) => Err(DeviceError::Panicked),
+    }
+}
+
+/// Whether the next part of the request is worth trying after `opened`. It isn't after a
+/// device opened, and it isn't after an open that didn't return, because the process stays on
+/// the backend it asked first.
+#[cfg(not(target_arch = "wasm32"))]
+fn next_part_wanted(opened: &Result<OpenedDevice, DeviceError>) -> bool {
+    !matches!(opened, Ok(_) | Err(DeviceError::OpenTimedOut(_)))
+}
+
+/// The instance for a part of the request. On Windows D3D12's adapters are the core's kept
+/// ones, and only the core's instance can use them.
+#[cfg(not(target_arch = "wasm32"))]
+fn part_instance(
+    display: winit::event_loop::OwnedDisplayHandle,
+    backends: wgpu::Backends,
+) -> wgpu::Instance {
+    #[cfg(windows)]
+    if backends == wgpu::Backends::DX12 {
+        return vfx_core::device::d3d12_instance().clone();
+    }
+    new_wgpu_instance(display, backends)
+}
+
+/// Opens a device for `request` on `surface` and returns it together with the surface.
+#[cfg(not(target_arch = "wasm32"))]
+fn open_on_surface(
+    instance: &wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    request: &DeviceRequest,
+) -> Result<OpenedDevice, DeviceError> {
+    let (adapter, gpu) = pollster::block_on(open_device(instance, &surface, request))?;
+    Ok(OpenedDevice {
+        surface,
+        adapter,
+        gpu,
+    })
+}
+
+/// The adapters that match `request` and can show the window, best first.
+#[cfg(not(target_arch = "wasm32"))]
+async fn usable_adapters(
     instance: &wgpu::Instance,
     surface: &wgpu::Surface<'_>,
-    choice: Option<&str>,
-) -> Result<wgpu::Adapter, DeviceError> {
-    let power_preference = match choice {
-        None | Some("high") => wgpu::PowerPreference::HighPerformance,
-        Some("low") => wgpu::PowerPreference::LowPower,
-        Some(name) => {
-            let wanted = name.to_lowercase();
-            let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
-            let names: Vec<String> = adapters.iter().map(|a| a.get_info().name).collect();
-            return adapters
-                .into_iter()
-                .find(|a| {
-                    a.get_info().name.to_lowercase().contains(&wanted)
-                        && a.is_surface_supported(surface)
-                })
-                .ok_or_else(|| DeviceError::NoNamedAdapter {
-                    name: name.to_owned(),
-                    available: names.join(", "),
-                });
-        }
-    };
-    instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference,
-            compatible_surface: Some(surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        })
-        .await
-        .map_err(DeviceError::NoAdapter)
+    request: &DeviceRequest,
+) -> Result<Vec<wgpu::Adapter>, DeviceError> {
+    let usable = |a: &wgpu::Adapter| a.is_surface_supported(surface);
+    let adapters = vfx_core::device::adapters(instance, request, usable).await;
+    if !adapters.is_empty() {
+        return Ok(adapters);
+    }
+    // This goes through the core so that D3D12's names come from its kept adapters.
+    let all = vfx_core::device::adapters(instance, request, |_| true).await;
+    let names: Vec<String> = all.iter().map(|a| a.get_info().name).collect();
+    Err(DeviceError::NoMatchingAdapter {
+        choice: request.adapter.clone(),
+        available: names.join(", "),
+    })
 }
 
-/// The adapter `choice` names and a device on it, with what effects need of it.
+/// The one adapter the browser offers for the window, returned as a list.
+#[cfg(target_arch = "wasm32")]
+async fn usable_adapters(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Result<Vec<wgpu::Adapter>, DeviceError> {
+    let options = wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(surface),
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    };
+    let adapter = instance.request_adapter(&options).await;
+    Ok(vec![adapter.map_err(DeviceError::NoAdapter)?])
+}
+
+/// Opens a device on the first adapter matching `request` that can make one, with the limits
+/// and features effects need.
 async fn open_device(
     instance: &wgpu::Instance,
     surface: &wgpu::Surface<'_>,
-    choice: Option<&str>,
+    #[cfg(not(target_arch = "wasm32"))] request: &DeviceRequest,
 ) -> Result<(wgpu::Adapter, Gpu), DeviceError> {
-    let adapter = pick_adapter(instance, surface, choice).await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let adapters = usable_adapters(instance, surface, request).await?;
+    #[cfg(target_arch = "wasm32")]
+    let adapters = usable_adapters(instance, surface).await?;
+    let mut refused = None;
+    for adapter in adapters {
+        match device_on(&adapter).await {
+            Ok(gpu) => return Ok((adapter, gpu)),
+            Err(e) => refused = Some(e),
+        }
+    }
+    Err(DeviceError::Request(refused.expect("at least one adapter")))
+}
+
+/// Opens a device on `adapter` with the limits and features effects need.
+async fn device_on(adapter: &wgpu::Adapter) -> Result<Gpu, wgpu::RequestDeviceError> {
     // Effects read a whole canvas back in one buffer, as large as the adapter
     // allows; a canvas over it faults and draws on the CPU.
     let supported = adapter.limits();
@@ -256,9 +394,8 @@ async fn open_device(
             memory_hints: Gpu::memory_hints(),
             ..wgpu::DeviceDescriptor::default()
         })
-        .await
-        .map_err(DeviceError::Request)?;
-    Ok((adapter, Gpu::from_parts(device, queue)))
+        .await?;
+    Ok(Gpu::from_parts(device, queue))
 }
 
 fn surface_config(
@@ -377,7 +514,7 @@ impl Preview {
     async fn new(
         window: Arc<Window>,
         #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))] mut instance: wgpu::Instance,
-        gpu_choice: Option<String>,
+        #[cfg(not(target_arch = "wasm32"))] gpu_choice: Option<String>,
         #[cfg(not(target_arch = "wasm32"))] display: winit::event_loop::OwnedDisplayHandle,
     ) -> Result<Self, DeviceError> {
         // Before the first wait on the GPU, so a drop while it opens is kept for the first frame.
@@ -393,10 +530,37 @@ impl Preview {
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
         }
-        let surface = instance
-            .create_surface(window.clone())
-            .map_err(DeviceError::Surface)?;
-        let (adapter, gpu) = open_device(&instance, &surface, gpu_choice.as_deref()).await?;
+        #[cfg(target_arch = "wasm32")]
+        let (surface, adapter, gpu) = {
+            let surface = instance
+                .create_surface(window.clone())
+                .map_err(DeviceError::Surface)?;
+            let (adapter, gpu) = open_device(&instance, &surface).await?;
+            (surface, adapter, gpu)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let OpenedDevice {
+            surface,
+            adapter,
+            gpu,
+        } = {
+            let mut parts = request_parts(&device_request(gpu_choice.as_deref())).into_iter();
+            let first = parts.next().expect("a first part");
+            let surface = instance
+                .create_surface(window.clone())
+                .map_err(DeviceError::Surface)?;
+            let mut opened = open_on_surface_within(instance.clone(), surface, first);
+            for part in parts {
+                if !next_part_wanted(&opened) {
+                    break;
+                }
+                let instance = part_instance(display.clone(), part.backends());
+                opened = (instance.create_surface(window.clone()))
+                    .map_err(DeviceError::Surface)
+                    .and_then(|surface| open_on_surface_within(instance, surface, part));
+            }
+            opened?
+        };
         #[cfg(not(target_arch = "wasm32"))]
         eprintln!(
             "preview: drawing on {} ({:?})",
@@ -1518,7 +1682,10 @@ fn window_attributes(start: &StartOptions) -> winit::window::WindowAttributes {
     attributes
 }
 
-fn new_wgpu_instance(display: winit::event_loop::OwnedDisplayHandle) -> wgpu::Instance {
+fn new_wgpu_instance(
+    display: winit::event_loop::OwnedDisplayHandle,
+    #[cfg(not(target_arch = "wasm32"))] backends: wgpu::Backends,
+) -> wgpu::Instance {
     #[allow(unused_mut)]
     let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(display));
     // WebGPU where the browser has it, WebGL2 otherwise (the fallback is in `new`).
@@ -1526,20 +1693,13 @@ fn new_wgpu_instance(display: winit::event_loop::OwnedDisplayHandle) -> wgpu::In
     {
         descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
     }
-    // D3D12 on Windows, where wgpu would otherwise pick Vulkan first: NVIDIA's Vulkan driver keeps
-    // a block of its own that grows for as long as the preview renders (#58), and D3D12 stays
-    // level. WGPU_BACKEND=vulkan still picks Vulkan.
-    #[cfg(windows)]
-    {
-        descriptor.backends = wgpu::Backends::DX12;
-    }
     // The D3D12 validation layer changes what DirectML finds in the same process, so it is on
     // only with WGPU_VALIDATION=1. Face models run beside this device.
     #[cfg(not(target_arch = "wasm32"))]
     {
         descriptor.flags =
             (wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION).with_env();
-        descriptor.backends = wgpu::Backends::from_env().unwrap_or(descriptor.backends);
+        descriptor.backends = backends;
         descriptor.backend_options = Gpu::backend_options();
     }
     wgpu::Instance::new(descriptor)
@@ -1555,7 +1715,6 @@ type StartOptions = script::Options;
 #[derive(Default)]
 struct StartOptions {
     effect: Option<String>,
-    gpu: Option<String>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1568,7 +1727,7 @@ fn start_options() -> StartOptions {
         .split('&')
         .find_map(|pair| pair.strip_prefix("effect="))
         .map(str::to_owned);
-    StartOptions { effect, gpu: None }
+    StartOptions { effect }
 }
 
 /// Shows a message in the page (web) or on stderr (native).
@@ -1598,9 +1757,17 @@ impl ApplicationHandler<GpuSetup> for App {
                 return;
             }
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let instance = part_instance(
+            event_loop.owned_display_handle(),
+            request_parts(&device_request(self.start.gpu.as_deref()))[0].backends(),
+        );
+        #[cfg(target_arch = "wasm32")]
+        let instance = new_wgpu_instance(event_loop.owned_display_handle());
         let setup = Preview::new(
             window,
-            new_wgpu_instance(event_loop.owned_display_handle()),
+            instance,
+            #[cfg(not(target_arch = "wasm32"))]
             self.start.gpu.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             event_loop.owned_display_handle(),
@@ -2367,7 +2534,17 @@ impl Preview {
     /// A new instance as well as a new device: after a reset the old instance's adapters may be
     /// stale. The surface is made here, on the window's thread, as macOS requires.
     fn start_opening_device(&mut self) {
-        let instance = new_wgpu_instance(self.reopening.display.clone());
+        let lost = self.reopening.lost_adapter_info.clone();
+        let request = match &lost {
+            Some(lost) if self.reopening.backoff.same_adapter_only() => {
+                DeviceRequest::same_adapter(lost)
+            }
+            _ => device_request(self.reopening.gpu_choice.as_deref()),
+        };
+        let mut parts = request_parts(&request).into_iter();
+        let first = parts.next().expect("a first part");
+        let display = self.reopening.display.clone();
+        let instance = part_instance(display.clone(), first.backends());
         let surface = match instance.create_surface(self.window.clone()) {
             Ok(surface) => surface,
             Err(e) => {
@@ -2379,32 +2556,33 @@ impl Preview {
                 return;
             }
         };
-        let lost = self.reopening.lost_adapter_info.clone();
-        let choice = (lost.as_ref())
-            .filter(|_| self.reopening.backoff.same_adapter_only())
-            .map(|lost| lost.name.clone())
-            .or_else(|| self.reopening.gpu_choice.clone());
         let lost_on_hardware = lost.is_none_or(|lost| lost.device_type != wgpu::DeviceType::Cpu);
+        let window = self.window.clone();
         let (answer, opening) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("preview GPU".into())
             .spawn(move || {
                 let _device_lock = vfx_core::d3d12_device_lock();
-                let opened =
-                    pollster::block_on(open_device(&instance, &surface, choice.as_deref()))
-                        .and_then(|(adapter, gpu)| {
-                            // A reset can hide every other adapter for a moment, and a software one
-                            // would stay for the night.
-                            let info = adapter.get_info();
-                            match lost_on_hardware && info.device_type == wgpu::DeviceType::Cpu {
-                                true => Err(DeviceError::Software(info.name)),
-                                false => Ok(OpenedDevice {
-                                    surface,
-                                    adapter,
-                                    gpu,
-                                }),
-                            }
-                        });
+                let mut opened = open_on_surface(&instance, surface, &first);
+                // Only Windows has a second part, and it can make surfaces on any thread.
+                for part in parts {
+                    if !next_part_wanted(&opened) {
+                        break;
+                    }
+                    let instance = part_instance(display.clone(), part.backends());
+                    opened = (instance.create_surface(window.clone()))
+                        .map_err(DeviceError::Surface)
+                        .and_then(|surface| open_on_surface(&instance, surface, &part));
+                }
+                let opened = opened.and_then(|opened| {
+                    // A reset can briefly hide every other adapter. A software adapter picked
+                    // then would be kept for the rest of the night, so it is refused.
+                    let info = opened.adapter.get_info();
+                    match lost_on_hardware && info.device_type == wgpu::DeviceType::Cpu {
+                        true => Err(DeviceError::Software(info.name)),
+                        false => Ok(opened),
+                    }
+                });
                 let _ = answer.send(opened);
             });
         if let (Ok(_), Some(outage)) = (spawned, &mut self.reopening.outage) {

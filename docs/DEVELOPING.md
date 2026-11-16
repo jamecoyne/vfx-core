@@ -129,7 +129,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `DeviceFaults::same_device` (whether two records are one device, across wgpu instances), `ReopenBackoff` (when to try for a new device after a loss) | vfx-core |
 | `FrameSource::with_frame_if_wanted`, `Image::byte_rows`, `View::byte_rows` (a frame's bytes as the source holds them, so an effect can tell it hasn't changed before the source converts it; by default the bytes `with_frame` shows) | vfx-core |
 | `Gpu::from_parts` | vfx-core |
-| Native only: `device::slot`, `DeviceSlot` (`try_wait` for live callers, never waits; `wait` for exports; the host's shared device while a host shares one), `Device`, `NoDevice`, `device::open` and `AdapterChoice` (a blocking open; `WGPU_ADAPTER_NAME` names the adapter), `adapter_name_from_env` | vfx-core |
+| Native only: `device::slot`, `DeviceSlot` (`try_wait` for live callers, never waits; `wait` for exports; the host's shared device while a host shares one; `on_loss` tells holders of a lost device of the slot's own to let go; the slot reopens by itself once they have), `LossSubscription`, `Device`, `NoDevice`, `device::open` (blocking) for a `DeviceRequest` (`Backend` order and `AdapterChoice`: high performance, low power, LUID or name; `with_env` takes `WGPU_BACKEND`, `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF`), `device::adapters` (the ranked adapters, for a host with its own instance; D3D12's are the kept ones of `device::d3d12_instance`, kept for the process so no open releases a D3D12 device), `device::luid`, `adapter_name_from_env` | vfx-core |
 | `d3d12_device_lock` (held while making or dropping a D3D12 device; segcam-face re-exports it) | vfx-core |
 | `Gpu::share`, `Gpu::shared` | vfx-core |
 | `Gpu::unshare` (a host whose device was lost stops sharing it before dropping it, which D3D12 needs to offer the adapter again) | vfx-core |
@@ -267,7 +267,8 @@ Record needs WebGPU in the browser.
 On the desktop, a lost GPU device is reopened in place. In the browser, the page says to reload.
 
 On Windows the preview draws with D3D12 by default, which avoids the memory growth seen with
-NVIDIA's Vulkan driver on the setups tested. `WGPU_BACKEND=vulkan` picks Vulkan instead.
+NVIDIA's Vulkan driver on the setups tested, and falls back to Vulkan, then GL, when D3D12 can't
+open. `WGPU_BACKEND=vulkan` picks Vulkan instead; `WGPU_POWER_PREF=low` the low power adapter.
 
 ## Releases
 
