@@ -7,7 +7,7 @@ on the same footage. Renders them with aerender and checks:
 
   c++       the Rust effect matches the C++ effect, within a level: clang fuses
             multiply-adds that Rust keeps separate, which moves the odd soft edge by one,
-            and at 16 and 32 bpc After Effects dithers as it writes the 8-bit TIFFs, a
+            and at 16 and 32 bpc After Effects dithers as it writes the 8-bit frames, a
             little differently for each render item, so even an untouched frame moves
   mfr       Multi-Frame Rendering on and off give identical frames
   motion    the footage's movers were found: the matte isn't empty, the overlay isn't the
@@ -18,12 +18,18 @@ Usage: python3 plugins/segcam/segcam-motion/ae-tests/run.py [--clip footage.mp4]
 
 Default footage is generated: squares crossing a gradient, as a PNG sequence, so every
 input pixel is known. Needs the Rust effect installed (the C++ one is compared when it is),
-After Effects 2026 (it is started if needed), ffmpeg. Runs on macOS and Windows. Results go
-to target/segcam-ae-tests/; exit status is non-zero on failure.
+After Effects 2026 (it is started if needed), ffmpeg. Runs on macOS and Windows. Exit status
+is non-zero on failure.
+
+Frames are 8-bit PNGs at 8 and 16 bpc and TIFFs at 32, and only frames that fail a check are
+kept. They go to $AE_TEST_OUT or --out. The harness refuses a folder on the system disk: a run
+at 1080p writes gigabytes.
 """
 
 import argparse
 import json
+import os
+import re
 import shutil
 import struct
 import subprocess
@@ -32,8 +38,6 @@ import time
 import zlib
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[3]
 AE_APP = "Adobe After Effects 2026"
 WINDOWS = sys.platform == "win32"
 if WINDOWS:
@@ -55,6 +59,13 @@ EFFECTS = {
 }
 # 8-bit levels the Rust and C++ effects may differ by.
 TOLERANCE = 1
+# After Effects ships this template hidden: 8-bit RGBA PNG, compressed. A script can't set
+# an output module's format or depth. PNG holds straight colour, which clips a 32 bpc value
+# above 1.0 before alpha, so 32 bpc keeps the TIFF template.
+PNG_TEMPLATE = "_HIDDEN X-Factor 8 Premul"
+TIFF_TEMPLATE = "TIFF Sequence with Alpha"
+TRANSPARENT = re.compile(rb"\x00+")
+PARTIAL = re.compile(rb"[\x01-\xfe]")
 
 
 # --- Footage -------------------------------------------------------------------------
@@ -111,11 +122,28 @@ def probe(path):
     return tuple(int(v) for v in out.strip().splitlines()[0].split(","))
 
 
-def read_tiff(path):
+def premultiplied(data):
+    """Straight 8-bit RGBA premultiplied, rounding to nearest. After Effects' PNGs hold
+    straight colour whatever the template says, and this gives back its TIFF's bytes."""
+    alpha = data[3::4]
+    out = bytearray(data)
+    for run in TRANSPARENT.finditer(alpha):
+        out[run.start() * 4 : run.end() * 4] = bytes((run.end() - run.start()) * 4)
+    for pixel in PARTIAL.finditer(alpha):
+        a = alpha[pixel.start()]
+        i = pixel.start() * 4
+        out[i : i + 3] = bytes((v * a + 127) // 255 for v in data[i : i + 3])
+    return bytes(out)
+
+
+def read_frame(path):
+    """A frame as premultiplied 8-bit RGBA, as the TIFF template writes it."""
     width, height = probe(path)
     data = subprocess.check_output(
         ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
     )
+    if path.suffix == ".png":
+        data = premultiplied(data)
     return width, height, data
 
 
@@ -125,7 +153,24 @@ def read_tiff(path):
 JSX = r"""
 var SPEC = %(spec)s;
 
-function build(depth) {
+// The PNG template if this After Effects has it, else the TIFF one; saved for the harness.
+function chooseTemplate() {
+    var probe = app.project.items.addComp("template probe", 4, 4, 1, 1, %(fps)d);
+    var templates = app.project.renderQueue.items.add(probe).outputModule(1).templates;
+    var chosen = SPEC.tiff;
+    for (var t = 0; t < templates.length; t++) {
+        if (templates[t] == SPEC.png) {
+            chosen = SPEC.png;
+        }
+    }
+    var record = new File(SPEC.out + "/template.txt");
+    record.open("w");
+    record.write(chosen);
+    record.close();
+    return chosen;
+}
+
+function build(depth, template, extension) {
     app.newProject();
     var p = app.project;
     p.bitsPerChannel = depth;
@@ -151,8 +196,8 @@ function build(depth) {
             rq.timeSpanStart = 0;
             rq.timeSpanDuration = duration;
             var om = rq.outputModule(1);
-            om.applyTemplate("TIFF Sequence with Alpha");
-            om.file = new File(SPEC.out + "/" + depth + "/" + name + "_[#####].tif");
+            om.applyTemplate(template);
+            om.file = new File(SPEC.out + "/" + depth + "/" + name + "_[#####]." + extension);
         }
     }
     p.save(new File(SPEC.out + "/" + depth + ".aep"));
@@ -160,8 +205,13 @@ function build(depth) {
 
 // Never discard someone's work: an unsaved project asks first, and Cancel stops here.
 if (app.project.close(CloseOptions.PROMPT_TO_SAVE_CHANGES)) {
+    app.newProject();
+    var png = chooseTemplate() == SPEC.png;
+    app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES);
     for (var d = 0; d < SPEC.depths.length; d++) {
-        build(SPEC.depths[d]);
+        var depth = SPEC.depths[d];
+        var usePng = png && depth < 32;
+        build(depth, usePng ? SPEC.png : SPEC.tiff, usePng ? "png" : "tif");
     }
     app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES);
     app.newProject();
@@ -180,6 +230,8 @@ def build_projects(out, footage, sequence, size, frames, effects):
         "depths": DEPTHS,
         "effects": [{"key": k, "match": EFFECTS[k][0]} for k in effects],
         "out": out.as_posix(),
+        "png": PNG_TEMPLATE,
+        "tiff": TIFF_TEMPLATE,
     }
     for depth in DEPTHS:
         (out / str(depth)).mkdir(parents=True, exist_ok=True)
@@ -199,6 +251,10 @@ def build_projects(out, footage, sequence, size, frames, effects):
     if missing:
         sys.exit(f"After Effects didn't save projects for {missing} bpc "
                  "(was the save prompt cancelled, or did the script fail?)")
+    png = (out / "template.txt").read_text() == PNG_TEMPLATE
+    if not png:
+        print(f"After Effects has no '{PNG_TEMPLATE}' template: writing uncompressed TIFFs")
+    return {depth: "png" if png and depth < 32 else "tif" for depth in DEPTHS}
 
 
 def run_script_windows(script, projects, timeout=900):
@@ -245,15 +301,29 @@ def compare(a, b):
     """(max channel difference, count of differing channels), or None if sizes differ."""
     if a[:2] != b[:2]:
         return None
+    if a[2] == b[2]:
+        return 0, 0
     diffs = [abs(x - y) for x, y in zip(a[2], b[2]) if x != y]
     return (max(diffs) if diffs else 0), len(diffs)
+
+
+def default_out():
+    if "AE_TEST_OUT" in os.environ:
+        return Path(os.environ["AE_TEST_OUT"])
+    sys.exit("set AE_TEST_OUT or --out to a folder that is not on the system disk")
+
+
+def on_system_disk(path):
+    existing = next(p for p in [path, *path.parents] if p.exists())
+    system = Path(os.environ.get("SystemDrive", "C:") + "\\") if WINDOWS else Path("/")
+    return existing.stat().st_dev == system.stat().st_dev
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--clip", type=Path, help="footage to use instead of the generated squares")
     parser.add_argument("--frames", type=int, default=40)
-    parser.add_argument("--out", type=Path, default=ROOT / "target/segcam-ae-tests")
+    parser.add_argument("--out", type=Path, help="folder for frames (default: $AE_TEST_OUT)")
     args = parser.parse_args()
 
     effects = [k for k, (_, bundle) in EFFECTS.items() if (MEDIACORE / bundle).exists()]
@@ -262,7 +332,9 @@ def main():
     if "cpp" not in effects:
         print("segcam's C++ effect isn't installed: skipping the c++ check")
 
-    out = args.out.resolve()
+    out = (args.out or default_out()).resolve()
+    if on_system_disk(out):
+        sys.exit(f"{out} is on the system disk; set AE_TEST_OUT or --out to another drive")
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
@@ -273,18 +345,12 @@ def main():
     else:
         size = (640, 360)
         footage, sequence = generate_footage(out / "footage", *size, args.frames), True
-        # The last frame, which the motion checks look at (PNG reads the same way as TIFF).
-        last_input = read_tiff(out / "footage" / f"frame_{args.frames - 1:05d}.png")
+        # The last frame, which the motion checks look at.
+        last_input = read_frame(out / "footage" / f"frame_{args.frames - 1:05d}.png")
 
     print(f"building {len(DEPTHS)} projects in After Effects "
           f"({len(effects)} effects x {len(MODES)} modes, {args.frames} frames)")
-    build_projects(out, footage, sequence, size, args.frames, effects)
-
-    rendered = {}
-    for depth in DEPTHS:
-        for mfr in ("ON", "OFF"):
-            print(f"rendering {depth} bpc with MFR {mfr}")
-            rendered[(depth, mfr)] = aerender(out, depth, mfr)
+    extensions = build_projects(out, footage, sequence, size, args.frames, effects)
 
     failures = 0
 
@@ -294,23 +360,31 @@ def main():
         failures += bool(problems)
         print(f"  {check:7} {what:22} {status}")
 
-    print("\nchecks")
+    # Each depth is checked as soon as it has rendered, and its frames that pass every check
+    # are deleted, so a run holds at most one depth's frames.
     for depth in DEPTHS:
-        on, off = rendered[(depth, "ON")], rendered[(depth, "OFF")]
+        for mfr in ("ON", "OFF"):
+            print(f"rendering {depth} bpc with MFR {mfr}")
+            aerender(out, depth, mfr)
+        on, off = out / f"{depth}-mfr-on", out / f"{depth}-mfr-off"
+        keep = set()
+        print(f"checks at {depth} bpc")
         for mode in MODES:
             what = f"{depth} bpc {mode}"
             mfr, cpp, motion = [], [], []
             worst = 0
             for f in range(args.frames):
-                frame = f"{mode}_{f:05d}.tif"
-                rust = read_tiff(on / f"rust_{frame}")
-                d = compare(rust, read_tiff(off / f"rust_{frame}"))
+                frame = f"{mode}_{f:05d}.{extensions[depth]}"
+                rust = read_frame(on / f"rust_{frame}")
+                d = compare(rust, read_frame(off / f"rust_{frame}"))
                 if d != (0, 0):
                     mfr.append(f"frame {f}: {d}")
+                    keep |= {on / f"rust_{frame}", off / f"rust_{frame}"}
                 if "cpp" in effects:
-                    d = compare(rust, read_tiff(on / f"cpp_{frame}"))
+                    d = compare(rust, read_frame(on / f"cpp_{frame}"))
                     if d is None or d[0] > TOLERANCE:
                         cpp.append(f"frame {f}: max {d[0] if d else 'size'}")
+                        keep |= {on / f"rust_{frame}", on / f"cpp_{frame}"}
                     elif d:
                         worst = max(worst, d[0])
                 if f == args.frames - 1:
@@ -321,13 +395,18 @@ def main():
                         motion.append("output is the input")
                     if mode in ("matte", "boxmatte") and all(a == 255 for a in alpha):
                         motion.append("matte is solid")
+                    if motion:
+                        keep.add(on / f"rust_{frame}")
             report("mfr", what, mfr)
             if "cpp" in effects:
                 report("c++", what + (f" (≤{worst})" if worst else ""), cpp)
             report("motion", what, motion)
+        for path in [*on.iterdir(), *off.iterdir()]:
+            if path not in keep:
+                path.unlink()
 
     print(f"\n{'all checks passed' if not failures else f'{failures} check(s) failed'}; "
-          f"frames in {out}")
+          f"failing frames kept in {out}")
     sys.exit(1 if failures else 0)
 
 

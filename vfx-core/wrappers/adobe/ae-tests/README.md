@@ -42,15 +42,37 @@ Narrow it with `--cases blur,hdr` and `--variants 32bpc-gpu`.
 | path | the plugin log (`~/Library/Logs/VfxPreview-AfterEffects.log`) shows the expected render path |
 | per-case checks | `checks.py`: blur past masks, Blur Edges, symmetry, 32 bpc headroom |
 
-Results are in `target/ae-tests/`: `report.txt`, `report.json`, and for each failure
+Results go to `$AE_TEST_OUT`: `report.txt`, `report.json`, and for each failure
 the After Effects frame, the expected frame and an amplified difference in `failures/`.
 The exit status is non-zero when anything fails.
 
+## Output
+
+Both After Effects harnesses, this one and segcam's
+(`plugins/segcam/segcam-motion/ae-tests/run.py`), write frames to `$AE_TEST_OUT`:
+
+- It has no default. Set it, or pass `--out`, to a folder on a data drive.
+- A folder on the system disk is refused. A segcam run at 1080p writes gigabytes of frames.
+
+At 8 and 16 bpc, frames are compressed 8-bit PNGs, through the template After Effects
+ships hidden as `_HIDDEN X-Factor 8 Premul`. A PNG holds straight colour whatever the
+template says. The harness premultiplies it as it reads, rounding to nearest, which gives
+back the TIFF template's bytes exactly.
+
+At 32 bpc, frames stay uncompressed TIFFs. A 32 bpc value above 1.0 under partial alpha
+reaches the TIFF through premultiplying and is clipped after. The PNG's straight colour
+clips it first, so the `hdr`, blend and linear references would fail. Where an After
+Effects lacks the PNG template, the harness says so and writes TIFFs at every depth. Frames that pass their checks are deleted. Only the ones that fail are kept, with
+the frame they were compared against.
+
 ## Limits
 
-- After Effects' output templates write 8-bit TIFFs, and neither scripts nor `aerender`
-  can change the bit depth. So 32 bpc values above 1.0 are checked indirectly: the `hdr`
-  case raises them and a second instance brings them back.
+- A script can't set an output module's format or depth (`setSettings` answers that both
+  are read-only), and `aerender` can't either. Only a template chooses them, and no
+  template After Effects 2026 ships writes a compressed float format with alpha. So the
+  frames are 8-bit at every depth, and the 16 and 32 bpc checks compare After Effects'
+  dithered 8-bit output. They don't prove 16-bit or float values. 32 bpc values above 1.0
+  are checked indirectly: the `hdr` case raises them and a second instance brings them back.
 - Reference cases use a layer that lines up with the composition. Offsets, masks and
   growth are checked by their geometry instead.
 - `aerender` can't run on GitHub's runners, which have no After Effects licence. Run it
