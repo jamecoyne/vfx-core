@@ -149,12 +149,12 @@ pub fn settings_from_params(p: &ParamValues, premultiplied: bool) -> RenderSetti
 /// segcam Motion. Caches per-frame analysis (see [`IncrementalRenderer`]), so a kept instance
 /// recomputes only what changed.
 pub struct SegcamMotion {
-    renderer: IncrementalRenderer,
-    /// What a render into a texture draws in RAM, uploaded unless the swarm
-    /// drew into the texture itself.
+    /// The renderer. The slot's loss thread reaches it to drop its drawer.
+    renderer: crate::gpu::ContextUser,
+    /// Holds what a render into a texture draws in RAM. It's uploaded to the texture
+    /// unless the swarm drew into the texture itself.
     canvas: Vec<Argb<u8>>,
     drew_into_texture: bool,
-    _slot_user: crate::gpu::ContextUser,
 }
 
 /// Sets aside face models with DirectML on the host's shared device, for the last
@@ -177,14 +177,11 @@ impl SegcamMotion {
     pub fn with_gpu(gpu: bool) -> Self {
         let mut renderer = IncrementalRenderer::default();
         renderer.use_gpu(gpu);
+        let release = IncrementalRenderer::release_device;
         Self {
-            renderer,
+            renderer: (crate::gpu::SLOT_CONTEXT).user_with(renderer, release, release_shared_faces),
             canvas: Vec::new(),
             drew_into_texture: false,
-            _slot_user: crate::gpu::ContextUser::new(
-                &crate::gpu::SLOT_CONTEXT,
-                release_shared_faces,
-            ),
         }
     }
 
@@ -206,7 +203,7 @@ impl CpuEffect for SegcamMotion {
     }
 
     fn clear_history(&mut self) -> bool {
-        self.renderer.clear_history();
+        self.renderer.lock().clear_history();
         true
     }
 
@@ -241,7 +238,8 @@ impl CpuEffect for SegcamMotion {
             analysis_step: AnalysisStep::for_frame_rate(ctx.frame_rate),
             ..settings_from_params(params, ctx.premultiplied)
         };
-        let (renderer, n) = (&mut self.renderer, ctx.frame);
+        let mut renderer = self.renderer.lock();
+        let (renderer, n) = (&mut *renderer, ctx.frame);
         self.drew_into_texture = false;
         match out {
             FrameOut::Pixels(ImageMut::U8(mut out)) => {
@@ -270,17 +268,17 @@ impl CpuEffect for SegcamMotion {
     }
 
     fn report(&self) -> Report {
-        self.renderer.report()
+        self.renderer.lock().report()
     }
 
     fn device_lost(&mut self) {
-        self.renderer.device_lost();
+        self.renderer.lock().device_lost();
         // Face models on DirectML hold the adapter's D3D12 device apart from the
         // slot. The host still shares the lost device here.
         if let Some(gpu) = vfx_core::Gpu::shared() {
             crate::faces::release_on_d3d12_adapter(&gpu.device.adapter_info());
         }
-        crate::gpu::SLOT_CONTEXT.release_host_context();
+        crate::gpu::SLOT_CONTEXT.release_host_shared();
     }
 }
 

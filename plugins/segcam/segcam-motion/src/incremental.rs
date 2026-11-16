@@ -665,16 +665,26 @@ impl IncrementalRenderer {
             }
             #[cfg(not(target_arch = "wasm32"))]
             Err(vfx_core::device::NoDevice::Opening | vfx_core::device::NoDevice::Lost(_)) => {}
-            // The report says why the slot gives no device, as an override that
-            // found none: the user who set it sees why it didn't take. After a
-            // loss only a machine left with no hardware adapter draws on the CPU;
-            // a failed open or pipeline build waits for its retry.
+            // The report says why the slot has no device, for instance when an adapter
+            // override found none, so the user who set it sees why it didn't take. After a
+            // loss, only a machine left with no hardware adapter draws on the CPU. A failed
+            // open waits for the slot's retry. A failed pipeline build is not retried on
+            // that device.
             #[cfg(not(target_arch = "wasm32"))]
             Err(why) => {
                 if matches!(why, vfx_core::device::NoDevice::SoftwareOnly(_)) {
                     self.awaiting_device = false;
                 }
-                self.last_reported_fault = Some(why.to_string());
+                let message = why.to_string();
+                let failed_build = matches!(
+                    why,
+                    vfx_core::device::NoDevice::Unusable(_)
+                        | vfx_core::device::NoDevice::Panicked(_)
+                );
+                if failed_build && self.last_reported_fault.as_ref() != Some(&message) {
+                    eprintln!("segcam Motion: no GPU pipelines ({message})");
+                }
+                self.last_reported_fault = Some(message);
             }
             #[cfg(target_arch = "wasm32")]
             Err(()) => {}
@@ -966,11 +976,24 @@ impl IncrementalRenderer {
         };
     }
 
-    /// Drops the drawer, for a lost device. The kept tiles and analysis are in
-    /// RAM, so the trail goes on; the next drawer starts with an empty atlas.
+    /// Drops the drawer if it draws on the slot's lost device `id`. The slot's loss thread
+    /// calls this, because what the drawer holds keeps the removed device alive, and D3D12
+    /// won't open a new device alongside it.
+    pub(crate) fn release_device(&mut self, id: u64) {
+        if self
+            .drawer
+            .as_ref()
+            .is_some_and(|drawer| drawer.on_device(id))
+        {
+            self.device_lost();
+        }
+    }
+
+    /// Drops the drawer after a device loss. The kept tiles and analysis are in
+    /// RAM, so the trail continues. The next drawer starts with an empty atlas.
     pub fn device_lost(&mut self) {
-        // Only an instance that drew on a device waits for the next; one that
-        // never had one draws on the CPU.
+        // Only an instance that drew on a device waits for the next one. An instance
+        // that never had a device draws on the CPU.
         self.awaiting_device |= self.drawer.is_some();
         self.set_drawer(None);
     }
@@ -1013,6 +1036,15 @@ impl IncrementalRenderer {
         drawer.begin_render(self.source_is_live);
         let drawn = self.draw_gpu(&mut drawer, s, count, number, frame, out);
         self.drawer = Some(drawer);
+        // The slot's loss thread skips an instance that is rendering, so this render drops
+        // the drawer if its device was lost after the draw.
+        if self
+            .drawer
+            .as_ref()
+            .is_some_and(|drawer| drawer.loss().is_some())
+        {
+            self.device_lost();
+        }
         drawn
     }
 
@@ -2547,8 +2579,7 @@ mod tests {
                         _ => Err(NoDevice::NoAdapter(request.clone())),
                     }
                 })));
-            let slot_context: &'static gpu::SlotContext =
-                Box::leak(Box::new(gpu::SlotContext::new(slot)));
+            let slot_context = gpu::test_slot_context_on(slot);
             let first = gpu::wait_for_context(slot_context);
             let frames = crossing();
             let mut state = IncrementalRenderer {
@@ -2573,6 +2604,140 @@ mod tests {
                 "{:?}",
                 after_failed_reopen.map(|_| "a picture")
             );
+        }
+
+        /// Makes two instances that draw on a slot's device, each kept as the effect keeps it.
+        fn two_instances() -> [gpu::ContextUser; 2] {
+            let slot_context = gpu::test_slot_context();
+            gpu::wait_for_context(slot_context);
+            let frames = crossing();
+            let instance = || {
+                let renderer = IncrementalRenderer {
+                    test_slot_context: Some(slot_context),
+                    test_next_device_wait: Some(Duration::from_secs(30)),
+                    ..Default::default()
+                };
+                slot_context.user_with(renderer, IncrementalRenderer::release_device, || {})
+            };
+            let instances = [instance(), instance()];
+            for instance in &instances {
+                let mut renderer = instance.lock();
+                renderer.use_gpu(true);
+                for n in 0..7 {
+                    render(&mut renderer, &frames, n);
+                }
+                assert!(drawn(&renderer) > 0, "drawing on the GPU before the loss");
+            }
+            instances
+        }
+
+        /// Loses the device both instances draw on while neither renders. Returns whether
+        /// everything on it was released within 10 s.
+        fn lose_unrendered(slot_context: &'static gpu::SlotContext) -> bool {
+            let context = gpu::wait_for_context(slot_context);
+            let held = Arc::downgrade(&context);
+            context.device.destroy();
+            let _ = vfx_core::poll_device(&context.device, wgpu::PollType::wait_indefinitely());
+            drop(context);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while held.strong_count() > 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            held.strong_count() == 0
+        }
+
+        /// Once the slot's loss thread has run, nothing keeps the lost device, even though
+        /// no instance rendered.
+        #[test]
+        fn idle_instances_release_device() {
+            let _lock = gpu_test_lock();
+            let instances = two_instances();
+            let slot_context = instances[0].lock().test_slot_context.unwrap();
+            assert!(
+                lose_unrendered(slot_context),
+                "the lost device is still held"
+            );
+        }
+
+        /// An instance idle through the loss draws its whole trail on the next device.
+        #[test]
+        fn idle_instance_recovers() {
+            let _lock = gpu_test_lock();
+            let [_busy, idle] = two_instances();
+            let slot_context = idle.lock().test_slot_context.unwrap();
+            assert!(
+                lose_unrendered(slot_context),
+                "the lost device is still held"
+            );
+            let frames = crossing();
+            let mut renderer = idle.lock();
+            let after = render(&mut renderer, &frames, 7);
+            assert_eq!(drawn(&renderer), 1, "not drawn on the next device");
+            let cpu = render(&mut IncrementalRenderer::default(), &frames, 7);
+            assert!(
+                within_gpu_bound(&cpu, &after),
+                "the trail on the next device"
+            );
+        }
+
+        /// Removes the D3D12 device ten times, with two instances on the hardware adapter and
+        /// one of them idle. Each time the busy instance's render meets the removal, the slot
+        /// must be back on the same adapter within 5 s, though the idle instance doesn't
+        /// render. The busy instance must then draw there.
+        #[test]
+        #[cfg(windows)]
+        #[ignore = "needs a hardware adapter"]
+        fn removals_reopen_same_adapter() {
+            let _lock = gpu_test_lock();
+            let [busy, _idle] = two_instances();
+            let slot_context = busy.lock().test_slot_context.unwrap();
+            let adapter = gpu::wait_for_context(slot_context).info.name.clone();
+            let frames = crossing();
+            for removal in 0..10 {
+                let context = gpu::wait_for_context(slot_context);
+                let lost = Arc::downgrade(&context);
+                let removed = std::time::Instant::now();
+                vfx_host::remove_d3d12_device(&context.device).expect("a D3D12 device");
+                drop(context);
+                // wgpu reports a removal only when work meets it, which is the busy
+                // instance's next draw.
+                let met = try_render(&mut busy.lock(), &frames, 7);
+                assert!(
+                    met.is_err(),
+                    "removal {removal}: drew on the removed device"
+                );
+                let next = loop {
+                    match slot_context.try_wait() {
+                        Ok(next) if lost.strong_count() == 0 => break next,
+                        _ if removed.elapsed() < Duration::from_secs(60) => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(why) => panic!("removal {removal}: no device in 60 s: {why}"),
+                        Ok(_) => panic!("removal {removal}: the lost context held for 60 s"),
+                    }
+                };
+                let back_in = removed.elapsed();
+                eprintln!(
+                    "removal {removal}: back on {} in {back_in:?}",
+                    next.info.name
+                );
+                assert_eq!(
+                    next.info.name, adapter,
+                    "removal {removal}: another adapter"
+                );
+                assert!(
+                    back_in < Duration::from_secs(5),
+                    "removal {removal}: {back_in:?}"
+                );
+                drop(next);
+                let mut renderer = busy.lock();
+                let drawn_before = drawn(&renderer);
+                render(&mut renderer, &frames, 7);
+                assert!(
+                    drawn(&renderer) > drawn_before,
+                    "removal {removal}: no GPU draw"
+                );
+            }
         }
 
         /// A render that isn't live waits for the next device, so the one after a loss draws.
@@ -2624,7 +2789,7 @@ mod tests {
                 ))
             })));
         let mut failed = IncrementalRenderer {
-            test_slot_context: Some(Box::leak(Box::new(gpu::SlotContext::new(slot)))),
+            test_slot_context: Some(Box::leak(Box::new(gpu::slot_context(slot)))),
             ..Default::default()
         };
         failed.use_gpu(true);
