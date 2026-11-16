@@ -17,6 +17,7 @@ onnx = ["dep:ort", "dep:windows"]
 
 [dependencies]
 rayon = "1.12.0"
+vfx-core = { path = "../../../vfx-core" }
 ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = [
     "std",
     "download-binaries",

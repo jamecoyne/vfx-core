@@ -7,7 +7,7 @@ mod motion_only;
 use segcam_motion::{Argb, SegcamMotion, View};
 use vfx_core::cpu::{FrameSource, Image, ImageMut, ViewMut};
 use vfx_core::wgpu;
-use vfx_core::{Context, CpuEffect, Frame, Gpu, ParamValue, Target};
+use vfx_core::{Context, CpuEffect, Frame, ParamValue, Target};
 
 const W: i32 = 320;
 const H: i32 = 180;
@@ -41,7 +41,7 @@ impl FrameSource for MovingSquare {
     ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
 )]
 fn unshared_device_target_is_declined() {
-    let host = pollster::block_on(Gpu::headless())
+    let host = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
         .ok()
         .filter(|gpu| gpu.device.adapter_info().device_type != wgpu::DeviceType::Cpu)
         .expect("a hardware GPU adapter");

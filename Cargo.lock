@@ -2840,6 +2840,7 @@ dependencies = [
  "objc2-vision",
  "ort",
  "rayon",
+ "vfx-core",
  "windows",
 ]
 
@@ -3542,6 +3543,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "wgpu",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

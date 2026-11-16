@@ -1156,7 +1156,7 @@ mod tests {
         lost.device.destroy();
         drop(on_device);
 
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).unwrap();
         let mut effects = Effects::restore(&gpu, released);
         assert_eq!(effects.source_name(), Some("still"));
         assert_eq!(effects.size(), (64, 64));
@@ -1204,7 +1204,7 @@ mod tests {
         lost.device.destroy();
         drop(on_device);
 
-        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).unwrap();
         let mut effects = Effects::restore(&gpu, released);
         let same = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
         assert_eq!(picture, same);

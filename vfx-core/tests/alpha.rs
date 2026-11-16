@@ -6,7 +6,8 @@ use vfx_core::{EffectChain, Frame, Gpu};
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 fn gpu() -> Gpu {
-    pollster::block_on(Gpu::headless()).expect("no GPU adapter available for headless tests")
+    vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+        .expect("no GPU adapter available for headless tests")
 }
 
 /// Runs a 2x1 frame (two pixels) through a single conversion.

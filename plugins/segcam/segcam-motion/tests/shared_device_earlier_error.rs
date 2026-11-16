@@ -9,7 +9,7 @@ use vfx_core::{Gpu, wgpu};
     ignore = "needs a hardware GPU adapter; Windows and Linux CI have only software adapters"
 )]
 fn host_error_before_open_leaves_gpu_usable() {
-    let gpu = pollster::block_on(Gpu::headless())
+    let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
         .ok()
         .filter(|gpu| gpu.device.adapter_info().device_type != wgpu::DeviceType::Cpu)
         .expect("a hardware GPU adapter");

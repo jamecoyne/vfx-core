@@ -88,12 +88,15 @@ CPU, while the device opens or after a fault, goes through RAM.
 
 ### Device loss
 
-A lost device is replaced while renders draw on the CPU. Reopening backs off at 1, 2, 4, 8 and 16 s,
-then every 30 s, on the same adapter for about 30 s and then on any. A failed first open (no adapter,
-or only a software adapter) retries at 1, 2, 4, 8 and 16 s, since a driver reset can look like
-either, then stays on the CPU. Each try holds the D3D12 device lock, so face models loading during a
-reset wait behind it, and face models that keep failing reload on the same backoff. In Resolume on
-Windows the new shared device opens off the render thread.
+segcam draws on the core's device slot (`vfx_core::device`), which every effect in the plugin file
+shares. A lost device is dropped and opened again while renders draw on the CPU: the next open
+starts once nothing holds the lost device, or after a backoff of 1, 2, 4, 8 and 16 s, then every
+30 s, on the same adapter for about 30 s and then on any. A failed open, the first included, is
+retried on the same backoff for as long as the process runs. A software adapter's device is
+declined (drawn on the CPU) unless `WGPU_ADAPTER_NAME` asked for it. Opens hold the D3D12 device
+lock, so face models loading during a reset wait behind them, and face models that keep failing
+reload on the same backoff. segcam builds its pipelines for a new device on a thread of its own and
+draws on the CPU until they are ready.
 
 ### Detection and drawing
 

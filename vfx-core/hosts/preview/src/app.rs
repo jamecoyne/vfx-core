@@ -2152,24 +2152,6 @@ struct OpenedDevice {
     gpu: Gpu,
 }
 
-/// Held while making or releasing a D3D12 device, which can deadlock against another thread doing
-/// the same (see [`segcam_face::d3d12_device_lock`]).
-#[cfg(all(
-    not(any(target_os = "macos", target_arch = "wasm32")),
-    feature = "tracker"
-))]
-fn d3d12_device_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
-    Some(segcam_face::d3d12_device_lock())
-}
-
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(not(target_os = "macos"), feature = "tracker")
-)))]
-fn d3d12_device_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
-    None
-}
-
 /// Why `--lose-gpu removed` could not remove the device.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, thiserror::Error)]
@@ -2184,7 +2166,6 @@ pub(crate) enum RemoveDeviceError {
     #[error("--lose-gpu removed: D3D12 only")]
     Unsupported,
 }
-
 /// Removes this device, and every other D3D12 user's of the adapter in this process, as a driver
 /// reset would. It touches nothing outside the process.
 #[cfg(windows)]
@@ -2408,7 +2389,7 @@ impl Preview {
         let spawned = std::thread::Builder::new()
             .name("preview GPU".into())
             .spawn(move || {
-                let _device_lock = d3d12_device_lock();
+                let _device_lock = vfx_core::d3d12_device_lock();
                 let opened =
                     pollster::block_on(open_device(&instance, &surface, choice.as_deref()))
                         .and_then(|(adapter, gpu)| {
@@ -2550,7 +2531,7 @@ fn retire_device(
             if let Some(tracker) = tracker {
                 tracker.stop();
             }
-            let _device_lock = d3d12_device_lock();
+            let _device_lock = vfx_core::d3d12_device_lock();
             let window_dropped = catch_unwind(AssertUnwindSafe(move || drop(window)));
             if effects_dropped.is_err() || window_dropped.is_err() {
                 eprintln!("preview: dropping a lost device panicked; it stays allocated");

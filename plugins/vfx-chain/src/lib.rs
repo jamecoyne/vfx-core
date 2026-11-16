@@ -287,7 +287,8 @@ mod tests {
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
     fn gpu() -> Gpu {
-        pollster::block_on(Gpu::headless()).expect("no GPU adapter available for tests")
+        vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+            .expect("no GPU adapter available for tests")
     }
 
     /// Runs the effect once on `input` (RGBA f32, `w` x `h`), with an optional layer.

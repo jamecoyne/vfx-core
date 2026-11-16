@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn readback_recovers_after_timeout() {
-        let gpu = pollster::block_on(Gpu::headless())
+        let gpu = crate::device::open(&crate::device::AdapterChoice::from_env())
             .expect("no GPU adapter available for headless tests");
         let frame = Frame::new(&gpu, 256, 256, wgpu::TextureFormat::Rgba32Float);
         let input: Vec<f32> = (0..256 * 256 * 4).map(|i| i as f32).collect();

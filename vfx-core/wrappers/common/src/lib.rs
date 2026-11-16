@@ -5,6 +5,7 @@
 
 pub mod contract;
 pub mod controls;
+#[cfg(not(target_arch = "wasm32"))]
 mod device;
 pub mod diag;
 mod kept;
@@ -13,7 +14,8 @@ pub mod pipeline;
 mod plugin;
 mod rows;
 
-pub use device::{OwnDevice, gpu, gpu_now};
+#[cfg(not(target_arch = "wasm32"))]
+pub use device::{device, pool_key, release_own_device, try_device};
 pub use kept::{CpuInstance, Panicked};
 pub use plugin::{Info, Kind, Outline, Plugin, map_points, plugin, register, same, served};
 pub use rows::{by_rows, on_workers, worker_threads};

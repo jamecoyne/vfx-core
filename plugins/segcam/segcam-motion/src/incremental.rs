@@ -142,9 +142,9 @@ pub struct IncrementalRenderer {
     simulate_models_loading: bool,
     /// A host's GPU frame the render may draw into instead of its output.
     target: Option<TargetOffer>,
-    /// The slot this instance draws from, where it isn't the process's.
+    /// The slot context this instance draws with, where it isn't the process's.
     #[cfg(test)]
-    test_slot: Option<&'static gpu::DeviceSlot>,
+    test_slot_context: Option<&'static gpu::SlotContext>,
 }
 
 /// A host's frame, offered to one render ([`vfx_core::CpuEffect::render_to`]), the record of
@@ -266,12 +266,12 @@ impl IncrementalRenderer {
         }
     }
 
-    fn device_slot(&self) -> &'static gpu::DeviceSlot {
+    fn slot_context(&self) -> &'static gpu::SlotContext {
         #[cfg(test)]
-        if let Some(slot) = self.test_slot {
-            return slot;
+        if let Some(slot_context) = self.test_slot_context {
+            return slot_context;
         }
-        &gpu::SHARED_SLOT
+        &gpu::SLOT_CONTEXT
     }
 
     /// Whether Swarm is to draw on the GPU where there is one (see [`Self::use_gpu`]).
@@ -588,17 +588,13 @@ impl IncrementalRenderer {
         if let Some(why) = self.drawer.as_ref().and_then(|drawer| drawer.loss()) {
             self.fall_back(&Fault(why));
         }
-        if self.gpu_wanted && self.drawer.is_none() && mode_uses_gpu {
-            match self.device_slot().now() {
-                gpu::DeviceNow::Ready(device) => {
-                    if let Some(drawer) = Drawer::new(device) {
-                        self.last_reported_fault = None;
-                        self.set_drawer(Some(Box::new(drawer)));
-                    }
-                }
-                gpu::DeviceNow::Waiting => {}
-                gpu::DeviceNow::Never => self.gpu_wanted = false,
-            }
+        if self.gpu_wanted
+            && self.drawer.is_none()
+            && mode_uses_gpu
+            && let Some(drawer) = self.slot_context().try_wait().ok().and_then(Drawer::new)
+        {
+            self.last_reported_fault = None;
+            self.set_drawer(Some(Box::new(drawer)));
         }
     }
 
@@ -2263,12 +2259,9 @@ mod tests {
         assert!(face_detection_calls_in(&mut state, &mut Frames(&frames[..1]), 1, 0) > 0);
     }
 
-    /// A device of the test's own, on the adapter `SEGCAM_GPU_ADAPTER` picks or on a software
-    /// one where there is none.
+    /// A device created for this test ([`gpu::test_context`]).
     fn own_device() -> Arc<gpu::GpuContext> {
-        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-        let dev = gpu::open(&choice).or_else(|_| gpu::open("fallback"));
-        Arc::new(dev.expect("a GPU adapter, hardware or fallback"))
+        Arc::new(gpu::test_context())
     }
 
     /// An instance drawing every swarm render on `dev`.
@@ -2313,25 +2306,12 @@ mod tests {
     #[test]
     fn lost_gpu_draws_on_cpu_until_reopen() {
         let _lock = gpu_test_lock();
-        let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-        gpu::open(&choice)
-            .or_else(|_| gpu::open("fallback"))
-            .expect("a GPU adapter, hardware or fallback");
-        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(move |_| {
-            gpu::open(&choice).or_else(|_| gpu::open("fallback"))
-        })));
-        let device = |slot: &'static gpu::DeviceSlot| loop {
-            match slot.now() {
-                gpu::DeviceNow::Ready(dev) => return dev,
-                gpu::DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
-                gpu::DeviceNow::Never => panic!("the slot gave up"),
-            }
-        };
-        let first = device(slot);
+        let slot_context = gpu::test_slot_context();
+        let first = gpu::wait_for_context(slot_context);
         let frames = crossing();
         let mut cpu = IncrementalRenderer::default();
         let mut on_gpu = IncrementalRenderer {
-            test_slot: Some(slot),
+            test_slot_context: Some(slot_context),
             ..Default::default()
         };
         on_gpu.use_gpu(true);
@@ -2361,7 +2341,7 @@ mod tests {
         assert!(gpu::Drawer::new(first.clone()).is_none(), "a drawer on it");
         assert!(on_gpu.gpu_wanted, "the instance gave up on the GPU");
 
-        let second = device(slot);
+        let second = gpu::wait_for_context(slot_context);
         assert!(
             !Arc::ptr_eq(&first, &second),
             "the slot kept the lost device"
@@ -2384,30 +2364,45 @@ mod tests {
         assert!(within_gpu_bound(&a, &b), "the picture after the reopen");
     }
 
-    /// A first open that keeps failing leaves the CPU for good once its retries are spent: with no
-    /// adapter the CPU is the machine's path. Until then renders draw on the CPU and keep asking.
-    #[test]
-    fn failed_first_open_stays_on_cpu() {
-        let slot: &'static gpu::DeviceSlot = Box::leak(Box::new(gpu::DeviceSlot::new(|_| {
-            Err(gpu::NoGpu::NoAdapter("none here".into()))
-        })));
-        let mut on_cpu = IncrementalRenderer {
-            test_slot: Some(slot),
+    /// An instance on a slot whose every open fails, after its first render.
+    fn render_without_adapter() -> (IncrementalRenderer, Vec<Argb<u8>>) {
+        let slot: &'static vfx_core::device::DeviceSlot =
+            Box::leak(Box::new(vfx_core::device::DeviceSlot::new(|_| {
+                Err(vfx_core::device::NoDevice::NoAdapterNamed(
+                    "none here".into(),
+                ))
+            })));
+        let mut failed = IncrementalRenderer {
+            test_slot_context: Some(Box::leak(Box::new(gpu::SlotContext::new(slot)))),
             ..Default::default()
         };
-        on_cpu.use_gpu(true);
-        assert!(slot.status().is_err());
-        render(&mut on_cpu, &crossing(), 0);
-        assert!(on_cpu.gpu_wanted, "the first failure was final");
-        let deadline = std::time::Instant::now() + gpu::FIRST_OPEN_TEST_DEADLINE;
-        while !matches!(slot.next_first_open_try(), gpu::DeviceNow::Never) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the slot never gave up"
-            );
-        }
-        render(&mut on_cpu, &crossing(), 0);
-        assert!(!on_cpu.gpu_wanted);
+        failed.use_gpu(true);
+        assert!(slot.wait().is_err());
+        let frames = crossing();
+        let pixels = render(&mut failed, &frames, frames.len() - 1);
+        (failed, pixels)
+    }
+
+    #[test]
+    fn failed_open_renders_like_cpu() {
+        let _lock = gpu_test_lock();
+        let (_, failed) = render_without_adapter();
+        let frames = crossing();
+        let reference = render(
+            &mut IncrementalRenderer::default(),
+            &frames,
+            frames.len() - 1,
+        );
+        assert!(failed == reference, "the render isn't the CPU's");
+    }
+
+    /// The slot retries for as long as the process runs, so the instance
+    /// keeps asking it.
+    #[test]
+    fn failed_open_keeps_gpu_wanted() {
+        let _lock = gpu_test_lock();
+        let (failed, _) = render_without_adapter();
+        assert!(failed.gpu_wanted, "the failure was final");
     }
 
     /// A source whose [`FrameSource::with_frame`] is costly, and which holds frames in other bytes
@@ -3668,26 +3663,12 @@ mod tests {
         }
 
         fn render_across_device_loss() -> DeviceLoss {
-            let choice = std::env::var("SEGCAM_GPU_ADAPTER").unwrap_or_default();
-            gpu::open(&choice)
-                .or_else(|_| gpu::open("fallback"))
-                .expect("a GPU adapter, hardware or fallback");
-            let slot: &'static gpu::DeviceSlot =
-                Box::leak(Box::new(gpu::DeviceSlot::new(move |_| {
-                    gpu::open(&choice).or_else(|_| gpu::open("fallback"))
-                })));
-            let device = || loop {
-                match slot.now() {
-                    gpu::DeviceNow::Ready(dev) => return dev,
-                    gpu::DeviceNow::Waiting => std::thread::sleep(Duration::from_millis(5)),
-                    gpu::DeviceNow::Never => panic!("the slot gave up"),
-                }
-            };
-            let first_device = device();
+            let slot_context = gpu::test_slot_context();
+            let first_device = gpu::wait_for_context(slot_context);
             let frames = crossing();
             let n = frames.len() - 1;
             let mut state = IncrementalRenderer {
-                test_slot: Some(slot),
+                test_slot_context: Some(slot_context),
                 ..Default::default()
             };
             state.use_gpu(true);
@@ -3695,7 +3676,7 @@ mod tests {
             let on_first = step(&mut state, &frames, n);
             first_device.device.destroy();
             let on_cpu = step(&mut state, &frames, n);
-            let second_device = device();
+            let second_device = gpu::wait_for_context(slot_context);
             let on_second = step(&mut state, &frames, n);
             DeviceLoss {
                 state,

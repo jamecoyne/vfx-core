@@ -29,9 +29,9 @@ use objc2_metal::{
     MTLTextureUsage,
 };
 use vfx_core::Gpu;
+use vfx_core::device::Device;
 use vfx_core::wgpu::{self, hal};
 use vfx_core::{Context, ParamValues};
-use vfx_host::OwnDevice;
 use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
 use crate::gl;
@@ -225,7 +225,7 @@ unsafe fn metal_texture(
 /// The zero-copy path for one plugin instance.
 pub struct Interop {
     /// The device the surfaces' textures were made on, kept open for as long as they are used.
-    device: Arc<OwnDevice>,
+    device: Arc<Device>,
     size: (u32, u32),
     input: Shared,
     output: Shared,
@@ -237,7 +237,7 @@ pub struct Interop {
 impl Interop {
     /// # Safety
     /// The host's GL context must be current.
-    pub unsafe fn new(device: Arc<OwnDevice>, size: (u32, u32)) -> Result<Self, InteropError> {
+    pub unsafe fn new(device: Arc<Device>, size: (u32, u32)) -> Result<Self, InteropError> {
         let gpu = device.gpu();
         // SAFETY: the caller has the context current. Each step cleans up after the
         // ones before it if it fails.
@@ -282,11 +282,12 @@ impl Interop {
     }
 
     /// Whether this was made on `device`. One made on a device since replaced must be rebuilt.
-    pub fn renders_on(&self, device: &Arc<OwnDevice>) -> bool {
+    pub fn renders_on(&self, device: &Arc<Device>) -> bool {
         Arc::ptr_eq(&self.device, device)
     }
 
     /// Renders one frame from the host's texture into its bound framebuffer.
+    /// Fails if the pipeline causes a validation error.
     ///
     /// # Safety
     /// The host's GL context must be current; `texture` is the host's input texture
@@ -298,7 +299,7 @@ impl Interop {
         texture: gl::GLuint,
         hardware: (u32, u32),
         host_fbo: gl::GLuint,
-    ) {
+    ) -> Result<(), wgpu::Error> {
         let gpu = self.device.gpu();
         let (w, h) = self.size;
         // 1. Host texture -> input surface (straight, top-down).
@@ -315,34 +316,36 @@ impl Interop {
         }
 
         // 2. The pipeline, entirely on the GPU.
-        let spec = Spec {
-            values,
-            ctx,
-            width: w,
-            height: h,
-            has_layer: false,
-        };
-        let mut lease = Lease::new(gpu, self.device.pool_key, &spec);
-        let extent = wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        };
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_texture(
-            self.input.texture.as_image_copy(),
-            lease.input().texture.as_image_copy(),
-            extent,
-        );
-        gpu.queue.submit(Some(encoder.finish()));
-        lease.render(gpu);
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_texture(
-            lease.output().texture.as_image_copy(),
-            self.output.texture.as_image_copy(),
-            extent,
-        );
-        gpu.queue.submit(Some(encoder.finish()));
+        vfx_host::pipeline::checked(gpu, || {
+            let spec = Spec {
+                values,
+                ctx,
+                width: w,
+                height: h,
+                has_layer: false,
+            };
+            let mut lease = Lease::new(gpu, vfx_host::pool_key(&self.device), &spec);
+            let extent = wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            };
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_texture(
+                self.input.texture.as_image_copy(),
+                lease.input().texture.as_image_copy(),
+                extent,
+            );
+            gpu.queue.submit(Some(encoder.finish()));
+            lease.render(gpu);
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_texture(
+                lease.output().texture.as_image_copy(),
+                self.output.texture.as_image_copy(),
+                extent,
+            );
+            gpu.queue.submit(Some(encoder.finish()));
+        })?;
         let _ = vfx_core::poll_device(&gpu.device, wgpu::PollType::wait_indefinitely());
 
         // 3. Output surface -> host framebuffer (premultiplied, bottom-up).
@@ -354,6 +357,7 @@ impl Interop {
                 [w as f32, h as f32],
             );
         }
+        Ok(())
     }
 
     /// # Safety

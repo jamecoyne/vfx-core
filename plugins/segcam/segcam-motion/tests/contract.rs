@@ -103,7 +103,7 @@ fn swarm_holds_contract() {
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
-    ignore = "needs a GPU adapter segcam draws on: hardware, or WARP with SEGCAM_GPU_ADAPTER=fallback"
+    ignore = "needs a GPU adapter segcam draws on: hardware, or the software one WGPU_ADAPTER_NAME names"
 )]
 fn gpu_swarm_holds_contract() {
     segcam_motion::gpu::status().expect("a GPU adapter");

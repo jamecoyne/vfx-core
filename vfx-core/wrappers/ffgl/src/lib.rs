@@ -223,7 +223,10 @@ impl Instance {
     /// Destroys the plugin's own device once `VFX_FFGL_LOSE_OWN_DEVICE_AFTER`, read when the
     /// instance is made, has counted down its RAM path renders. A test of the way back from a
     /// loss: the device's loss callback runs, and this render fails and passes its frame through.
-    fn inject_own_device_loss(renders_until_loss: &mut Option<u32>, device: &vfx_host::OwnDevice) {
+    fn inject_own_device_loss(
+        renders_until_loss: &mut Option<u32>,
+        device: &vfx_core::device::Device,
+    ) {
         let Some(renders) = renders_until_loss else {
             return;
         };
@@ -383,7 +386,7 @@ unsafe fn dispatch(code: u32, input: FFMixed, instance_ptr: *mut Instance) -> FF
             if vfx_host::plugin().kind == Kind::Gpu
                 && (!cfg!(target_os = "windows") || ram_path_forced())
             {
-                let _ = vfx_host::gpu_now(&LOG);
+                let _ = vfx_host::try_device(&LOG);
             }
             let mut instance = Instance::new();
             match unsafe { gl::Blit::new(gl::PASS) } {
@@ -777,7 +780,7 @@ unsafe fn process_gpu(
 
     // Never waits for a device: until one is open, and while a lost one is replaced, frames pass
     // through.
-    let Some(device) = vfx_host::gpu_now(&LOG) else {
+    let Some(device) = vfx_host::try_device(&LOG) else {
         LOG.note("render path: passing frames through: no device for the RAM path");
         return pass_through(blit);
     };
@@ -815,7 +818,7 @@ unsafe fn process_gpu(
             let rendered = catch_unwind(AssertUnwindSafe(|| unsafe {
                 interop.render(&values, ctx, input_texture.Handle, hardware, args.HostFBO)
             }));
-            if rendered.is_err() {
+            if !matches!(rendered, Ok(Ok(()))) {
                 LOG.note("warning: GPU render failed, passing frames through");
                 return pass_through(blit);
             }
@@ -878,11 +881,20 @@ unsafe fn process_gpu(
     };
     LOG.note("render path: GPU through RAM (texture readback)");
     Instance::inject_own_device_loss(&mut instance.renders_until_own_device_loss, &device);
-    let Ok(result) = catch_unwind(AssertUnwindSafe(|| {
-        pipeline::run(device.gpu(), device.pool_key, &job)
-    })) else {
-        LOG.note("warning: GPU render failed, passing frames through");
-        return pass_through(blit);
+    let result = match catch_unwind(AssertUnwindSafe(|| {
+        pipeline::run(device.gpu(), vfx_host::pool_key(&device), &job)
+    })) {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            LOG.note(&format!(
+                "warning: GPU render failed, passing frames through: {error}"
+            ));
+            return pass_through(blit);
+        }
+        Err(_) => {
+            LOG.note("warning: GPU render failed, passing frames through: it panicked");
+            return pass_through(blit);
+        }
     };
     #[cfg(not(target_os = "windows"))]
     let result = frame::canvas_to_texture(&result, w, h);

@@ -107,7 +107,8 @@ mod tests {
 
     /// Runs the effect once on `input` (RGBA f32, `w` x `h`).
     fn run(params: &ParamValues, w: u32, h: u32, input: &[f32]) -> Vec<f32> {
-        let gpu = pollster::block_on(Gpu::headless()).expect("no GPU adapter available for tests");
+        let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+            .expect("no GPU adapter available for tests");
         let mut effect = Blur::default();
         effect.prepare(&gpu, FORMAT, (w, h));
         let frame = Frame::new(&gpu, w, h, FORMAT);
