@@ -122,6 +122,7 @@ keep compiling. Once 1.0 is released, nothing here is removed or renamed.
 | `Context`: `time`, `frame`, `scale`, `premultiplied` | vfx-core |
 | `Context::frame_rate` | vfx-core |
 | `Region`, `Processor`, `EffectChain`, `Frame`, `Readback` | vfx-core |
+| `ReadbackRing` (small GPU results read back through three mapped buffers: `newest_finished` for live callers, never waits; `wait` for exports, native only; a result at most two submissions old, never older than one returned), `ReadbackError`, `readback::Finished` | vfx-core |
 | `FrameSource`: `with_frame`; `History` | vfx-core |
 | `FrameSource::held`; `History::push_slot(before, held)` | vfx-core |
 | `FrameSource::live` (true for `History`) | vfx-core |
