@@ -336,7 +336,10 @@ impl SlotContext {
             }
             *built = match context {
                 Ok(context) => {
-                    eprintln!("segcam Motion: drawing on the GPU ({})", context.info.name);
+                    eprintln!(
+                        "segcam Motion: drawing on the GPU ({}, {})",
+                        context.info.name, context.info.backend
+                    );
                     ContextState::Ready(Arc::new(context))
                 }
                 Err(why) => {
@@ -909,8 +912,8 @@ mod tests {
 
     impl HostShare {
         fn new() -> Self {
-            use vfx_core::device::{AdapterChoice, open};
-            let gpu = open(&AdapterChoice::from_env())
+            use vfx_core::device::{DeviceRequest, open};
+            let gpu = open(&DeviceRequest::from_env())
                 .expect("an adapter: CI has lavapipe, WARP or Metal");
             gpu.share();
             Self { _gpu: gpu }
@@ -974,10 +977,13 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn software_adapter_is_declined() {
-        use vfx_core::device::{AdapterChoice, open};
+        use vfx_core::device::{AdapterChoice, DeviceRequest, open};
         let _lock = gpu_test_lock();
         let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(|_| {
-            open(&AdapterChoice::Name("Microsoft Basic Render Driver".into()))
+            open(&DeviceRequest {
+                adapter: AdapterChoice::Name("Microsoft Basic Render Driver".into()),
+                ..DeviceRequest::default()
+            })
         })));
         let slot_context: &'static SlotContext = Box::leak(Box::new(SlotContext {
             declines_software: true,

@@ -75,4 +75,5 @@ carry on, and the title shows it while the device reopens. In the browser, a los
 recording, and the page says to reload.
 
 On Windows the preview draws with D3D12 by default, which avoids the memory growth seen with
-NVIDIA's Vulkan driver on the setups tested. `WGPU_BACKEND=vulkan` picks Vulkan instead.
+NVIDIA's Vulkan driver on the setups tested, and falls back to Vulkan, then GL, when D3D12 can't
+open. `WGPU_BACKEND=vulkan` picks Vulkan instead, and `WGPU_POWER_PREF=low` picks the low power adapter.

@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use vfx_core::device::{AdapterChoice, DeviceSlot, open};
+use vfx_core::device::{AdapterChoice, DeviceRequest, DeviceSlot, open};
 use vfx_core::{poll_device, wgpu};
 use windows::Win32::Graphics::Direct3D12::ID3D12Device5;
 use windows::core::Interface;
@@ -13,7 +13,10 @@ use windows::core::Interface;
 #[test]
 fn removed_device_frees_adapter() {
     let slot: &'static DeviceSlot = Box::leak(Box::new(DeviceSlot::new(|_| {
-        open(&AdapterChoice::Name("Microsoft Basic Render Driver".into()))
+        open(&DeviceRequest {
+            adapter: AdapterChoice::Name("Microsoft Basic Render Driver".into()),
+            ..DeviceRequest::default()
+        })
     })));
     let first = slot.wait().expect("WARP");
     let gpu = first.gpu();

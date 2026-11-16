@@ -175,21 +175,6 @@ impl SharedDevice {
         Ok(device)
     }
 
-    /// The adapter's GL device LUID, where it's on a single node.
-    fn luid_of(adapter: &wgpu::Adapter) -> Option<[u8; 8]> {
-        // SAFETY: query only the enumerated adapter's Vulkan physical device properties.
-        unsafe {
-            adapter.as_hal::<hal::api::Vulkan>().and_then(|a| {
-                let mut id = vk::PhysicalDeviceIDProperties::default();
-                let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
-                a.shared_instance()
-                    .raw_instance()
-                    .get_physical_device_properties2(a.raw_physical_device(), &mut properties);
-                (id.device_luid_valid != 0 && id.device_node_mask == 1).then_some(id.device_luid)
-            })
-        }
-    }
-
     /// A new device on the adapter with this LUID.
     fn make(luid: [u8; 8]) -> Result<Arc<Self>, SetupError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -199,7 +184,7 @@ impl SharedDevice {
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
         let adapter = adapters
             .into_iter()
-            .find(|adapter| Self::luid_of(adapter) == Some(luid))
+            .find(|adapter| vfx_core::device::luid(adapter) == Some(luid))
             .ok_or(SetupError::Unavailable(
                 "no Vulkan adapter matches the OpenGL device LUID (single node required)",
             ))?;
@@ -1619,7 +1604,7 @@ mod tests {
 
     fn two_devices() -> (Gpu, Gpu) {
         let open = || {
-            vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env())
+            vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
                 .expect("a GPU adapter")
         };
         (open(), open())
@@ -1730,7 +1715,7 @@ mod tests {
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
         let first = adapters
             .iter()
-            .filter_map(SharedDevice::luid_of)
+            .filter_map(vfx_core::device::luid)
             .find_map(|luid| SharedDevice::open(luid).ok())
             .expect("an adapter with shared memory");
         first.gpu.share();

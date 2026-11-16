@@ -3537,6 +3537,7 @@ dependencies = [
 name = "vfx-core"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "bytemuck",
  "libloading 0.9.1",
  "pollster",

@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn buffer_round_trip_swizzles_and_offsets() {
         let gpu =
-            vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).expect("GPU");
+            vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env()).expect("GPU");
         let device = AeDevice::with_pipelines(gpu, 1000);
         let storage_buffer = |data: &[f32]| {
             let buffer = device.gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -539,7 +539,7 @@ mod tests {
         #[test]
         fn rejects_null() {
             let gpu =
-                vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).expect("GPU");
+                vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env()).expect("GPU");
             let device = AeDevice::with_pipelines(gpu, 1);
             // SAFETY: null is allowed and nothing is wrapped.
             let err = unsafe { device.wrap_buffer(std::ptr::null_mut(), 32) }.unwrap_err();

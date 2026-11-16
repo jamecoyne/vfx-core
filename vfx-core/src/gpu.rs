@@ -14,11 +14,14 @@ impl DeviceFaults {
     /// Takes over `device`'s callbacks. Each new error message goes to stderr once.
     pub fn watch(device: &wgpu::Device) -> Self {
         let faults = Self::default();
-        faults.install(device);
+        faults.install(device, || {});
         faults
     }
 
-    fn install(&self, device: &wgpu::Device) {
+    /// Takes over `device`'s callbacks. `on_lost` runs once when the device is lost. It runs
+    /// inside wgpu, which may be holding locks then.
+    fn install(&self, device: &wgpu::Device, on_lost: impl FnOnce() + Send + 'static) {
+        let on_lost = Mutex::new(Some(on_lost));
         let errors = self.errors.clone();
         device.on_uncaptured_error(Arc::new(move |e| {
             if let Ok(mut errors) = errors.lock() {
@@ -33,6 +36,10 @@ impl DeviceFaults {
         device.set_device_lost_callback(move |reason, e| {
             if let Ok(mut lost) = lost.lock() {
                 lost.get_or_insert(format!("{reason:?}: {e}"));
+            }
+            let on_lost = on_lost.lock().ok().and_then(|mut on_lost| on_lost.take());
+            if let Some(on_lost) = on_lost {
+                on_lost();
             }
         });
     }
@@ -188,7 +195,14 @@ impl Gpu {
     /// Takes over the device's error and loss callbacks, for a host that doesn't share it; read
     /// them with [`Gpu::faults`].
     pub fn watch_faults(&self) {
-        self.faults.install(&self.device);
+        self.faults.install(&self.device, || {});
+    }
+
+    /// Like [`Self::watch_faults`], and `on_lost` also runs once when the device is lost. It runs
+    /// inside wgpu, which may be holding locks then.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn watch_faults_with_loss_hook(&self, on_lost: impl FnOnce() + Send + 'static) {
+        self.faults.install(&self.device, on_lost);
     }
 
     fn parts(&self) -> GpuParts {

@@ -19,8 +19,17 @@ wgpu = { version = "=30.0.2", features = ["fragile-send-sync-non-atomic-wasm"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "1.0.1"
 
+# The versions wgpu-hal uses: `device::luid` reads an adapter's LUID through them.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+ash = "0.38.0"
+
 [target.'cfg(windows)'.dependencies]
 libloading = "0.9.0"
+windows = { version = "0.62.2", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Com",

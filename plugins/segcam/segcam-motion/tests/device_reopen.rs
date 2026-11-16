@@ -49,7 +49,7 @@ impl FrameSource for Moving {
 }
 
 fn host_gpu() -> Option<Gpu> {
-    let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).ok()?;
+    let gpu = vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env()).ok()?;
     (gpu.device.adapter_info().device_type != wgpu::DeviceType::Cpu).then_some(gpu)
 }
 

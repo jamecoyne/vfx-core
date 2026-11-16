@@ -1156,7 +1156,7 @@ mod tests {
         lost.device.destroy();
         drop(on_device);
 
-        let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).unwrap();
+        let gpu = vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env()).unwrap();
         let mut effects = Effects::restore(&gpu, released);
         assert_eq!(effects.source_name(), Some("still"));
         assert_eq!(effects.size(), (64, 64));
@@ -1189,7 +1189,7 @@ mod tests {
             "the effects' objects don't hold the removed device"
         );
         drop(on_device);
-        assert!(crate::warp_offered(), "something kept the removed device");
+        assert!(crate::wait_for_warp(), "something kept the removed device");
     }
 
     /// A GPU effect's state was on the device, so it's rebuilt and draws the same frame again.
@@ -1204,7 +1204,7 @@ mod tests {
         lost.device.destroy();
         drop(on_device);
 
-        let gpu = vfx_core::device::open(&vfx_core::device::AdapterChoice::from_env()).unwrap();
+        let gpu = vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env()).unwrap();
         let mut effects = Effects::restore(&gpu, released);
         let same = render_to_float(&mut effects, &gpu, &controls, &values, 0.0);
         assert_eq!(picture, same);
