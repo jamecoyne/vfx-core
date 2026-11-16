@@ -2,8 +2,8 @@
 
 Each factory returns a check: check(case, variant, frames) -> list of failure messages,
 where `frames` maps a render resolution to its list of frames (`Image`s) and
-`variant.depth` is the project's bits per channel. Output frames are After Effects'
-TIFFs, which store premultiplied 8-bit RGBA.
+`variant.depth` is the project's bits per channel. Output frames are premultiplied 8-bit
+RGBA, as After Effects' TIFFs store them.
 """
 
 TOLERANCE = 2

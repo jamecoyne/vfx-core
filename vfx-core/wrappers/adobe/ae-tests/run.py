@@ -14,11 +14,14 @@ Effects, renders every case with aerender, and checks the frames:
 Usage: python3 vfx-core/wrappers/adobe/ae-tests/run.py [--cases blur,hdr] [--variants 32bpc-gpu]
 
 Needs the plugin installed, After Effects 2026 (it is started if needed), ffmpeg, and
-cargo. Results go to target/ae-tests/; the exit status is non-zero on any failure.
+cargo. Results go to $AE_TEST_OUT or --out, which must not be on the system disk. The exit
+status is non-zero on any failure.
 """
 
 import argparse
 import json
+import os
+import re
 import shutil
 import struct
 import subprocess
@@ -35,6 +38,13 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[3]
 AE_APP = "Adobe After Effects 2026"
 AERENDER = Path(f"/Applications/{AE_APP}/aerender")
+# After Effects ships this template hidden: 8-bit RGBA PNG, compressed. A script can't set
+# an output module's format or depth. PNG holds straight colour, which clips a 32 bpc value
+# above 1.0 before alpha, so 32 bpc keeps the TIFF template.
+PNG_TEMPLATE = "_HIDDEN X-Factor 8 Premul"
+TIFF_TEMPLATE = "TIFF Sequence with Alpha"
+TRANSPARENT = re.compile(rb"\x00+")
+PARTIAL = re.compile(rb"[\x01-\xfe]")
 
 
 def plugin_env():
@@ -149,7 +159,22 @@ def to_output(pixels, depth):
     return bytes(out)
 
 
-def read_tiff(path):
+def premultiplied(data):
+    """Straight 8-bit RGBA premultiplied, rounding to nearest. After Effects' PNGs hold
+    straight colour whatever the template says, and this gives back its TIFF's bytes."""
+    alpha = data[3::4]
+    out = bytearray(data)
+    for run in TRANSPARENT.finditer(alpha):
+        out[run.start() * 4 : run.end() * 4] = bytes((run.end() - run.start()) * 4)
+    for pixel in PARTIAL.finditer(alpha):
+        a = alpha[pixel.start()]
+        i = pixel.start() * 4
+        out[i : i + 3] = bytes((v * a + 127) // 255 for v in data[i : i + 3])
+    return bytes(out)
+
+
+def read_frame(path):
+    """A frame as premultiplied 8-bit RGBA, as the TIFF template writes it."""
     probe = subprocess.check_output(
         ["ffprobe", "-v", "error", "-show_entries", "stream=width,height",
          "-of", "csv=p=0", str(path)]
@@ -158,6 +183,8 @@ def read_tiff(path):
     data = subprocess.check_output(
         ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
     )
+    if path.suffix == ".png":
+        data = premultiplied(data)
     return Image(width, height, data)
 
 
@@ -213,7 +240,24 @@ function setParam(fx, name, value) {
     fx.property(name).setValue(value);
 }
 
-function build(v) {
+// The PNG template if this After Effects has it, else the TIFF one; saved for the harness.
+function chooseTemplate() {
+    var probe = app.project.items.addComp("template probe", 4, 4, 1, 1, %(fps)d);
+    var templates = app.project.renderQueue.items.add(probe).outputModule(1).templates;
+    var chosen = SPEC.tiff;
+    for (var t = 0; t < templates.length; t++) {
+        if (templates[t] == SPEC.png) {
+            chosen = SPEC.png;
+        }
+    }
+    var record = new File(SPEC.template_record);
+    record.open("w");
+    record.write(chosen);
+    record.close();
+    return chosen;
+}
+
+function build(v, template, extension) {
     app.newProject();
     var p = app.project;
     p.bitsPerChannel = v.depth;
@@ -269,8 +313,8 @@ function build(v) {
                 rq.setSettings({"Resolution": res});
             }
             var om = rq.outputModule(1);
-            om.applyTemplate("TIFF Sequence with Alpha");
-            om.file = new File(v.out + "/" + c.name + "_" + res + "_[#####].tif");
+            om.applyTemplate(template);
+            om.file = new File(v.out + "/" + c.name + "_" + res + "_[#####]." + extension);
         }
     }
     p.save(new File(v.aep));
@@ -278,8 +322,12 @@ function build(v) {
 
 // Never discard someone's work: an unsaved project asks first, and Cancel stops here.
 if (app.project.close(CloseOptions.PROMPT_TO_SAVE_CHANGES)) {
+    app.newProject();
+    var png = chooseTemplate() == SPEC.png;
+    app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES);
     for (var n = 0; n < SPEC.variants.length; n++) {
-        build(SPEC.variants[n]);
+        var usePng = png && SPEC.variants[n].depth < 32;
+        build(SPEC.variants[n], usePng ? SPEC.png : SPEC.tiff, usePng ? "png" : "tif");
     }
     app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES);
     app.newProject();
@@ -296,6 +344,9 @@ def build_fixtures(out, cases, variants, footage):
              "aep": str(out / f"{v.name}.aep"), "out": str(out / v.name)}
             for v in variants
         ],
+        "png": PNG_TEMPLATE,
+        "tiff": TIFF_TEMPLATE,
+        "template_record": str(out / "template.txt"),
     }
     for v in variants:
         (out / v.name).mkdir(parents=True, exist_ok=True)
@@ -312,6 +363,10 @@ def build_fixtures(out, cases, variants, footage):
     if missing:
         sys.exit(f"After Effects didn't save fixtures for {', '.join(missing)} "
                  "(was the save prompt cancelled, or did the script fail?)")
+    png = (out / "template.txt").read_text() == PNG_TEMPLATE
+    if not png:
+        print(f"After Effects has no '{PNG_TEMPLATE}' template: writing uncompressed TIFFs")
+    return {v.name: "png" if png and v.depth < 32 else "tif" for v in variants}
 
 
 # --- Rendering -------------------------------------------------------------------------
@@ -336,11 +391,11 @@ def aerender(variant, out, mfr):
     return PLUGIN_LOG.read_text().splitlines() if PLUGIN_LOG.exists() else []
 
 
-def load_frames(directory, case):
+def load_frames(directory, case, extension):
     frames = {}
     for res in case.get("resolutions", ["Full"]):
         frames[res] = [
-            read_tiff(directory / f"{case['name']}_{res}_{f:05d}.tif")
+            read_frame(directory / f"{case['name']}_{res}_{f:05d}.{extension}")
             for f in range(case.get("frames", 1))
         ]
     return frames
@@ -459,11 +514,28 @@ def save_failure(out, variant, case, frame, ae, ref):
 HALF_MEAN_LIMIT = 4.0
 
 
+def on_system_disk(path):
+    existing = next(p for p in [path, *path.parents] if p.exists())
+    return existing.stat().st_dev == Path("/").stat().st_dev
+
+
+def delete_passing_frames(rendered, cases, results):
+    """Deletes the rendered frames of every case whose checks all passed."""
+    for case in cases:
+        if any(r != "ok" for (c, _), cells in results.items() if c == case["name"]
+               for r in cells.values()):
+            continue
+        for directory in rendered.values():
+            for res in case.get("resolutions", ["Full"]):
+                for path in directory.glob(f"{case['name']}_{res}_*"):
+                    path.unlink()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--cases", help="comma-separated case names (default: all)")
     parser.add_argument("--variants", help="comma-separated variant names (default: all)")
-    parser.add_argument("--out", type=Path, default=ROOT / "target/ae-tests")
+    parser.add_argument("--out", type=Path, help="folder for results (default: $AE_TEST_OUT)")
     args = parser.parse_args()
 
     cases = CASES
@@ -478,7 +550,11 @@ def main():
         wanted = set(args.variants.split(","))
         variants = [v for v in VARIANTS if v.name in wanted]
 
-    out = args.out.resolve()
+    if not (args.out or os.environ.get("AE_TEST_OUT")):
+        sys.exit("set AE_TEST_OUT or --out to a folder that is not on the system disk")
+    out = (args.out or Path(os.environ["AE_TEST_OUT"])).resolve()
+    if on_system_disk(out):
+        sys.exit(f"{out} is on the system disk; set AE_TEST_OUT or --out to another drive")
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
@@ -496,7 +572,7 @@ def main():
         files[key] = out / f"{key}.rgba"
 
     print(f"building fixtures in After Effects ({len(cases)} cases, {len(variants)} variants)")
-    build_fixtures(out, cases, variants, {k: out / f"{k}.png" for k in files})
+    extensions = build_fixtures(out, cases, variants, {k: out / f"{k}.png" for k in files})
 
     references = render_references(out, cases, files)
 
@@ -518,7 +594,7 @@ def main():
     for case in cases:
         name = case["name"]
         for v in variants:
-            frames = load_frames(rendered[(v.name, "ON")], case)
+            frames = load_frames(rendered[(v.name, "ON")], case, extensions[v.name])
             if case.get("reference"):
                 failures = []
                 for f, ae in enumerate(frames["Full"]):
@@ -551,7 +627,7 @@ def main():
                     save_failure(out, v.name, name, 0, frames["Full"][0], None)
                 record(name, check.__qualname__.split(".")[0], v.name, failures)
             if v.mfr_off:
-                off = load_frames(rendered[(v.name, "OFF")], case)
+                off = load_frames(rendered[(v.name, "OFF")], case, extensions[v.name])
                 failures = []
                 for res in frames:
                     for f, (a, b) in enumerate(zip(frames[res], off[res])):
@@ -562,8 +638,8 @@ def main():
         gpu = [v for v in variants if v.accel == "METAL" and v.depth == 32]
         cpu = [v for v in variants if v.accel == "SOFTWARE" and v.depth == 32]
         if gpu and cpu:
-            a = load_frames(rendered[(gpu[0].name, "ON")], case)
-            b = load_frames(rendered[(cpu[0].name, "ON")], case)
+            a = load_frames(rendered[(gpu[0].name, "ON")], case, extensions[gpu[0].name])
+            b = load_frames(rendered[(cpu[0].name, "ON")], case, extensions[cpu[0].name])
             failures = []
             for res in a:
                 for f, (x, y) in enumerate(zip(a[res], b[res])):
@@ -588,6 +664,7 @@ def main():
     lines += ["", f"{total - len(failed)} of {total} passed in {time.time() - started:.0f}s"]
     lines += [""] + failed
     report = "\n".join(lines)
+    delete_passing_frames(rendered, cases, results)
     (out / "report.txt").write_text(report + "\n")
     (out / "report.json").write_text(json.dumps(
         [{"case": c, "check": k, "results": r} for (c, k), r in results.items()], indent=1))
