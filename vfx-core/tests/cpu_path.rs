@@ -1,19 +1,26 @@
 //! CPU-buffer path: host pixel buffers in RAM, with padded row strides and
 //! float formats. Like the render tests, these need a GPU adapter.
 
+use std::sync::OnceLock;
+
 use vfx_core::effects::ColorAdjust;
 use vfx_core::{EffectChain, Frame, Gpu, ParamValue, Readback};
 
-fn gpu() -> Gpu {
-    vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
-        .expect("no GPU adapter available for headless tests")
+/// The device every test in this binary shares, because WARP crashes when two devices
+/// draw at once from different threads.
+fn gpu() -> &'static Gpu {
+    static GPU: OnceLock<Gpu> = OnceLock::new();
+    GPU.get_or_init(|| {
+        vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
+            .expect("no GPU adapter available for headless tests")
+    })
 }
 
 #[test]
 fn strided_rgba8_round_trip_pads_rows() {
     let gpu = gpu();
     let (w, h, stride) = (5u32, 3u32, 32u32); // 20 bytes of pixels, 12 bytes of host padding per row
-    let frame = Frame::new(&gpu, w, h, wgpu::TextureFormat::Rgba8Unorm);
+    let frame = Frame::new(gpu, w, h, wgpu::TextureFormat::Rgba8Unorm);
 
     let mut host = vec![0xEEu8; (stride * h) as usize];
     for y in 0..h as usize {
@@ -21,9 +28,9 @@ fn strided_rgba8_round_trip_pads_rows() {
             host[y * stride as usize + x] = (y * 50 + x) as u8;
         }
     }
-    frame.write_strided(&gpu, &host, stride);
+    frame.write_strided(gpu, &host, stride);
 
-    let back = frame.read_strided(&gpu, stride);
+    let back = frame.read_strided(gpu, stride);
     for y in 0..h as usize {
         let row = &back[y * stride as usize..(y + 1) * stride as usize];
         assert_eq!(
@@ -51,8 +58,8 @@ fn rgba32_float_keeps_values_above_one() {
         .take((w * h * 4) as usize)
         .collect();
 
-    let src = Frame::new(&gpu, w, h, format);
-    src.write(&gpu, bytemuck::cast_slice(&input));
+    let src = Frame::new(gpu, w, h, format);
+    src.write(gpu, bytemuck::cast_slice(&input));
 
     let mut chain = EffectChain::new();
     let stage = chain.push(Box::new(ColorAdjust::default()));
@@ -60,11 +67,11 @@ fn rgba32_float_keeps_values_above_one() {
         .params_mut(stage)
         .set("brightness", ParamValue::Float(0.5))
         .unwrap();
-    chain.prepare(&gpu, format, (w, h));
-    let dst = Frame::new(&gpu, w, h, format);
-    chain.render(&gpu, &src, &dst, 0.0);
+    chain.prepare(gpu, format, (w, h));
+    let dst = Frame::new(gpu, w, h, format);
+    chain.render(gpu, &src, &dst, 0.0);
 
-    let out: Vec<f32> = bytemuck::pod_collect_to_vec(&dst.read(&gpu));
+    let out: Vec<f32> = bytemuck::pod_collect_to_vec(&dst.read(gpu));
     // Brightness is added in linear space and nothing clamps it, so 2.0 + 0.5 stays 2.5.
     assert_eq!(&out[..4], &[2.5, 0.0, 0.75, 1.0]);
 }
@@ -87,9 +94,9 @@ fn rgba16_float_round_trip_and_effect() {
         pixels.extend_from_slice(&one); // A
     }
 
-    let src = Frame::new(&gpu, w, h, format);
-    src.write(&gpu, &pixels);
-    assert_eq!(src.read(&gpu), pixels, "half-float round trip is exact");
+    let src = Frame::new(gpu, w, h, format);
+    src.write(gpu, &pixels);
+    assert_eq!(src.read(gpu), pixels, "half-float round trip is exact");
 
     let mut chain = EffectChain::new();
     let stage = chain.push(Box::new(ColorAdjust::default()));
@@ -97,11 +104,11 @@ fn rgba16_float_round_trip_and_effect() {
         .params_mut(stage)
         .set("brightness", ParamValue::Float(0.5))
         .unwrap();
-    chain.prepare(&gpu, format, (w, h));
-    let dst = Frame::new(&gpu, w, h, format);
-    chain.render(&gpu, &src, &dst, 0.0);
+    chain.prepare(gpu, format, (w, h));
+    let dst = Frame::new(gpu, w, h, format);
+    chain.render(gpu, &src, &dst, 0.0);
 
-    let out = dst.read(&gpu);
+    let out = dst.read(gpu);
     // Red goes 0.25 → 0.75; green 0 → 0.5 (0x3800); blue 1.0 → 1.5 (0x3E00).
     assert_eq!(&out[0..2], &three_quarters);
     assert_eq!(&out[2..4], &[0x00, 0x38]);
@@ -111,9 +118,9 @@ fn rgba16_float_round_trip_and_effect() {
 #[test]
 fn wrong_buffer_size_is_rejected() {
     let gpu = gpu();
-    let frame = Frame::new(&gpu, 4, 4, wgpu::TextureFormat::Rgba8Unorm);
+    let frame = Frame::new(gpu, 4, 4, wgpu::TextureFormat::Rgba8Unorm);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        frame.write(&gpu, &[0u8; 10]);
+        frame.write(gpu, &[0u8; 10]);
     }));
     assert!(result.is_err(), "short buffer must panic");
 }
@@ -122,24 +129,24 @@ fn wrong_buffer_size_is_rejected() {
 fn float_readback_reuse_returns_each_write() {
     let gpu = gpu();
     // 80-byte rows need padding to the GPU's 256-byte copy pitch.
-    let frame = Frame::new(&gpu, 5, 3, wgpu::TextureFormat::Rgba32Float);
-    let mut readback = Readback::new(&gpu, &frame);
+    let frame = Frame::new(gpu, 5, 3, wgpu::TextureFormat::Rgba32Float);
+    let mut readback = Readback::new(gpu, &frame);
     for offset in [0.0, 2.0, -0.5] {
         let input: Vec<f32> = (0..60).map(|i| i as f32 * 0.25 + offset).collect();
-        frame.write(&gpu, bytemuck::cast_slice(&input));
-        assert_eq!(readback.read_f32(&gpu, &frame), input);
-        assert_eq!(frame.read(&gpu), bytemuck::cast_slice::<f32, u8>(&input));
+        frame.write(gpu, bytemuck::cast_slice(&input));
+        assert_eq!(readback.read_f32(gpu, &frame), input);
+        assert_eq!(frame.read(gpu), bytemuck::cast_slice::<f32, u8>(&input));
     }
 }
 
 #[test]
 fn readback_rejects_mismatched_size() {
     let gpu = gpu();
-    let frame = Frame::new(&gpu, 5, 3, wgpu::TextureFormat::Rgba32Float);
-    let other = Frame::new(&gpu, 3, 5, wgpu::TextureFormat::Rgba32Float);
-    let mut readback = Readback::new(&gpu, &frame);
+    let frame = Frame::new(gpu, 5, 3, wgpu::TextureFormat::Rgba32Float);
+    let other = Frame::new(gpu, 3, 5, wgpu::TextureFormat::Rgba32Float);
+    let mut readback = Readback::new(gpu, &frame);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        readback.read_f32(&gpu, &other);
+        readback.read_f32(gpu, &other);
     }));
     assert!(result.is_err(), "readback must match the frame's layout");
 }

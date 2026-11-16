@@ -1,13 +1,20 @@
 //! Vignette, Blend, Flip, PixelConvert transfer curves and blur direction, on float frames.
 
+use std::sync::OnceLock;
+
 use vfx_core::effects::{Blend, Flip, GaussianBlur, PixelConvert, Vignette};
 use vfx_core::{Effect, EffectChain, Frame, Gpu, ParamValue};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
-fn gpu() -> Gpu {
-    vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
-        .expect("no GPU adapter available for headless tests")
+/// The device every test in this binary shares, because WARP crashes when two devices
+/// draw at once from different threads.
+fn gpu() -> &'static Gpu {
+    static GPU: OnceLock<Gpu> = OnceLock::new();
+    GPU.get_or_init(|| {
+        vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
+            .expect("no GPU adapter available for headless tests")
+    })
 }
 
 fn frame(gpu: &Gpu, w: u32, h: u32, pixels: &[[f32; 4]]) -> Frame {
@@ -48,7 +55,7 @@ fn srgb_round_trip_keeps_values_including_hdr() {
     let gpu = gpu();
     let pixels = [[0.0, 0.5, 1.0, 0.5], [2.0, 0.01, 0.2, 1.0]];
     let linear = run(
-        &gpu,
+        gpu,
         PixelConvert::srgb_to_linear(),
         (2, 1),
         &pixels,
@@ -60,7 +67,7 @@ fn srgb_round_trip_keeps_values_including_hdr() {
     assert_eq!(linear[0][3], 0.5);
 
     let back = run(
-        &gpu,
+        gpu,
         PixelConvert::linear_to_srgb(),
         (2, 1),
         &linear,
@@ -78,7 +85,7 @@ fn vignette_leaves_centre_and_tints_corners() {
     let (w, h) = (9u32, 9u32);
     let white = vec![[1.0, 1.0, 1.0, 1.0]; (w * h) as usize];
     let out = run(
-        &gpu,
+        gpu,
         Vignette::default(),
         (w, h),
         &white,
@@ -109,7 +116,7 @@ fn vignette_zero_radius_covers_frame() {
     let (w, h) = (9u32, 9u32);
     let white = vec![[1.0, 1.0, 1.0, 1.0]; (w * h) as usize];
     let out = run(
-        &gpu,
+        gpu,
         Vignette::default(),
         (w, h),
         &white,
@@ -143,7 +150,7 @@ fn blend_modes_and_transparent_layer() {
     };
     for mode in 0..4 {
         let out = run(
-            &gpu,
+            gpu,
             Blend::default(),
             (2, 1),
             &base,
@@ -164,7 +171,7 @@ fn blend_modes_and_transparent_layer() {
 fn blend_without_layer_copies_input() {
     let gpu = gpu();
     let base = [[0.1, 0.2, 0.3, 0.4], [0.9, 0.8, 0.7, 1.0]];
-    let out = run(&gpu, Blend::default(), (2, 1), &base, None, &[]);
+    let out = run(gpu, Blend::default(), (2, 1), &base, None, &[]);
     assert_eq!(out, base.to_vec());
 }
 
@@ -175,7 +182,7 @@ fn horizontal_blur_does_not_spread_vertically() {
     let mut pixels = vec![[0.0, 0.0, 0.0, 1.0]; (w * h) as usize];
     pixels[(3 * w + 3) as usize] = [1.0, 1.0, 1.0, 1.0];
     let out = run(
-        &gpu,
+        gpu,
         GaussianBlur::default(),
         (w, h),
         &pixels,
@@ -203,7 +210,7 @@ fn flip_mirrors_each_axis() {
         .collect();
     let flipped = |x: f32, y: f32| {
         run(
-            &gpu,
+            gpu,
             Flip::default(),
             (w, h),
             &input,
