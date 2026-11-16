@@ -2,6 +2,8 @@
 //! against values worked out from the formula, within 8-bit quantisation. They need a GPU
 //! adapter.
 
+use std::sync::OnceLock;
+
 use vfx_core::effects::{ColorAdjust, FeedbackTrail, GaussianBlur};
 use vfx_core::{EffectChain, Frame, Gpu, ParamValue};
 
@@ -10,9 +12,14 @@ const W: u32 = 9;
 const H: u32 = 9;
 const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
 
-fn gpu() -> Gpu {
-    vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
-        .expect("no GPU adapter available for headless tests")
+/// The device every test in this binary shares, because WARP crashes when two devices
+/// draw at once from different threads.
+fn gpu() -> &'static Gpu {
+    static GPU: OnceLock<Gpu> = OnceLock::new();
+    GPU.get_or_init(|| {
+        vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
+            .expect("no GPU adapter available for headless tests")
+    })
 }
 
 fn solid(color: [u8; 4]) -> Vec<u8> {
@@ -52,7 +59,7 @@ fn color_adjust_defaults_are_identity() {
     let input = solid([128, 64, 200, 255]);
     let mut chain = EffectChain::new();
     chain.push(Box::new(ColorAdjust::default()));
-    assert_eq!(run(&gpu, &mut chain, &input), input);
+    assert_eq!(run(gpu, &mut chain, &input), input);
 }
 
 #[test]
@@ -66,7 +73,7 @@ fn color_adjust_brightness_offsets_each_channel() {
         .set("brightness", ParamValue::Float(0.25))
         .unwrap();
 
-    let out = run(&gpu, &mut chain, &input);
+    let out = run(gpu, &mut chain, &input);
     let px = pixel(&out, 4, 4);
     // 0.25 is 63.75 of 255 levels; 200 clamps at white.
     for (channel, expected) in [192u8, 128, 255].into_iter().enumerate() {
@@ -88,7 +95,7 @@ fn blur_impulse_spreads_and_conserves_energy() {
         .params_mut(stage)
         .set("radius", ParamValue::Float(2.0))
         .unwrap();
-    let out = run(&gpu, &mut chain, &input);
+    let out = run(gpu, &mut chain, &input);
 
     // sigma = 1 gives taps 1, 0.6065, 0.1353; the 2-D centre weight is
     // (1 / 2.4836)^2 ≈ 0.162.
@@ -122,7 +129,7 @@ fn zero_radius_blur_is_identity() {
         .params_mut(stage)
         .set("radius", ParamValue::Float(0.0))
         .unwrap();
-    assert_eq!(run(&gpu, &mut chain, &input), input);
+    assert_eq!(run(gpu, &mut chain, &input), input);
 }
 
 #[test]
@@ -139,14 +146,14 @@ fn feedback_trail_fades_across_frames() {
         .params_mut(stage)
         .set("decay", ParamValue::Float(0.5))
         .unwrap();
-    chain.prepare(&gpu, FORMAT, (W, H));
+    chain.prepare(gpu, FORMAT, (W, H));
 
-    let input = Frame::new(&gpu, W, H, FORMAT);
-    let output = Frame::new(&gpu, W, H, FORMAT);
+    let input = Frame::new(gpu, W, H, FORMAT);
+    let output = Frame::new(gpu, W, H, FORMAT);
     let mut render = |pixels: &[u8]| {
-        input.write_rgba8(&gpu, pixels);
-        chain.render(&gpu, &input, &output, 0.0);
-        output.read_rgba8(&gpu)
+        input.write_rgba8(gpu, pixels);
+        chain.render(gpu, &input, &output, 0.0);
+        output.read_rgba8(gpu)
     };
 
     assert_eq!(
@@ -187,7 +194,7 @@ fn chain_of_three_matches_composed_formula() {
         .set("brightness", ParamValue::Float(0.1))
         .unwrap();
 
-    let out = run(&gpu, &mut chain, &input);
+    let out = run(gpu, &mut chain, &input);
     let px = pixel(&out, 4, 4);
     // 0.2 is 51 of 255 levels. Each stage quantises to 8 bits, so allow 2 levels of drift.
     for (channel, expected) in [179u8, 115, 251].into_iter().enumerate() {
@@ -200,5 +207,5 @@ fn empty_chain_copies_input() {
     let gpu = gpu();
     let input = solid([3, 77, 250, 255]);
     let mut chain = EffectChain::new();
-    assert_eq!(run(&gpu, &mut chain, &input), input);
+    assert_eq!(run(gpu, &mut chain, &input), input);
 }

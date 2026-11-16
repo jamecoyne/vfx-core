@@ -282,31 +282,38 @@ impl Effect for VfxPreview {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
 
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
-    fn gpu() -> Gpu {
-        vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
-            .expect("no GPU adapter available for tests")
+    /// The device every test in this binary shares, because WARP crashes when two
+    /// devices draw at once from different threads.
+    fn gpu() -> &'static Gpu {
+        static GPU: OnceLock<Gpu> = OnceLock::new();
+        GPU.get_or_init(|| {
+            vfx_core::device::open(&vfx_core::device::DeviceRequest::from_env())
+                .expect("no GPU adapter available for tests")
+        })
     }
 
     /// Runs the effect once on `input` (RGBA f32, `w` x `h`), with an optional layer.
     fn run(params: &ParamValues, w: u32, h: u32, input: &[f32], layer: Option<&[f32]>) -> Vec<f32> {
         let gpu = gpu();
         let mut effect = VfxPreview::default();
-        effect.prepare(&gpu, FORMAT, (w, h));
+        effect.prepare(gpu, FORMAT, (w, h));
         let frame = |pixels: &[f32]| {
-            let f = Frame::new(&gpu, w, h, FORMAT);
-            f.write(&gpu, bytemuck_f32(pixels));
+            let f = Frame::new(gpu, w, h, FORMAT);
+            f.write(gpu, bytemuck_f32(pixels));
             f
         };
-        let (input, output) = (frame(input), Frame::new(&gpu, w, h, FORMAT));
+        let (input, output) = (frame(input), Frame::new(gpu, w, h, FORMAT));
         let layer = layer.map(frame);
         let layers: Vec<&Frame> = layer.iter().collect();
-        effect.render_layers(&gpu, &input, &layers, &output, params, &Context::at(0.0));
+        effect.render_layers(gpu, &input, &layers, &output, params, &Context::at(0.0));
         output
-            .read(&gpu)
+            .read(gpu)
             .as_chunks::<4>()
             .0
             .iter()
