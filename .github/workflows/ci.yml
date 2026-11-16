@@ -46,6 +46,17 @@ jobs:
       - name: Tests (headless render, effects, reference checks)
         run: cargo test -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p colour-adjust -p gaussian-blur -p vignette -p blend -p segcam-motion -p segcam-face -p cargo-vfx
 
+      # The runner has no GPU, so segcam draws on WARP, where the references were drawn.
+      - name: segcam stored references (WARP)
+        if: runner.os == 'Windows'
+        env:
+          WGPU_ADAPTER_NAME: Microsoft Basic Render Driver
+        shell: bash
+        # A filter that matches nothing passes, so the step checks the test ran.
+        run: |
+          cargo test -p segcam-motion --test gpu -- --ignored --exact references::gpu_draws_match | tee references.log
+          grep -q '^test references::gpu_draws_match \.\.\. ok' references.log
+
       # segcam-face without ONNX Runtime: Vision alone on macOS, no detector elsewhere.
       - name: segcam-face without ONNX Runtime
         run: |
