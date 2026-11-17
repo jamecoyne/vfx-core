@@ -10,7 +10,7 @@ default-members = ["vfx-core"]
 # The latest stable Rust, raised at each dependency update. Resolver 3 picks the newest crate
 # versions that build with it.
 [workspace.package]
-rust-version = "1.99"
+rust-version = "1.100"
 
 # The pixel heavy crates' tests run optimised: minutes become seconds, and overflow checks and
 # debug assertions stay on.
